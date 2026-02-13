@@ -7,9 +7,9 @@ RUN set -ex \
   && apt-get install -qq --no-install-recommends ca-certificates gosu wget \
   && rm -rf /var/lib/apt/lists/*
 
-ENV BITCOIN_VERSION 28.0.2
-ENV BITCOIN_URL https://download.bitcoincashnode.org/misc/builds/upgrade12_temp/linux/bitcoin-cash-node-28.0.2-x86_64-linux-gnu.tar.gz
-ENV BITCOIN_SHA256 140b44fd76a4f9428354bfbec4800d58fd39fb723320e761a035f15c2dd43596
+ENV BITCOIN_VERSION=28.0.2
+ENV BITCOIN_URL=https://download.bitcoincashnode.org/misc/builds/upgrade12_temp/linux/bitcoin-cash-node-28.0.2-x86_64-linux-gnu.tar.gz
+ENV BITCOIN_SHA256=140b44fd76a4f9428354bfbec4800d58fd39fb723320e761a035f15c2dd43596
 
 # install bitcoin binaries
 RUN set -ex \
@@ -20,7 +20,7 @@ RUN set -ex \
   && rm -rf /tmp/*
 
 # create data directory
-ENV BITCOIN_DATA /data
+ENV BITCOIN_DATA=/data
 RUN mkdir "$BITCOIN_DATA" \
   && chown -R bitcoin:bitcoin "$BITCOIN_DATA" \
   && ln -sfn "$BITCOIN_DATA" /home/bitcoin/.bitcoin \

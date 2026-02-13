@@ -2,8 +2,8 @@
 
 FROM postgres:14.6
 
-ENV PG_MAJOR 14
-ENV PG_FULL 14.6
+ENV PG_MAJOR=14
+ENV PG_FULL=14.6
 
 RUN apt-get update \
   && apt-cache showpkg postgresql-$PG_MAJOR-pldebugger \

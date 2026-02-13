@@ -16,6 +16,6 @@ COPY --from=build-stage /chaingraph/production-dependencies ./
 COPY --from=build-stage /chaingraph/defaults.env ./
 COPY --from=build-stage /chaingraph/bin bin
 COPY --from=build-stage /chaingraph/build build
-ENV NODE_ENV production
+ENV NODE_ENV=production
 EXPOSE 3200
 CMD ["node", "bin/chaingraph.js"]
