@@ -59,6 +59,9 @@ const recreateDbOnStartup = true as boolean;
 const dir = dirname(fileURLToPath(import.meta.url));
 const migration = (path: string) =>
   resolve(dir, '../../images/hasura/hasura-data/migrations/', path);
+const backfillOrphanMempoolDescendantsMigrationPath = migration(
+  'default/1778158619747_backfill_orphan_mempool_descendants/up.sql'
+);
 const dbUpMigrationPaths = [
   migration('default/1616195337538_init/up.sql'),
   migration('default/1673124945608_tokens/up.sql'),
@@ -66,6 +69,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1778151011521_cascade_invalidate_mempool_descendants/up.sql'
   ),
+  backfillOrphanMempoolDescendantsMigrationPath,
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -794,6 +798,185 @@ SELECT transaction_values.name AS "transactionName",
       t.deepEqual(archivedDescendants, [
         { replacedAt: '2026-01-01 00:10:00', transactionName: 'child_b' },
         { replacedAt: '2026-01-01 00:10:00', transactionName: 'child_c' },
+      ]);
+    } finally {
+      await client.query(/* sql */ `ROLLBACK;`);
+    }
+  }
+);
+
+test.serial(
+  '[e2e] backfills existing orphan mempool descendants with idempotence',
+  async (t) => {
+    await client.query(/* sql */ `BEGIN;`);
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      const backfillMigration = readFileSync(
+        backfillOrphanMempoolDescendantsMigrationPath,
+        'utf8'
+      );
+      await client.query(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('backfill_parent_a', decode(repeat('e1', 32), 'hex')),
+      ('backfill_child_b',  decode(repeat('e2', 32), 'hex')),
+      ('backfill_child_c',  decode(repeat('e3', 32), 'hex'))
+)
+INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
+  SELECT hash, 1, 0, 100, false
+    FROM transaction_values;
+`);
+      await client.query(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('backfill_parent_a', decode(repeat('e1', 32), 'hex')),
+      ('backfill_child_b',  decode(repeat('e2', 32), 'hex'))
+)
+INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode)
+  SELECT hash, 0, 1000, '\\x51'::bytea
+    FROM transaction_values;
+`);
+      await client.query(/* sql */ `
+WITH input_values (child_name, parent_name, input_index) AS (
+    VALUES
+      ('backfill_child_b', 'backfill_parent_a', 0),
+      ('backfill_child_c', 'backfill_child_b',  0)
+),
+transaction_values (name, hash) AS (
+    VALUES
+      ('backfill_parent_a', decode(repeat('e1', 32), 'hex')),
+      ('backfill_child_b',  decode(repeat('e2', 32), 'hex')),
+      ('backfill_child_c',  decode(repeat('e3', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction_values.name, transaction.internal_id, transaction.hash
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
+  SELECT child.internal_id, input_values.input_index, 0, 0, parent.hash, '\\x51'::bytea
+    FROM input_values
+    JOIN named_transactions child
+      ON child.name = input_values.child_name
+    JOIN named_transactions parent
+      ON parent.name = input_values.parent_name;
+`);
+      await client.query(/* sql */ `
+WITH selected_nodes AS (
+    SELECT name, internal_id
+      FROM node
+      WHERE name = 'node1'
+),
+transaction_values (name, hash) AS (
+    VALUES
+      ('backfill_parent_a', decode(repeat('e1', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction_values.name, transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id, validated_at, replaced_at)
+  SELECT selected_nodes.internal_id,
+         named_transactions.internal_id,
+         timestamp '2026-01-01 00:00:00',
+         timestamp '2026-01-01 00:10:00'
+    FROM selected_nodes
+    CROSS JOIN named_transactions;
+`);
+      await client.query(/* sql */ `
+WITH selected_nodes AS (
+    SELECT name, internal_id
+      FROM node
+      WHERE name = 'node1'
+),
+transaction_values (name, hash) AS (
+    VALUES
+      ('backfill_child_b', decode(repeat('e2', 32), 'hex')),
+      ('backfill_child_c', decode(repeat('e3', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction_values.name, transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
+  SELECT selected_nodes.internal_id, named_transactions.internal_id, timestamp '2026-01-01 00:00:00'
+    FROM selected_nodes
+    CROSS JOIN named_transactions;
+`);
+      await client.query(backfillMigration);
+      await client.query(backfillMigration);
+
+      const remainingMempool = (
+        await client.query<{
+          transactionName: string;
+        }>(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('backfill_child_b', decode(repeat('e2', 32), 'hex')),
+      ('backfill_child_c', decode(repeat('e3', 32), 'hex'))
+)
+SELECT transaction_values.name AS "transactionName"
+  FROM node_transaction
+  JOIN node
+    ON node.internal_id = node_transaction.node_internal_id
+  JOIN transaction
+    ON transaction.internal_id = node_transaction.transaction_internal_id
+  JOIN transaction_values
+    ON transaction_values.hash = transaction.hash
+  WHERE node.name = 'node1'
+  ORDER BY "transactionName";
+`)
+      ).rows;
+      t.deepEqual(remainingMempool, []);
+
+      const archivedTransactions = (
+        await client.query<{
+          historyRowCount: number;
+          replacedAt: string;
+          transactionName: string;
+        }>(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('backfill_parent_a', decode(repeat('e1', 32), 'hex')),
+      ('backfill_child_b',  decode(repeat('e2', 32), 'hex')),
+      ('backfill_child_c',  decode(repeat('e3', 32), 'hex'))
+)
+SELECT transaction_values.name AS "transactionName",
+       COUNT(*)::integer AS "historyRowCount",
+       MIN(node_transaction_history.replaced_at)::text AS "replacedAt"
+  FROM node_transaction_history
+  JOIN node
+    ON node.internal_id = node_transaction_history.node_internal_id
+  JOIN transaction
+    ON transaction.internal_id = node_transaction_history.transaction_internal_id
+  JOIN transaction_values
+    ON transaction_values.hash = transaction.hash
+  WHERE node.name = 'node1'
+  GROUP BY transaction_values.name
+  ORDER BY "transactionName";
+`)
+      ).rows;
+      t.deepEqual(archivedTransactions, [
+        {
+          historyRowCount: 1,
+          replacedAt: '2026-01-01 00:10:00',
+          transactionName: 'backfill_child_b',
+        },
+        {
+          historyRowCount: 1,
+          replacedAt: '2026-01-01 00:10:00',
+          transactionName: 'backfill_child_c',
+        },
+        {
+          historyRowCount: 1,
+          replacedAt: '2026-01-01 00:10:00',
+          transactionName: 'backfill_parent_a',
+        },
       ]);
     } finally {
       await client.query(/* sql */ `ROLLBACK;`);
