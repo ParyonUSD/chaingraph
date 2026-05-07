@@ -63,6 +63,9 @@ const dbUpMigrationPaths = [
   migration('default/1616195337538_init/up.sql'),
   migration('default/1673124945608_tokens/up.sql'),
   migration('default/1676794104752_parse_bytecode_pattern/up.sql'),
+  migration(
+    'default/1778151011521_cascade_invalidate_mempool_descendants/up.sql'
+  ),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -616,9 +619,187 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'transaction_hash_key',
     'transaction_pkey',
   ]);
+  // cspell:ignore tgenabled tgname
+  const triggers = (
+    await client.query<{
+      tgenabled: string;
+      tgname: string;
+    }>(/* sql */ `
+  SELECT tgname, tgenabled FROM pg_trigger
+    WHERE tgname IN (
+      'trigger_public_node_block_insert',
+      'trigger_public_node_transaction_history_insert'
+    )
+    ORDER BY tgname;
+  `)
+  ).rows;
+  t.deepEqual(triggers, [
+    { tgenabled: 'O', tgname: 'trigger_public_node_block_insert' },
+    {
+      tgenabled: 'O',
+      tgname: 'trigger_public_node_transaction_history_insert',
+    },
+  ]);
   clearStdoutBuffer();
   t.pass();
 });
+
+test.serial(
+  '[e2e] cascades replaced mempool transaction history to same-node descendants',
+  async (t) => {
+    await client.query(/* sql */ `BEGIN;`);
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await client.query(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('parent_a', decode(repeat('f1', 32), 'hex')),
+      ('child_b',  decode(repeat('f3', 32), 'hex')),
+      ('child_c',  decode(repeat('f4', 32), 'hex'))
+)
+INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
+  SELECT hash, 1, 0, 100, false
+    FROM transaction_values;
+`);
+      await client.query(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('parent_a', decode(repeat('f1', 32), 'hex')),
+      ('child_b',  decode(repeat('f3', 32), 'hex'))
+)
+INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode)
+  SELECT hash, 0, 1000, '\\x51'::bytea
+    FROM transaction_values;
+`);
+      await client.query(/* sql */ `
+WITH input_values (child_name, parent_name, input_index) AS (
+    VALUES
+      ('child_b', 'parent_a', 0),
+      ('child_c', 'child_b',  0)
+),
+transaction_values (name, hash) AS (
+    VALUES
+      ('parent_a', decode(repeat('f1', 32), 'hex')),
+      ('child_b',  decode(repeat('f3', 32), 'hex')),
+      ('child_c',  decode(repeat('f4', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction_values.name, transaction.internal_id, transaction.hash
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
+  SELECT child.internal_id, input_values.input_index, 0, 0, parent.hash, '\\x51'::bytea
+    FROM input_values
+    JOIN named_transactions child
+      ON child.name = input_values.child_name
+    JOIN named_transactions parent
+      ON parent.name = input_values.parent_name;
+`);
+      await client.query(/* sql */ `
+WITH selected_nodes AS (
+    SELECT name, internal_id
+      FROM node
+      WHERE name IN ('node1', 'node2')
+),
+transaction_values (name, hash) AS (
+    VALUES
+      ('child_b', decode(repeat('f3', 32), 'hex')),
+      ('child_c', decode(repeat('f4', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction_values.name, transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
+  SELECT selected_nodes.internal_id, named_transactions.internal_id, timestamp '2026-01-01 00:00:00'
+    FROM selected_nodes
+    CROSS JOIN named_transactions;
+`);
+      await client.query(/* sql */ `
+WITH selected_nodes AS (
+    SELECT name, internal_id
+      FROM node
+      WHERE name = 'node1'
+),
+transaction_values (name, hash) AS (
+    VALUES
+      ('parent_a', decode(repeat('f1', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction_values.name, transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id, validated_at, replaced_at)
+  SELECT selected_nodes.internal_id,
+         named_transactions.internal_id,
+         timestamp '2026-01-01 00:00:00',
+         timestamp '2026-01-01 00:10:00'
+    FROM selected_nodes
+    CROSS JOIN named_transactions;
+`);
+      const remainingMempool = (
+        await client.query<{
+          nodeName: string;
+          transactionName: string;
+        }>(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('child_b', decode(repeat('f3', 32), 'hex')),
+      ('child_c', decode(repeat('f4', 32), 'hex'))
+)
+SELECT node.name AS "nodeName", transaction_values.name AS "transactionName"
+  FROM node_transaction
+  JOIN node
+    ON node.internal_id = node_transaction.node_internal_id
+  JOIN transaction
+    ON transaction.internal_id = node_transaction.transaction_internal_id
+  JOIN transaction_values
+    ON transaction_values.hash = transaction.hash
+  ORDER BY "nodeName", "transactionName";
+`)
+      ).rows;
+      t.deepEqual(remainingMempool, [
+        { nodeName: 'node2', transactionName: 'child_b' },
+        { nodeName: 'node2', transactionName: 'child_c' },
+      ]);
+      const archivedDescendants = (
+        await client.query<{
+          replacedAt: string;
+          transactionName: string;
+        }>(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('child_b', decode(repeat('f3', 32), 'hex')),
+      ('child_c', decode(repeat('f4', 32), 'hex'))
+)
+SELECT transaction_values.name AS "transactionName",
+       node_transaction_history.replaced_at::text AS "replacedAt"
+  FROM node_transaction_history
+  JOIN node
+    ON node.internal_id = node_transaction_history.node_internal_id
+  JOIN transaction
+    ON transaction.internal_id = node_transaction_history.transaction_internal_id
+  JOIN transaction_values
+    ON transaction_values.hash = transaction.hash
+  WHERE node.name = 'node1'
+  ORDER BY "transactionName";
+`)
+      ).rows;
+      t.deepEqual(archivedDescendants, [
+        { replacedAt: '2026-01-01 00:10:00', transactionName: 'child_b' },
+        { replacedAt: '2026-01-01 00:10:00', transactionName: 'child_c' },
+      ]);
+    } finally {
+      await client.query(/* sql */ `ROLLBACK;`);
+    }
+  }
+);
 
 test.serial(
   '[e2e] after initial sync is complete, requests transactions as they are announced',

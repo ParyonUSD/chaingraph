@@ -564,14 +564,17 @@ DELETE FROM node_block WHERE
 /**
  * After initial sync, Chaingraph begins tracking each node's mempool.
  *
- * To maintain consistency, a trigger which is disabled before initial sync must
+ * To maintain consistency, triggers which are disabled before initial sync must
  * be reenabled to clear any confirmed or conflicting transactions when a block
  * is accepted.
  */
 export const reenableMempoolCleaning = async () => {
   const client = await pool.connect();
-  const res = await client.query(
+  await client.query(
     `ALTER TABLE node_block ENABLE TRIGGER trigger_public_node_block_insert;`
+  );
+  const res = await client.query(
+    `ALTER TABLE node_transaction_history ENABLE TRIGGER trigger_public_node_transaction_history_insert;`
   );
   client.release();
   return res.rowCount;
