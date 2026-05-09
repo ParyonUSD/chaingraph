@@ -300,7 +300,7 @@ export const saveBlock = async ({
   }>(
     (transactions, transaction) => {
       // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-      transactionCache.has(transaction.hash)
+      transactionCache.get(transaction.hash)?.db === true
         ? transactions.alreadySaved.push(transaction)
         : transactions.unknown.push(transaction);
       return transactions;
@@ -453,11 +453,6 @@ inserted_block (internal_id) AS (
   ON CONFLICT ON CONSTRAINT "block_hash_key" DO NOTHING
   RETURNING internal_id
 ),
-inserted_block_transactions AS (
-  INSERT INTO block_transaction (block_internal_id, transaction_internal_id, transaction_index)
-    SELECT blk.internal_id, tx.internal_id, tx.transaction_index
-      FROM inserted_block blk CROSS JOIN joined_transactions tx
-),
 new_or_existing_block (internal_id) AS (
   SELECT COALESCE (
     (SELECT internal_id FROM inserted_block),
@@ -465,27 +460,78 @@ new_or_existing_block (internal_id) AS (
       block.hash
     )}'::bytea)
   )
-)
-INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
+),
+inserted_block_transactions AS (
+  INSERT INTO block_transaction (block_internal_id, transaction_internal_id, transaction_index)
+    SELECT blk.internal_id, tx.internal_id, tx.transaction_index
+      FROM new_or_existing_block blk CROSS JOIN joined_transactions tx
+    ON CONFLICT ON CONSTRAINT "block_transaction_pkey" DO NOTHING
+    RETURNING transaction_internal_id
+),
+inserted_node_blocks AS (
+  INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
   SELECT node.node_internal_id, blk.internal_id, node.accepted_at
     FROM new_or_existing_block blk CROSS JOIN accepting_nodes node
-  ON CONFLICT ON CONSTRAINT "node_block_pkey" DO NOTHING`;
+  ON CONFLICT ON CONSTRAINT "node_block_pkey" DO NOTHING
+  RETURNING block_internal_id
+)
+SELECT
+  (SELECT COUNT(*)::bigint FROM joined_transactions) AS "joinedTransactionCount",
+  (SELECT COUNT(*)::bigint FROM inserted_block_transactions) AS "insertedBlockTransactionCount",
+  (SELECT COUNT(*)::bigint FROM inserted_node_blocks) AS "insertedNodeBlockCount";`;
   const client = await pool.connect();
-  await client.query('BEGIN;');
-  const saveTransactionsResult = await client.query<{ count: string }>(
-    addAllTransactions
-  );
-  const attemptedSavedTransactions = blockTransactions.unknown;
-  const savedTransactionCount = Number(saveTransactionsResult.rows[0]!.count);
-  const transactionCacheMisses =
-    attemptedSavedTransactions.length - savedTransactionCount;
-  await client.query(addBlockQuery);
-  await client.query('COMMIT;');
-  client.release();
-  return {
-    attemptedSavedTransactions,
-    transactionCacheMisses,
-  };
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    await client.query('BEGIN;');
+    const saveTransactionsResult = await client.query<{ count: string }>(
+      addAllTransactions
+    );
+    const attemptedSavedTransactions = blockTransactions.unknown;
+    const savedTransactionCount = Number(saveTransactionsResult.rows[0]!.count);
+    const transactionCacheMisses =
+      attemptedSavedTransactions.length - savedTransactionCount;
+    const addBlockResult = await client.query<{
+      insertedBlockTransactionCount: string;
+      insertedNodeBlockCount: string;
+      joinedTransactionCount: string;
+    }>(addBlockQuery);
+    const joinedTransactionCount = Number(
+      addBlockResult.rows[0]!.joinedTransactionCount
+    );
+    const linkedBlockTransactionCount = Number(
+      (
+        await client.query<{ count: string }>(
+          /* sql */ `
+          SELECT COUNT(*)::bigint AS count
+            FROM block_transaction
+            INNER JOIN block ON block.internal_id = block_transaction.block_internal_id
+            WHERE block.hash = $1;
+        `,
+          [Buffer.from(block.hash, 'hex')]
+        )
+      ).rows[0]!.count
+    );
+    if (
+      joinedTransactionCount !== block.transactions.length ||
+      linkedBlockTransactionCount !== block.transactions.length
+    ) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        `Failed to save all transactions for block ${block.height} (${block.hash}): joined ${joinedTransactionCount}/${block.transactions.length}, linked ${linkedBlockTransactionCount}/${block.transactions.length}.`
+      );
+    }
+    await client.query('COMMIT;');
+    return {
+      attemptedSavedTransactions,
+      transactionCacheMisses,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
+  } finally {
+    client.release();
+  }
 };
 
 /**
