@@ -1453,8 +1453,54 @@ test.serial(
   }
 );
 
+test.serial(
+  '[e2e] saves block transactions if previously announced tx is seen but not yet saved',
+  async (t) => {
+    const tipStartIndex = 162;
+    const [, tx1] = tipA[tipStartIndex]!.transactions;
+    mempool[swapEndianness(tx1!.hash)] = false;
+    const node1RequestedTx = new Promise((res) => {
+      node1.once('peergetdata', (_, message) => {
+        res(message.inventory);
+      });
+    });
+    peers.node1.sendMessage(
+      peers.node1.messages.Inventory.forTransaction(
+        Buffer.from(tx1!.hash, 'hex')
+      )
+    );
+    await node1RequestedTx;
+    logger.debug(
+      `node1: announced tipA[${tipStartIndex}] transaction 1 without providing the transaction: ${
+        tx1!.hash
+      }`
+    );
+    newBlocks('node1', [tipA[tipStartIndex]!]);
+    newBlocks('node2', [tipB[tipStartIndex]!]);
+    newBlocks('node3', [tipA[tipStartIndex]!]);
+    await waitForStdout(/Saved new block – height:\s+3163[^\n]+nodes: node2/u);
+    await waitForStdout(
+      /Saved new block – height:\s+3163[^\n]+nodes: node1, node4/u
+    );
+    const blockTransactionCount = (
+      await client.query<{ count: string }>(
+        /* sql */ `
+        SELECT COUNT(*) FROM block_transaction
+          INNER JOIN block ON block.internal_id = block_transaction.block_internal_id
+          WHERE block.hash = $1;
+      `,
+        [hexToBin(tipA[tipStartIndex]!.header.hash)]
+      )
+    ).rows[0]!.count;
+    t.deepEqual(
+      blockTransactionCount,
+      tipA[tipStartIndex]!.transactions.length.toString()
+    );
+  }
+);
+
 test.serial('[e2e] syncs remaining blocks one-by-one', async (t) => {
-  const tipStartIndex = 162;
+  const tipStartIndex = 163;
   slowFeedBlocks('node1', tipA.slice(tipStartIndex), 1);
   slowFeedBlocks('node2', tipB.slice(tipStartIndex), 1);
   /**
