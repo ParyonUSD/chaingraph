@@ -774,11 +774,23 @@ export const reenableMempoolCleaning = async () => {
   await client.query(
     `ALTER TABLE node_block ENABLE TRIGGER trigger_public_node_block_insert;`
   );
-  const res = await client.query(
-    `ALTER TABLE node_transaction_history ENABLE TRIGGER trigger_public_node_transaction_history_insert;`
-  );
+  const triggerExists =
+    (
+      await client.query<{ triggerExists: boolean }>(/* sql */ `
+SELECT EXISTS (
+  SELECT 1 FROM pg_trigger
+    WHERE tgrelid = 'node_transaction_history'::regclass
+      AND tgname = 'trigger_public_node_transaction_history_insert'
+) AS "triggerExists";
+`)
+    ).rows[0]?.triggerExists === true;
+  if (triggerExists) {
+    await client.query(
+      `ALTER TABLE node_transaction_history ENABLE TRIGGER trigger_public_node_transaction_history_insert;`
+    );
+  }
   client.release();
-  return res.rowCount;
+  return triggerExists;
 };
 
 /**

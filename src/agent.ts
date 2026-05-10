@@ -845,7 +845,12 @@ export class Agent {
                     this.logger.info(
                       `Agent: all managed indexes have been created.`
                     );
-                    return reenableMempoolCleaning().then(() => {
+                    return reenableMempoolCleaning().then((schemaIsCurrent) => {
+                      if (!schemaIsCurrent) {
+                        this.logger.warn(
+                          'Agent: WARNING! Database schema is old and missing multiple bug fixes. Update the Hasura image to apply migrations and then restart this agent.'
+                        );
+                      }
                       this.logger.info('Agent: enabled mempool tracking.');
                       this.saveInboundTransactions = true;
                       this.scheduleIncompleteBlockRepair();
