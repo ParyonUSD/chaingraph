@@ -145,6 +145,7 @@ const postgresE2eConnectionStringTestDb = `${postgresE2eConnectionStringBase}/${
 const e2eEnvVariables = {
   /* eslint-disable @typescript-eslint/naming-convention */
   CHAINGRAPH_GENESIS_BLOCKS: `${e2eTestNetworkMagicHex}:${genesisBlockRaw},e3e1f3e8:${genesisBlockRaw},dab5bffa:${testnetGenesisBlockRaw}`,
+  CHAINGRAPH_INCOMPLETE_BLOCK_REPAIR_BATCH_SIZE: '10000',
   CHAINGRAPH_INTERNAL_API_PORT: chaingraphInternalApiPort,
   CHAINGRAPH_LOG_FIREHOSE: logP2pMessage.toString(),
   CHAINGRAPH_LOG_PATH: chaingraphE2eLogPath,
@@ -564,6 +565,37 @@ const sleep = async (ms: number) =>
   new Promise((res) => {
     setTimeout(res, ms);
   });
+const blockRepairPollingAttempts = 40;
+const blockRepairPollingIntervalMs = 250;
+const getBlockTransactionCount = async (blockHash: string) =>
+  Number(
+    (
+      await client.query<{ count: string }>(
+        /* sql */ `
+        SELECT COUNT(*) FROM block_transaction
+          INNER JOIN block ON block.internal_id = block_transaction.block_internal_id
+          WHERE block.hash = $1;
+      `,
+        [hexToBin(blockHash)]
+      )
+    ).rows[0]!.count
+  );
+const waitForBlockTransactionCount = async (
+  blockHash: string,
+  expectedCount: number,
+  remainingAttempts = blockRepairPollingAttempts
+): Promise<number> => {
+  const count = await getBlockTransactionCount(blockHash);
+  if (count === expectedCount || remainingAttempts === 0) {
+    return count;
+  }
+  await sleep(blockRepairPollingIntervalMs);
+  return waitForBlockTransactionCount(
+    blockHash,
+    expectedCount,
+    remainingAttempts - 1
+  );
+};
 
 test.serial(
   '[e2e] ignores inbound transactions before initial sync is complete',
@@ -1393,6 +1425,51 @@ test.serial('[e2e] shuts down with SIGINT', async (t) => {
   t.pass();
 });
 
+const historicalRepairTipIndex = 161;
+const historicalRepairTransactionIndex = 1;
+const historicalRepairBlock = tipA[historicalRepairTipIndex]!;
+const historicalRepairBlockHash = historicalRepairBlock.header.hash;
+
+test.serial(
+  '[e2e] prepares incomplete historical block transaction before restart',
+  async (t) => {
+    const transactionHash =
+      historicalRepairBlock.transactions[historicalRepairTransactionIndex]!
+        .hash;
+    const selectedTransaction = (
+      await client.query<{ hash: string }>(
+        /* sql */ `
+        SELECT encode(transaction.hash, 'hex') AS hash
+          FROM block_transaction
+          INNER JOIN block
+            ON block.internal_id = block_transaction.block_internal_id
+          INNER JOIN transaction
+            ON transaction.internal_id =
+              block_transaction.transaction_internal_id
+          WHERE block.hash = $1
+            AND block_transaction.transaction_index = $2;
+      `,
+        [hexToBin(historicalRepairBlockHash), historicalRepairTransactionIndex]
+      )
+    ).rows;
+    t.deepEqual(selectedTransaction, [{ hash: transactionHash }]);
+    await client.query(
+      /* sql */ `
+        DELETE FROM block_transaction
+          USING block
+          WHERE block.internal_id = block_transaction.block_internal_id
+            AND block.hash = $1
+            AND block_transaction.transaction_index = $2;
+      `,
+      [hexToBin(historicalRepairBlockHash), historicalRepairTransactionIndex]
+    );
+    t.deepEqual(
+      await getBlockTransactionCount(historicalRepairBlockHash),
+      historicalRepairBlock.transactions.length - 1
+    );
+  }
+);
+
 test.serial(
   '[e2e] restores sync-state from database on restart (after initial sync)',
   async (t) => {
@@ -1441,6 +1518,20 @@ test.serial('[e2e] catches up a new node via headers', async (t) => {
   await waitForStdout('Agent: enabled mempool tracking.');
   t.pass();
 });
+
+test.serial(
+  '[e2e] self-heals incomplete historical block transactions on startup',
+  async (t) => {
+    t.timeout(oneMinute);
+    t.deepEqual(
+      await waitForBlockTransactionCount(
+        historicalRepairBlockHash,
+        historicalRepairBlock.transactions.length
+      ),
+      historicalRepairBlock.transactions.length
+    );
+  }
+);
 
 test.serial(
   '[e2e] handles empty headers messages (fully-synced)',

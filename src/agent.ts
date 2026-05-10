@@ -31,6 +31,7 @@ import {
   chaingraphLogFirehose,
   chaingraphUserAgent,
   genesisBlocks,
+  incompleteBlockRepairBatchSize,
   postgresMaxConnections,
   trustedNodes,
 } from './config.js';
@@ -38,6 +39,7 @@ import {
   acceptBlocksViaHeaders,
   createIndexes,
   getAllKnownBlockHashes,
+  getIncompleteBlocks,
   getIndexCreationProgress,
   listExistingIndexes,
   optionallyDisableSynchronousCommit,
@@ -50,6 +52,7 @@ import {
   saveBlock,
   saveTransactionForNodes,
 } from './db.js';
+import type { IncompleteBlock } from './db.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -287,6 +290,23 @@ export class Agent {
   heartbeatInterval: NodeJS.Timeout;
 
   scheduledBlockBufferFill = false;
+
+  scheduledIncompleteBlockRepair = false;
+
+  incompleteBlockRepairInProgress = false;
+
+  currentIncompleteBlockRepair:
+    | {
+        hash: string;
+        resolve: () => void;
+      }
+    | undefined;
+
+  incompleteBlockRepairTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  incompleteBlockRepairNextHeight = 0;
+
+  completedIncompleteBlockRepairScan = false;
 
   /**
    * The next second after which to log another warning that one or more nodes
@@ -828,6 +848,7 @@ export class Agent {
                     return reenableMempoolCleaning().then(() => {
                       this.logger.info('Agent: enabled mempool tracking.');
                       this.saveInboundTransactions = true;
+                      this.scheduleIncompleteBlockRepair();
                     });
                   })
                   .catch((err) => {
@@ -904,6 +925,198 @@ export class Agent {
       clearInterval(progressLogInterval);
     });
     return indexCreationCompletion;
+  }
+
+  canScheduleIncompleteBlockRepair() {
+    return ![
+      incompleteBlockRepairBatchSize === 0,
+      !this.completedInitialSync,
+      this.scheduledIncompleteBlockRepair,
+      this.incompleteBlockRepairInProgress,
+      this.completedIncompleteBlockRepairScan,
+      this.willShutdown,
+    ].includes(true);
+  }
+
+  scheduleIncompleteBlockRepair() {
+    if (!this.canScheduleIncompleteBlockRepair()) {
+      return;
+    }
+    this.incompleteBlockRepairTimeout = setTimeout(() => {
+      this.scheduledIncompleteBlockRepair = false;
+      this.repairIncompleteBlocks().catch((err) => {
+        this.logger.fatal(err);
+        this.shutdown().catch((shutdownErr) => {
+          this.logger.error(shutdownErr);
+        });
+      });
+    });
+    this.scheduledIncompleteBlockRepair = true;
+  }
+
+  getIncompleteBlockRepairRange() {
+    const bestHeight = Math.max(
+      ...Object.values(this.blockTree.getBestHeights())
+    );
+    const finalHeight = bestHeight + 1;
+    const heightLowerBound =
+      this.incompleteBlockRepairNextHeight > bestHeight
+        ? 0
+        : this.incompleteBlockRepairNextHeight;
+    const heightUpperBound = Math.min(
+      heightLowerBound + incompleteBlockRepairBatchSize,
+      finalHeight
+    );
+    return { finalHeight, heightLowerBound, heightUpperBound };
+  }
+
+  updateIncompleteBlockRepairProgress({
+    finalHeight,
+    heightLowerBound,
+    heightUpperBound,
+    incompleteBlockCount,
+    limit,
+  }: {
+    finalHeight: number;
+    heightLowerBound: number;
+    heightUpperBound: number;
+    incompleteBlockCount: number;
+    limit: number;
+  }) {
+    if (incompleteBlockCount === limit) {
+      this.incompleteBlockRepairNextHeight = heightLowerBound;
+      return;
+    }
+    if (heightUpperBound === finalHeight) {
+      this.incompleteBlockRepairNextHeight = 0;
+      this.completedIncompleteBlockRepairScan = true;
+      this.logger.info('Agent: completed incomplete block repair scan.');
+      return;
+    }
+    this.incompleteBlockRepairNextHeight = heightUpperBound;
+  }
+
+  async repairIncompleteBlock(block: IncompleteBlock) {
+    if (this.currentIncompleteBlockRepair !== undefined) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        `Agent: attempted to repair incomplete block ${block.height} (${block.hash}) while already repairing ${this.currentIncompleteBlockRepair.hash}.`
+      );
+    }
+    const sourceNodes = this.blockTree.getNodesWithBlock(
+      block.hash,
+      block.height
+    );
+    if (sourceNodes.length === 0) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        `Agent: incomplete block ${block.height} (${block.hash}) is not currently accepted by any connected node.`
+      );
+    }
+    this.logger.info(
+      `Agent: self-healing incomplete block ${block.height} (${block.hash}); linked size ${block.linkedSizeBytes}/${block.sizeBytes} bytes across ${block.transactionCount} saved transaction(s).`
+    );
+    const alreadyDownloading = this.blockDownloads.some(
+      (download) => download.hash === block.hash
+    );
+    return new Promise<void>((resolve) => {
+      this.currentIncompleteBlockRepair = {
+        hash: block.hash,
+        resolve,
+      };
+      if (!alreadyDownloading) {
+        this.blockBuffer.reserveBlock();
+        this.requestBlock(block.hash, block.height);
+      }
+    });
+  }
+
+  canRepairIncompleteBlocks() {
+    return (
+      incompleteBlockRepairBatchSize !== 0 &&
+      this.completedInitialSync &&
+      !this.willShutdown
+    );
+  }
+
+  getRegisteredNodeInternalIds() {
+    return Object.values(this.nodes)
+      .map((node) => node.internalId)
+      .filter((id): id is number => id !== undefined);
+  }
+
+  async repairIncompleteBlocksSequentially(blocks: IncompleteBlock[]) {
+    await blocks.reduce<Promise<void>>(async (previousRepair, block) => {
+      await previousRepair;
+      await this.repairIncompleteBlock(block);
+    }, Promise.resolve());
+  }
+
+  async repairIncompleteBlocksOnce() {
+    const { finalHeight, heightLowerBound, heightUpperBound } =
+      this.getIncompleteBlockRepairRange();
+    const scanStartTime = Date.now();
+    const { incompleteBlocks, scannedBlockCount } = await getIncompleteBlocks({
+      excludedBlockHashes: [],
+      heightLowerBound,
+      heightUpperBound,
+      limit: incompleteBlockRepairBatchSize,
+      nodeInternalIds: this.getRegisteredNodeInternalIds(),
+    });
+    const scanDurationMs = Date.now() - scanStartTime;
+    const scanRate =
+      scanDurationMs === 0
+        ? scannedBlockCount * msPerSecond
+        : Math.round((scannedBlockCount / scanDurationMs) * msPerSecond);
+    const scanPerformanceLog = `scanned ${scannedBlockCount.toLocaleString()} block(s) in ${scanDurationMs.toLocaleString()}ms (${scanRate.toLocaleString()} blocks/s)`;
+    if (incompleteBlocks.length === 0) {
+      this.updateIncompleteBlockRepairProgress({
+        finalHeight,
+        heightLowerBound,
+        heightUpperBound,
+        incompleteBlockCount: incompleteBlocks.length,
+        limit: incompleteBlockRepairBatchSize,
+      });
+      this.logger.info(
+        `Agent: no incomplete blocks found from height ${heightLowerBound} to ${
+          heightUpperBound - 1
+        }; ${scanPerformanceLog}.`
+      );
+      return;
+    }
+    this.logger.warn(
+      `Agent: found ${
+        incompleteBlocks.length
+      } incomplete block(s) from height ${heightLowerBound} to ${
+        heightUpperBound - 1
+      }; ${scanPerformanceLog}; requesting full block contents for repair.`
+    );
+    await this.repairIncompleteBlocksSequentially(incompleteBlocks);
+  }
+
+  /**
+   * Audit a bounded range of blocks accepted by currently-connected nodes. If
+   * the saved transactions don't sum to the saved block size, re-request the
+   * full block and let the normal block-saving path repair missing rows.
+   */
+  async repairIncompleteBlocks() {
+    if (!this.canRepairIncompleteBlocks()) {
+      return;
+    }
+    if (this.incompleteBlockRepairInProgress) {
+      return;
+    }
+    this.incompleteBlockRepairInProgress = true;
+    await this.repairIncompleteBlocksOnce()
+      .then(() => {
+        this.incompleteBlockRepairInProgress = false;
+        this.scheduleIncompleteBlockRepair();
+      })
+      .catch((err) => {
+        this.incompleteBlockRepairInProgress = false;
+        // eslint-disable-next-line functional/no-throw-statement
+        throw err;
+      });
   }
 
   /**
@@ -1417,6 +1630,11 @@ export class Agent {
         blockTimestampToDate(block.timestamp)
       );
     });
+    const currentRepair = this.currentIncompleteBlockRepair;
+    if (currentRepair?.hash === block.hash) {
+      currentRepair.resolve();
+      this.currentIncompleteBlockRepair = undefined;
+    }
     this.blockBuffer.removeBlock(block);
   }
 
@@ -1754,6 +1972,9 @@ export class Agent {
     this.willShutdown = true;
     clearInterval(eventLoopDurationInterval);
     clearInterval(this.heartbeatInterval);
+    if (this.incompleteBlockRepairTimeout !== undefined) {
+      clearTimeout(this.incompleteBlockRepairTimeout);
+    }
     Object.values(this.nodes).forEach((connection) => {
       connection.disconnect();
     });

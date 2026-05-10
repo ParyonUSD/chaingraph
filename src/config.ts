@@ -36,6 +36,7 @@ const configuration = {
 const expectedOptions = [
   'CHAINGRAPH_BLOCK_BUFFER_TARGET_SIZE_MB',
   'CHAINGRAPH_GENESIS_BLOCKS',
+  'CHAINGRAPH_INCOMPLETE_BLOCK_REPAIR_BATCH_SIZE',
   'CHAINGRAPH_INTERNAL_API_PORT',
   'CHAINGRAPH_LOG_FIREHOSE',
   'CHAINGRAPH_LOG_LEVEL_STDOUT',
@@ -109,6 +110,19 @@ if (isNaN(blockBufferTargetSizeMb) || blockBufferTargetSizeMb <= 0) {
   // eslint-disable-next-line functional/no-throw-statement
   throw new Error(
     'The CHAINGRAPH_BLOCK_BUFFER_TARGET_SIZE_MB environment variable must be greater than 0.'
+  );
+}
+
+const incompleteBlockRepairBatchSize = Number(
+  configuration.CHAINGRAPH_INCOMPLETE_BLOCK_REPAIR_BATCH_SIZE
+);
+if (
+  !Number.isInteger(incompleteBlockRepairBatchSize) ||
+  incompleteBlockRepairBatchSize < 0
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    'The CHAINGRAPH_INCOMPLETE_BLOCK_REPAIR_BATCH_SIZE environment variable must be an integer greater than or equal to 0.'
   );
 }
 
@@ -376,6 +390,7 @@ export {
   chaingraphLogLevelPath,
   chaingraphUserAgent,
   genesisBlocks,
+  incompleteBlockRepairBatchSize,
   postgresMaxConnections,
   postgresConnectionString,
   postgresSynchronousCommit,
