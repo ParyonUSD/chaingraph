@@ -70,6 +70,7 @@ const dbUpMigrationPaths = [
     'default/1778151011521_cascade_invalidate_mempool_descendants/up.sql'
   ),
   backfillOrphanMempoolDescendantsMigrationPath,
+  migration('default/1778351597200_fix_block_encoded_transaction_count/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
