@@ -360,6 +360,7 @@ export class Agent {
     'block_inclusions_index',
     'output_search_index',
     'spent_by_index',
+    'token_category_index',
   ];
 
   /**

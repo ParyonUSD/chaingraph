@@ -815,6 +815,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'output_pkey',
     'output_search_index',
     'spent_by_index',
+    'token_category_index',
     'transaction_hash_key',
     'transaction_pkey',
   ]);
