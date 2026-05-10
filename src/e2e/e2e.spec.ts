@@ -671,6 +671,57 @@ const waitForExpiredMempoolArchive = async (
   return waitForExpiredMempoolArchive(remainingAttempts - 1);
 };
 
+const getConfirmedMempoolArchiveState = async () =>
+  (
+    await client.query<{
+      historyRowCount: number;
+      inMempool: boolean;
+      replacedAt: string | null;
+    }>(/* sql */ `
+WITH selected_node AS (
+    SELECT internal_id
+      FROM node
+      WHERE name = 'node1'
+),
+selected_transaction AS (
+    SELECT internal_id
+      FROM transaction
+      WHERE hash = decode(repeat('d5', 32), 'hex')
+)
+SELECT (node_transaction.transaction_internal_id IS NOT NULL) AS "inMempool",
+       COUNT(node_transaction_history.transaction_internal_id)::integer AS "historyRowCount",
+       MIN(node_transaction_history.replaced_at)::text AS "replacedAt"
+  FROM selected_transaction
+  CROSS JOIN selected_node
+  LEFT JOIN node_transaction
+    ON node_transaction.node_internal_id = selected_node.internal_id
+   AND node_transaction.transaction_internal_id = selected_transaction.internal_id
+  LEFT JOIN node_transaction_history
+    ON node_transaction_history.node_internal_id = selected_node.internal_id
+   AND node_transaction_history.transaction_internal_id = selected_transaction.internal_id
+  GROUP BY node_transaction.transaction_internal_id;
+`)
+  ).rows[0];
+
+const confirmedMempoolArchiveCompleted = (
+  row: Awaited<ReturnType<typeof getConfirmedMempoolArchiveState>>
+) =>
+  row !== undefined &&
+  !row.inMempool &&
+  row.historyRowCount === 1 &&
+  row.replacedAt === null;
+
+const waitForConfirmedMempoolArchive = async (
+  remainingAttempts = mempoolExpirationPollingAttempts
+): Promise<Awaited<ReturnType<typeof getConfirmedMempoolArchiveState>>> => {
+  const row = await getConfirmedMempoolArchiveState();
+  if (confirmedMempoolArchiveCompleted(row) || remainingAttempts === 0) {
+    return row;
+  }
+  await sleep(mempoolExpirationPollingIntervalMs);
+  return waitForConfirmedMempoolArchive(remainingAttempts - 1);
+};
+
 test.serial(
   '[e2e] ignores inbound transactions before initial sync is complete',
   async (t) => {
@@ -1083,6 +1134,193 @@ WITH transaction_values (hash) AS (
       (decode(repeat('d1', 32), 'hex')),
       (decode(repeat('d2', 32), 'hex')),
       (decode(repeat('d3', 32), 'hex'))
+)
+DELETE FROM transaction
+  USING transaction_values
+  WHERE transaction.hash = transaction_values.hash;
+`);
+    }
+  }
+);
+
+test.serial(
+  '[e2e] archives stale mempool transactions already accepted by blocks',
+  async (t) => {
+    await client.query(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('confirmed_parent_a', decode(repeat('d4', 32), 'hex')),
+      ('confirmed_child_b',  decode(repeat('d5', 32), 'hex'))
+)
+INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
+  SELECT hash, 1, 0, 100, false
+    FROM transaction_values;
+`);
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await client.query(/* sql */ `
+INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode)
+  VALUES (decode(repeat('d4', 32), 'hex'), 0, 1000, '\\x51'::bytea);
+`);
+      await client.query(/* sql */ `
+WITH selected_transaction AS (
+    SELECT internal_id
+      FROM transaction
+      WHERE hash = decode(repeat('d5', 32), 'hex')
+)
+INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
+  SELECT selected_transaction.internal_id,
+         0,
+         0,
+         0,
+         decode(repeat('d4', 32), 'hex'),
+         '\\x51'::bytea
+    FROM selected_transaction;
+`);
+      await client.query(/* sql */ `
+WITH selected_transaction AS (
+    SELECT internal_id
+      FROM transaction
+      WHERE hash = decode(repeat('d5', 32), 'hex')
+),
+inserted_block AS (
+    INSERT INTO block (height, version, "timestamp", hash, previous_block_hash, merkle_root, bits, nonce, size_bytes)
+      VALUES (4001, 1, 0, decode(repeat('d6', 32), 'hex'), decode(repeat('d7', 32), 'hex'), decode(repeat('d8', 32), 'hex'), 0, 0, 181)
+      RETURNING internal_id
+)
+INSERT INTO block_transaction (block_internal_id, transaction_internal_id, transaction_index)
+  SELECT inserted_block.internal_id, selected_transaction.internal_id, 1
+    FROM inserted_block
+    CROSS JOIN selected_transaction;
+`);
+      await client.query(/* sql */ `
+WITH selected_node AS (
+    SELECT internal_id
+      FROM node
+      WHERE name = 'node1'
+),
+selected_block AS (
+    SELECT internal_id
+      FROM block
+      WHERE hash = decode(repeat('d6', 32), 'hex')
+)
+INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
+  SELECT selected_node.internal_id,
+         selected_block.internal_id,
+         timestamp '2026-01-01 00:10:00'
+    FROM selected_node
+    CROSS JOIN selected_block;
+`);
+      await client.query(/* sql */ `
+WITH selected_node AS (
+    SELECT internal_id
+      FROM node
+      WHERE name = 'node1'
+),
+selected_transaction AS (
+    SELECT internal_id
+      FROM transaction
+      WHERE hash = decode(repeat('d5', 32), 'hex')
+)
+INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
+  SELECT selected_node.internal_id,
+         selected_transaction.internal_id,
+         timestamp '2026-01-01 00:00:00'
+    FROM selected_node
+    CROSS JOIN selected_transaction;
+`);
+      const archivedTransaction = await waitForConfirmedMempoolArchive();
+      t.deepEqual(archivedTransaction, {
+        historyRowCount: 1,
+        inMempool: false,
+        replacedAt: null,
+      });
+    } finally {
+      await client.query(/* sql */ `
+WITH transaction_values (hash) AS (
+    VALUES
+      (decode(repeat('d4', 32), 'hex')),
+      (decode(repeat('d5', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+DELETE FROM node_transaction
+  USING named_transactions
+  WHERE node_transaction.transaction_internal_id = named_transactions.internal_id;
+`);
+      await client.query(/* sql */ `
+WITH transaction_values (hash) AS (
+    VALUES
+      (decode(repeat('d4', 32), 'hex')),
+      (decode(repeat('d5', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+DELETE FROM node_transaction_history
+  USING named_transactions
+  WHERE node_transaction_history.transaction_internal_id = named_transactions.internal_id;
+`);
+      await client.query(/* sql */ `
+WITH selected_block AS (
+    SELECT internal_id
+      FROM block
+      WHERE hash = decode(repeat('d6', 32), 'hex')
+)
+DELETE FROM node_block
+  USING selected_block
+  WHERE node_block.block_internal_id = selected_block.internal_id;
+`);
+      await client.query(/* sql */ `
+WITH selected_block AS (
+    SELECT internal_id
+      FROM block
+      WHERE hash = decode(repeat('d6', 32), 'hex')
+)
+DELETE FROM node_block_history
+  USING selected_block
+  WHERE node_block_history.block_internal_id = selected_block.internal_id;
+`);
+      await client.query(/* sql */ `
+WITH selected_block AS (
+    SELECT internal_id
+      FROM block
+      WHERE hash = decode(repeat('d6', 32), 'hex')
+)
+DELETE FROM block_transaction
+  USING selected_block
+  WHERE block_transaction.block_internal_id = selected_block.internal_id;
+`);
+      await client.query(/* sql */ `
+DELETE FROM block
+  WHERE hash = decode(repeat('d6', 32), 'hex');
+`);
+      await client.query(/* sql */ `
+WITH selected_transaction AS (
+    SELECT internal_id
+      FROM transaction
+      WHERE hash = decode(repeat('d5', 32), 'hex')
+)
+DELETE FROM input
+  USING selected_transaction
+  WHERE input.transaction_internal_id = selected_transaction.internal_id;
+`);
+      await client.query(/* sql */ `
+DELETE FROM output
+  WHERE transaction_hash = decode(repeat('d4', 32), 'hex');
+`);
+      await client.query(/* sql */ `
+WITH transaction_values (hash) AS (
+    VALUES
+      (decode(repeat('d4', 32), 'hex')),
+      (decode(repeat('d5', 32), 'hex'))
 )
 DELETE FROM transaction
   USING transaction_values

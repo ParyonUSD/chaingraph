@@ -40,6 +40,7 @@ import {
 import {
   acceptBlocksViaHeaders,
   archiveMempoolTransaction,
+  archiveMempoolTransactionsAcceptedByBlocks,
   createIndexes,
   getAllKnownBlockHashes,
   getIncompleteBlocks,
@@ -866,8 +867,8 @@ export class Agent {
                       }
                       this.logger.info('Agent: enabled mempool tracking.');
                       this.saveInboundTransactions = true;
-                      this.scheduleMempoolTransactionExpirationScan();
                       this.scheduleIncompleteBlockRepair();
+                      this.scheduleMempoolTransactionExpirationScan();
                     });
                   })
                   .catch((err) => {
@@ -950,9 +951,17 @@ export class Agent {
     return ![
       !this.completedInitialSync,
       !this.saveInboundTransactions,
+      this.waitingForIncompleteBlockRepairScan(),
       this.mempoolTransactionExpirationScanTimeout !== undefined,
       this.willShutdown,
     ].includes(true);
+  }
+
+  waitingForIncompleteBlockRepairScan() {
+    return (
+      incompleteBlockRepairBatchSize !== 0 &&
+      !this.completedIncompleteBlockRepairScan
+    );
   }
 
   scheduleMempoolTransactionExpirationScan(delayMs = 0, forceSchedule = false) {
@@ -1004,6 +1013,7 @@ export class Agent {
     if (!this.saveInboundTransactions || this.willShutdown) {
       return;
     }
+    await this.archiveAcceptedMempoolTransactions();
     const expiresBefore = new Date(
       Date.now() + mempoolTransactionExpirationScanIntervalMs
     );
@@ -1044,6 +1054,32 @@ export class Agent {
         transaction.nodeName
       }; archived from node_transaction to node_transaction_history with replaced_at ${transaction.expiresAt.toISOString()}.`
     );
+  }
+
+  async archiveAcceptedMempoolTransactions() {
+    const archivedTransactions =
+      await archiveMempoolTransactionsAcceptedByBlocks();
+    if (archivedTransactions.length === 0) {
+      return;
+    }
+    this.logger.warn(
+      `Agent: archived ${archivedTransactions.length.toLocaleString()} stale mempool transaction(s) already accepted or replaced by blocks before ordinary expiry.`
+    );
+    archivedTransactions.forEach((transaction) => {
+      if (transaction.replacedAt === null) {
+        this.logger.info(
+          `Agent: archived stale confirmed mempool transaction ${transaction.hash} for node ${transaction.nodeName}; transaction is already accepted by a block, archived with replaced_at NULL.`
+        );
+        return;
+      }
+      this.logger.info(
+        `Agent: archived stale replaced mempool transaction ${
+          transaction.hash
+        } for node ${
+          transaction.nodeName
+        }; an accepted block already spends the same outpoint, archived with replaced_at ${transaction.replacedAt.toISOString()}.`
+      );
+    });
   }
 
   canScheduleIncompleteBlockRepair() {
@@ -1110,6 +1146,7 @@ export class Agent {
       this.incompleteBlockRepairNextHeight = 0;
       this.completedIncompleteBlockRepairScan = true;
       this.logger.info('Agent: completed incomplete block repair scan.');
+      this.scheduleMempoolTransactionExpirationScan();
       return;
     }
     this.incompleteBlockRepairNextHeight = heightUpperBound;

@@ -1,3 +1,4 @@
+/* eslint-disable max-lines */
 import pg from 'pg';
 
 import type { Agent } from './agent.js';
@@ -113,6 +114,12 @@ export interface ExpiringMempoolTransaction {
   nodeName: string;
   transactionInternalId: number;
   validatedAt: Date;
+}
+
+export interface ArchivedMempoolTransaction {
+  hash: string;
+  nodeName: string;
+  replacedAt: Date | null;
 }
 
 /**
@@ -291,6 +298,110 @@ SELECT encode(transaction.hash, 'hex') AS "hash",
       nodeName: transaction.nodeName,
       transactionInternalId: Number(transaction.transactionInternalId),
       validatedAt: timestampWithoutTimezoneToDate(transaction.validatedAt),
+    }));
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Archive node_transaction rows for transactions that are already accepted or
+ * replaced by accepted blocks for the same node. This repairs historical rows
+ * missed when block inclusions are added after the node_block trigger has
+ * already fired.
+ */
+export const archiveMempoolTransactionsAcceptedByBlocks = async (): Promise<
+  ArchivedMempoolTransaction[]
+> => {
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const result = await client.query<{
+      hash: string;
+      nodeName: string;
+      replacedAt: string | null;
+    }>(/* sql */ `
+WITH directly_accepted AS (
+    SELECT node_transaction.node_internal_id,
+           node_transaction.transaction_internal_id,
+           NULL::timestamp without time zone AS replaced_at
+      FROM node_transaction
+      JOIN block_transaction
+        ON block_transaction.transaction_internal_id = node_transaction.transaction_internal_id
+      JOIN node_block
+        ON node_block.node_internal_id = node_transaction.node_internal_id
+       AND node_block.block_internal_id = block_transaction.block_internal_id
+),
+replaced_by_accepted AS (
+    SELECT node_transaction.node_internal_id,
+           node_transaction.transaction_internal_id,
+           MIN(node_block.accepted_at) AS replaced_at
+      FROM node_transaction
+      JOIN input mempool_input
+        ON mempool_input.transaction_internal_id = node_transaction.transaction_internal_id
+      JOIN input accepted_input
+        ON accepted_input.outpoint_transaction_hash = mempool_input.outpoint_transaction_hash
+       AND accepted_input.outpoint_index = mempool_input.outpoint_index
+       AND accepted_input.transaction_internal_id != node_transaction.transaction_internal_id
+      JOIN block_transaction
+        ON block_transaction.transaction_internal_id = accepted_input.transaction_internal_id
+      JOIN node_block
+        ON node_block.node_internal_id = node_transaction.node_internal_id
+       AND node_block.block_internal_id = block_transaction.block_internal_id
+      WHERE mempool_input.outpoint_transaction_hash != '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
+      GROUP BY node_transaction.node_internal_id,
+               node_transaction.transaction_internal_id
+),
+archive_candidates AS (
+    SELECT node_internal_id, transaction_internal_id, replaced_at
+      FROM directly_accepted
+    UNION ALL
+    SELECT node_internal_id, transaction_internal_id, replaced_at
+      FROM replaced_by_accepted
+),
+archive_rows AS (
+    SELECT node_internal_id,
+           transaction_internal_id,
+           CASE
+             WHEN bool_or(replaced_at IS NULL) THEN NULL::timestamp without time zone
+             ELSE MIN(replaced_at)
+           END AS replaced_at
+      FROM archive_candidates
+      GROUP BY node_internal_id, transaction_internal_id
+),
+deleted_rows AS (
+    DELETE FROM node_transaction
+      USING archive_rows
+      WHERE node_transaction.node_internal_id = archive_rows.node_internal_id
+        AND node_transaction.transaction_internal_id = archive_rows.transaction_internal_id
+      RETURNING node_transaction.node_internal_id,
+                node_transaction.transaction_internal_id,
+                node_transaction.validated_at,
+                archive_rows.replaced_at
+),
+inserted_history AS (
+    INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id, validated_at, replaced_at)
+      SELECT node_internal_id, transaction_internal_id, validated_at, replaced_at
+        FROM deleted_rows
+      RETURNING node_internal_id, transaction_internal_id, replaced_at
+)
+SELECT encode(transaction.hash, 'hex') AS "hash",
+       node.name AS "nodeName",
+       inserted_history.replaced_at::text AS "replacedAt"
+  FROM inserted_history
+  JOIN node
+    ON node.internal_id = inserted_history.node_internal_id
+  JOIN transaction
+    ON transaction.internal_id = inserted_history.transaction_internal_id
+  ORDER BY "nodeName", "hash";
+`);
+    return result.rows.map((row) => ({
+      hash: row.hash,
+      nodeName: row.nodeName,
+      replacedAt:
+        row.replacedAt === null
+          ? null
+          : timestampWithoutTimezoneToDate(row.replacedAt),
     }));
   } finally {
     client.release();
