@@ -560,15 +560,6 @@ WITH transaction_values (hash, version, locktime, size_bytes, is_coinbase) AS (
         )}'::bytea, '${hexToByteaString(input.unlockingBytecode)}'::bytea)`
     )
     .join(',')}
-), node_transaction_values (node_internal_id, validated_at) AS (
-  VALUES ${nodeValidations
-    .map(
-      (validation) =>
-        `(${
-          validation.nodeInternalId
-        }::bigint, ${dateToTimestampWithoutTimezone(validation.validatedAt)})`
-    )
-    .join(',')}
 ), new_transaction (transaction_hash, transaction_internal_id) AS (
   INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
     SELECT hash, version, locktime, size_bytes, is_coinbase FROM transaction_values
@@ -580,21 +571,52 @@ WITH transaction_values (hash, version, locktime, size_bytes, is_coinbase) AS (
 ), insert_inputs AS (
   INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
     SELECT transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode FROM input_values CROSS JOIN new_transaction
-), new_or_existing_transaction (transaction_internal_id) AS (
-  SELECT COALESCE (
-    (SELECT transaction_internal_id FROM new_transaction),
-    (SELECT internal_id AS transaction_internal_id FROM transaction WHERE transaction.hash = '${hexToByteaString(
-      transaction.hash
-    )}'::bytea)
-  )
+)
+SELECT COUNT(*) FROM new_transaction;
+`;
+  const saveNodeValidations = /* sql */ `
+WITH node_transaction_values (node_internal_id, validated_at) AS (
+  VALUES ${nodeValidations
+    .map(
+      (validation) =>
+        `(${
+          validation.nodeInternalId
+        }::bigint, ${dateToTimestampWithoutTimezone(validation.validatedAt)})`
+    )
+    .join(',')}
 )
 INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
-  SELECT node_internal_id, transaction_internal_id, validated_at FROM node_transaction_values CROSS JOIN new_or_existing_transaction
+  SELECT node_internal_id, $1::bigint, validated_at FROM node_transaction_values
   ON CONFLICT ON CONSTRAINT "node_transaction_pkey" DO NOTHING;
 `;
   const client = await pool.connect();
-  await client.query(saveTransaction);
-  client.release();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    await client.query('BEGIN;');
+    await client.query(saveTransaction);
+    const transactionInternalIdResult = await client.query<{
+      internalId: string;
+    }>(
+      /* sql */ `SELECT internal_id AS "internalId" FROM transaction WHERE hash = $1;`,
+      [Buffer.from(transaction.hash, 'hex')]
+    );
+    const transactionInternalId =
+      transactionInternalIdResult.rows[0]?.internalId;
+    if (transactionInternalId === undefined) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        `Failed to save or find transaction while recording node validation: ${transaction.hash}`
+      );
+    }
+    await client.query(saveNodeValidations, [transactionInternalId]);
+    await client.query('COMMIT;');
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
+  } finally {
+    client.release();
+  }
 };
 
 /**

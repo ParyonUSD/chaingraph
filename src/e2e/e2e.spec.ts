@@ -27,6 +27,8 @@ import { execa } from 'execa';
 import got from 'got';
 import pg from 'pg';
 
+import type { ChaingraphTransaction } from '../types/chaingraph.js';
+
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
 import {
   chipnetCashTokensTx,
@@ -576,6 +578,41 @@ const sleep = async (ms: number) =>
   new Promise((res) => {
     setTimeout(res, ms);
   });
+
+const repeatedHashByteLength = 32;
+const transactionSaveConflictPollingAttempts = 50;
+const transactionSaveConflictPollingIntervalMs = 20;
+const waitForTransactionSaveConflict = async (
+  transactionHash: string,
+  remainingAttempts = transactionSaveConflictPollingAttempts
+): Promise<void> => {
+  const result = await client.query<{ waiting: boolean }>(
+    /* sql */ `
+    SELECT EXISTS (
+      SELECT 1
+        FROM pg_stat_activity
+        -- cspell:disable-next-line
+        WHERE datname = $1
+          AND query LIKE '%INSERT INTO transaction%'
+          AND query LIKE $2
+          AND wait_event_type IS NOT NULL
+    ) AS waiting;
+  `,
+    [e2eTestDbName, `%${transactionHash}%`]
+  );
+  if (result.rows[0]!.waiting) {
+    return;
+  }
+  if (remainingAttempts === 0) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `Timed out waiting for saveTransactionForNodes conflict on ${transactionHash}.`
+    );
+  }
+  await sleep(transactionSaveConflictPollingIntervalMs);
+  await waitForTransactionSaveConflict(transactionHash, remainingAttempts - 1);
+};
+
 const blockRepairPollingAttempts = 40;
 const blockRepairPollingIntervalMs = 250;
 const getBlockTransactionCount = async (blockHash: string) =>
@@ -805,6 +842,153 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
   clearStdoutBuffer();
   t.pass();
 });
+
+test.serial(
+  '[e2e] records node validation after concurrent transaction insert conflict',
+  async (t) => {
+    const transactionHash = 'c1'.repeat(repeatedHashByteLength);
+    const validatedAt = new Date('2026-01-01T00:00:00.000Z');
+    const transaction: ChaingraphTransaction = {
+      hash: transactionHash,
+      inputs: [
+        {
+          outpointIndex: 0,
+          outpointTransactionHash: 'c2'.repeat(repeatedHashByteLength),
+          sequenceNumber: 0,
+          unlockingBytecode: '51',
+        },
+      ],
+      isCoinbase: false,
+      locktime: 0,
+      outputs: [
+        {
+          lockingBytecode: '51',
+          valueSatoshis: 1000n,
+        },
+      ],
+      sizeBytes: 100,
+      version: 1,
+    };
+    const nodeInternalId = Number(
+      (
+        await client.query<{ internalId: number }>(
+          /* sql */ `SELECT internal_id AS "internalId" FROM node WHERE name = 'node1';`
+        )
+      ).rows[0]!.internalId
+    );
+    await client.query(
+      /* sql */ `
+      DELETE FROM node_transaction
+        USING transaction
+        WHERE node_transaction.transaction_internal_id = transaction.internal_id
+          AND transaction.hash = $1;
+    `,
+      [Buffer.from(transactionHash, 'hex')]
+    );
+    await client.query(
+      /* sql */ `
+      DELETE FROM input
+        USING transaction
+        WHERE input.transaction_internal_id = transaction.internal_id
+          AND transaction.hash = $1;
+    `,
+      [Buffer.from(transactionHash, 'hex')]
+    );
+    await client.query(
+      /* sql */ `DELETE FROM output WHERE transaction_hash = $1;`,
+      [Buffer.from(transactionHash, 'hex')]
+    );
+    await client.query(/* sql */ `DELETE FROM transaction WHERE hash = $1;`, [
+      Buffer.from(transactionHash, 'hex'),
+    ]);
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+      postgresE2eConnectionStringTestDb;
+    const { pool: dbPool, saveTransactionForNodes } = await import('../db.js');
+    const competingClient = new pg.Client({
+      connectionString: postgresE2eConnectionStringTestDb,
+    });
+    await competingClient.connect();
+    // eslint-disable-next-line functional/no-let
+    let competingTransactionOpen = false;
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await competingClient.query(/* sql */ `BEGIN;`);
+      competingTransactionOpen = true;
+      await competingClient.query(
+        /* sql */ `
+        INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
+          VALUES ($1, 1, 0, 100, false);
+      `,
+        [Buffer.from(transactionHash, 'hex')]
+      );
+      const savePromise = saveTransactionForNodes(transaction, [
+        { nodeInternalId, validatedAt },
+      ]);
+      await waitForTransactionSaveConflict(transactionHash);
+      await competingClient.query(/* sql */ `COMMIT;`);
+      competingTransactionOpen = false;
+      await t.notThrowsAsync(savePromise);
+      const savedValidationCount = Number(
+        (
+          await client.query<{ count: string }>(
+            /* sql */ `
+            SELECT COUNT(*)::bigint AS count
+              FROM node_transaction
+              JOIN transaction
+                ON transaction.internal_id = node_transaction.transaction_internal_id
+              WHERE transaction.hash = $1
+                AND node_transaction.node_internal_id = $2
+                AND node_transaction.validated_at = $3;
+          `,
+            [Buffer.from(transactionHash, 'hex'), nodeInternalId, validatedAt]
+          )
+        ).rows[0]!.count
+      );
+      t.deepEqual(savedValidationCount, 1);
+    } finally {
+      if (competingTransactionOpen) {
+        await competingClient.query(/* sql */ `ROLLBACK;`).catch((err) => {
+          logger.debug(err);
+        });
+      }
+      await client.query(
+        /* sql */ `
+        DELETE FROM node_transaction
+          USING transaction
+          WHERE node_transaction.transaction_internal_id = transaction.internal_id
+            AND transaction.hash = $1;
+      `,
+        [Buffer.from(transactionHash, 'hex')]
+      );
+      await client.query(
+        /* sql */ `
+        DELETE FROM input
+          USING transaction
+          WHERE input.transaction_internal_id = transaction.internal_id
+            AND transaction.hash = $1;
+      `,
+        [Buffer.from(transactionHash, 'hex')]
+      );
+      await client.query(
+        /* sql */ `DELETE FROM output WHERE transaction_hash = $1;`,
+        [Buffer.from(transactionHash, 'hex')]
+      );
+      await client.query(/* sql */ `DELETE FROM transaction WHERE hash = $1;`, [
+        Buffer.from(transactionHash, 'hex'),
+      ]);
+      await competingClient.end();
+      await dbPool.end();
+      if (originalPostgresConnectionString === undefined) {
+        delete process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+      } else {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+  }
+);
 
 test.serial(
   '[e2e] cascades replaced mempool transaction history to same-node descendants',
