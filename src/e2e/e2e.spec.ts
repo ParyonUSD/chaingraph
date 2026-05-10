@@ -74,6 +74,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1778415174939_fix_data_carrier_outputs_empty_bytecode/up.sql'
   ),
+  migration('default/1778429124205_fix_coinbase_only_value_aggregates/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
