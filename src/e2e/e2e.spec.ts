@@ -78,6 +78,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1778435997270_add_node_transaction_history_primary_key/up.sql'
   ),
+  migration('default/1778437612917_fix_zero_length_pushdata_patterns/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
