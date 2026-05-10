@@ -1051,6 +1051,34 @@ test.serial(
   }
 );
 
+test.serial(
+  '[e2e] records validation when another node announces a known transaction',
+  async (t) => {
+    peers.node2.sendMessage(
+      new peers.node2.messages.Transaction(new Transaction(halTxRaw))
+    );
+    const delay = 1000;
+    await sleep(delay);
+    const validations = await client.query<{ name: string }>(
+      /* sql */ `
+      SELECT node.name
+        FROM node_transaction
+        INNER JOIN node
+          ON node.internal_id = node_transaction.node_internal_id
+        INNER JOIN transaction
+          ON transaction.internal_id = node_transaction.transaction_internal_id
+        WHERE transaction.hash = $1
+        ORDER BY node.name ASC;
+      `,
+      [hexToBin(halTxHash)]
+    );
+    t.deepEqual(
+      validations.rows.map(({ name }) => name),
+      ['node1', 'node2']
+    );
+  }
+);
+
 test.serial('[e2e] handles first chipnet CashTokens transaction', async (t) => {
   peers.node1.sendMessage(
     new peers.node1.messages.Transaction(new Transaction(chipnetCashTokensTx))
