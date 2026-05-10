@@ -383,8 +383,6 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
 /**
  * Immediately mark a node as having validated a transaction already known to
  * exist in the database.
- *
- * TODO: test
  */
 export const recordNodeValidation = async (
   transactionHash: string,
@@ -397,16 +395,27 @@ export const recordNodeValidation = async (
   /*
    * The transaction is already saved, just insert `node_transaction`s.
    */
-  await client.query(/* sql */ `
-    INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
-    SELECT node_internal_id, validated_at FROM (VALUES (
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    await client.query(/* sql */ `
+    WITH node_transaction_values (node_internal_id, validated_at) AS (
+      VALUES (
       ${validation.nodeInternalId}::bigint,
-      ${dateToTimestampWithoutTimezone(validation.validatedAt)})
-      INNER JOIN (SELECT internal_id as transaction_internal_id from transaction WHERE hash = '${hexToByteaString(
-        transactionHash
-      )}'::bytea);
-    `);
-  client.release();
+      ${dateToTimestampWithoutTimezone(validation.validatedAt)}
+      )
+    ), known_transaction (transaction_internal_id) AS (
+      SELECT internal_id
+        FROM transaction
+        WHERE hash = '${hexToByteaString(transactionHash)}'::bytea
+    )
+    INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
+      SELECT node_internal_id, transaction_internal_id, validated_at
+        FROM node_transaction_values
+        CROSS JOIN known_transaction;
+  `);
+  } finally {
+    client.release();
+  }
 };
 
 /**

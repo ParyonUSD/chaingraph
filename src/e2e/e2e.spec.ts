@@ -1076,6 +1076,17 @@ test.serial(
       validations.rows.map(({ name }) => name),
       ['node1', 'node2']
     );
+    await client.query(
+      /* sql */ `
+      DELETE FROM node_transaction
+        USING node, transaction
+        WHERE node_transaction.node_internal_id = node.internal_id
+          AND node_transaction.transaction_internal_id = transaction.internal_id
+          AND node.name = 'node2'
+          AND transaction.hash = $1;
+      `,
+      [hexToBin(halTxHash)]
+    );
   }
 );
 
