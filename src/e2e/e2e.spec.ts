@@ -1129,6 +1129,23 @@ test.serial(
   }
 );
 
+test.serial(
+  '[e2e] get hex-encoded block with multiple transactions',
+  async (t) => {
+    const blockWithMultipleTransactions = mockchainBeforeFork[1]!;
+    t.true(blockWithMultipleTransactions.transactions.length > 1);
+    /* eslint-disable @typescript-eslint/naming-convention */
+    const encodedHex = (
+      await client.query<{ block_encoded_hex: string }>(
+        /* sql */ `SELECT block_encoded_hex(block) FROM block WHERE hash = $1::bytea;`,
+        [hexToBin(blockWithMultipleTransactions.header.hash)]
+      )
+    ).rows[0]!.block_encoded_hex;
+    /* eslint-enable @typescript-eslint/naming-convention */
+    t.deepEqual(encodedHex, binToHex(blockWithMultipleTransactions.toBuffer()));
+  }
+);
+
 const newBlocks = (
   node: 'node1' | 'node2' | 'node3',
   blocks: BitcoreBlock[]
