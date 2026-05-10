@@ -2096,6 +2096,28 @@ test(
 );
 
 test(
+  'zero-length OP_PUSHDATA1',
+  bytecodeFunction,
+  'parse_bytecode_pattern_with_pushdata_lengths',
+  '4c00',
+  '4c00'
+);
+test(
+  'zero-length OP_PUSHDATA2',
+  bytecodeFunction,
+  'parse_bytecode_pattern_with_pushdata_lengths',
+  '4d0000',
+  '4d0000'
+);
+test(
+  'zero-length OP_PUSHDATA4',
+  bytecodeFunction,
+  'parse_bytecode_pattern_with_pushdata_lengths',
+  '4e00000000',
+  '4e00000000'
+);
+
+test(
   'OP_RETURN with OP_PUSHDATA2',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
