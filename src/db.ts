@@ -775,6 +775,7 @@ export const reenableMempoolCleaning = async () => {
     `ALTER TABLE node_block ENABLE TRIGGER trigger_public_node_block_insert;`
   );
   const triggerExists =
+    // cspell:ignore tgrelid tgname
     (
       await client.query<{ triggerExists: boolean }>(/* sql */ `
 SELECT EXISTS (
