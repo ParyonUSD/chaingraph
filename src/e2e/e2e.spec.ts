@@ -1186,6 +1186,38 @@ test.serial(
   }
 );
 
+test.serial(
+  '[e2e] [postgres] transaction_data_carrier_outputs ignores empty locking bytecode',
+  async (t) => {
+    const txHash =
+      '0000000000000000000000000000000000000000000000000000000000000075';
+    await client.query(
+      /* sql */ `
+      INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
+        VALUES ($1::bytea, 1, 0, 10, false);
+    `,
+      [hexToBin(txHash)]
+    );
+    await client.query(
+      /* sql */ `
+      INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode)
+        VALUES ($1::bytea, 0, 1, $2::bytea);
+    `,
+      [hexToBin(txHash), hexToBin('')]
+    );
+    const outputs = await client.query<{ outputIndex: string }>(
+      /* sql */ `
+      SELECT output_index AS "outputIndex"
+        FROM transaction_data_carrier_outputs(
+          (SELECT transaction FROM transaction WHERE hash = $1::bytea)
+        );
+    `,
+      [hexToBin(txHash)]
+    );
+    t.deepEqual(outputs.rows, []);
+  }
+);
+
 const newBlocks = (
   node: 'node1' | 'node2' | 'node3',
   blocks: BitcoreBlock[]
