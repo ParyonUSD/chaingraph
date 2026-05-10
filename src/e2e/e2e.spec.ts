@@ -1986,6 +1986,18 @@ const bytecodeFunction = test.macro<[string, string, string]>({
     `[e2e] [postgres] ${functionName} – ${patternHex}: ${providedTitle ?? ''}`,
 });
 
+const bytecodeFunctionReturnsNull = test.macro<[string, string]>({
+  exec: async (t, functionName, bytecodeHex) => {
+    const result = await client.query<{ isNull: boolean }>(
+      /* sql */ `SELECT ${functionName} ($1) IS NULL AS "isNull";`,
+      [hexToBin(bytecodeHex)]
+    );
+    t.true(result.rows[0]!.isNull);
+  },
+  title: (providedTitle, functionName, bytecodeHex) =>
+    `[e2e] [postgres] ${functionName} – ${bytecodeHex}: ${providedTitle ?? ''}`,
+});
+
 test(
   'P2PKH',
   bytecodeFunction,
@@ -2169,10 +2181,9 @@ test(
 
 test(
   'no redeem',
-  bytecodeFunction,
+  bytecodeFunctionReturnsNull,
   'parse_bytecode_pattern_redeem',
-  `0002000051`,
-  ''
+  `0002000051`
 );
 
 test(
@@ -2230,6 +2241,31 @@ test(
     )
   )}`,
   '004e515253'
+);
+
+test(
+  'malformed OP_PUSHDATA1 redeem',
+  bytecodeFunctionReturnsNull,
+  'parse_bytecode_pattern_redeem',
+  '4c'
+);
+test(
+  'malformed OP_PUSHDATA2 redeem',
+  bytecodeFunctionReturnsNull,
+  'parse_bytecode_pattern_redeem',
+  '4d11'
+);
+test(
+  'malformed OP_PUSHDATA4 redeem',
+  bytecodeFunctionReturnsNull,
+  'parse_bytecode_pattern_redeem',
+  '4e112233'
+);
+test(
+  'oversized OP_PUSHDATA4 redeem',
+  bytecodeFunctionReturnsNull,
+  'parse_bytecode_pattern_redeem',
+  '4effffffff'
 );
 
 test('[e2e] [postgres] encode_uint16le', async (t) => {
