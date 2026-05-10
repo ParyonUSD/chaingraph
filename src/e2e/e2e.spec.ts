@@ -75,6 +75,9 @@ const dbUpMigrationPaths = [
     'default/1778415174939_fix_data_carrier_outputs_empty_bytecode/up.sql'
   ),
   migration('default/1778429124205_fix_coinbase_only_value_aggregates/up.sql'),
+  migration(
+    'default/1778435997270_add_node_transaction_history_primary_key/up.sql'
+  ),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -653,6 +656,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'node_internal_id_key',
     'node_name_key',
     'node_pkey',
+    'node_transaction_history_pkey',
     'node_transaction_pkey',
     'output_pkey',
     'output_search_index',
