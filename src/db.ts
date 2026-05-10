@@ -373,7 +373,8 @@ WITH transaction_values (hash, version, locktime, size_bytes, is_coinbase) AS (
   )
 )
 INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
-  SELECT node_internal_id, transaction_internal_id, validated_at FROM node_transaction_values CROSS JOIN new_or_existing_transaction;
+  SELECT node_internal_id, transaction_internal_id, validated_at FROM node_transaction_values CROSS JOIN new_or_existing_transaction
+  ON CONFLICT ON CONSTRAINT "node_transaction_pkey" DO NOTHING;
 `;
   const client = await pool.connect();
   await client.query(saveTransaction);
@@ -411,7 +412,8 @@ export const recordNodeValidation = async (
     INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
       SELECT node_internal_id, transaction_internal_id, validated_at
         FROM node_transaction_values
-        CROSS JOIN known_transaction;
+        CROSS JOIN known_transaction
+      ON CONFLICT ON CONSTRAINT "node_transaction_pkey" DO NOTHING;
   `);
   } finally {
     client.release();
