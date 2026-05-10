@@ -41,6 +41,8 @@ spec:
           value: {{ .Values.agent.synchronousCommit | quote }}
         - name: CHAINGRAPH_BLOCK_BUFFER_TARGET_SIZE_MB
           value: {{ .Values.agent.blockBufferTargetSizeMb | quote }}
+        - name: CHAINGRAPH_INCOMPLETE_BLOCK_REPAIR_BATCH_SIZE
+          value: {{ .Values.agent.repairBlocksBatchSize | quote }}
         - name: CHAINGRAPH_GENESIS_BLOCKS
           value: {{ .Values.agent.genesisBlocks | quote }}
         - name: CHAINGRAPH_TRUSTED_NODES

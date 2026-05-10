@@ -93,6 +93,118 @@ export const getAllKnownBlockHashes = async () => {
   return hashes;
 };
 
+export interface IncompleteBlock {
+  hash: string;
+  height: number;
+  linkedSizeBytes: number;
+  sizeBytes: number;
+  transactionCount: number;
+}
+
+/**
+ * Find blocks for which the locally saved block_transaction rows don't sum to
+ * the block's saved byte size. This avoids the SQL block encoder so it can
+ * detect incomplete blocks even if encoder functions have bugs (e.g. #75).
+ */
+export const getIncompleteBlocks = async ({
+  heightLowerBound,
+  heightUpperBound,
+  limit,
+  nodeInternalIds,
+  excludedBlockHashes,
+}: {
+  excludedBlockHashes: string[];
+  heightLowerBound: number;
+  heightUpperBound: number;
+  limit: number;
+  nodeInternalIds: number[];
+}) => {
+  if (nodeInternalIds.length === 0) {
+    return [];
+  }
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const incompleteBlocks = await client.query<{
+      hash: Buffer;
+      height: string;
+      linkedSizeBytes: string;
+      sizeBytes: string;
+      transactionCount: string;
+    }>(
+      /* sql */ `
+WITH linked_transactions AS (
+  SELECT
+    block.internal_id,
+    block.height,
+    block.hash,
+    block.size_bytes,
+    COUNT(block_transaction.transaction_internal_id)::bigint
+      AS transaction_count,
+    COALESCE(SUM(transaction.size_bytes), 0)::bigint
+      AS transaction_size_bytes
+    FROM block
+    LEFT JOIN block_transaction
+      ON block_transaction.block_internal_id = block.internal_id
+    LEFT JOIN transaction
+      ON transaction.internal_id = block_transaction.transaction_internal_id
+    WHERE block.height >= $2
+      AND block.height < $3
+      AND NOT (encode(block.hash, 'hex') = ANY($5::text[]))
+      AND EXISTS (
+        SELECT 1 FROM node_block
+          WHERE node_block.block_internal_id = block.internal_id
+            AND node_block.node_internal_id = ANY($1::integer[])
+      )
+    GROUP BY block.internal_id
+),
+linked_block_sizes AS (
+  SELECT
+    hash,
+    height,
+    size_bytes,
+    transaction_count,
+    80 +
+      CASE
+        WHEN transaction_count <= 252 THEN 1
+        WHEN transaction_count <= 65535 THEN 3
+        WHEN transaction_count <= 4294967295 THEN 5
+        ELSE 9
+      END +
+      transaction_size_bytes AS linked_size_bytes
+    FROM linked_transactions
+)
+SELECT
+  hash,
+  height,
+  linked_size_bytes AS "linkedSizeBytes",
+  size_bytes AS "sizeBytes",
+  transaction_count AS "transactionCount"
+  FROM linked_block_sizes
+  WHERE linked_size_bytes != size_bytes
+  ORDER BY height ASC, hash ASC
+  LIMIT $4;
+`,
+      [
+        nodeInternalIds,
+        heightLowerBound,
+        heightUpperBound,
+        limit,
+        excludedBlockHashes,
+      ]
+    );
+    return incompleteBlocks.rows.map((block) => ({
+      hash: block.hash.toString('hex'),
+      height: Number(block.height),
+      linkedSizeBytes: Number(block.linkedSizeBytes),
+      sizeBytes: Number(block.sizeBytes),
+      transactionCount: Number(block.transactionCount),
+    }));
+  } finally {
+    client.release();
+  }
+};
+
 /**
  * Create or update one or more trusted node in the Chaingraph database,
  * returning it's internal ID.

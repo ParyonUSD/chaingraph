@@ -31,6 +31,7 @@ import {
   chaingraphLogFirehose,
   chaingraphUserAgent,
   genesisBlocks,
+  incompleteBlockRepairBatchSize,
   postgresMaxConnections,
   trustedNodes,
 } from './config.js';
@@ -38,6 +39,7 @@ import {
   acceptBlocksViaHeaders,
   createIndexes,
   getAllKnownBlockHashes,
+  getIncompleteBlocks,
   getIndexCreationProgress,
   listExistingIndexes,
   optionallyDisableSynchronousCommit,
@@ -50,6 +52,7 @@ import {
   saveBlock,
   saveTransactionForNodes,
 } from './db.js';
+import type { IncompleteBlock } from './db.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -86,6 +89,8 @@ const downloadTimeout = 300_000;
 const maxPendingDownloads = 200;
 
 const transactionCacheSize = 100_000;
+const incompleteBlockRepairMaxDownloads = 10;
+const incompleteBlockRepairRetryDelayMs = 250;
 
 export const cancelableDelay = (ms: number) => {
   // eslint-disable-next-line functional/no-let, @typescript-eslint/init-declarations
@@ -287,6 +292,16 @@ export class Agent {
   heartbeatInterval: NodeJS.Timeout;
 
   scheduledBlockBufferFill = false;
+
+  scheduledIncompleteBlockRepair = false;
+
+  incompleteBlockRepairTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  incompleteBlockRepairNextHeight = 0;
+
+  completedIncompleteBlockRepairScan = false;
+
+  pendingIncompleteBlockRepairs = new Set<string>();
 
   /**
    * The next second after which to log another warning that one or more nodes
@@ -828,6 +843,7 @@ export class Agent {
                     return reenableMempoolCleaning().then(() => {
                       this.logger.info('Agent: enabled mempool tracking.');
                       this.saveInboundTransactions = true;
+                      this.scheduleIncompleteBlockRepair(0);
                     });
                   })
                   .catch((err) => {
@@ -904,6 +920,187 @@ export class Agent {
       clearInterval(progressLogInterval);
     });
     return indexCreationCompletion;
+  }
+
+  canScheduleIncompleteBlockRepair() {
+    return ![
+      incompleteBlockRepairBatchSize === 0,
+      !this.completedInitialSync,
+      this.scheduledIncompleteBlockRepair,
+      this.completedIncompleteBlockRepairScan,
+      this.willShutdown,
+    ].includes(true);
+  }
+
+  scheduleIncompleteBlockRepair(delay = 0) {
+    if (!this.canScheduleIncompleteBlockRepair()) {
+      return;
+    }
+    this.incompleteBlockRepairTimeout = setTimeout(() => {
+      this.scheduledIncompleteBlockRepair = false;
+      this.repairIncompleteBlocks().catch((err) => {
+        this.logger.error(err);
+      });
+    }, delay);
+    this.scheduledIncompleteBlockRepair = true;
+  }
+
+  getIncompleteBlockRepairRange() {
+    const bestHeight = Math.max(
+      ...Object.values(this.blockTree.getBestHeights())
+    );
+    const finalHeight = bestHeight + 1;
+    const heightLowerBound =
+      this.incompleteBlockRepairNextHeight > bestHeight
+        ? 0
+        : this.incompleteBlockRepairNextHeight;
+    const heightUpperBound = Math.min(
+      heightLowerBound + incompleteBlockRepairBatchSize,
+      finalHeight
+    );
+    return { finalHeight, heightLowerBound, heightUpperBound };
+  }
+
+  updateIncompleteBlockRepairProgress({
+    finalHeight,
+    heightLowerBound,
+    heightUpperBound,
+    incompleteBlockCount,
+    limit,
+  }: {
+    finalHeight: number;
+    heightLowerBound: number;
+    heightUpperBound: number;
+    incompleteBlockCount: number;
+    limit: number;
+  }) {
+    if (incompleteBlockCount === limit) {
+      this.incompleteBlockRepairNextHeight = heightLowerBound;
+      return;
+    }
+    if (heightUpperBound === finalHeight) {
+      this.incompleteBlockRepairNextHeight = 0;
+      this.completedIncompleteBlockRepairScan = true;
+      this.logger.info('Agent: completed incomplete block repair scan.');
+      return;
+    }
+    this.incompleteBlockRepairNextHeight = heightUpperBound;
+  }
+
+  requestIncompleteBlockRepair(block: IncompleteBlock) {
+    if (
+      this.pendingIncompleteBlockRepairs.has(block.hash) ||
+      this.blockDownloads.some((download) => download.hash === block.hash)
+    ) {
+      return false;
+    }
+    const sourceNodes = this.blockTree.getNodesWithBlock(
+      block.hash,
+      block.height
+    );
+    if (sourceNodes.length === 0) {
+      this.logger.warn(
+        `Agent: incomplete block ${block.height} (${block.hash}) is not currently accepted by any connected node; skipping repair.`
+      );
+      return false;
+    }
+    this.logger.info(
+      `Agent: self-healing incomplete block ${block.height} (${block.hash}); linked size ${block.linkedSizeBytes}/${block.sizeBytes} bytes across ${block.transactionCount} saved transaction(s).`
+    );
+    this.pendingIncompleteBlockRepairs.add(block.hash);
+    this.blockBuffer.reserveBlock();
+    this.requestBlock(block.hash, block.height);
+    return true;
+  }
+
+  canRepairIncompleteBlocks() {
+    return (
+      incompleteBlockRepairBatchSize !== 0 &&
+      this.completedInitialSync &&
+      !this.willShutdown
+    );
+  }
+
+  getIncompleteBlockRepairCapacity() {
+    return (
+      incompleteBlockRepairMaxDownloads -
+      this.pendingIncompleteBlockRepairs.size
+    );
+  }
+
+  getRegisteredNodeInternalIds() {
+    return Object.values(this.nodes)
+      .map((node) => node.internalId)
+      .filter((id): id is number => id !== undefined);
+  }
+
+  requestIncompleteBlockRepairs(blocks: IncompleteBlock[]) {
+    return blocks.reduce(
+      (requestedRepairs, block) =>
+        requestedRepairs + (this.requestIncompleteBlockRepair(block) ? 1 : 0),
+      0
+    );
+  }
+
+  scheduleNextIncompleteBlockRepair(requestedRepairs: number) {
+    const delay =
+      requestedRepairs === 0 ||
+      this.pendingIncompleteBlockRepairs.size >=
+        incompleteBlockRepairMaxDownloads
+        ? incompleteBlockRepairRetryDelayMs
+        : 0;
+    this.scheduleIncompleteBlockRepair(delay);
+  }
+
+  /**
+   * Audit a bounded range of blocks accepted by currently-connected nodes. If
+   * the saved transactions don't sum to the saved block size, re-request the
+   * full block and let the normal block-saving path repair missing rows.
+   */
+  async repairIncompleteBlocks() {
+    if (!this.canRepairIncompleteBlocks()) {
+      return;
+    }
+    const repairCapacity = this.getIncompleteBlockRepairCapacity();
+    if (repairCapacity <= 0) {
+      this.scheduleIncompleteBlockRepair(incompleteBlockRepairRetryDelayMs);
+      return;
+    }
+    const { finalHeight, heightLowerBound, heightUpperBound } =
+      this.getIncompleteBlockRepairRange();
+    const incompleteBlocks = await getIncompleteBlocks({
+      excludedBlockHashes: [...this.pendingIncompleteBlockRepairs],
+      heightLowerBound,
+      heightUpperBound,
+      limit: repairCapacity,
+      nodeInternalIds: this.getRegisteredNodeInternalIds(),
+    });
+    this.updateIncompleteBlockRepairProgress({
+      finalHeight,
+      heightLowerBound,
+      heightUpperBound,
+      incompleteBlockCount: incompleteBlocks.length,
+      limit: repairCapacity,
+    });
+    if (incompleteBlocks.length === 0) {
+      this.logger.trace(
+        `Agent: no incomplete blocks found from height ${heightLowerBound} to ${
+          heightUpperBound - 1
+        }.`
+      );
+      this.scheduleIncompleteBlockRepair();
+      return;
+    }
+    this.logger.warn(
+      `Agent: found ${
+        incompleteBlocks.length
+      } incomplete block(s) from height ${heightLowerBound} to ${
+        heightUpperBound - 1
+      }; requesting full block contents for repair.`
+    );
+    const requestedRepairs =
+      this.requestIncompleteBlockRepairs(incompleteBlocks);
+    this.scheduleNextIncompleteBlockRepair(requestedRepairs);
   }
 
   /**
@@ -1417,6 +1614,8 @@ export class Agent {
         blockTimestampToDate(block.timestamp)
       );
     });
+    this.pendingIncompleteBlockRepairs.delete(block.hash);
+    this.scheduleIncompleteBlockRepair();
     this.blockBuffer.removeBlock(block);
   }
 
@@ -1754,6 +1953,9 @@ export class Agent {
     this.willShutdown = true;
     clearInterval(eventLoopDurationInterval);
     clearInterval(this.heartbeatInterval);
+    if (this.incompleteBlockRepairTimeout !== undefined) {
+      clearTimeout(this.incompleteBlockRepairTimeout);
+    }
     Object.values(this.nodes).forEach((connection) => {
       connection.disconnect();
     });
