@@ -1173,6 +1173,33 @@ test.serial(
 );
 
 test.serial(
+  '[e2e] [postgres] value aggregates handle coinbase-only blocks',
+  async (t) => {
+    const aggregates = (
+      await client.query<{
+        feeSatoshis: string;
+        generatedValueSatoshis: string;
+        inputValueSatoshis: string;
+        outputValueSatoshis: string;
+      }>(/* sql */ `
+        SELECT
+          block_fee_satoshis(block)::text AS "feeSatoshis",
+          block_generated_value_satoshis(block)::text AS "generatedValueSatoshis",
+          block_input_value_satoshis(block)::text AS "inputValueSatoshis",
+          block_output_value_satoshis(block)::text AS "outputValueSatoshis"
+          FROM block WHERE height = 0;
+      `)
+    ).rows[0]!;
+    t.deepEqual(aggregates, {
+      feeSatoshis: '0',
+      generatedValueSatoshis: '5000000000',
+      inputValueSatoshis: '0',
+      outputValueSatoshis: '5000000000',
+    });
+  }
+);
+
+test.serial(
   '[e2e] get hex-encoded block with multiple transactions',
   async (t) => {
     const blockWithMultipleTransactions = mockchainBeforeFork[1]!;
