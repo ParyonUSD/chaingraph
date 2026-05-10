@@ -159,7 +159,6 @@ const e2eEnvVariables = {
   CHAINGRAPH_INTERNAL_API_PORT: chaingraphInternalApiPort,
   CHAINGRAPH_LOG_FIREHOSE: logP2pMessage.toString(),
   CHAINGRAPH_LOG_PATH: chaingraphE2eLogPath,
-  CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_MS: '1000',
   CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS: '100',
   CHAINGRAPH_POSTGRES_CONNECTION_STRING: postgresE2eConnectionStringTestDb,
   CHAINGRAPH_TRUSTED_NODES: e2eTrustedNodesSet1,
@@ -656,7 +655,7 @@ const waitForExpiredMempoolArchive = async (
   remainingAttempts = mempoolExpirationPollingAttempts
 ): Promise<Awaited<ReturnType<typeof getExpiredMempoolArchiveState>>> => {
   const rows = await getExpiredMempoolArchiveState();
-  const expectedReplacedAt = '2026-01-01 00:00:01';
+  const expectedReplacedAt = '2026-01-15 00:00:00';
   if (
     rows.every(
       (row) =>
@@ -999,19 +998,19 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
         {
           historyRowCount: 1,
           inMempool: false,
-          replacedAt: '2026-01-01 00:00:01',
+          replacedAt: '2026-01-15 00:00:00',
           transactionName: 'expiry_child_b',
         },
         {
           historyRowCount: 1,
           inMempool: false,
-          replacedAt: '2026-01-01 00:00:01',
+          replacedAt: '2026-01-15 00:00:00',
           transactionName: 'expiry_child_c',
         },
         {
           historyRowCount: 1,
           inMempool: false,
-          replacedAt: '2026-01-01 00:00:01',
+          replacedAt: '2026-01-15 00:00:00',
           transactionName: 'expiry_parent_a',
         },
       ]);

@@ -106,6 +106,15 @@ export interface IncompleteBlockScan {
   scannedBlockCount: number;
 }
 
+export interface ExpiringMempoolTransaction {
+  expiresAt: Date;
+  hash: string;
+  nodeInternalId: number;
+  nodeName: string;
+  transactionInternalId: number;
+  validatedAt: Date;
+}
+
 /**
  * Find blocks for which the locally saved block_transaction rows don't sum to
  * the block's saved byte size. This avoids the SQL block encoder so it can
@@ -232,6 +241,102 @@ SELECT
       })),
       scannedBlockCount: Number(scan.scannedBlockCount),
     };
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Find node_transaction rows which will expire before the provided timestamp.
+ */
+export const getMempoolTransactionsExpiringBefore = async ({
+  expiresBefore,
+  expirationMs,
+}: {
+  expirationMs: number;
+  expiresBefore: Date;
+}): Promise<ExpiringMempoolTransaction[]> => {
+  const expirationInterval = `${expirationMs}::double precision * interval '1 millisecond'`;
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const transactions = await client.query<{
+      expiresAt: string;
+      hash: string;
+      nodeInternalId: string;
+      nodeName: string;
+      transactionInternalId: string;
+      validatedAt: string;
+    }>(/* sql */ `
+SELECT encode(transaction.hash, 'hex') AS "hash",
+       node.name AS "nodeName",
+       node_transaction.node_internal_id AS "nodeInternalId",
+       node_transaction.transaction_internal_id AS "transactionInternalId",
+       node_transaction.validated_at::text AS "validatedAt",
+       (node_transaction.validated_at + (${expirationInterval}))::text AS "expiresAt"
+  FROM node_transaction
+  JOIN node
+    ON node.internal_id = node_transaction.node_internal_id
+  JOIN transaction
+    ON transaction.internal_id = node_transaction.transaction_internal_id
+  WHERE node_transaction.validated_at + (${expirationInterval}) <= ${dateToTimestampWithoutTimezone(
+      expiresBefore
+    )}
+  ORDER BY "expiresAt", "nodeName", "hash";
+`);
+    return transactions.rows.map((transaction) => ({
+      expiresAt: timestampWithoutTimezoneToDate(transaction.expiresAt),
+      hash: transaction.hash,
+      nodeInternalId: Number(transaction.nodeInternalId),
+      nodeName: transaction.nodeName,
+      transactionInternalId: Number(transaction.transactionInternalId),
+      validatedAt: timestampWithoutTimezoneToDate(transaction.validatedAt),
+    }));
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Archive a single node_transaction row. Existing history triggers handle any
+ * same-node descendants with the same replaced_at timestamp.
+ */
+export const archiveMempoolTransaction = async ({
+  nodeInternalId,
+  replacedAt,
+  transactionInternalId,
+}: {
+  nodeInternalId: number;
+  replacedAt: Date;
+  transactionInternalId: number;
+}) => {
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const result = await client.query<{
+      archivedCount: number;
+    }>(
+      /* sql */ `
+WITH deleted_row AS (
+    DELETE FROM node_transaction
+      WHERE node_internal_id = $1
+        AND transaction_internal_id = $2
+      RETURNING node_internal_id,
+                transaction_internal_id,
+                validated_at,
+                ${dateToTimestampWithoutTimezone(replacedAt)} AS replaced_at
+),
+inserted_history AS (
+    INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id, validated_at, replaced_at)
+      SELECT node_internal_id, transaction_internal_id, validated_at, replaced_at
+        FROM deleted_row
+      RETURNING transaction_internal_id
+)
+SELECT COUNT(*)::integer AS "archivedCount" FROM inserted_history;
+`,
+      [nodeInternalId, transactionInternalId]
+    );
+    return result.rows[0]!.archivedCount;
   } finally {
     client.release();
   }

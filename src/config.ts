@@ -42,6 +42,8 @@ const expectedOptions = [
   'CHAINGRAPH_LOG_LEVEL_STDOUT',
   'CHAINGRAPH_LOG_LEVEL_PATH',
   'CHAINGRAPH_LOG_PATH',
+  'CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_MS',
+  'CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS',
   'CHAINGRAPH_POSTGRES_CONNECTION_STRING',
   'CHAINGRAPH_POSTGRES_MAX_CONNECTIONS',
   'CHAINGRAPH_POSTGRES_SYNCHRONOUS_COMMIT',
@@ -123,6 +125,32 @@ if (
   // eslint-disable-next-line functional/no-throw-statement
   throw new Error(
     'The CHAINGRAPH_INCOMPLETE_BLOCK_REPAIR_BATCH_SIZE environment variable must be an integer greater than or equal to 0.'
+  );
+}
+
+const mempoolTransactionExpirationMs = Number(
+  configuration.CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_MS
+);
+if (
+  !Number.isInteger(mempoolTransactionExpirationMs) ||
+  mempoolTransactionExpirationMs <= 0
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    'The CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_MS environment variable must be an integer greater than 0.'
+  );
+}
+
+const mempoolTransactionExpirationScanIntervalMs = Number(
+  configuration.CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS
+);
+if (
+  !Number.isInteger(mempoolTransactionExpirationScanIntervalMs) ||
+  mempoolTransactionExpirationScanIntervalMs <= 0
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    'The CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS environment variable must be an integer greater than 0.'
   );
 }
 
@@ -391,6 +419,8 @@ export {
   chaingraphUserAgent,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
+  mempoolTransactionExpirationMs,
+  mempoolTransactionExpirationScanIntervalMs,
   postgresMaxConnections,
   postgresConnectionString,
   postgresSynchronousCommit,

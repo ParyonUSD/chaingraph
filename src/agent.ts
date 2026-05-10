@@ -32,15 +32,19 @@ import {
   chaingraphUserAgent,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
+  mempoolTransactionExpirationMs,
+  mempoolTransactionExpirationScanIntervalMs,
   postgresMaxConnections,
   trustedNodes,
 } from './config.js';
 import {
   acceptBlocksViaHeaders,
+  archiveMempoolTransaction,
   createIndexes,
   getAllKnownBlockHashes,
   getIncompleteBlocks,
   getIndexCreationProgress,
+  getMempoolTransactionsExpiringBefore,
   listExistingIndexes,
   optionallyDisableSynchronousCommit,
   optionallyEnableSynchronousCommit,
@@ -52,7 +56,7 @@ import {
   saveBlock,
   saveTransactionForNodes,
 } from './db.js';
-import type { IncompleteBlock } from './db.js';
+import type { ExpiringMempoolTransaction, IncompleteBlock } from './db.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -303,6 +307,15 @@ export class Agent {
     | undefined;
 
   incompleteBlockRepairTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  mempoolTransactionExpirationScanTimeout:
+    | ReturnType<typeof setTimeout>
+    | undefined;
+
+  mempoolTransactionExpirationTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
 
   incompleteBlockRepairNextHeight = 0;
 
@@ -853,6 +866,7 @@ export class Agent {
                       }
                       this.logger.info('Agent: enabled mempool tracking.');
                       this.saveInboundTransactions = true;
+                      this.scheduleMempoolTransactionExpirationScan();
                       this.scheduleIncompleteBlockRepair();
                     });
                   })
@@ -930,6 +944,106 @@ export class Agent {
       clearInterval(progressLogInterval);
     });
     return indexCreationCompletion;
+  }
+
+  canScanForMempoolTransactionExpirations() {
+    return ![
+      !this.completedInitialSync,
+      !this.saveInboundTransactions,
+      this.mempoolTransactionExpirationScanTimeout !== undefined,
+      this.willShutdown,
+    ].includes(true);
+  }
+
+  scheduleMempoolTransactionExpirationScan(delayMs = 0, forceSchedule = false) {
+    if (
+      (!forceSchedule && !this.canScanForMempoolTransactionExpirations()) ||
+      this.willShutdown
+    ) {
+      return;
+    }
+    this.mempoolTransactionExpirationScanTimeout = setTimeout(() => {
+      this.mempoolTransactionExpirationScanTimeout = undefined;
+      this.scanForMempoolTransactionExpirations()
+        .catch((err) => {
+          this.logger.error(
+            err,
+            'Agent: failed to scan for expiring mempool transactions.'
+          );
+        })
+        .finally(() => {
+          this.scheduleMempoolTransactionExpirationScan(
+            mempoolTransactionExpirationScanIntervalMs,
+            true
+          );
+        });
+    }, delayMs);
+  }
+
+  scheduleMempoolTransactionExpiration(
+    transaction: ExpiringMempoolTransaction
+  ) {
+    const key = `${transaction.nodeInternalId}:${transaction.transactionInternalId}`;
+    if (this.mempoolTransactionExpirationTimers.has(key)) {
+      return;
+    }
+    const delayMs = Math.max(transaction.expiresAt.getTime() - Date.now(), 0);
+    const timeout = setTimeout(() => {
+      this.mempoolTransactionExpirationTimers.delete(key);
+      this.expireMempoolTransaction(transaction).catch((err) => {
+        this.logger.error(
+          err,
+          `Agent: failed to expire mempool transaction ${transaction.hash} for node ${transaction.nodeName}.`
+        );
+      });
+    }, delayMs);
+    this.mempoolTransactionExpirationTimers.set(key, timeout);
+  }
+
+  async scanForMempoolTransactionExpirations() {
+    if (!this.saveInboundTransactions || this.willShutdown) {
+      return;
+    }
+    const expiresBefore = new Date(
+      Date.now() + mempoolTransactionExpirationScanIntervalMs
+    );
+    const expiringTransactions = await getMempoolTransactionsExpiringBefore({
+      expirationMs: mempoolTransactionExpirationMs,
+      expiresBefore,
+    });
+    if (expiringTransactions.length === 0) {
+      this.logger.debug(
+        `Agent: no mempool transactions expiring before ${expiresBefore.toISOString()}; next scan in ${mempoolTransactionExpirationScanIntervalMs.toLocaleString()}ms.`
+      );
+      return;
+    }
+    this.logger.info(
+      `Agent: found ${
+        expiringTransactions.length
+      } mempool transaction(s) expiring before ${expiresBefore.toISOString()}; scheduling exact expiry.`
+    );
+    expiringTransactions.forEach((transaction) => {
+      this.scheduleMempoolTransactionExpiration(transaction);
+    });
+  }
+
+  async expireMempoolTransaction(transaction: ExpiringMempoolTransaction) {
+    const archivedCount = await archiveMempoolTransaction({
+      nodeInternalId: transaction.nodeInternalId,
+      replacedAt: transaction.expiresAt,
+      transactionInternalId: transaction.transactionInternalId,
+    });
+    if (archivedCount === 0) {
+      this.logger.debug(
+        `Agent: skipped expiry of mempool transaction ${transaction.hash} for node ${transaction.nodeName}; it has already left node_transaction.`
+      );
+      return;
+    }
+    this.logger.warn(
+      `Agent: expired mempool transaction ${transaction.hash} for node ${
+        transaction.nodeName
+      }; archived from node_transaction to node_transaction_history with replaced_at ${transaction.expiresAt.toISOString()}.`
+    );
   }
 
   canScheduleIncompleteBlockRepair() {
@@ -1980,6 +2094,13 @@ export class Agent {
     if (this.incompleteBlockRepairTimeout !== undefined) {
       clearTimeout(this.incompleteBlockRepairTimeout);
     }
+    if (this.mempoolTransactionExpirationScanTimeout !== undefined) {
+      clearTimeout(this.mempoolTransactionExpirationScanTimeout);
+    }
+    this.mempoolTransactionExpirationTimers.forEach((timeout) => {
+      clearTimeout(timeout);
+    });
+    this.mempoolTransactionExpirationTimers.clear();
     Object.values(this.nodes).forEach((connection) => {
       connection.disconnect();
     });
