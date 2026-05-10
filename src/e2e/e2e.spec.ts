@@ -71,6 +71,9 @@ const dbUpMigrationPaths = [
   ),
   backfillOrphanMempoolDescendantsMigrationPath,
   migration('default/1778351597200_fix_block_encoded_transaction_count/up.sql'),
+  migration(
+    'default/1778415174939_fix_data_carrier_outputs_empty_bytecode/up.sql'
+  ),
 ];
 
 const chaingraphInternalApiPort = '3201';
