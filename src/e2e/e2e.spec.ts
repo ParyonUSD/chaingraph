@@ -159,6 +159,8 @@ const e2eEnvVariables = {
   CHAINGRAPH_INTERNAL_API_PORT: chaingraphInternalApiPort,
   CHAINGRAPH_LOG_FIREHOSE: logP2pMessage.toString(),
   CHAINGRAPH_LOG_PATH: chaingraphE2eLogPath,
+  CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_MS: '1000',
+  CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS: '100',
   CHAINGRAPH_POSTGRES_CONNECTION_STRING: postgresE2eConnectionStringTestDb,
   CHAINGRAPH_TRUSTED_NODES: e2eTrustedNodesSet1,
   NODE_ENV: 'production',
@@ -607,6 +609,69 @@ const waitForBlockTransactionCount = async (
   );
 };
 
+const mempoolExpirationPollingAttempts = 50;
+const mempoolExpirationPollingIntervalMs = 100;
+const getExpiredMempoolArchiveState = async () =>
+  (
+    await client.query<{
+      historyRowCount: number;
+      inMempool: boolean;
+      replacedAt: string | null;
+      transactionName: string;
+    }>(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('expiry_parent_a', decode(repeat('d1', 32), 'hex')),
+      ('expiry_child_b',  decode(repeat('d2', 32), 'hex')),
+      ('expiry_child_c',  decode(repeat('d3', 32), 'hex'))
+),
+selected_node AS (
+    SELECT internal_id
+      FROM node
+      WHERE name = 'node1'
+),
+named_transactions AS (
+    SELECT transaction_values.name, transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+SELECT named_transactions.name AS "transactionName",
+       (node_transaction.transaction_internal_id IS NOT NULL) AS "inMempool",
+       COUNT(node_transaction_history.transaction_internal_id)::integer AS "historyRowCount",
+       MIN(node_transaction_history.replaced_at)::text AS "replacedAt"
+  FROM named_transactions
+  CROSS JOIN selected_node
+  LEFT JOIN node_transaction
+    ON node_transaction.node_internal_id = selected_node.internal_id
+   AND node_transaction.transaction_internal_id = named_transactions.internal_id
+  LEFT JOIN node_transaction_history
+    ON node_transaction_history.node_internal_id = selected_node.internal_id
+   AND node_transaction_history.transaction_internal_id = named_transactions.internal_id
+  GROUP BY named_transactions.name, node_transaction.transaction_internal_id
+  ORDER BY named_transactions.name;
+`)
+  ).rows;
+const waitForExpiredMempoolArchive = async (
+  remainingAttempts = mempoolExpirationPollingAttempts
+): Promise<Awaited<ReturnType<typeof getExpiredMempoolArchiveState>>> => {
+  const rows = await getExpiredMempoolArchiveState();
+  const expectedReplacedAt = '2026-01-01 00:00:01';
+  if (
+    rows.every(
+      (row) =>
+        !row.inMempool &&
+        row.historyRowCount === 1 &&
+        row.replacedAt === expectedReplacedAt
+    ) ||
+    remainingAttempts === 0
+  ) {
+    return rows;
+  }
+  await sleep(mempoolExpirationPollingIntervalMs);
+  return waitForExpiredMempoolArchive(remainingAttempts - 1);
+};
+
 test.serial(
   '[e2e] ignores inbound transactions before initial sync is complete',
   async (t) => {
@@ -844,6 +909,186 @@ SELECT transaction_values.name AS "transactionName",
       ]);
     } finally {
       await client.query(/* sql */ `ROLLBACK;`);
+    }
+  }
+);
+
+test.serial(
+  '[e2e] archives expired mempool transactions and descendants',
+  async (t) => {
+    await client.query(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('expiry_parent_a', decode(repeat('d1', 32), 'hex')),
+      ('expiry_child_b',  decode(repeat('d2', 32), 'hex')),
+      ('expiry_child_c',  decode(repeat('d3', 32), 'hex'))
+)
+INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
+  SELECT hash, 1, 0, 100, false
+    FROM transaction_values;
+`);
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await client.query(/* sql */ `
+WITH transaction_values (name, hash) AS (
+    VALUES
+      ('expiry_parent_a', decode(repeat('d1', 32), 'hex')),
+      ('expiry_child_b',  decode(repeat('d2', 32), 'hex'))
+)
+INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode)
+  SELECT hash, 0, 1000, '\\x51'::bytea
+    FROM transaction_values;
+`);
+      await client.query(/* sql */ `
+WITH input_values (child_name, parent_name, input_index) AS (
+    VALUES
+      ('expiry_child_b', 'expiry_parent_a', 0),
+      ('expiry_child_c', 'expiry_child_b',  0)
+),
+transaction_values (name, hash) AS (
+    VALUES
+      ('expiry_parent_a', decode(repeat('d1', 32), 'hex')),
+      ('expiry_child_b',  decode(repeat('d2', 32), 'hex')),
+      ('expiry_child_c',  decode(repeat('d3', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction_values.name, transaction.internal_id, transaction.hash
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
+  SELECT child.internal_id, input_values.input_index, 0, 0, parent.hash, '\\x51'::bytea
+    FROM input_values
+    JOIN named_transactions child
+      ON child.name = input_values.child_name
+    JOIN named_transactions parent
+      ON parent.name = input_values.parent_name;
+`);
+      await client.query(/* sql */ `
+WITH selected_node AS (
+    SELECT internal_id
+      FROM node
+      WHERE name = 'node1'
+),
+transaction_values (name, hash) AS (
+    VALUES
+      ('expiry_parent_a', decode(repeat('d1', 32), 'hex')),
+      ('expiry_child_b',  decode(repeat('d2', 32), 'hex')),
+      ('expiry_child_c',  decode(repeat('d3', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction_values.name, transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
+  SELECT selected_node.internal_id,
+         named_transactions.internal_id,
+         CASE
+           WHEN named_transactions.name = 'expiry_parent_a'
+             THEN timestamp '2026-01-01 00:00:00'
+           ELSE CURRENT_TIMESTAMP + interval '1 day'
+         END
+    FROM selected_node
+    CROSS JOIN named_transactions;
+`);
+      const archivedTransactions = await waitForExpiredMempoolArchive();
+      t.deepEqual(archivedTransactions, [
+        {
+          historyRowCount: 1,
+          inMempool: false,
+          replacedAt: '2026-01-01 00:00:01',
+          transactionName: 'expiry_child_b',
+        },
+        {
+          historyRowCount: 1,
+          inMempool: false,
+          replacedAt: '2026-01-01 00:00:01',
+          transactionName: 'expiry_child_c',
+        },
+        {
+          historyRowCount: 1,
+          inMempool: false,
+          replacedAt: '2026-01-01 00:00:01',
+          transactionName: 'expiry_parent_a',
+        },
+      ]);
+    } finally {
+      await client.query(/* sql */ `
+WITH transaction_values (hash) AS (
+    VALUES
+      (decode(repeat('d1', 32), 'hex')),
+      (decode(repeat('d2', 32), 'hex')),
+      (decode(repeat('d3', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+DELETE FROM node_transaction
+  USING named_transactions
+  WHERE node_transaction.transaction_internal_id = named_transactions.internal_id;
+`);
+      await client.query(/* sql */ `
+WITH transaction_values (hash) AS (
+    VALUES
+      (decode(repeat('d1', 32), 'hex')),
+      (decode(repeat('d2', 32), 'hex')),
+      (decode(repeat('d3', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+DELETE FROM node_transaction_history
+  USING named_transactions
+  WHERE node_transaction_history.transaction_internal_id = named_transactions.internal_id;
+`);
+      await client.query(/* sql */ `
+WITH transaction_values (hash) AS (
+    VALUES
+      (decode(repeat('d1', 32), 'hex')),
+      (decode(repeat('d2', 32), 'hex')),
+      (decode(repeat('d3', 32), 'hex'))
+),
+named_transactions AS (
+    SELECT transaction.internal_id
+      FROM transaction
+      JOIN transaction_values
+        ON transaction_values.hash = transaction.hash
+)
+DELETE FROM input
+  USING named_transactions
+  WHERE input.transaction_internal_id = named_transactions.internal_id;
+`);
+      await client.query(/* sql */ `
+WITH transaction_values (hash) AS (
+    VALUES
+      (decode(repeat('d1', 32), 'hex')),
+      (decode(repeat('d2', 32), 'hex')),
+      (decode(repeat('d3', 32), 'hex'))
+)
+DELETE FROM output
+  USING transaction_values
+  WHERE output.transaction_hash = transaction_values.hash;
+`);
+      await client.query(/* sql */ `
+WITH transaction_values (hash) AS (
+    VALUES
+      (decode(repeat('d1', 32), 'hex')),
+      (decode(repeat('d2', 32), 'hex')),
+      (decode(repeat('d3', 32), 'hex'))
+)
+DELETE FROM transaction
+  USING transaction_values
+  WHERE transaction.hash = transaction_values.hash;
+`);
     }
   }
 );
