@@ -116,6 +116,27 @@ const renderSyncPercentage = (value: number) => {
 };
 
 const msPerSecond = 1000;
+const durationDecimalPlaces = 1;
+const transactionRateDecimalPlaces = 2;
+
+const formatDurationSeconds = (durationMs: number) =>
+  `${(durationMs / msPerSecond).toFixed(durationDecimalPlaces)}s`;
+
+const formatTransactionRate = (transactionCount: number, durationMs: number) =>
+  durationMs === 0
+    ? 'n/a tx/s'
+    : `${((transactionCount * msPerSecond) / durationMs).toFixed(
+        transactionRateDecimalPlaces
+      )}tx/s`;
+
+const formatTransactionDuration = (
+  transactionCount: number,
+  durationMs: number
+) =>
+  transactionCount === 0
+    ? 'n/a/tx'
+    : `${formatDurationSeconds(durationMs / transactionCount)}/tx`;
+
 /**
  * Convert a bitcoin block header timestamp (UTC in seconds) to a `Date`.
  * @param timestamp - the block header timestamp
@@ -1736,6 +1757,7 @@ export class Agent {
 
     const durationMs = completionTime - startTime;
     const transactions = attemptedSavedTransactions.length;
+    const savedTransactionCount = transactions - transactionCacheMisses;
     const inputs = attemptedSavedTransactions.reduce(
       (total, tx) => total + tx.inputs.length,
       0
@@ -1769,15 +1791,29 @@ export class Agent {
       .toString()
       .padStart(heightMinWidth, ' ')} | timestamp: ${blockTimestampToDate(
       block.timestamp
-    ).toISOString()} | hash: ${block.hash} | new txs: ${
-      transactions - transactionCacheMisses
-    }/${block.transactions.length.toString()} (${transactionCacheMisses} cache misses) | nodes: ${nodeAcceptances
+    ).toISOString()} | hash: ${
+      block.hash
+    } | new txs: ${savedTransactionCount}/${block.transactions.length.toString()} (${transactionCacheMisses} cache misses) | nodes: ${nodeAcceptances
       .map((acceptance) => acceptance.nodeName)
       .join(', ')}`;
+    const blockInsertLog = `Inserting block ${
+      block.height
+    } with ${savedTransactionCount} new transaction${
+      savedTransactionCount === 1 ? '' : 's'
+    } for ${nodeAcceptances
+      .map((acceptance) => acceptance.nodeName)
+      .join(', ')} took ${formatDurationSeconds(
+      durationMs
+    )} (${formatTransactionDuration(
+      savedTransactionCount,
+      durationMs
+    )}, ${formatTransactionRate(savedTransactionCount, durationMs)})`;
     if (isHistoricalSync) {
       this.logger.debug(blockSyncLog);
+      this.logger.trace(blockInsertLog);
     } else {
       this.logger.info(blockSyncLog);
+      this.logger.debug(blockInsertLog);
     }
 
     nodeAcceptances.forEach((acceptance) => {
@@ -1875,7 +1911,7 @@ export class Agent {
     txCacheItem.db = true;
     this.transactionCache.set(transactionHash, txCacheItem);
     this.logger.trace(
-      `Marked transaction saved to DB - hash: ${transactionHash}`
+      `Marked transaction as saved to DB - hash: ${transactionHash}`
     );
   }
 
@@ -1917,7 +1953,14 @@ export class Agent {
           .join(', ')} - hash: ${tx.hash}`
       );
       // TODO: collect statistics on save speed
+      const startTime = Date.now();
       await saveTransactionForNodes(tx, validations);
+      const durationMs = Date.now() - startTime;
+      this.logger.debug(
+        `Inserting mempool tx ${
+          tx.hash
+        } for node ${nodeName} took ${formatDurationSeconds(durationMs)}`
+      );
       this.markTransactionSavedToDb(tx.hash);
     }
   }
