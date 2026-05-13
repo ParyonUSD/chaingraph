@@ -69,7 +69,9 @@ test('SyncState scales when marking many contiguous heights as pending', (t) => 
   const maximumDurationMs = 1_000;
 
   const startedAt = Date.now();
+  // eslint-disable-next-line functional/no-loop-statement
   for (
+    // eslint-disable-next-line functional/no-let
     let nextHeight = state.getPendingSyncHeight() + 1;
     nextHeight <= pendingThroughHeight;
     nextHeight = state.getPendingSyncHeight() + 1
