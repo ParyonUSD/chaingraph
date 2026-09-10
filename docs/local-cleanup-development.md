@@ -73,9 +73,9 @@ curl -H 'Content-Type: application/json' \
 The small buffer and two database connections reproduce the successful chipnet
 catch-up settings recorded in `.scratch/pg-duckdb-local-runbook.md`. With the
 automatic buffer, this startup queued many block reservations, reached the
-200-download limit, and waited for five-minute retries. Only local runtime
-settings were adjusted. Incomplete-block repair and mempool cleanup remain
-enabled; their implementations are unchanged.
+200-download limit, and waited for five-minute retries. These local runtime
+settings affect ingestion buffering. Incomplete-block repair and mempool cleanup
+remain enabled.
 
 ## Existing work and validation
 
@@ -113,5 +113,8 @@ cleanup test. It does not connect to BCH mainnet.
 
 Backups of both pre-existing local databases, plus the previous Hasura catalog,
 are in `.scratch/cleanup-development/`. The test output is `e2e-tests.log` there.
-These backups and logs remain ignored by Git. The cleanup performance fix has
-not yet been implemented or deployed.
+These backups and logs remain ignored by Git. The cleanup function was
+subsequently updated in commit `141b14e`; the complete repository checks then
+passed with 115 tests and one existing TODO. The local
+agent was restarted to load the fix. The performance clone received an image
+containing only this function change, preserving its existing runtime.
