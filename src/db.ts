@@ -311,6 +311,11 @@ SELECT encode(transaction.hash, 'hex') AS "hash",
  * replaced by accepted blocks for the same node. This repairs historical rows
  * missed when block inclusions are added after the node_block trigger has
  * already fired.
+ *
+ * The correlated input lookups use OFFSET 0 as a planning barrier. Without it,
+ * Postgres can flatten the joins and scan the entire historical input table to
+ * resolve conflicts for a comparatively small current mempool. Keep each lookup
+ * constrained to a mempool transaction and then one of its outpoints.
  */
 export const archiveMempoolTransactionsAcceptedByBlocks = async (): Promise<
   ArchivedMempoolTransaction[]
@@ -337,22 +342,32 @@ WITH directly_accepted AS (
 replaced_by_accepted AS (
     SELECT node_transaction.node_internal_id,
            node_transaction.transaction_internal_id,
-           MIN(node_block.accepted_at) AS replaced_at
+           replacement.replaced_at
       FROM node_transaction
-      JOIN input mempool_input
-        ON mempool_input.transaction_internal_id = node_transaction.transaction_internal_id
-      JOIN input accepted_input
-        ON accepted_input.outpoint_transaction_hash = mempool_input.outpoint_transaction_hash
-       AND accepted_input.outpoint_index = mempool_input.outpoint_index
-       AND accepted_input.transaction_internal_id != node_transaction.transaction_internal_id
-      JOIN block_transaction
-        ON block_transaction.transaction_internal_id = accepted_input.transaction_internal_id
-      JOIN node_block
-        ON node_block.node_internal_id = node_transaction.node_internal_id
-       AND node_block.block_internal_id = block_transaction.block_internal_id
-      WHERE mempool_input.outpoint_transaction_hash != '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
-      GROUP BY node_transaction.node_internal_id,
-               node_transaction.transaction_internal_id
+      CROSS JOIN LATERAL (
+        SELECT MIN(node_block.accepted_at) AS replaced_at
+          FROM LATERAL (
+            SELECT outpoint_transaction_hash, outpoint_index
+              FROM input
+              WHERE transaction_internal_id = node_transaction.transaction_internal_id
+                AND outpoint_transaction_hash != '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
+              OFFSET 0
+          ) mempool_input
+          CROSS JOIN LATERAL (
+            SELECT transaction_internal_id
+              FROM input
+              WHERE outpoint_transaction_hash = mempool_input.outpoint_transaction_hash
+                AND outpoint_index = mempool_input.outpoint_index
+                AND transaction_internal_id != node_transaction.transaction_internal_id
+              OFFSET 0
+          ) accepted_input
+          JOIN block_transaction
+            ON block_transaction.transaction_internal_id = accepted_input.transaction_internal_id
+          JOIN node_block
+            ON node_block.node_internal_id = node_transaction.node_internal_id
+           AND node_block.block_internal_id = block_transaction.block_internal_id
+          HAVING COUNT(*) > 0
+      ) replacement
 ),
 archive_candidates AS (
     SELECT node_internal_id, transaction_internal_id, replaced_at
