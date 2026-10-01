@@ -379,7 +379,11 @@ export class Agent {
   managedIndexes: (keyof typeof indexDefinitions)[] = [
     'block_height_index',
     'block_inclusions_index',
+    'output_accepted_node_ids_gin',
     'output_search_index',
+    'output_unspent_fungible_category',
+    'output_unspent_locking_prefix',
+    'output_unspent_node_ids_gin',
     'spent_by_index',
     'token_category_index',
   ];

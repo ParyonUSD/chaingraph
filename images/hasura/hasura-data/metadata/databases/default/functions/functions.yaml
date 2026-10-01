@@ -1,2 +1,4 @@
+- "!include public_accepted_output.yaml"
 - "!include public_search_output.yaml"
 - "!include public_search_output_prefix.yaml"
+- "!include public_unspent_output.yaml"
