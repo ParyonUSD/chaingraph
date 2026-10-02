@@ -83,6 +83,7 @@ const dbUpMigrationPaths = [
   migration('default/1778437612917_fix_zero_length_pushdata_patterns/up.sql'),
   migration('default/1778438318512_fix_redeem_bytecode_parser/up.sql'),
   migration('default/1790852400000_add_output_node_membership/up.sql'),
+  migration('default/1790930801000_inline_output_membership_roots/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -1005,9 +1006,48 @@ test.serial(
       unspentNodeIds: [],
     });
 
+    await t.throwsAsync(
+      client.query(/* sql */ `
+        SELECT count(*) FROM unspent_output('node1');
+      `),
+      { message: /output node membership is not ready/u }
+    );
+    await t.throwsAsync(
+      client.query(/* sql */ `
+        SELECT count(*) FROM accepted_output('node1');
+      `),
+      { message: /output node membership is not ready/u }
+    );
+
     await client.query(/* sql */ `
       UPDATE output_membership.state SET ready = true, phase = 'ready' WHERE id;
     `);
+
+    await client.query('BEGIN');
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      // cspell:ignore seqscan
+      await client.query('SET LOCAL enable_seqscan = off');
+      const plan = (
+        await client.query<{ [key: string]: string }>(
+          /* sql */ `
+          EXPLAIN (COSTS OFF)
+          SELECT output_index
+            FROM unspent_output('node1')
+            WHERE token_category = $1
+              AND nonfungible_token_capability IS NULL;
+        `,
+          [parentHash]
+        )
+      ).rows
+        .map((row) => row['QUERY PLAN'])
+        .join('\n');
+      t.false(plan.includes('Function Scan on unspent_output'));
+      t.regex(plan, /output_unspent_fungible_category/u);
+    } finally {
+      await client.query('ROLLBACK');
+    }
+
     const rootResult = (
       await client.query<{ outputIndex: string }>(
         /* sql */ `
