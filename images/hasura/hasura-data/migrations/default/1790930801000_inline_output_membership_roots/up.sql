@@ -1,4 +1,4 @@
-CREATE FUNCTION output_membership.require_ready() RETURNS boolean
+CREATE OR REPLACE FUNCTION output_membership.require_ready() RETURNS boolean
   LANGUAGE plpgsql
   STABLE
   PARALLEL RESTRICTED
