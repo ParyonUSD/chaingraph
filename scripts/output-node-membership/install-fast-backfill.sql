@@ -155,8 +155,8 @@ BEGIN
 
   PERFORM set_config('output_membership.backfill', 'on', false);
 
-  SELECT phase
-    INTO STRICT current_phase
+  SELECT phase, input_rows, transaction_rows, node_rows
+    INTO STRICT current_phase, input_count, transaction_count, node_count
     FROM output_membership_backfill.state
     WHERE id
     FOR UPDATE;
@@ -284,6 +284,30 @@ BEGIN
     PERFORM set_config('enable_nestloop', 'on', false);
     PERFORM set_config('enable_mergejoin', 'off', false);
     PERFORM set_config('enable_hashjoin', 'off', false);
+    PERFORM set_config('enable_seqscan', 'off', false);
+
+    IF current_phase = 'acceptance-ready' THEN
+      /*
+       * Replace the pre-acceptance estimate with the remaining peak. The
+       * accepted heap now has an exact size; the other terms bound its lookup
+       * indexes, the input lookup index, desired rows, page overhead, and WAL.
+       */
+      required_bytes := ceil((
+        pg_total_relation_size(
+          'output_membership_backfill.accepted_transaction'
+        )::numeric
+        + transaction_count * 80::numeric
+        + input_count * 80::numeric
+        + desired_row_ceiling::numeric * (112 + 8 * node_count)
+      ) * 1.15) + 68719476736;
+
+      UPDATE output_membership_backfill.state
+        SET
+          required_scratch_bytes = required_bytes::bigint,
+          updated_at = clock_timestamp()
+        WHERE id AND phase = 'acceptance-ready';
+      COMMIT;
+    END IF;
 
     /*
      * These indexes turn each output heap batch into bounded point lookups.
@@ -352,19 +376,6 @@ BEGIN
           WHERE output.ctid >= format('(%s,0)', start_block)::tid
             AND output.ctid < format('(%s,0)', end_block)::tid
       ),
-      spent_output AS MATERIALIZED (
-        SELECT
-          output_batch.target_ctid,
-          array_agg(DISTINCT node_id ORDER BY node_id)::integer[] AS spent_node_ids
-          FROM output_batch
-          INNER JOIN public.input
-            ON input.outpoint_transaction_hash = output_batch.transaction_hash
-            AND input.outpoint_index = output_batch.output_index
-          INNER JOIN output_membership_backfill.accepted_transaction
-            USING (transaction_internal_id)
-          CROSS JOIN LATERAL unnest(accepted_node_ids) AS node_id
-          GROUP BY output_batch.target_ctid
-      ),
       computed AS MATERIALIZED (
         SELECT
           output_batch.target_ctid,
@@ -396,8 +407,18 @@ BEGIN
           FROM output_batch
           LEFT JOIN output_membership_backfill.accepted_transaction
             USING (transaction_hash)
-          LEFT JOIN spent_output
-            USING (target_ctid)
+          LEFT JOIN LATERAL (
+            SELECT array_agg(
+              DISTINCT node_id ORDER BY node_id
+            )::integer[] AS spent_node_ids
+              FROM public.input
+              INNER JOIN output_membership_backfill.accepted_transaction
+                USING (transaction_internal_id)
+              CROSS JOIN LATERAL unnest(accepted_node_ids) AS node_id
+              WHERE input.outpoint_transaction_hash =
+                output_batch.transaction_hash
+                AND input.outpoint_index = output_batch.output_index
+          ) AS spent_output ON true
       )
       INSERT INTO output_membership_backfill.desired_output
       SELECT

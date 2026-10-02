@@ -212,6 +212,36 @@ END
 $$;
 SQL
 
+target_plan="$(psql "${psql_args[@]}" -At <<'SQL'
+SET enable_nestloop = on;
+SET enable_mergejoin = off;
+SET enable_hashjoin = off;
+SET enable_seqscan = off;
+EXPLAIN (COSTS off)
+SELECT output.ctid, spent_output.spent_node_ids
+FROM output
+LEFT JOIN LATERAL (
+  SELECT array_agg(DISTINCT node_id ORDER BY node_id)::integer[] AS spent_node_ids
+  FROM input
+  INNER JOIN output_membership_backfill.accepted_transaction
+    USING (transaction_internal_id)
+  CROSS JOIN LATERAL unnest(accepted_node_ids) AS node_id
+  WHERE input.outpoint_transaction_hash = output.transaction_hash
+    AND input.outpoint_index = output.output_index
+) AS spent_output ON true;
+SQL
+)"
+if [[ "$target_plan" != *"output_membership_backfill_input_outpoint"* ]]; then
+  echo "target plan did not use the covering input outpoint index" >&2
+  echo "$target_plan" >&2
+  exit 1
+fi
+if [[ "$target_plan" == *"CTE Scan on spent_output"* ]]; then
+  echo "target plan retained the quadratic spent-output CTE join" >&2
+  echo "$target_plan" >&2
+  exit 1
+fi
+
 if psql "${psql_args[@]}" -c \
   "CALL output_membership_backfill.run(10, 'WRITERS_PAUSED', 107374182400, 10, true)" \
   >/dev/null 2>&1; then
