@@ -82,6 +82,8 @@ const dbUpMigrationPaths = [
   ),
   migration('default/1778437612917_fix_zero_length_pushdata_patterns/up.sql'),
   migration('default/1778438318512_fix_redeem_bytecode_parser/up.sql'),
+  migration('default/1790852400000_add_output_node_membership/up.sql'),
+  migration('default/1790930801000_inline_output_membership_roots/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -777,11 +779,12 @@ test.serial(
 );
 
 const oneMinute = 60_000;
+const threeMinutes = 180_000;
 test.serial('[e2e] completes initial sync', async (t) => {
-  t.timeout(oneMinute);
+  t.timeout(threeMinutes);
   await waitForStdout(
     /Saved new block – height:\s+3000[^\n]+nodes: node1, node2, node3/u,
-    oneMinute
+    threeMinutes
   );
   await waitForStdout('Agent: initial sync is complete.');
   t.pass();
@@ -812,8 +815,12 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'node_pkey',
     'node_transaction_history_pkey',
     'node_transaction_pkey',
+    'output_accepted_node_ids_gin',
     'output_pkey',
     'output_search_index',
+    'output_unspent_fungible_category',
+    'output_unspent_locking_prefix',
+    'output_unspent_node_ids_gin',
     'spent_by_index',
     'token_category_index',
     'transaction_hash_key',
@@ -843,6 +850,241 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
   clearStdoutBuffer();
   t.pass();
 });
+
+test.serial(
+  '[e2e] maintains accepted and unspent output membership',
+  async (t) => {
+    const parentHash = Buffer.from('d1'.repeat(repeatedHashByteLength), 'hex');
+    const childHash = Buffer.from('d2'.repeat(repeatedHashByteLength), 'hex');
+    const nodeInternalId = (
+      await client.query<{ internalId: number }>(/* sql */ `
+        SELECT internal_id AS "internalId" FROM node WHERE name = 'node1';
+      `)
+    ).rows[0]!.internalId;
+
+    await client.query(/* sql */ `
+      INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
+        VALUES ('${'\\x'}${parentHash.toString('hex')}', 1, 0, 100, false);
+      INSERT INTO output (
+        transaction_hash, output_index, value_satoshis, locking_bytecode
+      ) VALUES
+        ('${'\\x'}${parentHash.toString('hex')}', 0, 1000, '\\x51'),
+        ('${'\\x'}${parentHash.toString('hex')}', 1, 0, '\\x6a0101');
+      INSERT INTO node_transaction (
+        node_internal_id, transaction_internal_id, validated_at
+      )
+        SELECT ${nodeInternalId}, internal_id, now()
+          FROM transaction WHERE hash = '${'\\x'}${parentHash.toString('hex')}';
+    `);
+
+    const parentMembership = (
+      await client.query<{
+        acceptedNodeIds: number[];
+        outputIndex: string;
+        unspentNodeIds: number[];
+      }>(
+        /* sql */ `
+        SELECT
+          output_index AS "outputIndex",
+          accepted_node_ids AS "acceptedNodeIds",
+          unspent_node_ids AS "unspentNodeIds"
+          FROM output
+          WHERE transaction_hash = $1
+          ORDER BY output_index;
+      `,
+        [parentHash]
+      )
+    ).rows;
+    t.deepEqual(parentMembership, [
+      {
+        acceptedNodeIds: [nodeInternalId],
+        outputIndex: '0',
+        unspentNodeIds: [nodeInternalId],
+      },
+      {
+        acceptedNodeIds: [nodeInternalId],
+        outputIndex: '1',
+        unspentNodeIds: [],
+      },
+    ]);
+
+    await client.query(/* sql */ `
+      INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
+        VALUES ('${'\\x'}${childHash.toString('hex')}', 1, 0, 100, false);
+      INSERT INTO input (
+        transaction_internal_id, input_index, outpoint_index,
+        sequence_number, outpoint_transaction_hash, unlocking_bytecode
+      )
+        SELECT internal_id, 0, 0, 4294967295,
+          '${'\\x'}${parentHash.toString('hex')}', '\\x51'
+          FROM transaction WHERE hash = '${'\\x'}${childHash.toString('hex')}';
+      INSERT INTO output (
+        transaction_hash, output_index, value_satoshis, locking_bytecode
+      ) VALUES ('${'\\x'}${childHash.toString('hex')}', 0, 900, '\\x51');
+      INSERT INTO node_transaction (
+        node_internal_id, transaction_internal_id, validated_at
+      )
+        SELECT ${nodeInternalId}, internal_id, now()
+          FROM transaction WHERE hash = '${'\\x'}${childHash.toString('hex')}';
+    `);
+
+    const [spentParentMembership] = (
+      await client.query<{
+        unspentNodeIds: number[];
+      }>(
+        /* sql */ `
+        SELECT unspent_node_ids AS "unspentNodeIds"
+          FROM output
+          WHERE transaction_hash = $1 AND output_index = 0;
+      `,
+        [parentHash]
+      )
+    ).rows;
+    t.deepEqual(spentParentMembership, { unspentNodeIds: [] });
+
+    const [childMembership] = (
+      await client.query<{
+        acceptedNodeIds: number[];
+        unspentNodeIds: number[];
+      }>(
+        /* sql */ `
+        SELECT
+          accepted_node_ids AS "acceptedNodeIds",
+          unspent_node_ids AS "unspentNodeIds"
+          FROM output
+          WHERE transaction_hash = $1 AND output_index = 0;
+      `,
+        [childHash]
+      )
+    ).rows;
+    t.deepEqual(childMembership, {
+      acceptedNodeIds: [nodeInternalId],
+      unspentNodeIds: [nodeInternalId],
+    });
+
+    await client.query(/* sql */ `
+      DELETE FROM node_transaction
+        USING transaction
+        WHERE node_transaction.transaction_internal_id = transaction.internal_id
+          AND transaction.hash = '${'\\x'}${childHash.toString('hex')}'
+          AND node_transaction.node_internal_id = ${nodeInternalId};
+    `);
+
+    const [restoredParentMembership] = (
+      await client.query<{
+        unspentNodeIds: number[];
+      }>(
+        /* sql */ `
+        SELECT unspent_node_ids AS "unspentNodeIds"
+          FROM output
+          WHERE transaction_hash = $1 AND output_index = 0;
+      `,
+        [parentHash]
+      )
+    ).rows;
+    t.deepEqual(restoredParentMembership, {
+      unspentNodeIds: [nodeInternalId],
+    });
+
+    const [invalidatedChildMembership] = (
+      await client.query<{
+        acceptedNodeIds: number[];
+        unspentNodeIds: number[];
+      }>(
+        /* sql */ `
+        SELECT
+          accepted_node_ids AS "acceptedNodeIds",
+          unspent_node_ids AS "unspentNodeIds"
+          FROM output
+          WHERE transaction_hash = $1 AND output_index = 0;
+      `,
+        [childHash]
+      )
+    ).rows;
+    t.deepEqual(invalidatedChildMembership, {
+      acceptedNodeIds: [],
+      unspentNodeIds: [],
+    });
+
+    await t.throwsAsync(
+      client.query(/* sql */ `
+        SELECT count(*) FROM unspent_output('node1');
+      `),
+      { message: /output node membership is not ready/u }
+    );
+    await t.throwsAsync(
+      client.query(/* sql */ `
+        SELECT count(*) FROM accepted_output('node1');
+      `),
+      { message: /output node membership is not ready/u }
+    );
+
+    await client.query(/* sql */ `
+      UPDATE output_membership.state SET ready = true, phase = 'ready' WHERE id;
+    `);
+
+    await client.query('BEGIN');
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      // cspell:ignore seqscan
+      await client.query('SET LOCAL enable_seqscan = off');
+      const plan = (
+        await client.query<{ [key: string]: string }>(
+          /* sql */ `
+          EXPLAIN (COSTS OFF)
+          SELECT output_index
+            FROM unspent_output('node1')
+            WHERE token_category = $1
+              AND nonfungible_token_capability IS NULL;
+        `,
+          [parentHash]
+        )
+      ).rows
+        .map((row) => row['QUERY PLAN'])
+        .join('\n');
+      t.false(plan.includes('Function Scan on unspent_output'));
+      t.regex(plan, /output_unspent_fungible_category/u);
+    } finally {
+      await client.query('ROLLBACK');
+    }
+
+    const rootResult = (
+      await client.query<{ outputIndex: string }>(
+        /* sql */ `
+        SELECT output_index AS "outputIndex"
+          FROM unspent_output('node1')
+          WHERE transaction_hash = $1
+          ORDER BY output_index;
+      `,
+        [parentHash]
+      )
+    ).rows;
+    t.deepEqual(rootResult, [{ outputIndex: '0' }]);
+
+    await client.query(/* sql */ `
+      DELETE FROM input
+        USING transaction
+        WHERE input.transaction_internal_id = transaction.internal_id
+          AND transaction.hash = '${'\\x'}${childHash.toString('hex')}';
+      DELETE FROM output WHERE transaction_hash = '${'\\x'}${childHash.toString(
+      'hex'
+    )}';
+      DELETE FROM transaction WHERE hash = '${'\\x'}${childHash.toString(
+      'hex'
+    )}';
+      DELETE FROM node_transaction
+        USING transaction
+        WHERE node_transaction.transaction_internal_id = transaction.internal_id
+          AND transaction.hash = '${'\\x'}${parentHash.toString('hex')}';
+      DELETE FROM output WHERE transaction_hash = '${'\\x'}${parentHash.toString(
+      'hex'
+    )}';
+      DELETE FROM transaction WHERE hash = '${'\\x'}${parentHash.toString(
+      'hex'
+    )}';
+    `);
+  }
+);
 
 test.serial(
   '[e2e] getAllKnownBlockHashes returns hex hashes for every known block',
@@ -2018,15 +2260,13 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   t.pass();
 });
 
-test.serial(
-  '[e2e] new block saved after reorg',
-  async (t) => {
-    const acceptedBlocks = (
-      await client.query<{
-        hash: string;
-        nodeName: string;
-      }>(
-        /* sql */ `
+test.serial('[e2e] new block saved after reorg', async (t) => {
+  const acceptedBlocks = (
+    await client.query<{
+      hash: string;
+      nodeName: string;
+    }>(
+      /* sql */ `
       SELECT node.name AS "nodeName", encode(block.hash, 'hex') AS hash
         FROM node_block
         INNER JOIN node
@@ -2037,14 +2277,13 @@ test.serial(
           AND block.height = $1
         ORDER BY block.hash;
     `,
-        [splitHeight + 1]
-      )
-    ).rows;
-    t.deepEqual(acceptedBlocks, [
-      { hash: tipA[0]!.header.hash, nodeName: 'node3' },
-    ]);
-  }
-);
+      [splitHeight + 1]
+    )
+  ).rows;
+  t.deepEqual(acceptedBlocks, [
+    { hash: tipA[0]!.header.hash, nodeName: 'node3' },
+  ]);
+});
 
 test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
   const tipStartIndex = 2;

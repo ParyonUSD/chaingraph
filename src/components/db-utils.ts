@@ -2,7 +2,11 @@
 export const indexDefinitions = {
   block_height_index: /* sql */ `CREATE INDEX block_height_index ON block USING btree (height);`,
   block_inclusions_index: /* sql */ `CREATE INDEX block_inclusions_index ON block_transaction USING btree (transaction_internal_id);`,
+  output_accepted_node_ids_gin: /* sql */ `CREATE INDEX output_accepted_node_ids_gin ON output USING gin (accepted_node_ids);`,
   output_search_index: /* sql */ `CREATE INDEX output_search_index ON output USING btree (substring(locking_bytecode, 0, 26));`,
+  output_unspent_fungible_category: /* sql */ `CREATE INDEX output_unspent_fungible_category ON output USING btree (token_category) WHERE cardinality(unspent_node_ids) > 0 AND token_category IS NOT NULL AND nonfungible_token_capability IS NULL;`,
+  output_unspent_locking_prefix: /* sql */ `CREATE INDEX output_unspent_locking_prefix ON output USING btree (substring(locking_bytecode, 0, 26)) WHERE cardinality(unspent_node_ids) > 0;`,
+  output_unspent_node_ids_gin: /* sql */ `CREATE INDEX output_unspent_node_ids_gin ON output USING gin (unspent_node_ids);`,
   spent_by_index: /* sql */ `CREATE INDEX spent_by_index ON input USING btree (outpoint_transaction_hash, outpoint_index);`,
   token_category_index: /* sql */ `CREATE INDEX token_category_index ON output USING btree (token_category);`,
 };
