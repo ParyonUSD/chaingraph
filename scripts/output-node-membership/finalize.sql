@@ -13,7 +13,7 @@ SELECT pg_advisory_lock(20261001, 1);
 DO $guard$
 BEGIN
   IF (SELECT phase FROM output_membership.state WHERE id)
-    NOT IN ('backfilled', 'indexing', 'indexed') THEN
+    NOT IN ('backfilled', 'indexing', 'indexed', 'ready') THEN
     RAISE EXCEPTION 'a completed output membership backfill is required';
   END IF;
 
