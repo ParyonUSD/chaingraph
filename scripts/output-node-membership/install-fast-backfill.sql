@@ -161,6 +161,15 @@ BEGIN
     WHERE id
     FOR UPDATE;
 
+  IF current_phase <> 'pending' AND (
+    input_count IS NULL
+    OR transaction_count IS NULL
+    OR node_count IS NULL
+  ) THEN
+    RAISE EXCEPTION
+      'persisted source counts are required to resume phase %', current_phase;
+  END IF;
+
   IF current_phase <> 'pending' AND EXISTS (
     SELECT 1
       FROM output_membership_backfill.state
@@ -300,6 +309,16 @@ BEGIN
         + input_count * 80::numeric
         + desired_row_ceiling::numeric * (112 + 8 * node_count)
       ) * 1.15) + 68719476736;
+
+      IF required_bytes IS NULL THEN
+        RAISE EXCEPTION 'remaining scratch estimate unexpectedly evaluated to null';
+      END IF;
+      IF required_bytes > scratch_budget_bytes THEN
+        RAISE EXCEPTION
+          'remaining scratch gate rejected build: required % bytes, budget % bytes',
+          required_bytes::bigint,
+          scratch_budget_bytes;
+      END IF;
 
       UPDATE output_membership_backfill.state
         SET

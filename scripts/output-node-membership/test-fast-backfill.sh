@@ -204,6 +204,16 @@ BEGIN
   IF (SELECT next_target_heap_block FROM output_membership_backfill.state WHERE id) = 0 THEN
     RAISE EXCEPTION 'target-build cursor did not commit before the injected failure';
   END IF;
+  IF (SELECT required_scratch_bytes FROM output_membership_backfill.state WHERE id) IS NULL THEN
+    RAISE EXCEPTION 'resumed acceptance did not refresh the remaining scratch bound';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM output_membership_backfill.state
+    WHERE id AND required_scratch_bytes > scratch_budget_bytes
+  ) THEN
+    RAISE EXCEPTION 'refreshed scratch bound exceeds the persisted budget';
+  END IF;
   IF to_regclass('output_membership_backfill.accepted_transaction') IS NULL
     OR to_regclass('output_membership_backfill.desired_output') IS NULL THEN
     RAISE EXCEPTION 'target-build recovery relations are incorrect';
