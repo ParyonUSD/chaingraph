@@ -184,6 +184,34 @@ END
 $$;
 SQL
 
+if psql "${psql_args[@]}" >/dev/null 2>&1 <<'SQL'
+SET output_membership_backfill.test_fail_during_target = on;
+CALL output_membership_backfill.run(
+  10, 'WRITERS_PAUSED', 107374182400, 10, false
+);
+SQL
+then
+  echo "expected injected target-build failure" >&2
+  exit 1
+fi
+
+psql "${psql_args[@]}" <<'SQL' >/dev/null
+DO $$
+BEGIN
+  IF (SELECT phase FROM output_membership_backfill.state WHERE id) <> 'target-building' THEN
+    RAISE EXCEPTION 'target-build phase was not durable across the injected failure';
+  END IF;
+  IF (SELECT next_target_heap_block FROM output_membership_backfill.state WHERE id) = 0 THEN
+    RAISE EXCEPTION 'target-build cursor did not commit before the injected failure';
+  END IF;
+  IF to_regclass('output_membership_backfill.accepted_transaction') IS NULL
+    OR to_regclass('output_membership_backfill.desired_output') IS NULL THEN
+    RAISE EXCEPTION 'target-build recovery relations are incorrect';
+  END IF;
+END
+$$;
+SQL
+
 if psql "${psql_args[@]}" -c \
   "CALL output_membership_backfill.run(10, 'WRITERS_PAUSED', 107374182400, 10, true)" \
   >/dev/null 2>&1; then

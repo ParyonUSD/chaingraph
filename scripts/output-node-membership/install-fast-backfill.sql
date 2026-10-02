@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS output_membership_backfill.state (
     phase IN (
       'pending',
       'acceptance-ready',
+      'target-building',
       'target-ready',
       'backfilling',
       'backfilled'
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS output_membership_backfill.state (
   required_scratch_bytes bigint,
   desired_row_ceiling bigint,
   output_heap_blocks bigint,
+  next_target_heap_block bigint NOT NULL DEFAULT 0,
   next_output_heap_block bigint NOT NULL DEFAULT 0,
   source_rows bigint,
   rows_updated bigint NOT NULL DEFAULT 0,
@@ -53,6 +55,22 @@ CREATE TABLE IF NOT EXISTS output_membership_backfill.state (
   updated_at timestamp with time zone NOT NULL DEFAULT clock_timestamp(),
   original_membership_state jsonb NOT NULL
 );
+
+ALTER TABLE output_membership_backfill.state
+  ADD COLUMN IF NOT EXISTS next_target_heap_block bigint NOT NULL DEFAULT 0;
+ALTER TABLE output_membership_backfill.state
+  DROP CONSTRAINT IF EXISTS state_phase_check;
+ALTER TABLE output_membership_backfill.state
+  ADD CONSTRAINT state_phase_check CHECK (
+    phase IN (
+      'pending',
+      'acceptance-ready',
+      'target-building',
+      'target-ready',
+      'backfilling',
+      'backfilled'
+    )
+  );
 
 INSERT INTO output_membership_backfill.state (
   id,
@@ -184,13 +202,14 @@ BEGIN
     END IF;
 
     /*
-     * Upper-bound node-array staging rows, a second copy for spilled
-     * hash batches, the desired heap and CTID index, 15 percent overhead, and
-     * 64 GiB for WAL/checkpoints. The bound uses row counts, not distinctness.
+     * Upper-bound the accepted heap, its two lookup indexes, the covering
+     * input lookup index, the desired heap and CTID index, 15 percent page
+     * overhead, and 64 GiB for WAL/checkpoints. Target batches need no
+     * database-sized hash or sort spill.
      */
     required_bytes := ceil((
-      2::numeric * transaction_count * (80 + 4 * node_count)
-      + 2::numeric * input_count * (80 + 4 * node_count)
+      transaction_count * (160 + 4 * node_count)
+      + input_count * 80::numeric
       + desired_row_ceiling::numeric * (112 + 8 * node_count)
     ) * 1.15) + 68719476736;
 
@@ -261,46 +280,105 @@ BEGIN
     WHERE id
     FOR UPDATE;
 
-  IF current_phase = 'acceptance-ready' THEN
-    PERFORM set_config('enable_nestloop', 'off', false);
+  IF current_phase IN ('acceptance-ready', 'target-building') THEN
+    PERFORM set_config('enable_nestloop', 'on', false);
     PERFORM set_config('enable_mergejoin', 'off', false);
-    PERFORM set_config('enable_hashjoin', 'on', false);
+    PERFORM set_config('enable_hashjoin', 'off', false);
 
     /*
-     * Capture CTID plus the stable outpoint key. Already-correct rows are not
-     * copied, so a partly completed original backfill stays sparse.
+     * These indexes turn each output heap batch into bounded point lookups.
+     * Their builds use bounded maintenance_work_mem rather than the unbounded
+     * hash and sort spills of the former whole-database target query.
      */
-    CREATE TABLE output_membership_backfill.desired_output AS
-      WITH spent_output AS MATERIALIZED (
-        /* Conflicting accepted spenders contribute the union of their nodes. */
-        SELECT
-          input.outpoint_transaction_hash AS transaction_hash,
-          input.outpoint_index AS output_index,
-          array_agg(DISTINCT node_id ORDER BY node_id)::integer[] AS spent_node_ids
-          FROM public.input
-          INNER JOIN output_membership_backfill.accepted_transaction
-            USING (transaction_internal_id)
-          CROSS JOIN LATERAL unnest(accepted_node_ids) AS node_id
-          WHERE NOT (
-            input.outpoint_transaction_hash = decode(repeat('00', 32), 'hex')
-            AND input.outpoint_index = 4294967295
-          )
-          GROUP BY input.outpoint_transaction_hash, input.outpoint_index
-      ),
-      computed AS NOT MATERIALIZED (
+    CREATE UNIQUE INDEX IF NOT EXISTS accepted_transaction_internal_id
+      ON output_membership_backfill.accepted_transaction
+        (transaction_internal_id);
+    COMMIT;
+    CREATE UNIQUE INDEX IF NOT EXISTS accepted_transaction_hash
+      ON output_membership_backfill.accepted_transaction
+        (transaction_hash);
+    COMMIT;
+    CREATE INDEX IF NOT EXISTS output_membership_backfill_input_outpoint
+      ON public.input (outpoint_transaction_hash, outpoint_index)
+      INCLUDE (transaction_internal_id);
+    COMMIT;
+
+    CREATE TABLE IF NOT EXISTS output_membership_backfill.desired_output (
+      target_ctid tid PRIMARY KEY,
+      transaction_hash bytea NOT NULL,
+      output_index bigint NOT NULL,
+      accepted_node_ids integer[] NOT NULL,
+      unspent_node_ids integer[] NOT NULL
+    );
+    COMMIT;
+
+    IF current_phase = 'acceptance-ready' THEN
+      UPDATE output_membership_backfill.state
+        SET
+          phase = 'target-building',
+          output_heap_blocks = (
+            pg_relation_size('public.output')
+            + current_setting('block_size')::bigint - 1
+          ) / current_setting('block_size')::bigint,
+          next_target_heap_block = 0,
+          source_rows = 0,
+          updated_at = clock_timestamp()
+        WHERE id AND phase = 'acceptance-ready';
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'fast-backfill phase changed while starting target';
+      END IF;
+      COMMIT;
+    END IF;
+
+    LOOP
+      SELECT next_target_heap_block, output_heap_blocks, source_rows
+        INTO STRICT start_block, final_block, source_count
+        FROM output_membership_backfill.state
+        WHERE id
+        FOR UPDATE;
+
+      EXIT WHEN start_block >= final_block;
+      end_block := least(start_block + batch_heap_blocks, final_block);
+
+      WITH output_batch AS MATERIALIZED (
         SELECT
           output.ctid AS target_ctid,
           output.transaction_hash,
           output.output_index,
           output.accepted_node_ids AS old_accepted_node_ids,
           output.unspent_node_ids AS old_unspent_node_ids,
+          output.locking_bytecode
+          FROM public.output
+          WHERE output.ctid >= format('(%s,0)', start_block)::tid
+            AND output.ctid < format('(%s,0)', end_block)::tid
+      ),
+      spent_output AS MATERIALIZED (
+        SELECT
+          output_batch.target_ctid,
+          array_agg(DISTINCT node_id ORDER BY node_id)::integer[] AS spent_node_ids
+          FROM output_batch
+          INNER JOIN public.input
+            ON input.outpoint_transaction_hash = output_batch.transaction_hash
+            AND input.outpoint_index = output_batch.output_index
+          INNER JOIN output_membership_backfill.accepted_transaction
+            USING (transaction_internal_id)
+          CROSS JOIN LATERAL unnest(accepted_node_ids) AS node_id
+          GROUP BY output_batch.target_ctid
+      ),
+      computed AS MATERIALIZED (
+        SELECT
+          output_batch.target_ctid,
+          output_batch.transaction_hash,
+          output_batch.output_index,
+          output_batch.old_accepted_node_ids,
+          output_batch.old_unspent_node_ids,
           coalesce(
             accepted_transaction.accepted_node_ids,
             ARRAY[]::integer[]
           ) AS accepted_node_ids,
           CASE
-            WHEN octet_length(output.locking_bytecode) > 0
-              AND get_byte(output.locking_bytecode, 0) = 106
+            WHEN octet_length(output_batch.locking_bytecode) > 0
+              AND get_byte(output_batch.locking_bytecode, 0) = 106
               THEN ARRAY[]::integer[]
             ELSE ARRAY(
               SELECT accepted_node_id
@@ -315,12 +393,13 @@ BEGIN
                 ORDER BY accepted_node_id
             )::integer[]
           END AS unspent_node_ids
-          FROM public.output
+          FROM output_batch
           LEFT JOIN output_membership_backfill.accepted_transaction
             USING (transaction_hash)
           LEFT JOIN spent_output
-            USING (transaction_hash, output_index)
+            USING (target_ctid)
       )
+      INSERT INTO output_membership_backfill.desired_output
       SELECT
         target_ctid,
         transaction_hash,
@@ -330,34 +409,47 @@ BEGIN
         FROM computed
         WHERE ROW(old_accepted_node_ids, old_unspent_node_ids)
           IS DISTINCT FROM ROW(accepted_node_ids, unspent_node_ids)
-        LIMIT desired_row_ceiling + 1;
+        LIMIT desired_row_ceiling - source_count + 1;
+      GET DIAGNOSTICS updated_count = ROW_COUNT;
 
-    SELECT count(*)
-      INTO source_count
-      FROM output_membership_backfill.desired_output;
-    IF source_count > desired_row_ceiling THEN
-      RAISE EXCEPTION
-        'desired output exceeded the % row ceiling; retry with a larger proven budget',
-        desired_row_ceiling;
-    END IF;
+      IF source_count + updated_count > desired_row_ceiling THEN
+        RAISE EXCEPTION
+          'desired output exceeded the % row ceiling; retry with a larger proven budget',
+          desired_row_ceiling;
+      END IF;
 
-    CREATE UNIQUE INDEX desired_output_target_ctid
-      ON output_membership_backfill.desired_output (target_ctid);
+      UPDATE output_membership_backfill.state
+        SET
+          next_target_heap_block = end_block,
+          source_rows = source_count + updated_count,
+          updated_at = clock_timestamp()
+        WHERE id
+          AND phase = 'target-building'
+          AND next_target_heap_block = start_block;
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'target-build cursor changed unexpectedly';
+      END IF;
+      COMMIT;
+
+      IF current_setting(
+        'output_membership_backfill.test_fail_during_target', true
+      ) = 'on' THEN
+        RAISE EXCEPTION 'requested fault during target build';
+      END IF;
+    END LOOP;
+
     ANALYZE output_membership_backfill.desired_output;
-
     DROP TABLE output_membership_backfill.accepted_transaction;
+    DROP INDEX public.output_membership_backfill_input_outpoint;
 
     UPDATE output_membership_backfill.state
       SET
         phase = 'target-ready',
-        output_heap_blocks = (
-          pg_relation_size('public.output')
-          + current_setting('block_size')::bigint - 1
-        ) / current_setting('block_size')::bigint,
-        source_rows = source_count,
         target_built_at = clock_timestamp(),
         updated_at = clock_timestamp()
-      WHERE id AND phase = 'acceptance-ready';
+      WHERE id
+        AND phase = 'target-building'
+        AND next_target_heap_block = output_heap_blocks;
     IF NOT FOUND THEN
       RAISE EXCEPTION 'fast-backfill phase changed while building target';
     END IF;

@@ -49,19 +49,19 @@ suspension state.
 Set `scratch_budget_bytes` to current free filesystem bytes, not total volume
 capacity. The helper counts `input`, `output`, `transaction`, and configured
 nodes without trusting planner distinct estimates. It rejects the source build
-unless the budget covers two copies of worst-case acceptance and spend state,
-the desired heap and CTID index, 15 percent overhead, and 64 GiB for WAL and
-checkpoints. `desired_row_ceiling` is enforced while creating the target. The
-query stops at one row above the ceiling and rolls back. The shown 160 million
-ceiling pads the proven 133 million-row full-mainnet target by about 20 percent.
-With 1.033 billion inputs, 410 million transactions, and two nodes, the gate
-estimates about 358 GiB, leaving about 54 GiB from a measured 412 GiB budget.
-Recheck those inputs immediately before a production run.
+unless the budget covers the acceptance heap, two acceptance lookup indexes, a
+covering input outpoint index, the desired heap and CTID index, 15 percent page
+overhead, and 64 GiB for WAL and checkpoints. `desired_row_ceiling` is enforced
+across all committed target batches. The shown 160 million ceiling pads the
+proven 133 million-row full-mainnet target by about 20 percent. Recheck the row
+counts and free bytes immediately before a run.
 
-The acceptance source commits first, so a disconnect during the desired-target
-query does not repeat acceptance. Spend state is temporary and has no indexes.
-The target query uses sequential hash joins and drops acceptance when the target
-commits. Each CTID batch then updates `public.output`, records its counts,
+The acceptance source commits first, so a disconnect during target construction
+does not repeat acceptance. The helper adds bounded B-tree lookup indexes,
+scans the output heap in batches, and commits the target cursor after every
+batch. It drops the temporary input index and acceptance table after target
+construction. This avoids database-sized hash and sort spills. Each CTID batch
+then updates `public.output`, records its counts,
 advances the durable cursor, and updates the canonical row count in one
 transaction. A disconnected session can resume with the same command. Do not
 run `VACUUM FULL`, `CLUSTER`, table rewrites, or normalized-state writes between
