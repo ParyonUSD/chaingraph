@@ -98,7 +98,7 @@ CREATE TRIGGER test_backfill_guc
 AFTER UPDATE ON output
 FOR EACH STATEMENT EXECUTE FUNCTION output_membership.test_backfill_guc();
 
-INSERT INTO node VALUES (1, 'alpha'), (2, 'beta');
+INSERT INTO node VALUES (1, 'alpha'), (39, 'chipnet'), (40, 'empty');
 INSERT INTO transaction VALUES
   (1, decode(repeat('01', 32), 'hex')),
   (2, decode(repeat('02', 32), 'hex')),
@@ -108,6 +108,9 @@ INSERT INTO transaction VALUES
   (6, decode(repeat('06', 32), 'hex')),
   (7, decode(repeat('07', 32), 'hex')),
   (8, decode(repeat('08', 32), 'hex'));
+INSERT INTO transaction
+SELECT value, decode(lpad(to_hex(value), 64, '0'), 'hex')
+FROM generate_series(9, 19) AS value;
 INSERT INTO transaction
 SELECT 100000 + value,
        decode(lpad(to_hex(100000 + value), 64, '0'), 'hex')
@@ -121,14 +124,20 @@ SELECT 400000 + value,
        decode(lpad(to_hex(400000 + value), 64, '0'), 'hex')
 FROM generate_series(1, 12000) AS value;
 INSERT INTO block VALUES (1), (2), (3);
-INSERT INTO node_block VALUES (1, 1), (1, 2), (2, 3);
+INSERT INTO node_block VALUES (1, 1), (1, 2), (39, 3);
 INSERT INTO block_transaction VALUES (1, 1), (2, 2), (2, 5), (3, 5);
 INSERT INTO node_transaction VALUES
-  (2, 1),
-  (2, 3),
-  (2, 5),
+  (39, 1),
+  (39, 3),
+  (39, 5),
   (1, 6),
-  (2, 7);
+  (39, 7);
+INSERT INTO node_transaction
+SELECT node_id, transaction_id
+FROM generate_series(9, 16) AS transaction_id
+CROSS JOIN (VALUES (1), (39)) AS accepted(node_id);
+INSERT INTO node_transaction
+SELECT 39, transaction_id FROM generate_series(17, 19) AS transaction_id;
 INSERT INTO node_transaction
 SELECT 1, 100000 + value FROM generate_series(1, 6000) AS value;
 INSERT INTO node_transaction
@@ -162,9 +171,17 @@ SELECT decode(lpad(to_hex(120050 + value), 64, '0'), 'hex'), 0,
        decode('51', 'hex'), ARRAY[1], ARRAY[]::integer[]
 FROM generate_series(1, 6000) AS value;
 INSERT INTO output VALUES
-  (decode(repeat('03', 32), 'hex'), 0, decode('51', 'hex'), ARRAY[2], ARRAY[2]),
+  (decode(repeat('03', 32), 'hex'), 0, decode('51', 'hex'), ARRAY[39], ARRAY[39]),
   (decode(repeat('04', 32), 'hex'), 0, decode('51', 'hex'), ARRAY[1], ARRAY[]::integer[]),
   (decode(repeat('05', 32), 'hex'), 0, decode('51', 'hex'), ARRAY[1], ARRAY[]::integer[]);
+INSERT INTO output
+SELECT decode(lpad(to_hex(value), 64, '0'), 'hex'), 0,
+       decode('51', 'hex'), ARRAY[1,39], ARRAY[1,39]
+FROM generate_series(9, 16) AS value;
+INSERT INTO output
+SELECT decode(lpad(to_hex(value), 64, '0'), 'hex'), 0,
+       decode('51', 'hex'), ARRAY[39], ARRAY[39]
+FROM generate_series(17, 19) AS value;
 SQL
 
 psql "${psql_args[@]}" -f "$script_dir/install-fast-backfill.sql" >/dev/null
@@ -271,7 +288,7 @@ BEGIN
     RAISE EXCEPTION 'node-build stage was not durable across the injected failure';
   END IF;
   IF (SELECT count(*) FROM output_membership_backfill.target_node WHERE status = 'complete') <> 1
-    OR (SELECT count(*) FROM output_membership_backfill.target_node WHERE status = 'pending') <> 1 THEN
+    OR (SELECT count(*) FROM output_membership_backfill.target_node WHERE status = 'pending') <> 2 THEN
     RAISE EXCEPTION 'node-build resume markers are incorrect';
   END IF;
   IF (SELECT next_target_heap_block FROM output_membership_backfill.state WHERE id) <> 0 THEN
@@ -292,6 +309,35 @@ BEGIN
     OR to_regclass('output_membership_backfill.node_utxo_stage') IS NULL
     OR to_regclass('output_membership_backfill.desired_output') IS NULL THEN
     RAISE EXCEPTION 'node-build recovery relations are incorrect';
+  END IF;
+END
+$$;
+SQL
+
+# Reinstall over the exact live upgrade shape: the dense default node is
+# committed, the sparse chipnet node is pending, and no target CTID exists.
+psql "${psql_args[@]}" -f "$script_dir/install-fast-backfill.sql" >/dev/null
+psql "${psql_args[@]}" <<'SQL' >/dev/null
+DO $$
+BEGIN
+  IF (SELECT status FROM output_membership_backfill.target_node
+      WHERE node_internal_id = 1) <> 'complete'
+    OR (SELECT status FROM output_membership_backfill.target_node
+        WHERE node_internal_id = 39) <> 'pending'
+    OR (SELECT status FROM output_membership_backfill.target_node
+        WHERE node_internal_id = 40) <> 'pending' THEN
+    RAISE EXCEPTION 'procedure reinstall changed the durable node checkpoints';
+  END IF;
+  IF (SELECT count(*) FROM output_membership_backfill.desired_nondefault)
+      <> (SELECT rows_written FROM output_membership_backfill.target_node
+          WHERE node_internal_id = 1) THEN
+    RAISE EXCEPTION 'procedure reinstall changed the completed default-node source';
+  END IF;
+  IF (SELECT count(*) FROM output_membership_backfill.node_utxo_stage) <> 0
+    OR (SELECT next_target_heap_block FROM output_membership_backfill.state WHERE id) <> 0
+    OR (SELECT next_heap_block FROM output_membership.state WHERE id) <> 9
+    OR (SELECT rows_updated FROM output_membership.state WHERE id) <> 17 THEN
+    RAISE EXCEPTION 'procedure reinstall changed a target or canonical cursor';
   END IF;
 END
 $$;
@@ -356,10 +402,169 @@ if [[ "$spent_plan" == *"Materialize"* || "$target_plan" == *"LATERAL"* ]]; then
   exit 1
 fi
 
+sparse_spent_plan="$(psql "${psql_args[@]}" -At <<'SQL'
+SET work_mem = '4GB';
+SET jit = off;
+SET max_parallel_workers_per_gather = 0;
+SET join_collapse_limit = 1;
+SET from_collapse_limit = 1;
+SET enable_nestloop = on;
+SET enable_hashjoin = off;
+SET enable_mergejoin = on;
+SET enable_seqscan = off;
+SET enable_sort = on;
+SET enable_hashagg = off;
+EXPLAIN (COSTS off)
+SELECT candidate_input.outpoint_transaction_hash,
+       candidate_input.outpoint_index
+FROM (
+  SELECT exception.transaction_internal_id
+  FROM output_membership_backfill.acceptance_exception exception
+  WHERE 39 = ANY(exception.accepted_node_ids)
+  ORDER BY exception.transaction_internal_id
+) node_acceptance
+CROSS JOIN LATERAL (
+  SELECT input.outpoint_transaction_hash, input.outpoint_index
+  FROM input
+  WHERE input.transaction_internal_id = node_acceptance.transaction_internal_id
+    AND NOT (
+      input.outpoint_transaction_hash = decode(repeat('00', 32), 'hex')
+      AND input.outpoint_index = 4294967295
+    )
+  ORDER BY input.transaction_internal_id, input.input_index
+  OFFSET 0
+) candidate_input
+GROUP BY candidate_input.outpoint_transaction_hash,
+         candidate_input.outpoint_index
+HAVING count(*) > 0;
+SQL
+)"
+for expected_plan_node in \
+  "GroupAggregate" "Nested Loop" \
+  "acceptance_exception_internal_id" "input_pkey"; do
+  if [[ "$sparse_spent_plan" != *"$expected_plan_node"* ]]; then
+    echo "sparse spender plan is missing $expected_plan_node" >&2
+    echo "$sparse_spent_plan" >&2
+    exit 1
+  fi
+done
+if [[ "$sparse_spent_plan" == *"Seq Scan on input"* \
+  || "$sparse_spent_plan" == *"Materialize"* ]]; then
+  echo "sparse spender plan scans or materializes the global input" >&2
+  echo "$sparse_spent_plan" >&2
+  exit 1
+fi
+
+sparse_creator_plan="$(psql "${psql_args[@]}" -At <<'SQL'
+SET jit = off;
+SET max_parallel_workers_per_gather = 0;
+SET enable_nestloop = off;
+SET enable_hashjoin = off;
+SET enable_mergejoin = on;
+SET enable_seqscan = off;
+EXPLAIN (COSTS off)
+SELECT created_output.transaction_hash, created_output.output_index
+FROM (
+  SELECT node_acceptance.transaction_hash, candidate_output.output_index
+  FROM (
+    SELECT exception.transaction_hash
+    FROM output_membership_backfill.acceptance_exception exception
+    WHERE 39 = ANY(exception.accepted_node_ids)
+    ORDER BY exception.transaction_hash
+  ) node_acceptance
+  CROSS JOIN LATERAL (
+    SELECT output.output_index
+    FROM output
+    WHERE output.transaction_hash = node_acceptance.transaction_hash
+    ORDER BY output.output_index
+    OFFSET 0
+  ) candidate_output
+  ORDER BY node_acceptance.transaction_hash, candidate_output.output_index
+) created_output
+LEFT JOIN output_membership_backfill.node_utxo_stage spent_output
+  USING (transaction_hash, output_index)
+WHERE spent_output.transaction_hash IS NULL;
+SQL
+)"
+for expected_plan_node in \
+  "Merge Anti Join" "Nested Loop" "Incremental Sort" \
+  "acceptance_exception_hash" "output_pkey" "node_utxo_stage_pkey"; do
+  if [[ "$sparse_creator_plan" != *"$expected_plan_node"* ]]; then
+    echo "sparse creator plan is missing $expected_plan_node" >&2
+    echo "$sparse_creator_plan" >&2
+    exit 1
+  fi
+done
+if [[ "$sparse_creator_plan" == *"Seq Scan on output"* \
+  || "$sparse_creator_plan" == *"Materialize"* ]]; then
+  echo "sparse creator plan scans or materializes the global output" >&2
+  echo "$sparse_creator_plan" >&2
+  exit 1
+fi
+
+if psql "${psql_args[@]}" >/dev/null 2>&1 <<'SQL'
+SET output_membership_backfill.test_fail_during_sparse_node = on;
+CALL output_membership_backfill.run(
+  10, 'WRITERS_PAUSED', 107374182400, 10, false
+);
+SQL
+then
+  echo "expected injected sparse-node failure" >&2
+  exit 1
+fi
+
+psql "${psql_args[@]}" <<'SQL' >/dev/null
+DO $$
+BEGIN
+  IF (SELECT status FROM output_membership_backfill.target_node
+      WHERE node_internal_id = 1) <> 'complete'
+    OR (SELECT status FROM output_membership_backfill.target_node
+        WHERE node_internal_id = 39) <> 'pending'
+    OR (SELECT status FROM output_membership_backfill.target_node
+        WHERE node_internal_id = 40) <> 'pending' THEN
+    RAISE EXCEPTION 'sparse-node rollback changed the durable node checkpoints';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM output_membership_backfill.desired_nondefault
+    WHERE 39 = ANY(unspent_node_ids)
+  ) OR (SELECT count(*) FROM output_membership_backfill.node_utxo_stage) <> 0 THEN
+    RAISE EXCEPTION 'sparse-node failure retained partial membership state';
+  END IF;
+END
+$$;
+SQL
+
+if psql "${psql_args[@]}" -c \
+  "CALL output_membership_backfill.run(10, 'WRITERS_PAUSED', 107374182400, 10, false)" \
+  >/dev/null 2>&1; then
+  echo "expected sparse-node ceiling failure" >&2
+  exit 1
+fi
+psql "${psql_args[@]}" <<'SQL' >/dev/null
+DO $$
+BEGIN
+  IF (SELECT status FROM output_membership_backfill.target_node
+      WHERE node_internal_id = 1) <> 'complete'
+    OR (SELECT status FROM output_membership_backfill.target_node
+        WHERE node_internal_id = 39) <> 'pending'
+    OR (SELECT status FROM output_membership_backfill.target_node
+        WHERE node_internal_id = 40) <> 'pending'
+    OR EXISTS (
+      SELECT 1 FROM output_membership_backfill.desired_nondefault
+      WHERE 39 = ANY(unspent_node_ids)
+    )
+    OR (SELECT count(*) FROM output_membership_backfill.node_utxo_stage) <> 0 THEN
+    RAISE EXCEPTION 'sparse ceiling failure did not roll back atomically';
+  END IF;
+  UPDATE output_membership_backfill.state SET desired_row_ceiling = 20 WHERE id;
+END
+$$;
+SQL
+
 if psql "${psql_args[@]}" >/dev/null 2>&1 <<'SQL'
 SET output_membership_backfill.test_fail_after_source = on;
 CALL output_membership_backfill.run(
-  10, 'WRITERS_PAUSED', 107374182400, 10, false
+  10, 'WRITERS_PAUSED', 107374182400, 20, false
 );
 SQL
 then
@@ -375,6 +580,10 @@ BEGIN
   END IF;
   IF (SELECT count(*) FROM output_membership_backfill.target_node WHERE status <> 'complete') <> 0 THEN
     RAISE EXCEPTION 'node stages were not complete before sparse source commit';
+  END IF;
+  IF (SELECT rows_written FROM output_membership_backfill.target_node
+      WHERE node_internal_id = 39) <= 10 THEN
+    RAISE EXCEPTION 'overlap fixture did not exceed the rejected sparse ceiling';
   END IF;
   IF (SELECT count(*) FROM output_membership_backfill.desired_output) <> 0 THEN
     RAISE EXCEPTION 'final target began before the sparse source committed';
@@ -423,7 +632,7 @@ BEGIN
     OR (SELECT count(*) FROM output_membership_backfill.desired_output) <> 0 THEN
     RAISE EXCEPTION 'target ceiling failure did not roll back atomically';
   END IF;
-  UPDATE output_membership_backfill.state SET desired_row_ceiling=10 WHERE id;
+  UPDATE output_membership_backfill.state SET desired_row_ceiling=20 WHERE id;
 END
 $$;
 SQL
@@ -431,7 +640,7 @@ SQL
 if psql "${psql_args[@]}" >/dev/null 2>&1 <<'SQL'
 SET output_membership_backfill.test_fail_during_target = on;
 CALL output_membership_backfill.run(
-  10, 'WRITERS_PAUSED', 107374182400, 10, false
+  10, 'WRITERS_PAUSED', 107374182400, 20, false
 );
 SQL
 then
@@ -459,7 +668,7 @@ $$;
 SQL
 
 if psql "${psql_args[@]}" -c \
-  "CALL output_membership_backfill.run(10, 'WRITERS_PAUSED', 107374182400, 10, true)" \
+  "CALL output_membership_backfill.run(10, 'WRITERS_PAUSED', 107374182400, 20, true)" \
   >/dev/null 2>&1; then
   echo "expected injected backfill failure" >&2
   exit 1
@@ -485,7 +694,7 @@ psql "${psql_args[@]}" \
   --set=batch_heap_blocks=10 \
   --set=operator_confirmation=WRITERS_PAUSED \
   --set=scratch_budget_bytes=107374182400 \
-  --set=desired_row_ceiling=10 \
+  --set=desired_row_ceiling=20 \
   --file "$script_dir/run-fast-backfill.sql" >/dev/null
 
 psql "${psql_args[@]}" <<'SQL' >/dev/null
@@ -494,11 +703,11 @@ DECLARE
   actual jsonb;
   mismatch_count bigint;
   expected jsonb := '[
-    {"hash":"01","accepted":[1,2],"unspent":[]},
+    {"hash":"01","accepted":[1,39],"unspent":[]},
     {"hash":"02","accepted":[1],"unspent":[]},
-    {"hash":"03","accepted":[2],"unspent":[2]},
+    {"hash":"03","accepted":[39],"unspent":[39]},
     {"hash":"04","accepted":[],"unspent":[]},
-    {"hash":"05","accepted":[1,2],"unspent":[1]}
+    {"hash":"05","accepted":[1,39],"unspent":[1]}
   ]'::jsonb;
 BEGIN
   SELECT jsonb_agg(jsonb_build_object(
@@ -610,7 +819,7 @@ psql "${psql_args[@]}" -c \
   "DELETE FROM output WHERE transaction_hash = decode(repeat('01', 32), 'hex')" \
   >/dev/null
 if psql "${psql_args[@]}" -c \
-  "CALL output_membership_backfill.run(10, 'WRITERS_PAUSED', 107374182400, 10, false)" \
+  "CALL output_membership_backfill.run(10, 'WRITERS_PAUSED', 107374182400, 20, false)" \
   >/dev/null 2>&1; then
   echo "expected missing target row failure" >&2
   exit 1

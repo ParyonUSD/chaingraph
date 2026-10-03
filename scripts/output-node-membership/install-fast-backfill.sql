@@ -526,7 +526,6 @@ BEGIN
         PERFORM set_config('max_parallel_workers_per_gather', '0', true);
         PERFORM set_config('join_collapse_limit', '1', true);
         PERFORM set_config('from_collapse_limit', '1', true);
-        PERFORM set_config('enable_nestloop', 'off', true);
         PERFORM set_config('enable_hashjoin', 'off', true);
         PERFORM set_config('enable_mergejoin', 'on', true);
         PERFORM set_config('enable_seqscan', 'off', true);
@@ -534,6 +533,7 @@ BEGIN
         PERFORM set_config('enable_hashagg', 'off', true);
 
         IF current_node_id = default_node_id THEN
+          PERFORM set_config('enable_nestloop', 'off', true);
           WITH spender_acceptance AS NOT MATERIALIZED (
             SELECT accepted.transaction_internal_id
             FROM output_membership_backfill.accepted_transaction accepted
@@ -578,68 +578,133 @@ BEGIN
             output_index
           FROM node_utxo
           LIMIT desired_row_ceiling + 1;
-        ELSE
-          WITH node_acceptance AS NOT MATERIALIZED (
-            SELECT transaction_internal_id, transaction_hash
-            FROM output_membership_backfill.acceptance_exception
-            WHERE current_node_id = ANY(accepted_node_ids)
-          ),
-          created_output AS NOT MATERIALIZED (
-            SELECT output.transaction_hash, output.output_index
-            FROM node_acceptance
-            INNER JOIN public.output USING (transaction_hash)
-          ),
-          spent_output AS NOT MATERIALIZED (
-            SELECT
-              input.outpoint_transaction_hash AS transaction_hash,
-              input.outpoint_index AS output_index
-            FROM public.input
-            INNER JOIN node_acceptance USING (transaction_internal_id)
-            WHERE NOT (
-              input.outpoint_transaction_hash = decode(repeat('00', 32), 'hex')
-              AND input.outpoint_index = 4294967295
-            )
-            GROUP BY input.outpoint_transaction_hash, input.outpoint_index
-            HAVING count(*) > 0
-          ),
-          node_utxo AS NOT MATERIALIZED (
-            SELECT created_output.transaction_hash, created_output.output_index
-            FROM created_output
-            LEFT JOIN spent_output USING (transaction_hash, output_index)
-            WHERE spent_output.transaction_hash IS NULL
-          )
-          INSERT INTO output_membership_backfill.node_utxo_stage
+          SELECT count(*) INTO source_count
+            FROM output_membership_backfill.node_utxo_stage;
+          IF source_count > desired_row_ceiling THEN
+            RAISE EXCEPTION
+              'node % UTXO source exceeded the % row ceiling',
+              current_node_id, desired_row_ceiling;
+          END IF;
+          INSERT INTO output_membership_backfill.desired_nondefault
           SELECT
             transaction_hash,
-            output_index
-          FROM node_utxo
+            output_index,
+            ARRAY[default_node_id]::integer[],
+            ARRAY[current_node_id]::integer[]
+          FROM output_membership_backfill.node_utxo_stage
+          ON CONFLICT (transaction_hash, output_index) DO UPDATE
+            SET unspent_node_ids = ARRAY(
+              SELECT DISTINCT node_id
+              FROM unnest(
+                desired_nondefault.unspent_node_ids
+                || excluded.unspent_node_ids
+              ) AS node_id
+              ORDER BY node_id
+            )::integer[];
+          GET DIAGNOSTICS updated_count = ROW_COUNT;
+        ELSE
+          /*
+           * PostgreSQL severely underestimates distinct transaction keys on
+           * the billion-row input and output tables. OFFSET 0 keeps each
+           * ordered exception stream on the outside of its parameterized
+           * primary-key probes instead of reversing it into a global scan.
+           * Reuse the one capped node stage for spent keys. The next statement
+           * merge-anti-joins ordered creator probes against that stage and
+           * writes the node result directly to the sparse desired relation.
+           * Explicit outer-key ordering limits creator sorting to an
+           * Incremental Sort within each transaction hash.
+           */
+          PERFORM set_config('enable_nestloop', 'on', true);
+          PERFORM set_config('enable_sort', 'on', true);
+          INSERT INTO output_membership_backfill.node_utxo_stage
+          SELECT
+            input.outpoint_transaction_hash,
+            input.outpoint_index
+          FROM (
+            SELECT exception.transaction_internal_id
+            FROM output_membership_backfill.acceptance_exception exception
+            WHERE current_node_id = ANY(exception.accepted_node_ids)
+            ORDER BY exception.transaction_internal_id
+          ) node_acceptance
+          CROSS JOIN LATERAL (
+            SELECT
+              candidate_input.outpoint_transaction_hash,
+              candidate_input.outpoint_index
+            FROM public.input candidate_input
+            WHERE candidate_input.transaction_internal_id =
+              node_acceptance.transaction_internal_id
+              AND NOT (
+              candidate_input.outpoint_transaction_hash =
+                decode(repeat('00', 32), 'hex')
+              AND candidate_input.outpoint_index = 4294967295
+            )
+            ORDER BY
+              candidate_input.transaction_internal_id,
+              candidate_input.input_index
+            OFFSET 0
+          ) input
+          GROUP BY input.outpoint_transaction_hash, input.outpoint_index
+          HAVING count(*) > 0
           LIMIT desired_row_ceiling + 1;
-        END IF;
+          GET DIAGNOSTICS source_count = ROW_COUNT;
+          IF source_count > desired_row_ceiling THEN
+            RAISE EXCEPTION
+              'node % spent source exceeded the % row ceiling',
+              current_node_id, desired_row_ceiling;
+          END IF;
+          ANALYZE output_membership_backfill.node_utxo_stage;
 
-        SELECT count(*) INTO source_count
-          FROM output_membership_backfill.node_utxo_stage;
-        IF source_count > desired_row_ceiling THEN
-          RAISE EXCEPTION
-            'node % UTXO source exceeded the % row ceiling',
-            current_node_id, desired_row_ceiling;
+          IF current_setting(
+            'output_membership_backfill.test_fail_during_sparse_node', true
+          ) = 'on' THEN
+            RAISE EXCEPTION 'requested fault during sparse node target build';
+          END IF;
+
+          PERFORM set_config('enable_nestloop', 'off', true);
+          INSERT INTO output_membership_backfill.desired_nondefault
+          SELECT
+            created_output.transaction_hash,
+            created_output.output_index,
+            ARRAY[default_node_id]::integer[],
+            ARRAY[current_node_id]::integer[]
+          FROM (
+            SELECT node_acceptance.transaction_hash, output.output_index
+            FROM (
+              SELECT exception.transaction_hash
+              FROM output_membership_backfill.acceptance_exception exception
+              WHERE current_node_id = ANY(exception.accepted_node_ids)
+              ORDER BY exception.transaction_hash
+            ) node_acceptance
+            CROSS JOIN LATERAL (
+              SELECT candidate_output.output_index
+              FROM public.output candidate_output
+              WHERE candidate_output.transaction_hash =
+                node_acceptance.transaction_hash
+              ORDER BY candidate_output.output_index
+              OFFSET 0
+            ) output
+            ORDER BY node_acceptance.transaction_hash, output.output_index
+          ) created_output
+          LEFT JOIN output_membership_backfill.node_utxo_stage spent_output
+            USING (transaction_hash, output_index)
+          WHERE spent_output.transaction_hash IS NULL
+          LIMIT desired_row_ceiling + 1
+          ON CONFLICT (transaction_hash, output_index) DO UPDATE
+            SET unspent_node_ids = ARRAY(
+              SELECT DISTINCT node_id
+              FROM unnest(
+                desired_nondefault.unspent_node_ids
+                || excluded.unspent_node_ids
+              ) AS node_id
+              ORDER BY node_id
+            )::integer[];
+          GET DIAGNOSTICS updated_count = ROW_COUNT;
+          IF updated_count > desired_row_ceiling THEN
+            RAISE EXCEPTION
+              'node % UTXO source exceeded the % row ceiling',
+              current_node_id, desired_row_ceiling;
+          END IF;
         END IF;
-        INSERT INTO output_membership_backfill.desired_nondefault
-        SELECT
-          transaction_hash,
-          output_index,
-          ARRAY[default_node_id]::integer[],
-          ARRAY[current_node_id]::integer[]
-        FROM output_membership_backfill.node_utxo_stage
-        ON CONFLICT (transaction_hash, output_index) DO UPDATE
-          SET unspent_node_ids = ARRAY(
-            SELECT DISTINCT node_id
-            FROM unnest(
-              desired_nondefault.unspent_node_ids
-              || excluded.unspent_node_ids
-            ) AS node_id
-            ORDER BY node_id
-          )::integer[];
-        GET DIAGNOSTICS updated_count = ROW_COUNT;
 
         SELECT count(*) INTO source_count
           FROM output_membership_backfill.desired_nondefault;

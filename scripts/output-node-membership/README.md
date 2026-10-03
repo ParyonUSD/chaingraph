@@ -60,18 +60,28 @@ bytes immediately before every run or resume; the replacement target records
 that current-free-space value independently of the earlier acceptance budget.
 
 The acceptance source commits first, so a disconnect during target construction
-does not repeat acceptance. For each configured node, the helper streams
-accepted creators and spenders through merge joins, uses one external outpoint
-sort with `GroupAggregate`, and commits a durable node checkpoint. A capped
-per-node stage prevents overlap-heavy conflict updates from hiding a ceiling
-overflow. A final sequential output scan applies leading-`OP_RETURN` exclusion
-and materializes only rows whose current arrays differ. The acceptance and
-temporary input-index objects remain until cleanup so recovery never discards
-its proven sources. Each CTID batch then updates `public.output`, records counts,
-advances the durable cursor, and updates the canonical row count in one
-transaction. A disconnected session can resume with the same command. Do not
-run `VACUUM FULL`, `CLUSTER`, table rewrites, or normalized-state writes between
-source creation and completion because the work table contains captured CTIDs.
+does not repeat acceptance. The dense default node retains the global merge
+stream and one external outpoint sort with `GroupAggregate`. Non-default nodes
+scan their small acceptance-exception indexes in transaction-key order and use
+parameterized primary-key probes into `input` and `output`. The helper stores
+the sparse node's spent keys in the existing capped node stage, then
+merge-anti-joins ordered creator probes against those keys. This avoids another
+full pass over the mainnet input and output indexes. The creator plan uses an
+incremental sort within each transaction hash. The spender statement has one
+outpoint sort and `GroupAggregate`. These statements run in sequence and do not
+add a second ceiling-sized stage to the scratch bound.
+
+The helper commits a durable checkpoint after each node. A sparse-node failure
+rolls back its spent stage and desired rows while retaining every completed-node
+checkpoint. A final sequential output scan applies leading-`OP_RETURN`
+exclusion and materializes only rows whose current arrays differ. The acceptance
+and temporary input-index objects remain until cleanup so recovery never
+discards their proven sources. Each CTID batch then updates `public.output`,
+records counts, advances the durable cursor, and updates the canonical row count
+in one transaction. A disconnected session can resume with the same command.
+Do not run `VACUUM FULL`, `CLUSTER`, table rewrites, or normalized-state writes
+between source creation and completion because the work table contains captured
+CTIDs.
 
 Check progress without exposing connection details:
 
