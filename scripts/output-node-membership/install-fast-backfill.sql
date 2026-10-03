@@ -53,11 +53,17 @@ CREATE TABLE IF NOT EXISTS output_membership_backfill.state (
   target_built_at timestamp with time zone,
   finished_at timestamp with time zone,
   updated_at timestamp with time zone NOT NULL DEFAULT clock_timestamp(),
-  original_membership_state jsonb NOT NULL
+  original_membership_state jsonb NOT NULL,
+  target_stage text,
+  target_scratch_budget_bytes bigint
 );
 
 ALTER TABLE output_membership_backfill.state
   ADD COLUMN IF NOT EXISTS next_target_heap_block bigint NOT NULL DEFAULT 0;
+ALTER TABLE output_membership_backfill.state
+  ADD COLUMN IF NOT EXISTS target_stage text;
+ALTER TABLE output_membership_backfill.state
+  ADD COLUMN IF NOT EXISTS target_scratch_budget_bytes bigint;
 ALTER TABLE output_membership_backfill.state
   DROP CONSTRAINT IF EXISTS state_phase_check;
 ALTER TABLE output_membership_backfill.state
@@ -94,6 +100,14 @@ CREATE TABLE IF NOT EXISTS output_membership_backfill.batch (
   duration interval NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS output_membership_backfill.target_node (
+  node_internal_id integer PRIMARY KEY,
+  status text NOT NULL CHECK (status IN ('pending', 'complete')),
+  rows_written bigint,
+  started_at timestamp with time zone,
+  finished_at timestamp with time zone
+);
+
 CREATE OR REPLACE PROCEDURE output_membership_backfill.run (
   batch_heap_blocks bigint DEFAULT 20000,
   operator_confirmation text DEFAULT NULL,
@@ -115,6 +129,10 @@ DECLARE
   output_count bigint;
   transaction_count bigint;
   node_count bigint;
+  default_node_id integer;
+  current_node_id integer;
+  current_target_stage text;
+  target_budget bigint;
   required_bytes numeric;
   batch_started timestamp with time zone;
 BEGIN
@@ -174,13 +192,21 @@ BEGIN
     SELECT 1
       FROM output_membership_backfill.state
       WHERE id
-        AND (
-          state.scratch_budget_bytes <> run.scratch_budget_bytes
-          OR state.desired_row_ceiling <> run.desired_row_ceiling
-        )
+        AND state.desired_row_ceiling <> run.desired_row_ceiling
   ) THEN
     RAISE EXCEPTION
-      'resume must use the original scratch budget and desired row ceiling';
+      'resume must use the original desired row ceiling';
+  END IF;
+
+  IF current_phase <> 'pending' AND EXISTS (
+    SELECT 1
+      FROM output_membership_backfill.state
+      WHERE id
+        AND target_scratch_budget_bytes IS NOT NULL
+        AND target_scratch_budget_bytes <> run.scratch_budget_bytes
+  ) THEN
+    RAISE EXCEPTION
+      'replacement target resume must use its recorded current-free-space budget';
   END IF;
 
   IF current_phase = 'pending' THEN
@@ -193,9 +219,9 @@ BEGIN
       SET phase = 'backfilling', ready = false, updated_at = clock_timestamp()
       WHERE id;
 
-    PERFORM set_config('enable_nestloop', 'off', false);
-    PERFORM set_config('enable_mergejoin', 'off', false);
-    PERFORM set_config('enable_hashjoin', 'on', false);
+    PERFORM set_config('enable_nestloop', 'off', true);
+    PERFORM set_config('enable_mergejoin', 'off', true);
+    PERFORM set_config('enable_hashjoin', 'on', true);
 
     /* Exact counts avoid relying on input n_distinct or stale row estimates. */
     SELECT count(*) INTO input_count FROM public.input;
@@ -283,56 +309,65 @@ BEGIN
     END IF;
   END IF;
 
-  SELECT phase
-    INTO STRICT current_phase
+  SELECT phase, target_stage
+    INTO STRICT current_phase, current_target_stage
     FROM output_membership_backfill.state
     WHERE id
     FOR UPDATE;
 
+  /*
+   * Revision 1 built a target by probing the accepted and input indexes once
+   * per output. Only abandon that target when it has proven empty and no CTID
+   * update has started; the canonical backfill cursor and count must still be
+   * exactly the values captured at installation.
+   */
+  IF current_phase = 'target-building' AND current_target_stage IS NULL THEN
+    IF to_regclass('output_membership_backfill.desired_output') IS NULL THEN
+      RAISE EXCEPTION 'legacy target provenance is missing';
+    END IF;
+    SELECT count(*) INTO source_count
+      FROM output_membership_backfill.desired_output;
+    IF source_count <> 0
+      OR EXISTS (SELECT 1 FROM output_membership_backfill.batch)
+      OR EXISTS (
+        SELECT 1
+        FROM output_membership_backfill.state s
+        CROSS JOIN output_membership.state canonical
+        WHERE s.id AND canonical.id
+          AND (
+            s.next_output_heap_block <> 0
+            OR s.rows_updated <> 0
+            OR canonical.next_heap_block IS DISTINCT FROM
+              (s.original_membership_state->>'next_heap_block')::bigint
+            OR canonical.rows_updated IS DISTINCT FROM
+              (s.original_membership_state->>'rows_updated')::bigint
+          )
+      ) THEN
+      RAISE EXCEPTION
+        'cannot replace a nonempty target or a backfill which has begun updating output';
+    END IF;
+    DROP TABLE output_membership_backfill.desired_output;
+    TRUNCATE output_membership_backfill.target_node;
+    UPDATE output_membership_backfill.state
+      SET phase = 'acceptance-ready', next_target_heap_block = 0,
+          source_rows = NULL, updated_at = clock_timestamp()
+      WHERE id AND phase = 'target-building' AND target_stage IS NULL;
+    COMMIT;
+    current_phase := 'acceptance-ready';
+  END IF;
+
   IF current_phase IN ('acceptance-ready', 'target-building') THEN
-    PERFORM set_config('enable_nestloop', 'on', false);
-    PERFORM set_config('enable_mergejoin', 'off', false);
-    PERFORM set_config('enable_hashjoin', 'off', false);
-    PERFORM set_config('enable_seqscan', 'off', false);
-
-    IF current_phase = 'acceptance-ready' THEN
-      /*
-       * Replace the pre-acceptance estimate with the remaining peak. The
-       * accepted heap now has an exact size; the other terms bound its lookup
-       * indexes, the input lookup index, desired rows, page overhead, and WAL.
-       */
-      required_bytes := ceil((
-        pg_total_relation_size(
-          'output_membership_backfill.accepted_transaction'
-        )::numeric
-        + transaction_count * 80::numeric
-        + input_count * 80::numeric
-        + desired_row_ceiling::numeric * (112 + 8 * node_count)
-      ) * 1.15) + 68719476736;
-
-      IF required_bytes IS NULL THEN
-        RAISE EXCEPTION 'remaining scratch estimate unexpectedly evaluated to null';
-      END IF;
-      IF required_bytes > scratch_budget_bytes THEN
-        RAISE EXCEPTION
-          'remaining scratch gate rejected build: required % bytes, budget % bytes',
-          required_bytes::bigint,
-          scratch_budget_bytes;
-      END IF;
-
-      UPDATE output_membership_backfill.state
-        SET
-          required_scratch_bytes = required_bytes::bigint,
-          updated_at = clock_timestamp()
-        WHERE id AND phase = 'acceptance-ready';
-      COMMIT;
+    SELECT default_node_internal_id
+      INTO STRICT default_node_id
+      FROM output_membership.state
+      WHERE id;
+    IF default_node_id IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM public.node WHERE internal_id = default_node_id
+      ) THEN
+      RAISE EXCEPTION 'the canonical default node is missing';
     END IF;
 
-    /*
-     * These indexes turn each output heap batch into bounded point lookups.
-     * Their builds use bounded maintenance_work_mem rather than the unbounded
-     * hash and sort spills of the former whole-database target query.
-     */
     CREATE UNIQUE INDEX IF NOT EXISTS accepted_transaction_internal_id
       ON output_membership_backfill.accepted_transaction
         (transaction_internal_id);
@@ -341,133 +376,422 @@ BEGIN
       ON output_membership_backfill.accepted_transaction
         (transaction_hash);
     COMMIT;
-    CREATE INDEX IF NOT EXISTS output_membership_backfill_input_outpoint
-      ON public.input (outpoint_transaction_hash, outpoint_index)
-      INCLUDE (transaction_internal_id);
-    COMMIT;
 
-    CREATE TABLE IF NOT EXISTS output_membership_backfill.desired_output (
-      target_ctid tid PRIMARY KEY,
-      transaction_hash bytea NOT NULL,
-      output_index bigint NOT NULL,
-      accepted_node_ids integer[] NOT NULL,
-      unspent_node_ids integer[] NOT NULL
-    );
-    COMMIT;
+    SELECT target_stage
+      INTO STRICT current_target_stage
+      FROM output_membership_backfill.state
+      WHERE id
+      FOR UPDATE;
 
-    IF current_phase = 'acceptance-ready' THEN
+    IF current_target_stage IS NULL THEN
+      IF to_regclass('output_membership_backfill.acceptance_exception') IS NOT NULL
+        OR to_regclass('output_membership_backfill.desired_nondefault') IS NOT NULL
+        OR to_regclass('output_membership_backfill.desired_output') IS NOT NULL
+        OR EXISTS (SELECT 1 FROM output_membership_backfill.target_node) THEN
+        RAISE EXCEPTION 'unexpected replacement target relation exists';
+      END IF;
+
+      /* Usually small: every accepted array which differs from the heap default. */
+      CREATE TABLE output_membership_backfill.acceptance_exception AS
+        SELECT transaction_internal_id, transaction_hash, accepted_node_ids
+        FROM output_membership_backfill.accepted_transaction
+        WHERE accepted_node_ids IS DISTINCT FROM ARRAY[default_node_id]::integer[];
+      CREATE UNIQUE INDEX acceptance_exception_internal_id
+        ON output_membership_backfill.acceptance_exception
+          (transaction_internal_id);
+      CREATE UNIQUE INDEX acceptance_exception_hash
+        ON output_membership_backfill.acceptance_exception
+          (transaction_hash);
+      ANALYZE output_membership_backfill.acceptance_exception;
+
+      CREATE TABLE output_membership_backfill.excluded_default_output AS
+        SELECT output.transaction_hash, output.output_index
+        FROM output_membership_backfill.acceptance_exception exception
+        INNER JOIN public.output USING (transaction_hash)
+        WHERE NOT default_node_id = ANY(exception.accepted_node_ids)
+        LIMIT desired_row_ceiling + 1;
+      SELECT count(*) INTO source_count
+        FROM output_membership_backfill.excluded_default_output;
+      IF source_count > desired_row_ceiling THEN
+        RAISE EXCEPTION
+          'default-node exclusion source exceeded the % row ceiling',
+          desired_row_ceiling;
+      END IF;
+      ALTER TABLE output_membership_backfill.excluded_default_output
+        ADD PRIMARY KEY (transaction_hash, output_index);
+      ANALYZE output_membership_backfill.excluded_default_output;
+
+      CREATE TABLE output_membership_backfill.desired_nondefault (
+        transaction_hash bytea NOT NULL,
+        output_index bigint NOT NULL,
+        accepted_node_ids integer[] NOT NULL,
+        unspent_node_ids integer[] NOT NULL,
+        PRIMARY KEY (transaction_hash, output_index)
+      );
+      CREATE TABLE output_membership_backfill.desired_output (
+        target_ctid tid PRIMARY KEY,
+        transaction_hash bytea NOT NULL,
+        output_index bigint NOT NULL,
+        accepted_node_ids integer[] NOT NULL,
+        unspent_node_ids integer[] NOT NULL
+      );
+      CREATE TABLE output_membership_backfill.node_utxo_stage (
+        transaction_hash bytea NOT NULL,
+        output_index bigint NOT NULL,
+        PRIMARY KEY (transaction_hash, output_index)
+      );
+      INSERT INTO output_membership_backfill.target_node (
+        node_internal_id, status
+      )
+      SELECT internal_id, 'pending' FROM public.node ORDER BY internal_id;
+
+      /*
+       * Peak replacement scratch is the larger of: (a) one external outpoint
+       * sort plus the sparse source, capped node stage, and capped excluded-key
+       * stream; or (b) the sparse source and final target plus one 8 GiB hash
+       * spill allowance. Add measured exceptions, 15 percent page margin, and
+       * a fixed 64 GiB WAL/checkpoint reserve. The two peaks occur in separate
+       * committed stages; no billion-row spent table is retained.
+       */
+      required_bytes := ceil((
+        greatest(
+          input_count * 112::numeric
+            + desired_row_ceiling::numeric * (
+                (112 + 8 * node_count) + 128
+              ),
+          desired_row_ceiling::numeric * 2 * (112 + 8 * node_count)
+            + 8589934592::numeric
+        ) + pg_total_relation_size(
+            'output_membership_backfill.acceptance_exception'
+          )::numeric + pg_total_relation_size(
+            'output_membership_backfill.excluded_default_output'
+          )::numeric
+      ) * 1.15) + 68719476736;
+      IF required_bytes > scratch_budget_bytes THEN
+        RAISE EXCEPTION
+          'replacement scratch gate rejected build: required % bytes, current free-space budget % bytes',
+          required_bytes::bigint, scratch_budget_bytes;
+      END IF;
+
       UPDATE output_membership_backfill.state
-        SET
-          phase = 'target-building',
-          output_heap_blocks = (
-            pg_relation_size('public.output')
-            + current_setting('block_size')::bigint - 1
-          ) / current_setting('block_size')::bigint,
-          next_target_heap_block = 0,
-          source_rows = 0,
-          updated_at = clock_timestamp()
-        WHERE id AND phase = 'acceptance-ready';
+        SET phase = 'target-building',
+            target_stage = 'exceptions-ready',
+            target_scratch_budget_bytes = run.scratch_budget_bytes,
+            required_scratch_bytes = required_bytes::bigint,
+            output_heap_blocks = (
+              pg_relation_size('public.output')
+              + current_setting('block_size')::bigint - 1
+            ) / current_setting('block_size')::bigint,
+            next_target_heap_block = 0,
+            source_rows = 0,
+            updated_at = clock_timestamp()
+        WHERE id AND phase = 'acceptance-ready' AND target_stage IS NULL;
       IF NOT FOUND THEN
-        RAISE EXCEPTION 'fast-backfill phase changed while starting target';
+        RAISE EXCEPTION 'fast-backfill phase changed while starting replacement target';
       END IF;
       COMMIT;
+      current_target_stage := 'exceptions-ready';
     END IF;
 
-    LOOP
-      SELECT next_target_heap_block, output_heap_blocks, source_rows
-        INTO STRICT start_block, final_block, source_count
-        FROM output_membership_backfill.state
-        WHERE id
-        FOR UPDATE;
+    IF current_target_stage IN ('exceptions-ready', 'nodes-building') THEN
+      UPDATE output_membership_backfill.state
+        SET target_stage = 'nodes-building', updated_at = clock_timestamp()
+        WHERE id AND target_stage = 'exceptions-ready';
+      COMMIT;
 
-      EXIT WHEN start_block >= final_block;
-      end_block := least(start_block + batch_heap_blocks, final_block);
+      LOOP
+        SELECT node_internal_id
+          INTO current_node_id
+          FROM output_membership_backfill.target_node
+          WHERE status = 'pending'
+          ORDER BY (node_internal_id = default_node_id) DESC, node_internal_id
+          LIMIT 1;
+        EXIT WHEN NOT FOUND;
 
-      WITH output_batch AS MATERIALIZED (
+        UPDATE output_membership_backfill.target_node
+          SET started_at = clock_timestamp()
+          WHERE node_internal_id = current_node_id AND status = 'pending';
+        TRUNCATE output_membership_backfill.node_utxo_stage;
+
+        /*
+         * The input primary key is almost perfectly heap-correlated in the
+         * production database. Disabling optional sorts selects that stream;
+         * the one unavoidable outpoint Sort remains in the plan with
+         * "Disabled: true". Disabling hash aggregation makes GroupAggregate
+         * consume that sort directly, avoiding simultaneous HashAggregate and
+         * Sort spills. These settings are transaction-local and reset at COMMIT.
+         */
+        PERFORM set_config('work_mem', '4GB', true);
+        PERFORM set_config('jit', 'off', true);
+        PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+        PERFORM set_config('join_collapse_limit', '1', true);
+        PERFORM set_config('from_collapse_limit', '1', true);
+        PERFORM set_config('enable_nestloop', 'off', true);
+        PERFORM set_config('enable_hashjoin', 'off', true);
+        PERFORM set_config('enable_mergejoin', 'on', true);
+        PERFORM set_config('enable_seqscan', 'off', true);
+        PERFORM set_config('enable_sort', 'off', true);
+        PERFORM set_config('enable_hashagg', 'off', true);
+
+        IF current_node_id = default_node_id THEN
+          WITH spender_acceptance AS NOT MATERIALIZED (
+            SELECT accepted.transaction_internal_id
+            FROM output_membership_backfill.accepted_transaction accepted
+            LEFT JOIN (
+              SELECT transaction_internal_id
+              FROM output_membership_backfill.acceptance_exception
+              WHERE NOT current_node_id = ANY(accepted_node_ids)
+            ) excluded USING (transaction_internal_id)
+            WHERE excluded.transaction_internal_id IS NULL
+          ),
+          created_output AS NOT MATERIALIZED (
+            SELECT output.transaction_hash, output.output_index
+            FROM public.output
+            INNER JOIN output_membership_backfill.accepted_transaction accepted
+              USING (transaction_hash)
+            LEFT JOIN output_membership_backfill.excluded_default_output excluded
+              USING (transaction_hash, output_index)
+            WHERE excluded.transaction_hash IS NULL
+          ),
+          spent_output AS NOT MATERIALIZED (
+            SELECT
+              input.outpoint_transaction_hash AS transaction_hash,
+              input.outpoint_index AS output_index
+            FROM public.input
+            INNER JOIN spender_acceptance USING (transaction_internal_id)
+            WHERE NOT (
+              input.outpoint_transaction_hash = decode(repeat('00', 32), 'hex')
+              AND input.outpoint_index = 4294967295
+            )
+            GROUP BY input.outpoint_transaction_hash, input.outpoint_index
+            HAVING count(*) > 0
+          ),
+          node_utxo AS NOT MATERIALIZED (
+            SELECT created_output.transaction_hash, created_output.output_index
+            FROM created_output
+            LEFT JOIN spent_output USING (transaction_hash, output_index)
+            WHERE spent_output.transaction_hash IS NULL
+          )
+          INSERT INTO output_membership_backfill.node_utxo_stage
+          SELECT
+            transaction_hash,
+            output_index
+          FROM node_utxo
+          LIMIT desired_row_ceiling + 1;
+        ELSE
+          WITH node_acceptance AS NOT MATERIALIZED (
+            SELECT transaction_internal_id, transaction_hash
+            FROM output_membership_backfill.acceptance_exception
+            WHERE current_node_id = ANY(accepted_node_ids)
+          ),
+          created_output AS NOT MATERIALIZED (
+            SELECT output.transaction_hash, output.output_index
+            FROM node_acceptance
+            INNER JOIN public.output USING (transaction_hash)
+          ),
+          spent_output AS NOT MATERIALIZED (
+            SELECT
+              input.outpoint_transaction_hash AS transaction_hash,
+              input.outpoint_index AS output_index
+            FROM public.input
+            INNER JOIN node_acceptance USING (transaction_internal_id)
+            WHERE NOT (
+              input.outpoint_transaction_hash = decode(repeat('00', 32), 'hex')
+              AND input.outpoint_index = 4294967295
+            )
+            GROUP BY input.outpoint_transaction_hash, input.outpoint_index
+            HAVING count(*) > 0
+          ),
+          node_utxo AS NOT MATERIALIZED (
+            SELECT created_output.transaction_hash, created_output.output_index
+            FROM created_output
+            LEFT JOIN spent_output USING (transaction_hash, output_index)
+            WHERE spent_output.transaction_hash IS NULL
+          )
+          INSERT INTO output_membership_backfill.node_utxo_stage
+          SELECT
+            transaction_hash,
+            output_index
+          FROM node_utxo
+          LIMIT desired_row_ceiling + 1;
+        END IF;
+
+        SELECT count(*) INTO source_count
+          FROM output_membership_backfill.node_utxo_stage;
+        IF source_count > desired_row_ceiling THEN
+          RAISE EXCEPTION
+            'node % UTXO source exceeded the % row ceiling',
+            current_node_id, desired_row_ceiling;
+        END IF;
+        INSERT INTO output_membership_backfill.desired_nondefault
+        SELECT
+          transaction_hash,
+          output_index,
+          ARRAY[default_node_id]::integer[],
+          ARRAY[current_node_id]::integer[]
+        FROM output_membership_backfill.node_utxo_stage
+        ON CONFLICT (transaction_hash, output_index) DO UPDATE
+          SET unspent_node_ids = ARRAY(
+            SELECT DISTINCT node_id
+            FROM unnest(
+              desired_nondefault.unspent_node_ids
+              || excluded.unspent_node_ids
+            ) AS node_id
+            ORDER BY node_id
+          )::integer[];
+        GET DIAGNOSTICS updated_count = ROW_COUNT;
+
+        SELECT count(*) INTO source_count
+          FROM output_membership_backfill.desired_nondefault;
+        IF source_count > desired_row_ceiling THEN
+          RAISE EXCEPTION
+            'desired nondefault source exceeded the % row ceiling',
+            desired_row_ceiling;
+        END IF;
+        UPDATE output_membership_backfill.target_node
+          SET status = 'complete', rows_written = updated_count,
+              finished_at = clock_timestamp()
+          WHERE node_internal_id = current_node_id AND status = 'pending';
+        TRUNCATE output_membership_backfill.node_utxo_stage;
+        COMMIT;
+
+        IF current_setting(
+          'output_membership_backfill.test_fail_during_node', true
+        ) = 'on' THEN
+          RAISE EXCEPTION 'requested fault during node target build';
+        END IF;
+      END LOOP;
+
+      UPDATE output_membership_backfill.state
+        SET target_stage = 'nodes-ready', updated_at = clock_timestamp()
+        WHERE id AND target_stage = 'nodes-building'
+          AND NOT EXISTS (
+            SELECT 1 FROM output_membership_backfill.target_node
+            WHERE status <> 'complete'
+          );
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'node target stages are incomplete';
+      END IF;
+      COMMIT;
+      current_target_stage := 'nodes-ready';
+    END IF;
+
+    IF current_target_stage = 'nodes-ready' THEN
+      PERFORM set_config('work_mem', '4GB', true);
+      PERFORM set_config('jit', 'off', true);
+      PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+      PERFORM set_config('enable_nestloop', 'off', true);
+      PERFORM set_config('enable_hashjoin', 'off', true);
+      PERFORM set_config('enable_mergejoin', 'on', true);
+      PERFORM set_config('enable_seqscan', 'off', true);
+
+      /* Exact non-default accepted arrays, preserving any UTXO memberships. */
+      INSERT INTO output_membership_backfill.desired_nondefault
+      SELECT
+        output.transaction_hash,
+        output.output_index,
+        exception.accepted_node_ids,
+        ARRAY[]::integer[]
+      FROM public.output
+      INNER JOIN output_membership_backfill.acceptance_exception exception
+        USING (transaction_hash)
+      ON CONFLICT (transaction_hash, output_index) DO UPDATE
+        SET accepted_node_ids = excluded.accepted_node_ids;
+
+      /* Outputs of unaccepted transactions must be corrected from the heap default. */
+      INSERT INTO output_membership_backfill.desired_nondefault
+      SELECT
+        output.transaction_hash,
+        output.output_index,
+        ARRAY[]::integer[],
+        ARRAY[]::integer[]
+      FROM public.output
+      LEFT JOIN output_membership_backfill.accepted_transaction accepted
+        USING (transaction_hash)
+      WHERE accepted.transaction_hash IS NULL
+      ON CONFLICT (transaction_hash, output_index) DO UPDATE
+        SET accepted_node_ids = excluded.accepted_node_ids;
+
+      SELECT count(*) INTO source_count
+        FROM output_membership_backfill.desired_nondefault;
+      IF source_count > desired_row_ceiling THEN
+        RAISE EXCEPTION
+          'desired nondefault source exceeded the % row ceiling',
+          desired_row_ceiling;
+      END IF;
+      ANALYZE output_membership_backfill.desired_nondefault;
+      UPDATE output_membership_backfill.state
+        SET target_stage = 'source-ready', updated_at = clock_timestamp()
+        WHERE id AND target_stage = 'nodes-ready';
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'fast-backfill source stage changed unexpectedly';
+      END IF;
+      COMMIT;
+      current_target_stage := 'source-ready';
+
+      IF current_setting(
+        'output_membership_backfill.test_fail_after_source', true
+      ) = 'on' THEN
+        RAISE EXCEPTION 'requested fault after sparse source build';
+      END IF;
+    END IF;
+
+    IF current_target_stage = 'source-ready' THEN
+      TRUNCATE output_membership_backfill.desired_output;
+      PERFORM set_config('work_mem', '4GB', true);
+      PERFORM set_config('hash_mem_multiplier', '2', true);
+      PERFORM set_config('jit', 'off', true);
+      PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+      PERFORM set_config('enable_nestloop', 'off', true);
+      PERFORM set_config('enable_mergejoin', 'off', true);
+      PERFORM set_config('enable_hashjoin', 'on', true);
+      PERFORM set_config('enable_seqscan', 'on', true);
+
+      WITH computed AS NOT MATERIALIZED (
         SELECT
           output.ctid AS target_ctid,
           output.transaction_hash,
           output.output_index,
           output.accepted_node_ids AS old_accepted_node_ids,
           output.unspent_node_ids AS old_unspent_node_ids,
-          output.locking_bytecode
-          FROM public.output
-          WHERE output.ctid >= format('(%s,0)', start_block)::tid
-            AND output.ctid < format('(%s,0)', end_block)::tid
-      ),
-      computed AS MATERIALIZED (
-        SELECT
-          output_batch.target_ctid,
-          output_batch.transaction_hash,
-          output_batch.output_index,
-          output_batch.old_accepted_node_ids,
-          output_batch.old_unspent_node_ids,
           coalesce(
-            accepted_transaction.accepted_node_ids,
-            ARRAY[]::integer[]
+            desired.accepted_node_ids,
+            ARRAY[default_node_id]::integer[]
           ) AS accepted_node_ids,
           CASE
-            WHEN octet_length(output_batch.locking_bytecode) > 0
-              AND get_byte(output_batch.locking_bytecode, 0) = 106
+            WHEN octet_length(output.locking_bytecode) > 0
+              AND get_byte(output.locking_bytecode, 0) = 106
               THEN ARRAY[]::integer[]
-            ELSE ARRAY(
-              SELECT accepted_node_id
-                FROM unnest(coalesce(
-                  accepted_transaction.accepted_node_ids,
-                  ARRAY[]::integer[]
-                )) AS accepted_node_id
-                WHERE NOT accepted_node_id = ANY(coalesce(
-                  spent_output.spent_node_ids,
-                  ARRAY[]::integer[]
-                ))
-                ORDER BY accepted_node_id
-            )::integer[]
+            ELSE coalesce(desired.unspent_node_ids, ARRAY[]::integer[])
           END AS unspent_node_ids
-          FROM output_batch
-          LEFT JOIN output_membership_backfill.accepted_transaction
-            USING (transaction_hash)
-          LEFT JOIN LATERAL (
-            SELECT array_agg(
-              DISTINCT node_id ORDER BY node_id
-            )::integer[] AS spent_node_ids
-              FROM public.input
-              INNER JOIN output_membership_backfill.accepted_transaction
-                USING (transaction_internal_id)
-              CROSS JOIN LATERAL unnest(accepted_node_ids) AS node_id
-              WHERE input.outpoint_transaction_hash =
-                output_batch.transaction_hash
-                AND input.outpoint_index = output_batch.output_index
-          ) AS spent_output ON true
+        FROM public.output
+        LEFT JOIN output_membership_backfill.desired_nondefault desired
+          USING (transaction_hash, output_index)
       )
       INSERT INTO output_membership_backfill.desired_output
       SELECT
-        target_ctid,
-        transaction_hash,
-        output_index,
-        accepted_node_ids,
-        unspent_node_ids
-        FROM computed
-        WHERE ROW(old_accepted_node_ids, old_unspent_node_ids)
-          IS DISTINCT FROM ROW(accepted_node_ids, unspent_node_ids)
-        LIMIT desired_row_ceiling - source_count + 1;
-      GET DIAGNOSTICS updated_count = ROW_COUNT;
+        target_ctid, transaction_hash, output_index,
+        accepted_node_ids, unspent_node_ids
+      FROM computed
+      WHERE ROW(old_accepted_node_ids, old_unspent_node_ids)
+        IS DISTINCT FROM ROW(accepted_node_ids, unspent_node_ids)
+      LIMIT desired_row_ceiling + 1;
 
-      IF source_count + updated_count > desired_row_ceiling THEN
+      SELECT count(*) INTO source_count
+        FROM output_membership_backfill.desired_output;
+      IF source_count > desired_row_ceiling THEN
         RAISE EXCEPTION
           'desired output exceeded the % row ceiling; retry with a larger proven budget',
           desired_row_ceiling;
       END IF;
-
       UPDATE output_membership_backfill.state
-        SET
-          next_target_heap_block = end_block,
-          source_rows = source_count + updated_count,
-          updated_at = clock_timestamp()
-        WHERE id
-          AND phase = 'target-building'
-          AND next_target_heap_block = start_block;
+        SET target_stage = 'target-built', source_rows = source_count,
+            next_target_heap_block = output_heap_blocks,
+            updated_at = clock_timestamp()
+        WHERE id AND phase = 'target-building'
+          AND target_stage = 'source-ready';
       IF NOT FOUND THEN
-        RAISE EXCEPTION 'target-build cursor changed unexpectedly';
+        RAISE EXCEPTION 'fast-backfill target stage changed unexpectedly';
       END IF;
       COMMIT;
 
@@ -476,29 +800,22 @@ BEGIN
       ) = 'on' THEN
         RAISE EXCEPTION 'requested fault during target build';
       END IF;
-    END LOOP;
-
-    ANALYZE output_membership_backfill.desired_output;
-    DROP TABLE output_membership_backfill.accepted_transaction;
-    DROP INDEX public.output_membership_backfill_input_outpoint;
-
-    UPDATE output_membership_backfill.state
-      SET
-        phase = 'target-ready',
-        target_built_at = clock_timestamp(),
-        updated_at = clock_timestamp()
-      WHERE id
-        AND phase = 'target-building'
-        AND next_target_heap_block = output_heap_blocks;
-    IF NOT FOUND THEN
-      RAISE EXCEPTION 'fast-backfill phase changed while building target';
+      current_target_stage := 'target-built';
     END IF;
-    COMMIT;
-  END IF;
 
-  PERFORM set_config('enable_nestloop', 'on', false);
-  PERFORM set_config('enable_mergejoin', 'off', false);
-  PERFORM set_config('enable_hashjoin', 'off', false);
+    IF current_target_stage = 'target-built' THEN
+      ANALYZE output_membership_backfill.desired_output;
+      UPDATE output_membership_backfill.state
+        SET phase = 'target-ready', target_stage = 'complete',
+            target_built_at = clock_timestamp(), updated_at = clock_timestamp()
+        WHERE id AND phase = 'target-building'
+          AND target_stage = 'target-built';
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'fast-backfill phase changed while completing target';
+      END IF;
+      COMMIT;
+    END IF;
+  END IF;
 
   LOOP
     SELECT next_output_heap_block, output_heap_blocks
@@ -510,6 +827,9 @@ BEGIN
     EXIT WHEN start_block >= final_block;
     end_block := least(start_block + batch_heap_blocks, final_block);
     batch_started := clock_timestamp();
+    PERFORM set_config('enable_nestloop', 'on', true);
+    PERFORM set_config('enable_mergejoin', 'off', true);
+    PERFORM set_config('enable_hashjoin', 'off', true);
 
     SELECT count(*)
       INTO source_count
@@ -601,8 +921,8 @@ BEGIN
     COMMIT;
   END LOOP;
 
-  PERFORM set_config('enable_nestloop', 'off', false);
-  PERFORM set_config('enable_hashjoin', 'on', false);
+  PERFORM set_config('enable_nestloop', 'off', true);
+  PERFORM set_config('enable_hashjoin', 'on', true);
 
   SELECT count(*)
     INTO mismatch_count

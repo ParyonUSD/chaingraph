@@ -48,20 +48,26 @@ suspension state.
 
 Set `scratch_budget_bytes` to current free filesystem bytes, not total volume
 capacity. The helper counts `input`, `output`, `transaction`, and configured
-nodes without trusting planner distinct estimates. It rejects the source build
-unless the budget covers the acceptance heap, two acceptance lookup indexes, a
-covering input outpoint index, the desired heap and CTID index, 15 percent page
-overhead, and 64 GiB for WAL and checkpoints. `desired_row_ceiling` is enforced
-across all committed target batches. The shown 160 million ceiling pads the
-proven 133 million-row full-mainnet target by about 20 percent. Recheck the row
-counts and free bytes immediately before a run.
+nodes without trusting planner distinct estimates. After acceptance it measures
+the non-default acceptance relation and gates the larger of two disjoint peaks:
+one 112-byte-per-input external outpoint sort plus ceiling-bounded sparse source
+stages, or the sparse source and CTID target plus an 8 GiB hash-spill allowance.
+The gate adds 15 percent page overhead and reserves 64 GiB for WAL and
+checkpoints. `desired_row_ceiling` bounds every per-node source, the combined
+sparse source, and the final target. The shown 160 million ceiling pads the
+proven 133 million-row full-mainnet target by about 20 percent. Recheck free
+bytes immediately before every run or resume; the replacement target records
+that current-free-space value independently of the earlier acceptance budget.
 
 The acceptance source commits first, so a disconnect during target construction
-does not repeat acceptance. The helper adds bounded B-tree lookup indexes,
-scans the output heap in batches, and commits the target cursor after every
-batch. It drops the temporary input index and acceptance table after target
-construction. This avoids database-sized hash and sort spills. Each CTID batch
-then updates `public.output`, records its counts,
+does not repeat acceptance. For each configured node, the helper streams
+accepted creators and spenders through merge joins, uses one external outpoint
+sort with `GroupAggregate`, and commits a durable node checkpoint. A capped
+per-node stage prevents overlap-heavy conflict updates from hiding a ceiling
+overflow. A final sequential output scan applies leading-`OP_RETURN` exclusion
+and materializes only rows whose current arrays differ. The acceptance and
+temporary input-index objects remain until cleanup so recovery never discards
+its proven sources. Each CTID batch then updates `public.output`, records counts,
 advances the durable cursor, and updates the canonical row count in one
 transaction. A disconnected session can resume with the same command. Do not
 run `VACUUM FULL`, `CLUSTER`, table rewrites, or normalized-state writes between

@@ -17,5 +17,10 @@ END
 $guard$;
 
 DROP TABLE IF EXISTS output_membership_backfill.desired_output;
+DROP TABLE IF EXISTS output_membership_backfill.node_utxo_stage;
+DROP TABLE IF EXISTS output_membership_backfill.desired_nondefault;
+DROP TABLE IF EXISTS output_membership_backfill.excluded_default_output;
+DROP TABLE IF EXISTS output_membership_backfill.acceptance_exception;
 DROP TABLE IF EXISTS output_membership_backfill.accepted_transaction;
+DROP INDEX IF EXISTS public.output_membership_backfill_input_outpoint;
 SELECT pg_advisory_unlock(20261001, 1);
