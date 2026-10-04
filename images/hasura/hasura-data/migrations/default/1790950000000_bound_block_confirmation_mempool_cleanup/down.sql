@@ -26,4 +26,3 @@ INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id,
 RETURN NEW;
 END;
 $$;
-
