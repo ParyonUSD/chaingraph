@@ -5,7 +5,7 @@ import baseTest from 'ava';
 
 import type * as database from '../db.js';
 
-// cspell:words functiondef regprocedure
+// cspell:words functiondef prosrc regprocedure
 const test = baseTest as TestFn<{ db: typeof database }>;
 const host = process.env.CHAINGRAPH_E2E_POSTGRES_HOST ?? 'localhost';
 const port = process.env.CHAINGRAPH_E2E_POSTGRES_PORT ?? '5432';
@@ -183,21 +183,28 @@ SELECT node_internal_id AS node, transaction_internal_id::integer AS tx
 test.serial(
   '[e2e] migration down restores the previous trigger function',
   async (t) => {
-    const down = readMigration(
+    const downMigration = readMigration(
       '1790950000000_bound_block_confirmation_mempool_cleanup',
       'down'
-    ).replace(
+    );
+    const down = downMigration.replace(
       'FUNCTION trigger_node_block_insert()',
       'FUNCTION pg_temp.trigger_node_block_insert()'
     );
-    await t.context.db.pool.query(down);
-    const definition = await t.context.db.pool.query<{ definition: string }>(
-      /* sql */ `SELECT pg_get_functiondef('pg_temp.trigger_node_block_insert()'::regprocedure) AS definition;`
+    const expected = downMigration.replace(
+      'FUNCTION trigger_node_block_insert()',
+      'FUNCTION pg_temp.expected_legacy_node_block_insert()'
     );
-    t.true(
-      definition.rows[0]!.definition.includes(
-        'FROM input INNER JOIN newly_spent'
-      )
-    );
+    await t.context.db.pool.query(`${expected}\n${down}`);
+    const definitions = await t.context.db.pool.query<{
+      actual: string;
+      expected: string;
+    }>(/* sql */ `
+SELECT actual.prosrc AS actual, expected.prosrc AS expected
+  FROM pg_proc actual, pg_proc expected
+  WHERE actual.oid = 'pg_temp.trigger_node_block_insert()'::regprocedure
+    AND expected.oid = 'pg_temp.expected_legacy_node_block_insert()'::regprocedure;
+`);
+    t.is(definitions.rows[0]!.actual, definitions.rows[0]!.expected);
   }
 );
