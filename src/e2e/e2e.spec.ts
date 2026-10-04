@@ -3381,3 +3381,87 @@ test('[e2e] [postgres] encode_compact_uint', async (t) => {
   t.deepEqual(await query(BigInt('9223372036854775807')), 'ffffffffffffffff7f');
   /* eslint-enable @typescript-eslint/no-magic-numbers */
 });
+
+/* cspell: disable */
+const searchFixtureTxHash =
+  'f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0';
+const searchFixtureOutputs = {
+  /** P2PKH whose hash contains 0x5c (the LIKE escape character) */
+  backslash: '76a9144444444444444444445c4444444444444444444488ac',
+  /** P2PKH that only a wildcard reading of 0x25 or 0x5f would match */
+  other: '76a914997777777777777777777777777777777777777788ac',
+  /** 25-byte P2PKH */
+  p2pkh: '76a914111111111111111111111111111111111111111188ac',
+  /** a longer script sharing the P2PKH's first 25 bytes */
+  p2pkhPrefixed: '76a914111111111111111111111111111111111111111188acab',
+  /** 35-byte P2SH32 */
+  p2sh32:
+    'aa20222222222222222222222222222222222222222222222222222222222222222287',
+  /** shares the P2SH32's first 25 bytes, differs afterwards */
+  p2sh32SamePrefix:
+    'aa20222222222222222222222222222222222222222222333333333333333333333387',
+  /** P2PKH whose hash starts with 0x25 (LIKE "%") */
+  percent: '76a914255555555555555555555555555555555555555588ac',
+  /** P2PKH whose hash starts with 0x5f (LIKE "_") */
+  underscore: '76a9145f6666666666666666666666666666666666666688ac',
+};
+/* cspell: enable */
+
+/**
+ * Insert synthetic outputs in a database transaction that is always rolled
+ * back, run `query` restricted to the fixture transaction, and return the
+ * names of the matched fixture outputs.
+ */
+const searchFixtureMatches = async (query: string, parameter: unknown) => {
+  const names = Object.keys(searchFixtureOutputs);
+  await client.query('BEGIN;');
+  const insertAndQuery = async () => {
+    await client.query(
+      /* sql */ `INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase) VALUES ($1, 2, 0, 0, false);`,
+      [hexToBin(searchFixtureTxHash)]
+    );
+    await Object.values(searchFixtureOutputs).reduce<Promise<unknown>>(
+      async (chain, bytecode, index) =>
+        chain.then(async () =>
+          client.query(
+            /* sql */ `INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode) VALUES ($1, $2, 1000, $3);`,
+            [hexToBin(searchFixtureTxHash), index, hexToBin(bytecode)]
+          )
+        ),
+      Promise.resolve(undefined)
+    );
+    const result = await client.query<{ outputIndex: string }>(
+      /* sql */ `SELECT output_index AS "outputIndex" FROM ${query} AS o WHERE o.transaction_hash = $2 ORDER BY output_index;`,
+      [parameter, hexToBin(searchFixtureTxHash)]
+    );
+    return result.rows.map((row) => names[Number(row.outputIndex)]);
+  };
+  const rollback = async () => client.query('ROLLBACK;');
+  return insertAndQuery().then(
+    async (matches) => rollback().then(() => matches),
+    // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+    async (error: unknown) => rollback().then(async () => Promise.reject(error))
+  );
+};
+
+test.serial(
+  '[e2e] [sql] search_output: exact matches for locking bytecode of any length',
+  async (t) => {
+    const search = async (scripts: string[]) =>
+      searchFixtureMatches('search_output($1::text[])', scripts);
+    t.deepEqual(await search([searchFixtureOutputs.p2sh32]), ['p2sh32']);
+    t.deepEqual(await search([searchFixtureOutputs.p2pkh]), ['p2pkh']);
+    t.deepEqual(await search([searchFixtureOutputs.p2pkhPrefixed]), [
+      'p2pkhPrefixed',
+    ]);
+    t.deepEqual(
+      await search([
+        searchFixtureOutputs.p2sh32SamePrefix,
+        searchFixtureOutputs.p2pkh,
+        searchFixtureOutputs.p2pkh,
+      ]),
+      ['p2pkh', 'p2sh32SamePrefix']
+    );
+    t.deepEqual(await search([]), []);
+  }
+);
