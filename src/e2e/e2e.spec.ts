@@ -93,6 +93,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100003000_custom_plan_output_membership_refresh/up.sql'
   ),
+  migration('default/1791100004000_add_node_block_membership_index/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -818,6 +819,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'block_transaction_pkey',
     'input_pkey',
     'node_block_history_pkey',
+    'node_block_block_node_index',
     'node_block_pkey',
     'node_internal_id_key',
     'node_name_key',
