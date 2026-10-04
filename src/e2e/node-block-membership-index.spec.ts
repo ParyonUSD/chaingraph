@@ -46,6 +46,9 @@ test.serial(
         migration('1790930801000_inline_output_membership_roots')
       );
       await client.query(
+        migration('1790950000000_bound_block_confirmation_mempool_cleanup')
+      );
+      await client.query(
         migration('1791100003000_custom_plan_output_membership_refresh')
       );
       await client.query(indexDefinitions.block_inclusions_index);

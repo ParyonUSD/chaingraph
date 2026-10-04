@@ -45,6 +45,12 @@ test.serial(
       await client.query(
         migration('1790950000000_bound_block_confirmation_mempool_cleanup')
       );
+      await client.query(
+        migration('1791100003000_custom_plan_output_membership_refresh')
+      );
+      await client.query(
+        migration('1791100004000_add_node_block_membership_index')
+      );
       await client.query(/* sql */ `
 ALTER TABLE node_block ENABLE TRIGGER trigger_public_node_block_insert;
 ALTER TABLE node_transaction_history
