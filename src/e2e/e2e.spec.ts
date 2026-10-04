@@ -89,6 +89,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
+  migration('default/1791100002000_unambiguous_locking_bytecode_prefix/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -820,16 +821,16 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'node_pkey',
     'node_transaction_history_pkey',
     'node_transaction_pkey',
-    'output_accepted_node_ids_gin',
+    'output_acceptance_index',
     'output_pkey',
     'output_search_index',
-    'output_unspent_fungible_category',
-    'output_unspent_locking_prefix',
-    'output_unspent_node_ids_gin',
     'spent_by_index',
     'token_category_index',
     'transaction_hash_key',
     'transaction_pkey',
+    'unspent_output_category_index',
+    'unspent_output_index',
+    'unspent_output_search_index',
   ]);
   // cspell:ignore tgenabled tgname
   const triggers = (
@@ -1048,7 +1049,7 @@ test.serial(
         .map((row) => row['QUERY PLAN'])
         .join('\n');
       t.false(plan.includes('Function Scan on unspent_output'));
-      t.regex(plan, /output_unspent_fungible_category/u);
+      t.regex(plan, /unspent_output_category_index/u);
     } finally {
       await client.query('ROLLBACK');
     }
@@ -3499,10 +3500,7 @@ test.serial(
     );
     t.deepEqual(
       prefixIndexes.map(([name]) => name),
-      [
-        'output_locking_bytecode_prefix_index',
-        'output_unspent_locking_bytecode_prefix',
-      ]
+      ['output_search_index', 'unspent_output_search_index']
     );
     prefixIndexes.forEach(([name, definition]) => {
       t.true(
@@ -3548,7 +3546,7 @@ test.serial(
         rollback().then(async () => Promise.reject(error))
     );
     plans.forEach((plan) => {
-      t.true(plan.includes('test_output_locking_bytecode_prefix_index'), plan);
+      t.true(plan.includes('test_output_search_index'), plan);
       t.false(plan.includes('Seq Scan'), plan);
     });
   }

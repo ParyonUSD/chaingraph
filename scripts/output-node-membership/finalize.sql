@@ -21,10 +21,10 @@ BEGIN
     SELECT 1
       FROM pg_index
       WHERE indexrelid IN (
-        to_regclass('public.output_accepted_node_ids_gin'),
-        to_regclass('public.output_unspent_node_ids_gin'),
-        to_regclass('public.output_unspent_fungible_category'),
-        to_regclass('public.output_unspent_locking_prefix')
+        to_regclass('public.output_acceptance_index'),
+        to_regclass('public.unspent_output_index'),
+        to_regclass('public.unspent_output_category_index'),
+        to_regclass('public.unspent_output_search_index')
       )
       AND (NOT indisvalid OR NOT indisready)
   ) THEN
@@ -37,17 +37,16 @@ UPDATE output_membership.state
   SET phase = 'indexing', ready = false, updated_at = clock_timestamp()
   WHERE id;
 
-CREATE INDEX IF NOT EXISTS output_accepted_node_ids_gin
+CREATE INDEX IF NOT EXISTS output_acceptance_index
   ON public.output USING gin (accepted_node_ids);
-CREATE INDEX IF NOT EXISTS output_unspent_node_ids_gin
+CREATE INDEX IF NOT EXISTS unspent_output_index
   ON public.output USING gin (unspent_node_ids);
-CREATE INDEX IF NOT EXISTS output_unspent_fungible_category
+CREATE INDEX IF NOT EXISTS unspent_output_category_index
   ON public.output USING btree (token_category)
   WHERE cardinality(unspent_node_ids) > 0
-    AND token_category IS NOT NULL
-    AND nonfungible_token_capability IS NULL;
-CREATE INDEX IF NOT EXISTS output_unspent_locking_prefix
-  ON public.output USING btree (substring(locking_bytecode, 0, 26))
+    AND token_category IS NOT NULL;
+CREATE INDEX IF NOT EXISTS unspent_output_search_index
+  ON public.output USING btree (substring(locking_bytecode from 1 for 25))
   WHERE cardinality(unspent_node_ids) > 0;
 
 ANALYZE public.input;
@@ -234,10 +233,10 @@ BEGIN
   IF (
     SELECT count(*)
       FROM unnest(ARRAY[
-        'output_accepted_node_ids_gin',
-        'output_unspent_node_ids_gin',
-        'output_unspent_fungible_category',
-        'output_unspent_locking_prefix'
+        'output_acceptance_index',
+        'unspent_output_index',
+        'unspent_output_category_index',
+        'unspent_output_search_index'
       ]) AS expected(index_name)
       INNER JOIN pg_class ON pg_class.relname = expected.index_name
       INNER JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace

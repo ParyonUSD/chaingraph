@@ -47,6 +47,8 @@
     "hasura's",
     "indexdef",
     "indexname",
+    "indexrelid",
+    "indisvalid",
     "isready",
     "jsonpath",
     "kubectl",
