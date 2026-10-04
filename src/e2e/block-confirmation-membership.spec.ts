@@ -4,6 +4,8 @@ import type { TestFn } from 'ava';
 import baseTest from 'ava';
 import pg from 'pg';
 
+// cspell:ignore proconfig prosrc regprocedure
+
 const test = baseTest as TestFn<{ pool: pg.Pool }>;
 const host = process.env.CHAINGRAPH_E2E_POSTGRES_HOST ?? 'localhost';
 const port = process.env.CHAINGRAPH_E2E_POSTGRES_PORT ?? '5432';
@@ -11,8 +13,8 @@ const migrations = new URL(
   '../../images/hasura/hasura-data/migrations/default/',
   import.meta.url
 );
-const migration = (name: string) =>
-  readFileSync(new URL(`${name}/up.sql`, migrations), 'utf8');
+const migration = (name: string, direction: 'down' | 'up' = 'up') =>
+  readFileSync(new URL(`${name}/${direction}.sql`, migrations), 'utf8');
 const hashBytes = 32;
 
 test.before(async (t) => {
@@ -44,6 +46,17 @@ test.serial(
       );
       await client.query(
         migration('1790950000000_bound_block_confirmation_mempool_cleanup')
+      );
+      const previousRefresh = await client.query<{
+        config: string[];
+        source: string;
+      }>(/* sql */ `
+SELECT proconfig AS config, prosrc AS source
+  FROM pg_proc
+  WHERE oid = 'output_membership.refresh(bigint[],jsonb)'::regprocedure;
+`);
+      await client.query(
+        migration('1790951000000_bound_output_membership_refresh')
       );
       await client.query(/* sql */ `
 ALTER TABLE node_block ENABLE TRIGGER trigger_public_node_block_insert;
@@ -128,6 +141,45 @@ SELECT transaction_internal_id::integer AS tx, replaced_at::text AS replaced
           { replaced: '2026-02-01 00:00:00', tx: 4 },
         ]
       );
+
+      await client.query(/* sql */ `
+DELETE FROM node_block
+  WHERE node_internal_id = 1 AND block_internal_id = 100;
+`);
+      const afterReorg = await client.query(/* sql */ `
+SELECT encode(transaction_hash, 'hex') AS hash,
+       output_index::integer AS index,
+       accepted_node_ids AS accepted, unspent_node_ids AS unspent
+  FROM output
+  WHERE transaction_hash IN (
+    decode(repeat('01', 32), 'hex'),
+    decode(repeat('02', 32), 'hex')
+  )
+  ORDER BY hash, index;
+`);
+      t.deepEqual(afterReorg.rows, [
+        { accepted: [], hash: '01'.repeat(hashBytes), index: 0, unspent: [] },
+        {
+          accepted: [1],
+          hash: '02'.repeat(hashBytes),
+          index: 0,
+          unspent: [1],
+        },
+        { accepted: [1], hash: '02'.repeat(hashBytes), index: 1, unspent: [] },
+      ]);
+
+      await client.query(
+        migration('1790951000000_bound_output_membership_refresh', 'down')
+      );
+      const restoredRefresh = await client.query<{
+        config: string[];
+        source: string;
+      }>(/* sql */ `
+SELECT proconfig AS config, prosrc AS source
+  FROM pg_proc
+  WHERE oid = 'output_membership.refresh(bigint[],jsonb)'::regprocedure;
+`);
+      t.deepEqual(restoredRefresh.rows[0], previousRefresh.rows[0]);
     } finally {
       await client.query('ROLLBACK;');
       client.release();
