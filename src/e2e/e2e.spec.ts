@@ -84,6 +84,7 @@ const dbUpMigrationPaths = [
   migration('default/1778438318512_fix_redeem_bytecode_parser/up.sql'),
   migration('default/1790852400000_add_output_node_membership/up.sql'),
   migration('default/1790930801000_inline_output_membership_roots/up.sql'),
+  migration('default/1791100000000_fix_search_output_exact_matching/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
