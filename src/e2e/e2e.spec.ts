@@ -3227,3 +3227,23 @@ test.serial(
     t.deepEqual(await search([]), []);
   }
 );
+
+/* cspell: disable */
+test.serial(
+  '[e2e] [sql] search_output_prefix: treats every byte literally and accepts prefixes longer than 25 bytes',
+  async (t) => {
+    const search = async (prefix: string) =>
+      searchFixtureMatches('search_output_prefix($1::text)', prefix);
+    t.deepEqual(await search(searchFixtureOutputs.backslash), ['backslash']);
+    t.deepEqual(await search('76a9144444444444444444445c'), ['backslash']);
+    t.deepEqual(await search('76a91425'), ['percent']);
+    t.deepEqual(await search('76a9145f'), ['underscore']);
+    t.deepEqual(await search(searchFixtureOutputs.p2sh32), ['p2sh32']);
+    t.deepEqual(await search(searchFixtureOutputs.p2pkh), [
+      'p2pkh',
+      'p2pkhPrefixed',
+    ]);
+    t.deepEqual(await search('aa20'), ['p2sh32', 'p2sh32SamePrefix']);
+  }
+);
+/* cspell: enable */
