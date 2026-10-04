@@ -109,6 +109,25 @@ helm get values my-chaingraph -o yaml > my-values.yaml
 helm upgrade my-chaingraph bitauth/chaingraph --reset-values --values my-values.yaml
 ```
 
+#### Upgrading to the 1-based locking bytecode prefix indexes
+
+`output_search_index` and the partial `unspent_output_search_index` (previously `output_unspent_locking_prefix`) are now defined on `substring(locking_bytecode from 1 for 25)`, the unambiguous form of `substring(locking_bytecode, 0, 26)` (both return the first 25 bytes; PostgreSQL positions start at 1). The output membership indexes are also renamed. PostgreSQL only uses an expression index for the identical expression, and the agent only builds indexes that are missing by name, so on an existing deployment:
+
+1. Before upgrading the agent, rename the unchanged indexes and drop the indexes whose definitions change:
+
+   ```sql
+   ALTER INDEX IF EXISTS output_accepted_node_ids_gin RENAME TO output_acceptance_index;
+   ALTER INDEX IF EXISTS output_unspent_node_ids_gin RENAME TO unspent_output_index;
+   DROP INDEX CONCURRENTLY IF EXISTS output_search_index;
+   DROP INDEX CONCURRENTLY IF EXISTS output_unspent_locking_prefix;
+   DROP INDEX CONCURRENTLY IF EXISTS output_unspent_fungible_category;
+   ```
+
+2. Upgrade the agent. After initial sync it rebuilds `output_search_index` and builds `unspent_output_search_index` and `unspent_output_category_index` (now covering all unspent token outputs, fungible or not); this takes a while on large databases, and ingestion pauses while each index builds.
+3. When these are built, upgrade Hasura. Its migration switches `search_output` and `search_output_prefix` to the new expression. Until then, these two functions scan the whole `output` table.
+
+New deployments need no special steps.
+
 As a best practice, consider preserving the `my-values.yaml` file for future reference. You can also preserve the latest deployment status and notes at any time:
 
 ```sh
