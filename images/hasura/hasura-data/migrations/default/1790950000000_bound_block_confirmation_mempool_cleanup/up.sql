@@ -2,6 +2,9 @@ CREATE OR REPLACE FUNCTION trigger_node_block_insert() RETURNS trigger
   LANGUAGE plpgsql
 AS $$
 DECLARE
+  inserted_node_ids smallint[];
+  inserted_block_ids bigint[];
+  inserted_timestamps timestamp without time zone[];
   accepted_node_ids smallint[];
   accepted_transaction_ids bigint[];
   accepted_timestamps timestamp without time zone[];
@@ -16,13 +19,24 @@ BEGIN
    * OFFSET 0 prevents Postgres from flattening the outpoint lookup into a scan
    * of the historical input table.
    */
-  SELECT array_agg(new_table.node_internal_id ORDER BY new_table.node_internal_id, block_transaction.transaction_internal_id),
-         array_agg(block_transaction.transaction_internal_id ORDER BY new_table.node_internal_id, block_transaction.transaction_internal_id),
-         array_agg(new_table.accepted_at ORDER BY new_table.node_internal_id, block_transaction.transaction_internal_id)
+  SELECT array_agg(new_table.node_internal_id ORDER BY new_table.node_internal_id, new_table.block_internal_id),
+         array_agg(new_table.block_internal_id ORDER BY new_table.node_internal_id, new_table.block_internal_id),
+         array_agg(new_table.accepted_at ORDER BY new_table.node_internal_id, new_table.block_internal_id)
+    INTO inserted_node_ids, inserted_block_ids, inserted_timestamps
+    FROM new_table;
+
+  SELECT array_agg(inserted.node_internal_id ORDER BY inserted.ordinality, block_transaction.transaction_internal_id),
+         array_agg(block_transaction.transaction_internal_id ORDER BY inserted.ordinality, block_transaction.transaction_internal_id),
+         array_agg(inserted.accepted_at ORDER BY inserted.ordinality, block_transaction.transaction_internal_id)
     INTO accepted_node_ids, accepted_transaction_ids, accepted_timestamps
-    FROM new_table
-    JOIN block_transaction
-      ON block_transaction.block_internal_id = new_table.block_internal_id;
+    FROM unnest(inserted_node_ids, inserted_block_ids, inserted_timestamps)
+      WITH ORDINALITY AS inserted(node_internal_id, block_internal_id, accepted_at, ordinality)
+    CROSS JOIN LATERAL (
+      SELECT block_transaction.transaction_internal_id
+        FROM block_transaction
+        WHERE block_transaction.block_internal_id = inserted.block_internal_id
+        OFFSET 0
+    ) AS block_transaction;
 
   IF accepted_transaction_ids IS NULL THEN
     RETURN NEW;
