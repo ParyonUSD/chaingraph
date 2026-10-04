@@ -27,6 +27,7 @@ import { execa } from 'execa';
 import got from 'got';
 import pg from 'pg';
 
+import { indexDefinitions } from '../components/db-utils.js';
 import type { ChaingraphTransaction } from '../types/chaingraph.js';
 
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
@@ -819,16 +820,16 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'node_pkey',
     'node_transaction_history_pkey',
     'node_transaction_pkey',
-    'output_accepted_node_ids_gin',
+    'output_acceptance_index',
     'output_pkey',
     'output_search_index',
-    'output_unspent_fungible_category',
-    'output_unspent_locking_prefix',
-    'output_unspent_node_ids_gin',
     'spent_by_index',
     'token_category_index',
     'transaction_hash_key',
     'transaction_pkey',
+    'unspent_output_category_index',
+    'unspent_output_index',
+    'unspent_output_search_index',
   ]);
   // cspell:ignore tgenabled tgname
   const triggers = (
@@ -1047,7 +1048,7 @@ test.serial(
         .map((row) => row['QUERY PLAN'])
         .join('\n');
       t.false(plan.includes('Function Scan on unspent_output'));
-      t.regex(plan, /output_unspent_fungible_category/u);
+      t.regex(plan, /unspent_output_category_index/u);
     } finally {
       await client.query('ROLLBACK');
     }
@@ -3489,3 +3490,63 @@ test.serial(
   }
 );
 /* cspell: enable */
+
+test.serial(
+  '[e2e] [sql] search functions use the 1-based 25-byte locking bytecode prefix indexes',
+  async (t) => {
+    const prefixIndexes = Object.entries(indexDefinitions).filter(
+      ([, definition]) => definition.includes('locking_bytecode')
+    );
+    t.deepEqual(
+      prefixIndexes.map(([name]) => name),
+      ['output_search_index', 'unspent_output_search_index']
+    );
+    prefixIndexes.forEach(([name, definition]) => {
+      t.true(
+        definition.includes('substring(locking_bytecode from 1 for 25)'),
+        name
+      );
+    });
+    await client.query('BEGIN;');
+    const explainPlans = async () => {
+      await prefixIndexes.reduce<Promise<unknown>>(
+        async (chain, [name, definition]) =>
+          chain.then(async () =>
+            client.query(
+              definition.replace(
+                `CREATE INDEX ${name}`,
+                `CREATE INDEX test_${name}`
+              )
+            )
+          ),
+        Promise.resolve(undefined)
+      );
+      await client.query('SET LOCAL enable_seqscan = off;');
+      const plan = async (query: string) =>
+        (
+          await client.query<{ [column: string]: string }>(
+            `EXPLAIN (COSTS OFF) ${query}`
+          )
+        ).rows
+          .map((row) => Object.values(row).join(''))
+          .join('\n');
+      return [
+        // cspell: disable-next-line
+        await plan(`SELECT * FROM search_output(ARRAY['76a91411'])`),
+        // cspell: disable-next-line
+        await plan(`SELECT * FROM search_output_prefix('76a914')`),
+      ];
+    };
+    const rollback = async () => client.query('ROLLBACK;');
+    const plans = await explainPlans().then(
+      async (result) => rollback().then(() => result),
+      async (error: unknown) =>
+        // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+        rollback().then(async () => Promise.reject(error))
+    );
+    plans.forEach((plan) => {
+      t.true(plan.includes('test_output_search_index'), plan);
+      t.false(plan.includes('Seq Scan'), plan);
+    });
+  }
+);
