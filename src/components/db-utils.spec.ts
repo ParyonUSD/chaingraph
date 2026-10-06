@@ -111,7 +111,7 @@ test('deferred ingestion completes normalized indexes without building stale arr
   t.deepEqual(
     managedIndexesForMembershipMode('incremental')
       .filter((name) => !deferred.includes(name))
-      .sort(),
+      .sort((a, b) => a.localeCompare(b)),
     [
       'output_acceptance_index',
       'unspent_output_category_index',
