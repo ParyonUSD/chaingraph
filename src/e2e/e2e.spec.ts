@@ -27,6 +27,7 @@ import { execa } from 'execa';
 import got from 'got';
 import pg from 'pg';
 
+import { indexDefinitions } from '../components/db-utils.js';
 import type { ChaingraphTransaction } from '../types/chaingraph.js';
 
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
@@ -3250,3 +3251,61 @@ test.serial(
   }
 );
 /* cspell: enable */
+
+test.serial(
+  '[e2e] [sql] search functions use the 25-byte locking bytecode prefix index',
+  async (t) => {
+    const prefixIndexes = Object.entries(indexDefinitions).filter(
+      ([, definition]) => definition.includes('locking_bytecode')
+    );
+    t.deepEqual(
+      prefixIndexes.map(([name]) => name),
+      ['output_search_index']
+    );
+    prefixIndexes.forEach(([name, definition]) => {
+      t.true(definition.includes('substring(locking_bytecode, 0, 26)'), name);
+    });
+    await client.query('BEGIN;');
+    const explainPlans = async () => {
+      await prefixIndexes.reduce<Promise<unknown>>(
+        async (chain, [name, definition]) =>
+          chain.then(async () =>
+            client.query(
+              definition.replace(
+                `CREATE INDEX ${name}`,
+                `CREATE INDEX test_${name}`
+              )
+            )
+          ),
+        Promise.resolve(undefined)
+      );
+      // cspell: disable-next-line
+      await client.query('SET LOCAL enable_seqscan = off;');
+      const plan = async (query: string) =>
+        (
+          await client.query<{ [column: string]: string }>(
+            `EXPLAIN (COSTS OFF) ${query}`
+          )
+        ).rows
+          .map((row) => Object.values(row).join(''))
+          .join('\n');
+      return [
+        // cspell: disable-next-line
+        await plan(`SELECT * FROM search_output(ARRAY['76a91411'])`),
+        // cspell: disable-next-line
+        await plan(`SELECT * FROM search_output_prefix('76a914')`),
+      ];
+    };
+    const rollback = async () => client.query('ROLLBACK;');
+    const plans = await explainPlans().then(
+      async (result) => rollback().then(() => result),
+      async (error: unknown) =>
+        // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+        rollback().then(async () => Promise.reject(error))
+    );
+    plans.forEach((plan) => {
+      t.true(plan.includes('test_output_search_index'), plan);
+      t.false(plan.includes('Seq Scan'), plan);
+    });
+  }
+);
