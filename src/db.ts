@@ -29,6 +29,13 @@ export const pool = new pg.Pool({
   max: postgresMaxConnections,
 });
 
+const initialAcceptanceIds = (acceptances: { nodeInternalId: number }[]) =>
+  outputMembershipMode === 'incremental'
+    ? [
+        ...new Set(acceptances.map((acceptance) => acceptance.nodeInternalId)),
+      ].sort((a, b) => a - b)
+    : undefined;
+
 /** Fail closed before the agent connects to nodes; mode changes are operator actions. */
 // eslint-disable-next-line complexity
 export const validateOutputMembershipMode = async () => {
@@ -626,7 +633,11 @@ export const saveTransactionForNodes = async (
     outputMembershipMode,
     'all',
     async (client, nodeIds) => {
-      const saved = await insertTransactions(client, [transaction]);
+      const saved = await insertTransactions(
+        client,
+        [transaction],
+        initialAcceptanceIds(nodeValidations)
+      );
       const result = await client.query<{ internalId: string }>(
         'SELECT internal_id AS "internalId" FROM transaction WHERE hash = $1;',
         [Buffer.from(transaction.hash, 'hex')]
@@ -724,7 +735,8 @@ export const saveBlock = async ({
     async (client, nodeIds) => {
       const newlySaved = await insertTransactions(
         client,
-        attemptedSavedTransactions
+        attemptedSavedTransactions,
+        initialAcceptanceIds(nodeAcceptances)
       );
       await client.query(
         `INSERT INTO block (height, version, timestamp, hash, previous_block_hash,

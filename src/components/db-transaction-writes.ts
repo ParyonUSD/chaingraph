@@ -8,8 +8,18 @@ import { boundedValueRows, type QueryParameter } from './db-membership.js';
 /** Stream inserts; never duplicate a whole block as SQL or flatten all its inputs/outputs. */
 export const insertTransactions = async (
   client: pg.PoolClient,
-  transactions: ChaingraphTransaction[]
+  transactions: ChaingraphTransaction[],
+  initialAcceptedNodeIds?: number[]
 ) => {
+  /*
+   * These IDs describe acceptance to be published by the same transaction;
+   * finish_membership_changes must still recompute spends and other node support.
+   */
+  const acceptedNodeIds =
+    initialAcceptedNodeIds === undefined
+      ? undefined
+      : [...new Set(initialAcceptedNodeIds)].sort((a, b) => a - b);
+  const opReturn = 106;
   const newlySaved = new Map<string, string>();
   const transactionRows = function* transactionRows(): Generator<
     QueryParameter[]
@@ -39,11 +49,12 @@ export const insertTransactions = async (
     for (const transaction of transactions) {
       if (!newlySaved.has(transaction.hash)) continue;
       for (const [index, output] of transaction.outputs.entries()) {
-        yield [
+        const lockingBytecode = Buffer.from(output.lockingBytecode, 'hex');
+        const row: QueryParameter[] = [
           Buffer.from(transaction.hash, 'hex'),
           index,
           output.valueSatoshis.toString(),
-          Buffer.from(output.lockingBytecode, 'hex'),
+          lockingBytecode,
           output.tokenCategory === undefined
             ? null
             : Buffer.from(output.tokenCategory, 'hex'),
@@ -53,6 +64,13 @@ export const insertTransactions = async (
             ? null
             : Buffer.from(output.nonfungibleTokenCommitment, 'hex'),
         ];
+        if (acceptedNodeIds !== undefined) {
+          row.push(
+            acceptedNodeIds,
+            lockingBytecode[0] === opReturn ? [] : acceptedNodeIds
+          );
+        }
+        yield row;
       }
     }
   };
@@ -60,7 +78,11 @@ export const insertTransactions = async (
     await client.query(
       `INSERT INTO output (transaction_hash, output_index, value_satoshis,
       locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability,
-      nonfungible_token_commitment) VALUES ${chunk.values};`,
+      nonfungible_token_commitment${
+        acceptedNodeIds === undefined
+          ? ''
+          : ', accepted_node_ids, unspent_node_ids'
+      }) VALUES ${chunk.values};`,
       chunk.parameters
     );
   }

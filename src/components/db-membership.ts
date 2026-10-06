@@ -90,7 +90,13 @@ export const runMembershipTransaction = async <Result>(
   throw new Error('Membership transaction exhausted retries.');
 };
 
-export type QueryParameter = Buffer | boolean | number | string | null;
+export type QueryParameter =
+  | Buffer
+  | number[]
+  | boolean
+  | number
+  | string
+  | null;
 const bytesPerUnit = 1_048_576;
 export const sqlChunkTargetBytes = bytesPerUnit + bytesPerUnit;
 
