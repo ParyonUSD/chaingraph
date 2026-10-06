@@ -1,12 +1,20 @@
-/* eslint-disable max-lines */
+// cspell:ignore tgenabled relnamespace nspname tgisinternal regprocedure indrelid indisready relname unnest
+/* eslint-disable max-lines, functional/no-loop-statement, functional/no-let, no-await-in-loop */
 import pg from 'pg';
 
 import type { Agent } from './agent.js';
+import {
+  boundedValueRows,
+  type QueryParameter,
+  runMembershipTransaction,
+} from './components/db-membership.js';
+import { insertTransactions } from './components/db-transaction-writes.js';
 import {
   computeIndexCreationProgress,
   indexDefinitions,
 } from './components/db-utils.js';
 import {
+  outputMembershipMode,
   postgresConnectionString,
   postgresMaxConnections,
   postgresSynchronousCommit,
@@ -20,6 +28,78 @@ export const pool = new pg.Pool({
   connectionString: postgresConnectionString,
   max: postgresMaxConnections,
 });
+
+/** Fail closed before the agent connects to nodes; mode changes are operator actions. */
+// eslint-disable-next-line complexity
+export const validateOutputMembershipMode = async () => {
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const legacy = await client.query<{ count: number; disabled: number }>(`
+      SELECT COUNT(*)::integer AS count,
+        COUNT(*) FILTER (WHERE t.tgenabled = 'D')::integer AS disabled
+      FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND NOT t.tgisinternal AND t.tgname IN
+        ('trigger_output_membership_lock','trigger_zz_output_membership_insert',
+         'trigger_zz_output_membership_delete','trigger_zz_output_membership_update');`);
+    const expectedLegacyTriggers = 22;
+    const retired =
+      legacy.rows[0]?.count === expectedLegacyTriggers &&
+      legacy.rows[0].disabled === expectedLegacyTriggers;
+    if (outputMembershipMode === 'baseline') {
+      if (legacy.rows[0]?.count !== 0) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw new Error(
+          'Array membership is installed; explicitly select deferred or incremental mode.'
+        );
+      }
+      return;
+    }
+    if (!retired) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        'Opt-in membership modes require all 22 legacy membership triggers disabled.'
+      );
+    }
+    const state = await client.query<{ ready: boolean }>(
+      'SELECT ready FROM output_membership.state WHERE id;'
+    );
+    const ready = state.rows[0]?.ready;
+    if (ready !== (outputMembershipMode === 'incremental')) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        `Membership mode ${outputMembershipMode} is incompatible with readiness=${String(
+          ready
+        )}.`
+      );
+    }
+    if (outputMembershipMode === 'incremental') {
+      const installed = await client.query<{ complete: boolean }>(`
+        SELECT to_regprocedure('output_membership.lock_node(integer)') IS NOT NULL
+          AND to_regprocedure('output_membership.begin_membership_changes()') IS NOT NULL
+          AND to_regprocedure('output_membership.finish_membership_changes(integer[])') IS NOT NULL
+          AND to_regprocedure('output_membership.note_membership_changes(integer,bigint[],jsonb)') IS NOT NULL
+          AND current_setting('transaction_isolation') = 'read committed'
+          AND (SELECT COUNT(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+            WHERE i.indrelid = 'output'::regclass AND i.indisvalid AND i.indisready
+              AND c.relname IN ('output_acceptance_index','unspent_output_index',
+                'unspent_output_category_index','unspent_output_search_index')) = 4
+          AND (SELECT COUNT(*) FROM pg_trigger WHERE NOT tgisinternal AND tgenabled = 'O'
+            AND tgrelid IN ('node_transaction'::regclass,'node_block'::regclass)
+            AND tgname IN ('trigger_output_membership_collect_insert',
+              'trigger_output_membership_collect_delete','trigger_output_membership_collect_update')) = 6 AS complete;`);
+      if (installed.rows[0]?.complete !== true) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw new Error(
+          'Incremental membership requires installed queue APIs, all six collectors, all four valid array indexes, and READ COMMITTED.'
+        );
+      }
+    }
+  } finally {
+    client.release();
+  }
+};
 
 /**
  * Trim a Postgres "bytea"-formatted string (e.g. `\xc0de`), returning just the
@@ -319,15 +399,23 @@ SELECT encode(transaction.hash, 'hex') AS "hash",
  */
 export const archiveMempoolTransactionsAcceptedByBlocks = async (): Promise<
   ArchivedMempoolTransaction[]
-> => {
-  const client = await pool.connect();
-  // eslint-disable-next-line functional/no-try-statement
-  try {
-    const result = await client.query<{
-      hash: string;
-      nodeName: string;
-      replacedAt: string | null;
-    }>(/* sql */ `
+> =>
+  runMembershipTransaction(
+    pool,
+    outputMembershipMode,
+    async (client) =>
+      (
+        await client.query<{ internalId: number }>(
+          'SELECT DISTINCT node_internal_id AS "internalId" FROM node_transaction;'
+        )
+      ).rows.map((row) => row.internalId),
+    async (client, nodeIds) => {
+      const result = await client.query<{
+        hash: string;
+        nodeName: string;
+        replacedAt: string | null;
+      }>(
+        /* sql */ `
 WITH directly_accepted AS (
     SELECT node_transaction.node_internal_id,
            node_transaction.transaction_internal_id,
@@ -338,6 +426,7 @@ WITH directly_accepted AS (
       JOIN node_block
         ON node_block.node_internal_id = node_transaction.node_internal_id
        AND node_block.block_internal_id = block_transaction.block_internal_id
+      WHERE node_transaction.node_internal_id = ANY($1::integer[])
 ),
 replaced_by_accepted AS (
     SELECT node_transaction.node_internal_id,
@@ -368,6 +457,7 @@ replaced_by_accepted AS (
            AND node_block.block_internal_id = block_transaction.block_internal_id
           HAVING COUNT(*) > 0
       ) replacement
+      WHERE node_transaction.node_internal_id = ANY($1::integer[])
 ),
 archive_candidates AS (
     SELECT node_internal_id, transaction_internal_id, replaced_at
@@ -411,19 +501,19 @@ SELECT encode(transaction.hash, 'hex') AS "hash",
   JOIN transaction
     ON transaction.internal_id = inserted_history.transaction_internal_id
   ORDER BY "nodeName", "hash";
-`);
-    return result.rows.map((row) => ({
-      hash: row.hash,
-      nodeName: row.nodeName,
-      replacedAt:
-        row.replacedAt === null
-          ? null
-          : timestampWithoutTimezoneToDate(row.replacedAt),
-    }));
-  } finally {
-    client.release();
-  }
-};
+`,
+        [nodeIds]
+      );
+      return result.rows.map((row) => ({
+        hash: row.hash,
+        nodeName: row.nodeName,
+        replacedAt:
+          row.replacedAt === null
+            ? null
+            : timestampWithoutTimezoneToDate(row.replacedAt),
+      }));
+    }
+  );
 
 /**
  * Archive a single node_transaction row. Existing history triggers handle any
@@ -437,14 +527,16 @@ export const archiveMempoolTransaction = async ({
   nodeInternalId: number;
   replacedAt: Date;
   transactionInternalId: number;
-}) => {
-  const client = await pool.connect();
-  // eslint-disable-next-line functional/no-try-statement
-  try {
-    const result = await client.query<{
-      archivedCount: number;
-    }>(
-      /* sql */ `
+}) =>
+  runMembershipTransaction(
+    pool,
+    outputMembershipMode,
+    [nodeInternalId],
+    async (client) => {
+      const result = await client.query<{
+        archivedCount: number;
+      }>(
+        /* sql */ `
 WITH deleted_row AS (
     DELETE FROM node_transaction
       WHERE node_internal_id = $1
@@ -462,13 +554,11 @@ inserted_history AS (
 )
 SELECT COUNT(*)::integer AS "archivedCount" FROM inserted_history;
 `,
-      [nodeInternalId, transactionInternalId]
-    );
-    return result.rows[0]!.archivedCount;
-  } finally {
-    client.release();
-  }
-};
+        [nodeInternalId, transactionInternalId]
+      );
+      return result.rows[0]!.archivedCount;
+    }
+  );
 
 /**
  * Create or update one or more trusted node in the Chaingraph database,
@@ -529,112 +619,47 @@ export const registerTrustedNodeWithDb = async (node: {
  */
 export const saveTransactionForNodes = async (
   transaction: ChaingraphTransaction,
-  nodeValidations: {
-    nodeInternalId: number;
-    validatedAt: Date;
-  }[]
-) => {
-  const saveTransaction = /* sql */ `
-WITH transaction_values (hash, version, locktime, size_bytes, is_coinbase) AS (
-  VALUES ('${hexToByteaString(transaction.hash)}'::bytea, ${
-    transaction.version
-  }::bigint, ${transaction.locktime}::bigint, ${
-    transaction.sizeBytes
-  }::bigint, ${transaction.isCoinbase.toString()}::boolean)
-), output_values (output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment) AS (
-  VALUES ${transaction.outputs
-    .map(
-      (output, outputIndex) =>
-        `(${outputIndex}::bigint, ${output.valueSatoshis.toString()}::bigint, '${hexToByteaString(
-          output.lockingBytecode
-        )}'::bytea, ${
-          output.tokenCategory === undefined
-            ? 'NULL::bytea'
-            : `'${hexToByteaString(output.tokenCategory)}'::bytea`
-        }, ${
-          output.fungibleTokenAmount === undefined
-            ? 'NULL'
-            : `${output.fungibleTokenAmount.toString()}::bigint`
-        }, ${
-          output.nonfungibleTokenCapability === undefined
-            ? 'NULL'
-            : `'${output.nonfungibleTokenCapability}'::enum_nonfungible_token_capability`
-        }, ${
-          output.nonfungibleTokenCommitment === undefined
-            ? 'NULL'
-            : `'${hexToByteaString(output.nonfungibleTokenCommitment)}'::bytea`
-        })`
-    )
-    .join(',')}
-), input_values (input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode) AS (
-  VALUES ${transaction.inputs
-    .map(
-      (input, inputIndex) =>
-        `(${inputIndex}::bigint, ${input.outpointIndex}::bigint, ${
-          input.sequenceNumber
-        }::bigint, '${hexToByteaString(
-          input.outpointTransactionHash
-        )}'::bytea, '${hexToByteaString(input.unlockingBytecode)}'::bytea)`
-    )
-    .join(',')}
-), new_transaction (transaction_hash, transaction_internal_id) AS (
-  INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
-    SELECT hash, version, locktime, size_bytes, is_coinbase FROM transaction_values
-    ON CONFLICT ON CONSTRAINT "transaction_hash_key" DO NOTHING
-    RETURNING hash AS transaction_hash, internal_id AS transaction_internal_id
-), insert_outputs AS (
-  INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment)
-    SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category::bytea, fungible_token_amount::bigint, nonfungible_token_capability::enum_nonfungible_token_capability, nonfungible_token_commitment::bytea FROM output_values CROSS JOIN new_transaction
-), insert_inputs AS (
-  INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
-    SELECT transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode FROM input_values CROSS JOIN new_transaction
-)
-SELECT COUNT(*) FROM new_transaction;
-`;
-  const saveNodeValidations = /* sql */ `
-WITH node_transaction_values (node_internal_id, validated_at) AS (
-  VALUES ${nodeValidations
-    .map(
-      (validation) =>
-        `(${
-          validation.nodeInternalId
-        }::bigint, ${dateToTimestampWithoutTimezone(validation.validatedAt)})`
-    )
-    .join(',')}
-)
-INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
-  SELECT node_internal_id, $1::bigint, validated_at FROM node_transaction_values
-  ON CONFLICT ON CONSTRAINT "node_transaction_pkey" DO NOTHING;
-`;
-  const client = await pool.connect();
-  // eslint-disable-next-line functional/no-try-statement
-  try {
-    await client.query('BEGIN;');
-    await client.query(saveTransaction);
-    const transactionInternalIdResult = await client.query<{
-      internalId: string;
-    }>(
-      /* sql */ `SELECT internal_id AS "internalId" FROM transaction WHERE hash = $1;`,
-      [Buffer.from(transaction.hash, 'hex')]
-    );
-    const transactionInternalId =
-      transactionInternalIdResult.rows[0]?.internalId;
-    if (transactionInternalId === undefined) {
-      // eslint-disable-next-line functional/no-throw-statement
-      throw new Error(
-        `Failed to save or find transaction while recording node validation: ${transaction.hash}`
+  nodeValidations: { nodeInternalId: number; validatedAt: Date }[]
+) =>
+  runMembershipTransaction(
+    pool,
+    outputMembershipMode,
+    'all',
+    async (client, nodeIds) => {
+      const saved = await insertTransactions(client, [transaction]);
+      const result = await client.query<{ internalId: string }>(
+        'SELECT internal_id AS "internalId" FROM transaction WHERE hash = $1;',
+        [Buffer.from(transaction.hash, 'hex')]
       );
+      const internalId = result.rows[0]?.internalId;
+      if (internalId === undefined) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw new Error(
+          `Failed to save or find transaction while recording node validation: ${transaction.hash}`
+        );
+      }
+      for (const chunk of boundedValueRows(
+        nodeValidations.map((validation) => [
+          validation.nodeInternalId,
+          internalId,
+          validation.validatedAt.toISOString(),
+        ])
+      )) {
+        await client.query(
+          `INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
+      VALUES ${chunk.values} ON CONFLICT ON CONSTRAINT node_transaction_pkey DO NOTHING;`,
+          chunk.parameters
+        );
+      }
+      if (outputMembershipMode === 'incremental' && saved.size > 0) {
+        await client.query(
+          `SELECT output_membership.note_membership_changes(node_id, $2::bigint[])
+      FROM unnest($1::integer[]) AS node_id;`,
+          [nodeIds, [...saved.values()]]
+        );
+      }
     }
-    await client.query(saveNodeValidations, [transactionInternalId]);
-    await client.query('COMMIT;');
-  } catch (err) {
-    await client.query('ROLLBACK;');
-    // eslint-disable-next-line functional/no-throw-statement
-    throw err;
-  } finally {
-    client.release();
-  }
-};
+  );
 
 /**
  * Immediately mark a node as having validated a transaction already known to
@@ -642,38 +667,25 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
  */
 export const recordNodeValidation = async (
   transactionHash: string,
-  validation: {
-    nodeInternalId: number;
-    validatedAt: Date;
-  }
-) => {
-  const client = await pool.connect();
-  /*
-   * The transaction is already saved, just insert `node_transaction`s.
-   */
-  // eslint-disable-next-line functional/no-try-statement
-  try {
-    await client.query(/* sql */ `
-    WITH node_transaction_values (node_internal_id, validated_at) AS (
-      VALUES (
-      ${validation.nodeInternalId}::bigint,
-      ${dateToTimestampWithoutTimezone(validation.validatedAt)}
-      )
-    ), known_transaction (transaction_internal_id) AS (
-      SELECT internal_id
-        FROM transaction
-        WHERE hash = '${hexToByteaString(transactionHash)}'::bytea
-    )
-    INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
-      SELECT node_internal_id, transaction_internal_id, validated_at
-        FROM node_transaction_values
-        CROSS JOIN known_transaction
-      ON CONFLICT ON CONSTRAINT "node_transaction_pkey" DO NOTHING;
-  `);
-  } finally {
-    client.release();
-  }
-};
+  validation: { nodeInternalId: number; validatedAt: Date }
+) =>
+  runMembershipTransaction(
+    pool,
+    outputMembershipMode,
+    [validation.nodeInternalId],
+    async (client) => {
+      await client.query(
+        `INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at)
+    SELECT $1::integer, internal_id, $3::timestamp FROM transaction WHERE hash = $2::bytea
+    ON CONFLICT ON CONSTRAINT node_transaction_pkey DO NOTHING;`,
+        [
+          validation.nodeInternalId,
+          Buffer.from(transactionHash, 'hex'),
+          validation.validatedAt.toISOString(),
+        ]
+      );
+    }
+  );
 
 /**
  * Save a block to the database, inserting all transactions which aren't already
@@ -697,251 +709,108 @@ export const saveBlock = async ({
   }[];
   transactionCache: Agent['transactionCache'];
 }) => {
-  const blockTransactions = block.transactions.reduce<{
-    /**
-     * Transactions known to be successfully saved to the database.
-     */
-    alreadySaved: ChaingraphTransaction[];
-    /**
-     * Transactions in the block which aren't yet known to be saved to the
-     * database. These must be saved before the block can be saved.
-     */
-    unknown: ChaingraphTransaction[];
-  }>(
-    (transactions, transaction) => {
-      // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-      transactionCache.get(transaction.hash)?.db === true
-        ? transactions.alreadySaved.push(transaction)
-        : transactions.unknown.push(transaction);
-      return transactions;
-    },
-    { alreadySaved: [], unknown: [] }
+  const attemptedSavedTransactions = block.transactions.filter(
+    (transaction) => transactionCache.get(transaction.hash)?.db !== true
   );
-
-  const inputs: {
-    inputIndex: number;
-    transactionHash: string;
-    content: ChaingraphTransaction['inputs'][number];
-  }[] = [];
-  const outputs: {
-    outputIndex: number;
-    transactionHash: string;
-    content: ChaingraphTransaction['outputs'][number];
-  }[] = [];
-
-  blockTransactions.unknown.forEach((transaction) => {
-    inputs.push(
-      ...transaction.inputs.map((content, inputIndex) => ({
-        content,
-        inputIndex,
-        transactionHash: transaction.hash,
-      }))
-    );
-    outputs.push(
-      ...transaction.outputs.map((content, outputIndex) => ({
-        content,
-        outputIndex,
-        transactionHash: transaction.hash,
-      }))
-    );
-  });
-
-  const addAllTransactions = /* sql */ `
-WITH unknown_transaction_values (hash, version, locktime, size_bytes, is_coinbase) AS (
-  VALUES ${blockTransactions.unknown
-    .map(
-      (transaction) =>
-        `('${hexToByteaString(transaction.hash)}'::bytea, ${
-          transaction.version
-        }::bigint, ${transaction.locktime}::bigint, ${
-          transaction.sizeBytes
-        }::bigint, ${transaction.isCoinbase.toString()}::boolean)`
-    )
-    .join(',')}
-),
-unknown_input_values (transaction_hash, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode) AS (
-  VALUES ${inputs
-    .map(
-      (input) =>
-        `('${hexToByteaString(input.transactionHash)}'::bytea, ${
-          input.inputIndex
-        }::bigint, ${input.content.outpointIndex}::bigint, ${
-          input.content.sequenceNumber
-        }::bigint, '${hexToByteaString(
-          input.content.outpointTransactionHash
-        )}'::bytea, '${hexToByteaString(
-          input.content.unlockingBytecode
-        )}'::bytea)`
-    )
-    .join(',')}
-),
-unknown_output_values (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment) AS (
-  VALUES ${outputs
-    .map(
-      (output) =>
-        `('${hexToByteaString(output.transactionHash)}'::bytea, ${
-          output.outputIndex
-        }::bigint, ${output.content.valueSatoshis.toString()}::bigint, '${hexToByteaString(
-          output.content.lockingBytecode
-        )}'::bytea, ${
-          output.content.tokenCategory === undefined
-            ? 'NULL::bytea'
-            : `'${hexToByteaString(output.content.tokenCategory)}'::bytea`
-        }, ${
-          output.content.fungibleTokenAmount === undefined
-            ? 'NULL::bigint'
-            : `${output.content.fungibleTokenAmount.toString()}::bigint`
-        }, ${
-          output.content.nonfungibleTokenCapability === undefined
-            ? 'NULL::enum_nonfungible_token_capability'
-            : `'${output.content.nonfungibleTokenCapability}'::enum_nonfungible_token_capability`
-        }, ${
-          output.content.nonfungibleTokenCommitment === undefined
-            ? 'NULL::bytea'
-            : `'${hexToByteaString(
-                output.content.nonfungibleTokenCommitment
-              )}'::bytea`
-        })`
-    )
-    .join(',')}
-),
-newly_saved_transactions (hash, internal_id) AS (
-  INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
-    SELECT hash, version, locktime, size_bytes, is_coinbase FROM unknown_transaction_values
-    ON CONFLICT ON CONSTRAINT "transaction_hash_key" DO NOTHING
-    RETURNING hash, internal_id
-),
-newly_saved_outputs AS (
-  INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment)
-    SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category::bytea, fungible_token_amount::bigint, nonfungible_token_capability::enum_nonfungible_token_capability, nonfungible_token_commitment::bytea FROM unknown_output_values
-    WHERE transaction_hash IN (SELECT hash FROM newly_saved_transactions)
-),
-newly_saved_inputs AS (
-  INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
-    SELECT internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode
-    FROM unknown_input_values val INNER JOIN newly_saved_transactions txs ON val.transaction_hash = txs.hash
-)
-SELECT COUNT(*) FROM newly_saved_transactions;`;
-
-  /**
-   * TODO: perf – consider baking this into `addAllTransactions` to avoid re-sending the list of transaction hashes?
-   * TODO: perf – consider batching blocks during initial sync (targeting 100KB to 1MB queries)
-   * TODO: perf – use prepared statements
+  /*
+   * Body/topology publication currently fences the node universe. This is a
+   * correctness baseline for late parents and incomplete blocks; benchmark
+   * contention before replacing it with narrower topology synchronization.
    */
-  const addBlockQuery = /* sql */ `
-WITH transactions_in_block (hash, transaction_index) AS (
-  VALUES ${block.transactions
-    .map(
-      (transaction, index) =>
-        `('${hexToByteaString(transaction.hash)}'::bytea, ${index}::bigint)`
-    )
-    .join(',')}
-),
-accepting_nodes (node_internal_id, accepted_at) AS (
-  VALUES ${nodeAcceptances
-    .map(
-      (acceptance) =>
-        `(${acceptance.nodeInternalId}, ${
-          acceptance.acceptedAt === null
-            ? 'NULL::timestamp'
-            : dateToTimestampWithoutTimezone(acceptance.acceptedAt)
-        })`
-    )
-    .join(',')}
-),
-joined_transactions (internal_id, transaction_index) AS (
-  SELECT db.internal_id, val.transaction_index
-    FROM transaction db INNER JOIN transactions_in_block val ON val.hash = db.hash
-),
-inserted_block (internal_id) AS (
-  INSERT INTO block (height, version, timestamp, hash, previous_block_hash, merkle_root, bits, nonce, size_bytes)
-    VALUES (${block.height}, ${block.version}, ${block.timestamp},
-      '${hexToByteaString(block.hash)}'::bytea,
-      '${hexToByteaString(block.previousBlockHash)}'::bytea,
-      '${hexToByteaString(block.merkleRoot)}'::bytea,
-      ${block.bits}::bigint, ${block.nonce}::bigint, ${block.sizeBytes}::bigint)
-  ON CONFLICT ON CONSTRAINT "block_hash_key" DO NOTHING
-  RETURNING internal_id
-),
-new_or_existing_block (internal_id) AS (
-  SELECT COALESCE (
-    (SELECT internal_id FROM inserted_block),
-    (SELECT internal_id FROM block WHERE block.hash = '${hexToByteaString(
-      block.hash
-    )}'::bytea)
-  )
-),
-inserted_block_transactions AS (
-  INSERT INTO block_transaction (block_internal_id, transaction_internal_id, transaction_index)
-    SELECT blk.internal_id, tx.internal_id, tx.transaction_index
-      FROM new_or_existing_block blk CROSS JOIN joined_transactions tx
-    ON CONFLICT ON CONSTRAINT "block_transaction_pkey" DO NOTHING
-    RETURNING transaction_internal_id
-),
-inserted_node_blocks AS (
-  INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
-  SELECT node.node_internal_id, blk.internal_id, node.accepted_at
-    FROM new_or_existing_block blk CROSS JOIN accepting_nodes node
-  ON CONFLICT ON CONSTRAINT "node_block_pkey" DO NOTHING
-  RETURNING block_internal_id
-)
-SELECT
-  (SELECT COUNT(*)::bigint FROM joined_transactions) AS "joinedTransactionCount",
-  (SELECT COUNT(*)::bigint FROM inserted_block_transactions) AS "insertedBlockTransactionCount",
-  (SELECT COUNT(*)::bigint FROM inserted_node_blocks) AS "insertedNodeBlockCount";`;
-  const client = await pool.connect();
-  // eslint-disable-next-line functional/no-try-statement
-  try {
-    await client.query('BEGIN;');
-    const saveTransactionsResult = await client.query<{ count: string }>(
-      addAllTransactions
-    );
-    const attemptedSavedTransactions = blockTransactions.unknown;
-    const savedTransactionCount = Number(saveTransactionsResult.rows[0]!.count);
-    const transactionCacheMisses =
-      attemptedSavedTransactions.length - savedTransactionCount;
-    const addBlockResult = await client.query<{
-      insertedBlockTransactionCount: string;
-      insertedNodeBlockCount: string;
-      joinedTransactionCount: string;
-    }>(addBlockQuery);
-    const joinedTransactionCount = Number(
-      addBlockResult.rows[0]!.joinedTransactionCount
-    );
-    const linkedBlockTransactionCount = Number(
-      (
-        await client.query<{ count: string }>(
-          /* sql */ `
-          SELECT COUNT(*)::bigint AS count
-            FROM block_transaction
-            INNER JOIN block ON block.internal_id = block_transaction.block_internal_id
-            WHERE block.hash = $1;
-        `,
-          [Buffer.from(block.hash, 'hex')]
-        )
-      ).rows[0]!.count
-    );
-    if (
-      joinedTransactionCount !== block.transactions.length ||
-      linkedBlockTransactionCount !== block.transactions.length
-    ) {
-      // eslint-disable-next-line functional/no-throw-statement
-      throw new Error(
-        `Failed to save all transactions for block ${block.height} (${block.hash}): joined ${joinedTransactionCount}/${block.transactions.length}, linked ${linkedBlockTransactionCount}/${block.transactions.length}.`
+  return runMembershipTransaction(
+    pool,
+    outputMembershipMode,
+    'all',
+    async (client, nodeIds) => {
+      const newlySaved = await insertTransactions(
+        client,
+        attemptedSavedTransactions
       );
+      await client.query(
+        `INSERT INTO block (height, version, timestamp, hash, previous_block_hash,
+      merkle_root, bits, nonce, size_bytes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      ON CONFLICT ON CONSTRAINT block_hash_key DO NOTHING;`,
+        [
+          block.height,
+          block.version,
+          block.timestamp,
+          Buffer.from(block.hash, 'hex'),
+          Buffer.from(block.previousBlockHash, 'hex'),
+          Buffer.from(block.merkleRoot, 'hex'),
+          block.bits,
+          block.nonce,
+          block.sizeBytes,
+        ]
+      );
+      const blockResult = await client.query<{ internalId: string }>(
+        'SELECT internal_id AS "internalId" FROM block WHERE hash = $1;',
+        [Buffer.from(block.hash, 'hex')]
+      );
+      const blockId = blockResult.rows[0]!.internalId;
+      const transactionRows = function* transactionRows(): Generator<
+        QueryParameter[]
+      > {
+        for (const [index, transaction] of block.transactions.entries()) {
+          yield [Buffer.from(transaction.hash, 'hex'), index];
+        }
+      };
+      for (const chunk of boundedValueRows(transactionRows(), 1, [
+        'bytea',
+        'bigint',
+      ])) {
+        await client.query(
+          `INSERT INTO block_transaction (block_internal_id, transaction_internal_id, transaction_index)
+        SELECT $1::bigint, tx.internal_id, val.transaction_index::bigint
+        FROM (VALUES ${chunk.values}) val(hash,transaction_index)
+        JOIN transaction tx ON tx.hash = val.hash::bytea
+        ON CONFLICT ON CONSTRAINT block_transaction_pkey DO NOTHING;`,
+          [blockId, ...chunk.parameters]
+        );
+      }
+      const linked = await client.query<{ count: string }>(
+        'SELECT COUNT(*)::bigint AS count FROM block_transaction WHERE block_internal_id = $1;',
+        [blockId]
+      );
+      if (Number(linked.rows[0]!.count) !== block.transactions.length) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw new Error(
+          `Failed to save all transactions for block ${block.height} (${
+            block.hash
+          }): linked ${linked.rows[0]!.count}/${block.transactions.length}.`
+        );
+      }
+      for (const chunk of boundedValueRows(
+        nodeAcceptances.map((acceptance) => [
+          acceptance.nodeInternalId,
+          blockId,
+          acceptance.acceptedAt?.toISOString() ?? null,
+        ])
+      )) {
+        await client.query(
+          `INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
+        VALUES ${chunk.values} ON CONFLICT ON CONSTRAINT node_block_pkey DO NOTHING;`,
+          chunk.parameters
+        );
+      }
+      if (outputMembershipMode === 'incremental') {
+        /*
+         * Includes known transactions newly linked under existing accepted blocks,
+         * and creator/input ingestion that changes another node's spender view.
+         */
+        await client.query(
+          `SELECT output_membership.note_membership_changes(node_id,
+        ARRAY(SELECT transaction_internal_id FROM block_transaction WHERE block_internal_id = $2))
+        FROM unnest($1::integer[]) AS node_id;`,
+          [nodeIds, blockId]
+        );
+      }
+      return {
+        attemptedSavedTransactions,
+        transactionCacheMisses:
+          attemptedSavedTransactions.length - newlySaved.size,
+      };
     }
-    await client.query('COMMIT;');
-    return {
-      attemptedSavedTransactions,
-      transactionCacheMisses,
-    };
-  } catch (err) {
-    await client.query('ROLLBACK;');
-    // eslint-disable-next-line functional/no-throw-statement
-    throw err;
-  } finally {
-    client.release();
-  }
+  );
 };
 
 /**
@@ -969,24 +838,38 @@ export const acceptBlocksViaHeaders = async (
     acceptedAtTimestamp - twoHoursSeconds
   );
 
-  const insertNodeBlocks = /* sql */ `
-  WITH matching_blocks (internal_id, use_null) AS (
-    SELECT internal_id, (timestamp < ${nullifyAcceptedTimeBeforeBlockTimestamp}::bigint) AS use_null
-    FROM block WHERE hash IN (VALUES ${acceptedBlocks
-      .map((block) => `('${hexToByteaString(block.hash)}'::bytea)`)
-      .join(',')})
-  )
-    INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
-      SELECT n.id, blk.internal_id, CASE WHEN blk.use_null=true THEN NULL ELSE ${dateToTimestampWithoutTimezone(
-        acceptedAt
-      )} END
-      FROM matching_blocks blk CROSS JOIN (VALUES (${nodeInternalId}::bigint)) n(id)
-      ON CONFLICT DO NOTHING
-  `;
-  const client = await pool.connect();
-  const nodeBlockInsertResult = await client.query(insertNodeBlocks);
-  client.release();
-  return nodeBlockInsertResult.rowCount;
+  return runMembershipTransaction(
+    pool,
+    outputMembershipMode,
+    [nodeInternalId],
+    async (client) => {
+      let insertedCount = 0;
+      const headerParameterCount = 3;
+      const hashRows = function* hashRows(): Generator<QueryParameter[]> {
+        for (const block of acceptedBlocks)
+          yield [Buffer.from(block.hash, 'hex')];
+      };
+      for (const chunk of boundedValueRows(hashRows(), headerParameterCount, [
+        'bytea',
+      ])) {
+        const result = await client.query(
+          `INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
+        SELECT $1::integer, block.internal_id,
+          CASE WHEN block.timestamp < $2::bigint THEN NULL ELSE $3::timestamp END
+        FROM block JOIN (VALUES ${chunk.values}) val(hash) ON block.hash = val.hash::bytea
+        ON CONFLICT DO NOTHING;`,
+          [
+            nodeInternalId,
+            nullifyAcceptedTimeBeforeBlockTimestamp,
+            acceptedAt.toISOString(),
+            ...chunk.parameters,
+          ]
+        );
+        insertedCount += result.rowCount ?? 0;
+      }
+      return insertedCount;
+    }
+  );
 };
 
 /**
@@ -1005,17 +888,25 @@ export const acceptBlocksViaHeaders = async (
 export const removeStaleBlocksForNode = async (
   nodeInternalId: number,
   staleChain: string[]
-) => {
-  const client = await pool.connect();
-  await client.query(/* sql */ `
-DELETE FROM node_block WHERE
-  node_internal_id IN (VALUES (${nodeInternalId}::bigint)) AND
-  block_internal_id IN (SELECT internal_id from block WHERE hash IN (VALUES ${staleChain
-    .map((hash) => `('${hexToByteaString(hash)}'::bytea)`)
-    .join(',')}))
-`);
-  client.release();
-};
+) =>
+  runMembershipTransaction(
+    pool,
+    outputMembershipMode,
+    [nodeInternalId],
+    async (client) => {
+      const hashRows = function* hashRows(): Generator<QueryParameter[]> {
+        for (const hash of staleChain) yield [Buffer.from(hash, 'hex')];
+      };
+      for (const chunk of boundedValueRows(hashRows(), 1, ['bytea'])) {
+        await client.query(
+          `DELETE FROM node_block WHERE node_internal_id = $1::integer
+        AND block_internal_id IN (SELECT block.internal_id FROM block
+          JOIN (VALUES ${chunk.values}) val(hash) ON block.hash = val.hash::bytea);`,
+          [nodeInternalId, ...chunk.parameters]
+        );
+      }
+    }
+  );
 
 /**
  * After initial sync, Chaingraph begins tracking each node's mempool.

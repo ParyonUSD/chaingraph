@@ -1,7 +1,11 @@
 /* eslint-disable camelcase, @typescript-eslint/naming-convention */
 import test from 'ava';
 
-import { computeIndexCreationProgress, indexDefinitions } from './db-utils.js';
+import {
+  computeIndexCreationProgress,
+  indexDefinitions,
+  managedIndexesForMembershipMode,
+} from './db-utils.js';
 
 test('computeIndexCreationProgress: single index, phase: "building index: scanning table" 10%', async (t) => {
   const result = computeIndexCreationProgress([
@@ -99,3 +103,24 @@ test('computeIndexCreationProgress: multiple indexes', async (t) => {
 });
 
 test.todo('computeIndexCreationProgress: never produces NaN when a total is 0');
+
+test('deferred ingestion completes normalized indexes without building stale array indexes', (t) => {
+  const deferred = managedIndexesForMembershipMode('deferred');
+  t.true(deferred.includes('spent_by_index'));
+  t.true(deferred.includes('block_inclusions_index'));
+  t.deepEqual(
+    managedIndexesForMembershipMode('incremental')
+      .filter((name) => !deferred.includes(name))
+      .sort(),
+    [
+      'output_acceptance_index',
+      'unspent_output_category_index',
+      'unspent_output_index',
+      'unspent_output_search_index',
+    ]
+  );
+  t.deepEqual(
+    managedIndexesForMembershipMode('baseline'),
+    managedIndexesForMembershipMode('incremental')
+  );
+});

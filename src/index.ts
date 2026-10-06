@@ -5,10 +5,14 @@ import bitcoreP2pCash from '@chaingraph/bitcore-p2p-cash';
 
 import { Agent, cancelableDelay } from './agent.js';
 import { chaingraphInternalApiPort } from './config.js';
+import { validateOutputMembershipMode } from './db.js';
 import { instantiateLogger } from './logging.js';
 
 const logger = instantiateLogger();
 logger.info(`Starting Chaingraph...`);
+
+// Reject incompatible array state before constructing the agent or its writers.
+await validateOutputMembershipMode();
 
 const shutdownTasks = [] as (() => void)[];
 const agent = new Agent({

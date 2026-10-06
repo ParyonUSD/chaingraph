@@ -17,6 +17,21 @@ export const indexDefinitions = {
 };
 /* eslint-enable camelcase, @typescript-eslint/naming-convention */
 
+/** Array indexes are built by the fenced finalizer, after deferred ingestion. */
+export const managedIndexesForMembershipMode = (
+  mode: 'baseline' | 'deferred' | 'incremental'
+): (keyof typeof indexDefinitions)[] => {
+  const arrayIndexes: (keyof typeof indexDefinitions)[] = [
+    'output_acceptance_index',
+    'unspent_output_category_index',
+    'unspent_output_index',
+    'unspent_output_search_index',
+  ];
+  return (
+    Object.keys(indexDefinitions) as (keyof typeof indexDefinitions)[]
+  ).filter((name) => mode !== 'deferred' || !arrayIndexes.includes(name));
+};
+
 /**
  * Based on the typical Chaingraph workload, the table scanning phase of index
  * building is counted as 40% of progress, while the 'loading tuples in tree'

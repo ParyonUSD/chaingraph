@@ -11,6 +11,7 @@ import { binToHex, hexToBin, isHex } from '@bitauth/libauth';
 import dotenv from 'dotenv';
 
 import { bitcoreBlockToChaingraphBlock, messages } from './bitcore.js';
+import type { OutputMembershipMode } from './components/db-membership.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
 
 const dotEnvConfig = dotenv.config();
@@ -32,6 +33,21 @@ const configuration = {
 } as {
   [x: string]: string | undefined;
 };
+
+/** Explicit opt-in; startup verifies the installed SQL and readiness state. */
+const outputMembershipModeValue =
+  configuration.CHAINGRAPH_OUTPUT_MEMBERSHIP_MODE ?? 'baseline';
+if (
+  outputMembershipModeValue !== 'baseline' &&
+  outputMembershipModeValue !== 'deferred' &&
+  outputMembershipModeValue !== 'incremental'
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    'CHAINGRAPH_OUTPUT_MEMBERSHIP_MODE must be baseline, deferred, or incremental.'
+  );
+}
+const outputMembershipMode: OutputMembershipMode = outputMembershipModeValue;
 
 const expectedOptions = [
   'CHAINGRAPH_BLOCK_BUFFER_TARGET_SIZE_MB',
@@ -424,6 +440,7 @@ export {
   postgresMaxConnections,
   postgresConnectionString,
   postgresSynchronousCommit,
+  outputMembershipMode,
   isProduction,
   trustedNodes,
 };

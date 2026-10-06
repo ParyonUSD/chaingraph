@@ -19,6 +19,7 @@ import {
 } from './bitcore.js';
 import { BlockBuffer } from './components/block-buffer.js';
 import { BlockTree } from './components/block-tree.js';
+import { managedIndexesForMembershipMode } from './components/db-utils.js';
 import type { indexDefinitions } from './components/db-utils.js';
 import { SyncState } from './components/sync-state.js';
 import {
@@ -34,6 +35,7 @@ import {
   incompleteBlockRepairBatchSize,
   mempoolTransactionExpirationMs,
   mempoolTransactionExpirationScanIntervalMs,
+  outputMembershipMode,
   postgresMaxConnections,
   trustedNodes,
 } from './config.js';
@@ -376,17 +378,8 @@ export class Agent {
    * A list of indexes which are managed by Chaingraph. If these don't exist in
    * the database, they will be created after initial sync is complete.
    */
-  managedIndexes: (keyof typeof indexDefinitions)[] = [
-    'block_height_index',
-    'block_inclusions_index',
-    'output_acceptance_index',
-    'output_search_index',
-    'spent_by_index',
-    'token_category_index',
-    'unspent_output_category_index',
-    'unspent_output_index',
-    'unspent_output_search_index',
-  ];
+  managedIndexes: (keyof typeof indexDefinitions)[] =
+    managedIndexesForMembershipMode(outputMembershipMode);
 
   /**
    * Set to `true` if `shutdown` has been called.

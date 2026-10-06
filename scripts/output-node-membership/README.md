@@ -1,41 +1,56 @@
-# Output node membership rollout
+# Deferred output node membership candidate
 
-The Hasura migration adds maintained `accepted_node_ids` and
-`unspent_node_ids` arrays to `public.output`. It does not expose partially
-built state: `accepted_output` and `unspent_output` raise an error until the
-state has passed exact validation.
+This branch changes the rollout: complete normalized initial sync first, then
+build `accepted_node_ids`, `unspent_node_ids`, and their indexes with ingestion
+paused. Until that build completes, array-backed GraphQL roots remain unavailable.
+The candidate is experimental; its agent integration and mature-database
+large-block/reorg performance gate are not yet complete.
 
-For a database populated after the migration, leave the agent running through
-initial sync. The statement triggers maintain both arrays during ingestion.
-After sync and managed-index creation complete, run the backfill call (it has
-no historical heap pages to scan) and the finalizer.
+The deferred-maintenance migration disables the 22 legacy maintenance triggers.
+The seven TRUNCATE guards remain enabled. It also retires the old `backfill`
+procedure and writer-lock function; the old `finalize.sql` now fails closed.
+Do not re-enable the legacy triggers after backfill.
 
-For an existing database, stop the Chaingraph agent before applying the
-migration. The migration uses the most widely accepted node as a compact
-historical default, without rewriting the output table. Run the resumable
-backfill, then the finalizer:
+## Initial sync and offline build
 
-```sql
-CALL output_membership.backfill(20000);
-```
+Set `CHAINGRAPH_OUTPUT_MEMBERSHIP_MODE=deferred` for initial sync. Record both mainnet and chipnet
+normalized completion and managed-index completion before starting the build.
+Pause all writers and use the fenced lock-free runner in the infrastructure
+experiment worktree:
 
-```sh
-psql "$CHAINGRAPH_POSTGRES_CONNECTION_STRING" \
-  --file scripts/output-node-membership/finalize.sql
-```
+- `experiments/chaingraph/gke-test/fresh-sync/prepare_lock_free_array_backfill.py`
+- `experiments/chaingraph/gke-test/fresh-sync/prepare_lock_free_array_backfill.sql`
+- `experiments/chaingraph/gke-test/fresh-sync/performance_finalize_lock_free_arrays.sql`
 
-The backfill commits after each heap-page range. Its cursor and batch history
-are in `output_membership.state` and
-`output_membership.backfill_batch`; rerunning the same `CALL` resumes it. The
-procedure holds the same advisory lock used by ingestion triggers, so other
-writes wait until it finishes. Keeping the agent stopped also prevents an
-unbounded queue of waiting ingestion work.
+Those tools validate the original run/cluster/volume identity, fence ordinary
+writers, rebuild the entire then-current heap, retain durable batch progress,
+and build the array indexes. A historical partial build cannot be reused as
+complete coverage after deferred ingestion has resumed. Preserve the original
+experiment start time and interruptions in performance reporting.
 
-The finalizer builds any missing indexes, analyzes `input` and `output`, and
-independently reconstructs all accepted and unspent memberships from the
-normalized tables. It marks the GraphQL roots ready only after finding no
-missing, extra, malformed, or OP_RETURN memberships.
+## Ongoing maintenance after build
 
-`unspent_node_ids` deliberately excludes locking bytecode beginning with
-`OP_RETURN` (`0x6a`). Such outputs remain in `accepted_node_ids`, preserving
-the distinction between transaction acceptance and spendable output state.
+`scripts/output-node-membership/incremental.sql` is a separate candidate for
+targeted maintenance. It uses ordinary node/output row locks and no advisory
+locks. The agent must acquire node locks before normalized writes, collect all
+explicit and implicit acceptance changes, and publish array changes in the
+same database transaction. Duplicate acceptance skips unchanged array values;
+spends and reorgs can remove membership. Late creators must include every
+already-accepting affected node, not only the announcing node.
+
+After the offline build, the candidate agent uses
+`CHAINGRAPH_OUTPUT_MEMBERSHIP_MODE=incremental`. Startup rejects enabled legacy
+triggers, missing collectors or array indexes, and incompatible readiness.
+The compatibility `baseline` mode is restricted to databases without legacy
+array triggers; it cannot reactivate the old advisory-lock path.
+
+This SQL must not be used alone to enable production queries. Prove the actual
+agent path on a fully backfilled benchmark clone first: dense and byte-heavy
+approximately 32 MB blocks, long reorgs, overlapping nodes, replay/restart,
+and bounded memory/backlog. Small warm SQL timings are preliminary evidence.
+Keep the original database fenced until the reviewed performance gate permits
+release. Do not silently switch an existing initial-sync image to this candidate.
+
+`unspent_node_ids` excludes locking bytecode beginning with `OP_RETURN` (`0x6a`).
+Such outputs can remain accepted. Normalized mempool/block acceptance and all
+accepted spenders remain authoritative; the arrays are derived query state.
