@@ -24,6 +24,16 @@ only `-whitelist=mempool@172.17.0.1/32` on its new owner-labeled disposable node
 Earlier actual peerinfo observed that host agent IP. The wrapper rejects a run
 if either actual agent connection has another IP or any additional permission.
 
+The wrapper also disables mocktime on the owned node before each actual agent
+connection. Pinned BCHN `net_processing.cpp` at89a591f7 computes inbound
+`nNextInvSend` from non-mockable `GetTimeMicros` (lines4357,4713), but compares
+it with mockable `current_time` (lines4358,4710). A fixed2023 mocktime therefore
+prevents subsequent transaction/BIP35 sends. Historical fixture headers remain
+valid using the node's real wall clock. The production agent clock is untouched;
+raw blockchaininfo snapshots retain actual node IBD state. The initial failed
+proof is retained as fixture-clock-confounded rather than an agent correctness
+failure at `/private/tmp/chaingraph-positive-mempool-1e83-20261006-v1`.
+
 Build and commit this worktree first; the underlying harness requires a clean,
 compiled source tree at the explicitly supplied revision. Run from this folder:
 
