@@ -61,6 +61,7 @@ export const validateOutputMembershipMode = async () => {
           'Array membership is installed; explicitly select deferred or incremental mode.'
         );
       }
+      // cspell:ignore attrelid attisdropped attname
       const arrayColumns = await client.query<{ present: boolean }>(`
         SELECT EXISTS (SELECT 1 FROM pg_attribute
           WHERE attrelid = 'public.output'::regclass AND NOT attisdropped
