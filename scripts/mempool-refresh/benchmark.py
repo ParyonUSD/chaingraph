@@ -56,6 +56,18 @@ def main():
             (self.directory / 'base-harness.snapshot.py').write_text(options.base_harness.read_text())
 
         def start_agent(self, mode):
+            # Pinned BCHN's inbound nNextInvSend derives from non-mockable
+            # GetTimeMicros but is compared to mockable current_time. A fixed
+            # 2023 clock prevents later BIP35/transaction trickle sends forever.
+            # Historical consensus headers remain valid with real node time;
+            # change only this owned node, never the production agent clock.
+            self.rpc('setmocktime', '0')
+            self.report['bip35_fixture_clock'] = {
+                'mocktime_during_agent_connections': 0,
+                'agent_clock_modified': False,
+                'reason': 'BCHN89 inbound send timer mixes wall-clock deadline and mockable comparison',
+                'primary_source': 'src/net_processing.cpp lines4357-4358,4710-4713 at pinned89a591f7',
+            }
             super().start_agent(mode)
 
             def ready_peers():
@@ -71,10 +83,13 @@ def main():
                 return True
 
             self.wait('two actual peers with narrow mempool-only permission', ready_peers)
+            (self.directory / f'blockchaininfo-{mode}-{self.agent_runs[mode]}.json').write_text(self.rpc('getblockchaininfo').stdout)
 
         def benchmark_reorg(self):
             super().benchmark_reorg()
             self.report['reorg']['automatic_reorg_discovery_pass'] = True
+            (self.directory / 'reorg-peerinfo-after.json').write_text(self.rpc('getpeerinfo').stdout)
+            (self.directory / 'reorg-blockchaininfo-after.json').write_text(self.rpc('getblockchaininfo').stdout)
             self.stop_agent()
             expected = sorted(json.loads(self.rpc('getrawmempool').stdout))
             original_db = self.db
