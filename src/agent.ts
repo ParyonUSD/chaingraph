@@ -21,6 +21,7 @@ import { BlockBuffer } from './components/block-buffer.js';
 import { BlockTree } from './components/block-tree.js';
 import { managedIndexesForMembershipMode } from './components/db-utils.js';
 import type { indexDefinitions } from './components/db-utils.js';
+import { requestMempoolRefresh } from './components/mempool-refresh.js';
 import { SyncState } from './components/sync-state.js';
 import {
   formatBytes,
@@ -600,6 +601,7 @@ export class Agent {
           }
           nodeRegisteredResolver();
           this.requestHeaders(node.name);
+          this.requestMempoolRefreshForNode(node.name);
         });
       });
 
@@ -930,6 +932,9 @@ export class Agent {
                       }
                       this.logger.info('Agent: enabled mempool tracking.');
                       this.saveInboundTransactions = true;
+                      Object.keys(this.nodes).forEach((nodeName) => {
+                        this.requestMempoolRefreshForNode(nodeName);
+                      });
                       this.scheduleIncompleteBlockRepair();
                       this.scheduleMempoolTransactionExpirationScan();
                     });
@@ -1891,11 +1896,29 @@ export class Agent {
           staleChain,
           `${nodeName}: re-organization detected beginning at height: ${firstHeight}. The following stale blocks were removed:`
         );
+        this.requestMempoolRefreshForNode(nodeName);
         this.scheduleBlockBufferFill();
       })
       .catch((err) => {
         this.logger.error(err);
       });
+  }
+
+  /** Request positive mempool announcements only once tracking is ready. */
+  requestMempoolRefreshForNode(nodeName: string) {
+    const node = this.nodes[nodeName]!;
+    if (
+      !this.saveInboundTransactions ||
+      this.willShutdown ||
+      node.internalId === undefined ||
+      node.peer.status !== 'ready'
+    ) {
+      return;
+    }
+    requestMempoolRefresh(node, this.transactionCache);
+    this.logger.info(
+      `${nodeName}: requested positive mempool refresh (BIP35).`
+    );
   }
 
   /**

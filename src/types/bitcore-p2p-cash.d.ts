@@ -70,6 +70,7 @@ declare module '@chaingraph/bitcore-p2p-cash' {
     inventory: BitcoreInventory[];
   }
   export class SendHeadersMessage extends Message<SendHeadersMessage> {}
+  export class MemPoolMessage extends Message<MemPoolMessage> {}
 
   export class TransactionMessage extends Message<TransactionMessage> {
     transaction: Transaction;
@@ -114,6 +115,7 @@ declare module '@chaingraph/bitcore-p2p-cash' {
         forTransaction: (transactionHash: Buffer | string) => InventoryMessage;
       };
       SendHeaders: typeof SendHeadersMessage;
+      MemPool: typeof MemPoolMessage;
       Transaction: typeof TransactionMessage;
     };
 
