@@ -61,6 +61,16 @@ export const validateOutputMembershipMode = async () => {
           'Array membership is installed; explicitly select deferred or incremental mode.'
         );
       }
+      const arrayColumns = await client.query<{ present: boolean }>(`
+        SELECT EXISTS (SELECT 1 FROM pg_attribute
+          WHERE attrelid = 'public.output'::regclass AND NOT attisdropped
+            AND attname IN ('accepted_node_ids', 'unspent_node_ids')) AS present;`);
+      if (arrayColumns.rows[0]?.present !== false) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw new Error(
+          'Baseline mode requires a schema without array membership columns.'
+        );
+      }
       return;
     }
     if (!retired) {

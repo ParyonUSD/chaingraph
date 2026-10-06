@@ -29,7 +29,7 @@ export const managedIndexesForMembershipMode = (
   ];
   return (
     Object.keys(indexDefinitions) as (keyof typeof indexDefinitions)[]
-  ).filter((name) => mode !== 'deferred' || !arrayIndexes.includes(name));
+  ).filter((name) => mode === 'incremental' || !arrayIndexes.includes(name));
 };
 
 /**

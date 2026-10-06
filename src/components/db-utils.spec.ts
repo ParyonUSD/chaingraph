@@ -121,6 +121,6 @@ test('deferred ingestion completes normalized indexes without building stale arr
   );
   t.deepEqual(
     managedIndexesForMembershipMode('baseline'),
-    managedIndexesForMembershipMode('incremental')
+    managedIndexesForMembershipMode('deferred')
   );
 });
