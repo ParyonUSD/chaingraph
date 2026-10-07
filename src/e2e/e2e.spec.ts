@@ -166,6 +166,7 @@ const e2eEnvVariables = {
   CHAINGRAPH_INTERNAL_API_PORT: chaingraphInternalApiPort,
   CHAINGRAPH_LOG_FIREHOSE: logP2pMessage.toString(),
   CHAINGRAPH_LOG_PATH: chaingraphE2eLogPath,
+  CHAINGRAPH_MEMPOOL_RESYNC_MIN_INTERVAL_MS: '100',
   CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS: '100',
   CHAINGRAPH_POSTGRES_CONNECTION_STRING: postgresE2eConnectionStringTestDb,
   CHAINGRAPH_TRUSTED_NODES: e2eTrustedNodesSet1,
@@ -189,6 +190,40 @@ const peers = {
   node1: placeholder,
   node2: placeholder,
   node3: placeholder,
+};
+
+/**
+ * The transaction hashes (hex, as displayed) each mock node announces in reply
+ * to a BIP35 `mempool` request, and the number of requests each has received.
+ */
+const mempoolReplies: { [nodeName in keyof typeof peers]: string[] } = {
+  node1: [],
+  node2: [],
+  node3: [],
+};
+const mempoolRequestCounts: { [nodeName in keyof typeof peers]: number } = {
+  node1: 0,
+  node2: 0,
+  node3: 0,
+};
+const respondToMempoolRequests = (nodeName: keyof typeof peers, peer: Peer) => {
+  peer.on('mempool', () => {
+    mempoolRequestCounts[nodeName] += 1;
+    logger.debug(
+      `e2e: ${nodeName} received mempool request, announcing: ${mempoolReplies[
+        nodeName
+      ].join(', ')}`
+    );
+    /**
+     * BIP35 replies may be split across multiple `inv` messages; announce each
+     * transaction in its own message.
+     */
+    mempoolReplies[nodeName].forEach((hash) => {
+      peer.sendMessage(
+        peer.messages.Inventory.forTransaction(Buffer.from(hash, 'hex'))
+      );
+    });
+  });
 };
 
 test.beforeEach((t) => {
@@ -243,15 +278,24 @@ test.before(async () => {
   };
   node1.on('peerready', (peer) => {
     logPeerConnection(`node1`, peer);
-    if (!peer.subversion.includes('tx-broadcast')) peers.node1 = peer;
+    if (!peer.subversion.includes('tx-broadcast')) {
+      peers.node1 = peer;
+      respondToMempoolRequests('node1', peer);
+    }
   });
   node2.on('peerready', (peer) => {
     logPeerConnection(`node2`, peer);
-    if (!peer.subversion.includes('tx-broadcast')) peers.node2 = peer;
+    if (!peer.subversion.includes('tx-broadcast')) {
+      peers.node2 = peer;
+      respondToMempoolRequests('node2', peer);
+    }
   });
   node3.on('peerready', (peer) => {
     logPeerConnection(`node3`, peer);
-    if (!peer.subversion.includes('tx-broadcast')) peers.node3 = peer;
+    if (!peer.subversion.includes('tx-broadcast')) {
+      peers.node3 = peer;
+      respondToMempoolRequests('node3', peer);
+    }
   });
 
   if (logP2pMessage) {
@@ -791,6 +835,27 @@ test.serial('[e2e] completes initial sync', async (t) => {
   await waitForStdout('Agent: initial sync is complete.');
   t.pass();
 });
+
+test.serial(
+  '[e2e] requests the mempool of each node once mempool tracking is enabled',
+  async (t) => {
+    await waitForStdout('Agent: enabled mempool tracking.');
+    await waitForStdout(
+      'node1: requested node mempool (BIP35) – triggers: mempool-tracking-enabled'
+    );
+    await waitForStdout(
+      'node2: requested node mempool (BIP35) – triggers: mempool-tracking-enabled'
+    );
+    await waitForStdout(
+      'node3: requested node mempool (BIP35) – triggers: mempool-tracking-enabled'
+    );
+    const delay = 500;
+    await sleep(delay);
+    t.true(mempoolRequestCounts.node1 >= 1);
+    t.true(mempoolRequestCounts.node2 >= 1);
+    t.true(mempoolRequestCounts.node3 >= 1);
+  }
+);
 
 test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
   await waitForStdout('Agent: all managed indexes have been created.');
@@ -2002,6 +2067,73 @@ test.serial(
   }
 );
 
+const getNodeValidationCount = async (nodeName: string, hash: string) =>
+  Number(
+    (
+      await client.query<{ count: string }>(
+        /* sql */ `
+        SELECT COUNT(*) FROM node_transaction
+          INNER JOIN node
+            ON node.internal_id = node_transaction.node_internal_id
+          INNER JOIN transaction
+            ON transaction.internal_id = node_transaction.transaction_internal_id
+          WHERE node.name = $1 AND transaction.hash = $2;
+      `,
+        [nodeName, hexToBin(hash)]
+      )
+    ).rows[0]!.count
+  );
+const deleteNodeValidation = async (nodeName: string, hash: string) =>
+  client.query(
+    /* sql */ `
+    DELETE FROM node_transaction
+      USING node, transaction
+      WHERE node_transaction.node_internal_id = node.internal_id
+        AND node_transaction.transaction_internal_id = transaction.internal_id
+        AND node.name = $1
+        AND transaction.hash = $2;
+    `,
+    [nodeName, hexToBin(hash)]
+  );
+const nodeValidationPollingAttempts = 50;
+const nodeValidationPollingIntervalMs = 100;
+/**
+ * Wait for the node's `node_transaction` row for the transaction, returning
+ * the final count of matching rows (`0` if it never appeared).
+ */
+const waitForNodeValidation = async (
+  nodeName: string,
+  hash: string,
+  remainingAttempts = nodeValidationPollingAttempts
+): Promise<number> => {
+  const count = await getNodeValidationCount(nodeName, hash);
+  if (count !== 0 || remainingAttempts === 0) {
+    return count;
+  }
+  await sleep(nodeValidationPollingIntervalMs);
+  return waitForNodeValidation(nodeName, hash, remainingAttempts - 1);
+};
+
+/**
+ * Model https://github.com/bitauth/chaingraph/issues/81: node3 accepted a
+ * transaction (its `node_transaction` row was saved and the agent cached
+ * node3's acknowledgement), the transaction was later confirmed (archiving the
+ * row), then a re-organization returned it to node3's mempool. Nodes don't
+ * re-announce such transactions; they only appear in replies to `mempool`.
+ */
+test.serial(
+  '[e2e] prepares a transaction for return to the mempool by a re-org',
+  async (t) => {
+    peers.node3.sendMessage(
+      new peers.node3.messages.Transaction(new Transaction(halTxRaw))
+    );
+    t.is(await waitForNodeValidation('node3', halTxHash), 1);
+    await deleteNodeValidation('node3', halTxHash);
+    t.is(await getNodeValidationCount('node3', halTxHash), 0);
+    mempoolReplies.node3 = [halTxHash];
+  }
+);
+
 test.serial('[e2e] handles re-org of a single block', async (t) => {
   newBlocks('node1', [tipA[1]!]);
   newBlocks('node2', [tipB[1]!]);
@@ -2022,6 +2154,24 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   );
   t.pass();
 });
+
+test.serial(
+  '[e2e] re-records transactions returned to the mempool by a re-org',
+  async (t) => {
+    await waitForStdout(
+      'node3: requested node mempool (BIP35) – triggers: reorganization'
+    );
+    t.is(await waitForNodeValidation('node3', halTxHash), 1);
+    /**
+     * Clean up: stop announcing the transaction, wait for any pending replies,
+     * then remove node3's validation so later tests are unaffected.
+     */
+    mempoolReplies.node3 = [];
+    const delay = 500;
+    await sleep(delay);
+    await deleteNodeValidation('node3', halTxHash);
+  }
+);
 
 test.serial(
   '[e2e] new block saved after reorg',
