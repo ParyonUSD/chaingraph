@@ -1,8 +1,8 @@
 # Ingestion gate
 
 A reproducible local harness that every schema or agent change must pass
-**before** query benchmarking. It exists because the abandoned "array columns"
-optimisation passed every query benchmark and then turned out to serialise
+**before** query benchmarking. It exists because an earlier schema experiment
+(since abandoned) passed every query benchmark and then turned out to serialise
 ingestion (6,578 tx/s → 2 tx/s in production; a 31.75 MB block went from 4.2 s
 to 27.4 s). Query benchmarks only look at reads; this gate looks at writes.
 
@@ -57,8 +57,8 @@ seed) and cached under `data/ingestion-gate/fixtures/` (gitignored, ~320 MB).
 Only transaction payloads are cached; headers are built at run time with a
 fresh timestamp so blocks attach to each scenario's base chain and count as
 "live" blocks. Transactions are 1-input/2-output, ~318 bytes, P2PKH outputs,
-~199-byte unlocking scripts (the shape of the no-array baseline's dense
-fixture); dependent blocks spend output 0 of every transaction of the previous
+~199-byte unlocking scripts (the shape of the production-schema dense-block
+baseline fixture); dependent blocks spend output 0 of every transaction of the previous
 block. Bump `fixtureGeneratorVersion` in `lib/fixtures.mjs` when changing
 the generator.
 
@@ -86,7 +86,7 @@ indexes built, triggers enabled – the production write path), then measure.
 
 | Scenario | What it does | Detects |
 | --- | --- | --- |
-| `max-block` | One 31.80 MB block (100,001 txs, 200,001 outputs) announced via `headers`. Fails on wall time, WAL bytes, peak heap; correctness = `block_transaction` row count. | Per-block write amplification (extra UPDATEs, array/membership maintenance, new indexes or triggers on hot tables), WAL growth, agent memory blow-ups. |
+| `max-block` | One 31.80 MB block (100,001 txs, 200,001 outputs) announced via `headers`. Fails on wall time, WAL bytes, peak heap; correctness = `block_transaction` row count. | Per-block write amplification (extra UPDATEs, maintenance triggers, new indexes or triggers on hot tables), WAL growth, agent memory blow-ups. |
 | `burst` | Three such blocks (block n+1 spends block n) in one `headers` message; total drain time. | Contention between concurrent block saves (locks, advisory locks, hot rows), memory pressure under backlog. |
 | `reorg` | Two nodes follow a 100-block branch A (1,000 txs/block), receive 40 mempool txs, then both switch to a 101-block branch B (B[0] confirms 30 of the 40). Times convergence; checks each node's accepted chain (B accepted, A not, blocks ≤ fork still accepted), `block_transaction` for B, confirmed txs removed from `node_transaction` and archived in `node_transaction_history`, unconfirmed txs still in mempool, and no mempool row confirmed in a block of the same node. | Slow or incorrect stale-block removal/re-acceptance, mempool cleanup trigger regressions. |
 | `concurrent` | A mainnet-like node (8 × 12,500-tx blocks) and a chipnet-like node (different magic/genesis, 50 × 2,000-tx blocks), each a *sequential* writer (announce a block, wait until saved, next). Run alone, alone, then together on one agent/DB. Ratio = together tx/s ÷ (sum of alone tx/s). | Cross-network serialisation (e.g. a global advisory lock: ratio → ~0.5). Perfect parallelism → 1.0; the agent's single JS thread keeps it below that. |
@@ -111,19 +111,20 @@ indexes built, triggers enabled – the production write path), then measure.
 fail on master; they are reported as `PASS*` instead of failing the gate.
 Remove an entry as soon as the underlying bug is fixed.
 
-**How the defaults were chosen.** From three master runs and one b19783b run
+**How the defaults were chosen.** From three master runs and one baseline b19783b run
 on the reference laptop (table below): time limits ≈ 2× the slowest
 reference run (max-block 10 s vs 5.2 s; burst 30 s vs 12.4 s; reorg 6 s vs
 1.4 s), WAL ≈ 1.5× (WAL is deterministic: 224.5 MB / 675 MB every run), heap
 ≈ 2×, catch-up ≈ 0.4× of the slowest run (300 vs 715 blocks/s – catch-up is
 bimodal at ~715 or ~950 blocks/s run-to-run on this machine), concurrency
 ratio 0.6 (reference 0.79–0.80; full serialisation gives ≤ 0.5). A plain 3×
-time limit would *not* have caught e800183 on max-block wall time alone
+time limit would *not* have caught the abandoned experiment e800183 on max-block wall time alone
 (2.4×), which is why WAL is gated tighter.
 
 **Calibrating on a new machine.**
 
-1. Build the reference revision (`archive/pre-array-master`, b19783b) and
+1. Build the reference revision (baseline b19783b, tag
+   `archive/pre-array-master`) and
    current master into separate directories, e.g.
    `git archive b19783b | tar -x -C /tmp/agents/b19783b`, symlink
    `node_modules`, run `./node_modules/.bin/tsc`.
@@ -133,7 +134,7 @@ time limit would *not* have caught e800183 on max-block wall time alone
    ~2×, `minBlocksPerSecond` to ~0.4× of the slowest run; keep
    `minConcurrencyRatio` at 0.6 unless the reference is below 0.7.
    Optionally confirm the regression build still fails (step 2 with
-   `archive/output-membership-arrays`, e800183).
+   abandoned experiment e800183, tag `archive/output-membership-arrays`).
 4. Commit the new `thresholds.json` (or pass `--thresholds` for a
    machine-local file).
 
@@ -141,10 +142,10 @@ time limit would *not* have caught e800183 on max-block wall time alone
 
 MacBook Pro (Apple M-series, 10 cores, 64 GB), Node 24.14, host PostgreSQL
 18.3 (`--pg auto` → host), default settings. Master: three runs (range);
-others: one run. **Bold** = fails the default thresholds – e800183 fails all
+others: one run. **Bold** = fails the default thresholds – abandoned experiment e800183 fails all
 five scenarios.
 
-| Scenario | b19783b (pre-array master) | 704aa3b (master) | e800183 (output-membership arrays) |
+| Scenario | baseline b19783b | master 704aa3b | abandoned experiment e800183 |
 | --- | --- | --- | --- |
 | max-block wall / tx/s / WAL / heap | 5.07 s / 19,740 / 224.5 MB / 837 MB | 4.97–5.15 s / ~19,400–20,100 / 224.5 MB / 836–869 MB | **12.02 s** / 8,322 / **500.3 MB** / 840 MB |
 | burst drain / tx/s / WAL | 12.40 s / 24,186 / 675 MB | 11.53–12.14 s / 24,700–26,000 / 675 MB | **44.90 s** / 6,682 / **1,684 MB** |
