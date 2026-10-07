@@ -1,4 +1,4 @@
-import { createHash } from 'crypto';
+import crypto, { createHash } from 'crypto';
 
 import type {
   BitcoreBlock,
@@ -84,7 +84,20 @@ export const createPeerMessages = (networkName: string) =>
     network: internalBitcore.Networks.get(networkName),
   });
 
-const sha256 = (data: Uint8Array) => createHash('sha256').update(data).digest();
+/**
+ * Node.js' one-shot `crypto.hash` (Node.js v20.12+, v21.7+) avoids creating a
+ * `Hash` object per call. (Not yet included in this project's `@types/node`.)
+ */
+const oneShotHash = (
+  crypto as unknown as {
+    hash?: (algorithm: string, data: Uint8Array, encoding: 'buffer') => Buffer;
+  }
+).hash;
+
+const sha256 =
+  oneShotHash === undefined
+    ? (data: Uint8Array) => createHash('sha256').update(data).digest()
+    : (data: Uint8Array) => oneShotHash('sha256', data, 'buffer');
 
 /**
  * Compute the transaction hash (A.K.A. "transaction ID") of an encoded transaction:
