@@ -18,9 +18,9 @@ For more information, and for examples of live subscriptions and complex queries
 This is the ParyonUSD fork of [bitauth/chaingraph](https://github.com/bitauth/chaingraph). This section exists only on `paryon`.
 
 - **`master`** — only changes proposed upstream. It is the head branch of [bitauth/chaingraph#76](https://github.com/bitauth/chaingraph/pull/76), so anything pushed there appears in that PR; nothing fork-only goes on `master`. Once #76 merges, `master` is reset onto `upstream/master` and `paryon` is rebased.
-- **`paryon`** (this branch) — the deployed fork: `master` plus fork-only work (ingestion gate harness, PR #4; parked block-confirmation trigger fix, PR #3; experiment images; GKE-specific changes). Production and lab images are built from `paryon`, and PRs for fork-only work target `paryon`.
+- **`paryon`** (this branch) — the deployed fork: `master` plus fork-only work (ingestion gate harness, PR #4; parked block-confirmation trigger fix, PR #5; experiment images; GKE-specific changes). Production and lab images are built from `paryon`, and PRs for fork-only work target `paryon`.
 - **Promotion** — to propose a fork-only change upstream, cherry-pick it from `paryon` onto a new branch off `master` and open a separate upstream PR; do not fold it into #76.
-- **Archive tags** — every pre-consolidation branch is tagged `archive/<branch>`. `archive/output-membership-arrays` is the abandoned array-columns tip (`e800183`); `archive/pre-array-master` is `b19783b`.
+- **Archive tags** — every pre-consolidation branch is tagged `archive/<branch>`. `archive/output-membership-arrays` is `e800183`; `archive/pre-array-master` is `b19783b`.
 
 ## Quick Start
 
