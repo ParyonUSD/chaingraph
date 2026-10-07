@@ -106,6 +106,10 @@ const sha256 =
 export const encodedTransactionToHash = (encodedTransaction: Uint8Array) =>
   sha256(sha256(encodedTransaction)).reverse().toString('hex');
 
+const coinbaseOutpointIndex = 0xffffffff;
+const hashLength = 32;
+const coinbaseOutpointTransactionHash = '00'.repeat(hashLength);
+
 /**
  * Convert a bitcore transaction to the Chaingraph format.
  * @param bitcoreTransaction - the bitcore transaction
@@ -117,31 +121,42 @@ export const bitcoreTransactionToChaingraphTransaction = (
   bitcoreTransaction: BitcoreTransaction,
   encodedTransaction: Uint8Array = bitcoreTransaction.toBuffer()
 ): ChaingraphTransaction => {
-  const isCoinbase = bitcoreTransaction.isCoinbase();
+  /**
+   * Fields are read directly rather than via bitcore's `Input.toObject`, which
+   * also decodes and stringifies each unlocking bytecode (`scriptString`).
+   */
+  const inputs = bitcoreTransaction.inputs.map((input) => ({
+    outpointIndex: input.outputIndex,
+    outpointTransactionHash: input.prevTxId.toString('hex'),
+    sequenceNumber: input.sequenceNumber,
+    // eslint-disable-next-line no-underscore-dangle
+    unlockingBytecode: input._scriptBuffer.toString('hex'),
+  }));
+  /**
+   * Equivalent to bitcore's `Transaction.isCoinbase`, reusing the hex-encoded
+   * outpoint transaction hash.
+   */
+  const isCoinbase =
+    inputs.length === 1 &&
+    inputs[0]!.outpointIndex === coinbaseOutpointIndex &&
+    inputs[0]!.outpointTransactionHash === coinbaseOutpointTransactionHash;
   return {
     hash: encodedTransactionToHash(encodedTransaction),
-    inputs: bitcoreTransaction.inputs.map((bitcoreInput) => {
-      const input = bitcoreInput.toObject();
-      return {
-        outpointIndex: input.outputIndex,
-        outpointTransactionHash: input.prevTxId,
-        sequenceNumber: input.sequenceNumber,
-        unlockingBytecode: input.script,
-      };
-    }),
+    inputs,
     isCoinbase,
     locktime: bitcoreTransaction.nLockTime,
-    outputs: bitcoreTransaction.outputs.map((bitcoreOutput) => {
-      const output = bitcoreOutput.toObject();
+    outputs: bitcoreTransaction.outputs.map((output) => {
+      const { tokenData } = output;
       return {
         fungibleTokenAmount:
-          output.tokenData === undefined
+          tokenData === undefined
             ? undefined
-            : BigInt(output.tokenData.amount),
-        lockingBytecode: output.script,
-        nonfungibleTokenCapability: output.tokenData?.nft?.capability,
-        nonfungibleTokenCommitment: output.tokenData?.nft?.commitment,
-        tokenCategory: output.tokenData?.category,
+            : BigInt(tokenData.amount.toString()),
+        // eslint-disable-next-line no-underscore-dangle
+        lockingBytecode: output._scriptBuffer.toString('hex'),
+        nonfungibleTokenCapability: tokenData?.nft?.capability,
+        nonfungibleTokenCommitment: tokenData?.nft?.commitment,
+        tokenCategory: tokenData?.category,
         valueSatoshis: BigInt(output.satoshis),
       };
     }),
