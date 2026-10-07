@@ -125,6 +125,8 @@
     "test:prettier": "prettier \"src/**/*.ts\" --list-different",
     "test:spelling": "cspell \"{README.md,.github/*.md,src/**/*.ts}\"",
     "test:ava": "nyc --silent ava --timeout=30s",
+    "ingestion-gate": "node scripts/ingestion-gate/run.mjs",
+    "test:ingestion-gate": "yarn build && node scripts/ingestion-gate/run.mjs",
     "test:e2e": "nyc --silent ava --match='*[e2e]*' --timeout=30s",
     "test:unit": "nyc --silent ava --match='!*[e2e]*'",
     "start": "yarn build && node bin/chaingraph.js",
