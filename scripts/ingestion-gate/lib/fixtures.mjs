@@ -4,7 +4,7 @@
  * Transactions are NOT valid (signatures are random bytes, inputs may spend
  * nonexistent outpoints) – the mock nodes never validate, and the agent only
  * stores what it is given. Shapes are chosen to resemble the dense "max-size
- * block" fixture used for the no-array baseline (1-input / 2-output P2PKH-like
+ * block" fixture used for the production-schema baseline (1-input / 2-output P2PKH-like
  * transactions of ~318 bytes, ~100k per 32 MB block), and dependent blocks
  * spend the previous block's outputs so input/output joins see real rows.
  *
