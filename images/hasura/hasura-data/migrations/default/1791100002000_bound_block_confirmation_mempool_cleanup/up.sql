@@ -5,9 +5,9 @@ DECLARE
   inserted_node_ids smallint[];
   inserted_block_ids bigint[];
   inserted_timestamps timestamp without time zone[];
-  accepted_node_ids smallint[];
-  accepted_transaction_ids bigint[];
-  accepted_timestamps timestamp without time zone[];
+  confirmed_node_ids smallint[];
+  confirmed_transaction_ids bigint[];
+  confirmed_timestamps timestamp without time zone[];
   spent_node_ids smallint[];
   spent_transaction_ids bigint[];
   spent_timestamps timestamp without time zone[];
@@ -28,7 +28,7 @@ BEGIN
   SELECT array_agg(inserted.node_internal_id ORDER BY inserted.ordinality, block_transaction.transaction_internal_id),
          array_agg(block_transaction.transaction_internal_id ORDER BY inserted.ordinality, block_transaction.transaction_internal_id),
          array_agg(inserted.accepted_at ORDER BY inserted.ordinality, block_transaction.transaction_internal_id)
-    INTO accepted_node_ids, accepted_transaction_ids, accepted_timestamps
+    INTO confirmed_node_ids, confirmed_transaction_ids, confirmed_timestamps
     FROM unnest(inserted_node_ids, inserted_block_ids, inserted_timestamps)
       WITH ORDINALITY AS inserted(node_internal_id, block_internal_id, accepted_at, ordinality)
     CROSS JOIN LATERAL (
@@ -38,7 +38,7 @@ BEGIN
         OFFSET 0
     ) AS block_transaction;
 
-  IF accepted_transaction_ids IS NULL THEN
+  IF confirmed_transaction_ids IS NULL THEN
     RETURN NEW;
   END IF;
 
@@ -49,7 +49,7 @@ BEGIN
          array_agg(input.outpoint_index ORDER BY accepted.ordinality, input.input_index)
     INTO spent_node_ids, spent_transaction_ids, spent_timestamps,
          spent_outpoint_hashes, spent_outpoint_indexes
-    FROM unnest(accepted_node_ids, accepted_transaction_ids, accepted_timestamps)
+    FROM unnest(confirmed_node_ids, confirmed_transaction_ids, confirmed_timestamps)
       WITH ORDINALITY AS accepted(node_internal_id, transaction_internal_id, accepted_at, ordinality)
     JOIN input
       ON input.transaction_internal_id = accepted.transaction_internal_id

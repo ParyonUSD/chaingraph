@@ -58,7 +58,7 @@ CREATE TEMP TABLE node_block (node_internal_id smallint,
       'FUNCTION pg_temp.trigger_node_transaction_history_insert()'
     );
   const blockConfirmation = readMigration(
-    '1790950000000_bound_block_confirmation_mempool_cleanup',
+    '1791100002000_bound_block_confirmation_mempool_cleanup',
     'up'
   ).replace(
     'FUNCTION trigger_node_block_insert()',
@@ -184,7 +184,7 @@ test.serial(
   '[e2e] migration down restores the previous trigger function',
   async (t) => {
     const downMigration = readMigration(
-      '1790950000000_bound_block_confirmation_mempool_cleanup',
+      '1791100002000_bound_block_confirmation_mempool_cleanup',
       'down'
     );
     const down = downMigration.replace(
