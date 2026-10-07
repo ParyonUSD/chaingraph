@@ -50,6 +50,16 @@ declare module 'bitcore-lib-cash' {
     version: number;
   }
 
+  export namespace encoding {
+    class BufferReader {
+      pos: number;
+
+      readVarintNum: () => number;
+
+      constructor(buffer: Buffer);
+    }
+  }
+
   export interface BitcoreBlockHeader {
     hash: string;
     prevHash: Buffer;
@@ -60,8 +70,16 @@ declare module 'bitcore-lib-cash' {
     toHex: () => string;
   }
 
+  export namespace BlockHeader {
+    function fromBufferReader(
+      reader: encoding.BufferReader
+    ): BitcoreBlockHeader;
+  }
+
   export class Transaction {
     toObject: () => BitcoreTransactionObject;
+
+    fromBufferReader: (reader: encoding.BufferReader) => this;
 
     toBuffer: () => Uint8Array;
 
@@ -70,10 +88,12 @@ declare module 'bitcore-lib-cash' {
     hash: string;
 
     inputs: {
-      prevTxId: string;
+      prevTxId: Buffer;
       outputIndex: number;
       sequenceNumber: number;
       script: BitcoreScript;
+      _scriptBuffer: Buffer;
+      toObject: () => BitcoreTransactionObject['inputs'][number];
     }[];
 
     nLockTime: number;
@@ -81,8 +101,13 @@ declare module 'bitcore-lib-cash' {
     outputs: {
       satoshis: number;
       script: BitcoreScript;
+      _scriptBuffer: Buffer;
+      toObject: () => BitcoreTransactionObject['outputs'][number];
       tokenData?: {
-        amount: string;
+        /**
+         * A bn.js `BN`
+         */
+        amount: { toString: () => string };
         category: string;
         nft?: {
           capability: 'minting' | 'mutable' | 'none';
@@ -93,19 +118,28 @@ declare module 'bitcore-lib-cash' {
 
     version: number;
 
-    constructor(hexOrObject: BitcoreTransactionObjectOptions | string);
+    constructor(hexOrObject?: BitcoreTransactionObjectOptions | string);
   }
 
   export class Block {
+    static fromBuffer: (encoded: Buffer) => Block;
+
     static fromObject: (contents: unknown) => Block;
 
     static fromString: (raw: string) => Block;
 
     toBuffer: () => Uint8Array;
 
+    toObject: () => unknown;
+
     header: BitcoreBlockHeader;
 
     transactions: Transaction[];
+
+    constructor(contents: {
+      header: BitcoreBlockHeader;
+      transactions: Transaction[];
+    });
   }
 
   interface Network {

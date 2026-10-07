@@ -16,6 +16,7 @@ import type pino from 'pino';
 import {
   bitcoreBlockToChaingraphBlock,
   bitcoreTransactionToChaingraphTransaction,
+  createPeerMessages,
 } from './bitcore.js';
 import { BlockBuffer } from './components/block-buffer.js';
 import { BlockTree } from './components/block-tree.js';
@@ -496,7 +497,10 @@ export class Agent {
         subversion: chaingraphUserAgent,
         version: chaingraphProtocolVersion,
       };
-      const peer = new Peer(peerConfig);
+      const peer = new Peer({
+        ...peerConfig,
+        messages: createPeerMessages(node.networkMagicHex),
+      });
       const peerTxBroadcastConnection = new Peer({
         ...peerConfig,
         subversion: `${chaingraphUserAgent}tx-broadcast/`,

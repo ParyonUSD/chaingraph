@@ -23,6 +23,12 @@ declare module '@chaingraph/bitcore-p2p-cash' {
     Block: {
       fromBuffer: (rawBlock: Buffer) => BlockMessage;
     };
+
+    constructor(options?: {
+      Block?: typeof Block;
+      network?: ReturnType<typeof bitcoreModule.Networks.get>;
+      Transaction?: typeof Transaction;
+    });
   }
 
   export const enum BitcoreInventoryType {
@@ -129,6 +135,7 @@ declare module '@chaingraph/bitcore-p2p-cash' {
 
     constructor(config: {
       host?: string;
+      messages?: Messages;
       network?: string;
       port?: number;
       relay?: boolean;
