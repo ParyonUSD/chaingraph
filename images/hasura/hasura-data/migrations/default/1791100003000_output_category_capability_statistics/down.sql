@@ -1,0 +1,1 @@
+DROP STATISTICS IF EXISTS output_category_capability_stats;

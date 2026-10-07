@@ -87,6 +87,9 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
+  migration(
+    'default/1791100003000_output_category_capability_statistics/up.sql'
+  ),
 ];
 
 const chaingraphInternalApiPort = '3201';
