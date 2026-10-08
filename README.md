@@ -125,6 +125,20 @@ helm list # show releases
 helm status my-chaingraph > status.txt
 ```
 
+#### Managed index upgrade notes
+
+<!-- cspell:ignore indisvalid indexrelid -->
+
+The agent builds its managed indexes ([`indexDefinitions`](./src/components/db-utils.ts)) with a plain `CREATE INDEX` each time it starts and completes initial sync, if they don't already exist. On an already-synced database, a plain build blocks writes to the indexed table (and delays mempool tracking) until it finishes. To avoid that, create newly-added managed indexes by hand with `CREATE INDEX CONCURRENTLY` **before** upgrading the agent; the agent then finds the index and skips it.
+
+- **`output_mutable_bytecode_index`** (mutable NFT outputs by locking bytecode; ~5 minutes and ~1 GB on BCH mainnet, 2026):
+
+  ```sql
+  CREATE INDEX CONCURRENTLY output_mutable_bytecode_index ON output USING btree (locking_bytecode) INCLUDE (token_category, transaction_hash, output_index) WHERE nonfungible_token_capability = 'mutable';
+  ```
+
+  If a concurrent build fails or is cancelled it leaves an `INVALID` index which the agent will treat as existing; check with `SELECT indisvalid FROM pg_index WHERE indexrelid = 'output_mutable_bytecode_index'::regclass;`, and if `false`, `DROP INDEX CONCURRENTLY output_mutable_bytecode_index;` and retry.
+
 ## Architecture
 
 Chaingraph is a Kubernetes application which manages a stack of open source software including one or more Bitcoin Cash full nodes, a syncing agent, a Postgres SQL database, and a Hasura instance.

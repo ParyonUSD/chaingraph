@@ -817,6 +817,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'node_pkey',
     'node_transaction_history_pkey',
     'node_transaction_pkey',
+    'output_mutable_bytecode_index',
     'output_pkey',
     'output_search_index',
     'spent_by_index',
@@ -3256,7 +3257,7 @@ test.serial(
   '[e2e] [sql] search functions use the 25-byte locking bytecode prefix index',
   async (t) => {
     const prefixIndexes = Object.entries(indexDefinitions).filter(
-      ([, definition]) => definition.includes('locking_bytecode')
+      ([, definition]) => definition.includes('substring(locking_bytecode')
     );
     t.deepEqual(
       prefixIndexes.map(([name]) => name),
@@ -3307,5 +3308,47 @@ test.serial(
       t.true(plan.includes('test_output_search_index'), plan);
       t.false(plan.includes('Seq Scan'), plan);
     });
+  }
+);
+
+test.serial(
+  '[e2e] [sql] mutable NFT locking bytecode lookups use output_mutable_bytecode_index',
+  async (t) => {
+    const definition = indexDefinitions.output_mutable_bytecode_index;
+    t.true(
+      definition.includes("WHERE nonfungible_token_capability = 'mutable'"),
+      definition
+    );
+    await client.query('BEGIN;');
+    const explainPlan = async () => {
+      await client.query(
+        definition.replace(
+          'CREATE INDEX output_mutable_bytecode_index',
+          'CREATE INDEX test_output_mutable_bytecode_index'
+        )
+      );
+      // cspell: disable-next-line
+      await client.query('SET LOCAL enable_seqscan = off;');
+      return (
+        await client.query<{
+          [column: string]: string;
+        }>(/* sql */ `EXPLAIN (COSTS OFF)
+            SELECT transaction_hash, output_index FROM output
+              WHERE token_category = '\\x2469acc5afa4b10cb5b5c04afb89c3a3ffd61c5da9c01e26d00951cae2a02544'::bytea
+                AND nonfungible_token_capability = 'mutable'
+                AND locking_bytecode = '\\xaa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287'::bytea`)
+      ).rows
+        .map((row) => Object.values(row).join(''))
+        .join('\n');
+    };
+    const rollback = async () => client.query('ROLLBACK;');
+    const plan = await explainPlan().then(
+      async (result) => rollback().then(() => result),
+      async (error: unknown) =>
+        // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+        rollback().then(async () => Promise.reject(error))
+    );
+    t.true(plan.includes('test_output_mutable_bytecode_index'), plan);
+    t.false(plan.includes('Seq Scan'), plan);
   }
 );
