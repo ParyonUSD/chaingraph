@@ -43,6 +43,7 @@ import {
   archiveMempoolTransactionsAcceptedByBlocks,
   createIndexes,
   getAllKnownBlockHashes,
+  getIncompleteBlockAuditState,
   getIncompleteBlocks,
   getIndexCreationProgress,
   getMempoolTransactionsExpiringBefore,
@@ -55,9 +56,14 @@ import {
   registerTrustedNodeWithDb,
   removeStaleBlocksForNode,
   saveBlock,
+  saveIncompleteBlockAudit,
   saveTransactionForNodes,
 } from './db.js';
-import type { ExpiringMempoolTransaction, IncompleteBlock } from './db.js';
+import type {
+  ExpiringMempoolTransaction,
+  IncompleteBlock,
+  IncompleteBlockAuditState,
+} from './db.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -342,6 +348,20 @@ export class Agent {
   incompleteBlockRepairNextHeight = 0;
 
   completedIncompleteBlockRepairScan = false;
+
+  /**
+   * State of the in-progress incomplete block repair scan: the audit markers
+   * loaded when it began, and the nodes which were registered for every batch
+   * (only those nodes' markers are advanced when the scan completes).
+   */
+  incompleteBlockAuditPass:
+    | {
+        auditState: IncompleteBlockAuditState;
+        auditedBlockCount: number;
+        nodeInternalIdsInEveryBatch: number[];
+        startedAt: number;
+      }
+    | undefined;
 
   /**
    * The next second after which to log another warning that one or more nodes
@@ -1274,16 +1294,98 @@ export class Agent {
     }, Promise.resolve());
   }
 
+  /**
+   * Begin (or continue) an incomplete block audit pass. Blocks which a
+   * previous, completed pass already audited for a node are skipped for that
+   * node, so restarting a synced agent doesn't re-read every saved
+   * transaction (~51 GB on an 831k-block mainnet database).
+   */
+  async getIncompleteBlockAuditPass(nodeInternalIds: number[]) {
+    if (this.incompleteBlockAuditPass !== undefined) {
+      return this.incompleteBlockAuditPass;
+    }
+    const auditState = await getIncompleteBlockAuditState(nodeInternalIds);
+    const auditPass = {
+      auditState,
+      auditedBlockCount: 0,
+      nodeInternalIdsInEveryBatch: nodeInternalIds,
+      startedAt: Date.now(),
+    };
+    this.incompleteBlockAuditPass = auditPass;
+    if (!auditState.auditTableExists) {
+      this.logger.warn(
+        'Agent: database schema has no incomplete_block_audit table, so the incomplete block repair scan will audit every saved block on each startup. Update the Hasura image to apply migrations.'
+      );
+      return auditPass;
+    }
+    const markers = nodeInternalIds.map(
+      (id) =>
+        `${id}: ${auditState.auditedThroughBlockInternalIds.get(id) ?? 'none'}`
+    );
+    this.logger.info(
+      `Agent: starting incomplete block repair scan; skipping blocks already audited per node (node internal_id: audited through block internal_id) – ${markers.join(
+        ', '
+      )}.`
+    );
+    return auditPass;
+  }
+
+  async completeIncompleteBlockAuditPass() {
+    const auditPass = this.incompleteBlockAuditPass;
+    this.incompleteBlockAuditPass = undefined;
+    if (auditPass === undefined) {
+      return;
+    }
+    const { auditState, auditedBlockCount, nodeInternalIdsInEveryBatch } =
+      auditPass;
+    const durationSeconds = (
+      (Date.now() - auditPass.startedAt) /
+      msPerSecond
+    ).toFixed(1);
+    this.logger.info(
+      `Agent: incomplete block repair scan audited ${auditedBlockCount.toLocaleString()} block(s) in ${durationSeconds} seconds.`
+    );
+    if (!auditState.auditTableExists) {
+      return;
+    }
+    await saveIncompleteBlockAudit({
+      auditedThroughBlockInternalId: auditState.maxBlockInternalId,
+      nodeInternalIds: nodeInternalIdsInEveryBatch,
+    })
+      .then(() => {
+        this.logger.debug(
+          `Agent: recorded incomplete block audit through block internal_id ${
+            auditState.maxBlockInternalId
+          } for node internal_id(s): ${nodeInternalIdsInEveryBatch.join(', ')}.`
+        );
+      })
+      .catch((err) => {
+        this.logger.error(
+          err,
+          'Agent: failed to record incomplete block audit; the next startup will audit these blocks again.'
+        );
+      });
+  }
+
   async repairIncompleteBlocksOnce() {
     const { finalHeight, heightLowerBound, heightUpperBound } =
       this.getIncompleteBlockRepairRange();
+    const nodeInternalIds = this.getRegisteredNodeInternalIds();
+    const auditPass = await this.getIncompleteBlockAuditPass(nodeInternalIds);
+    auditPass.nodeInternalIdsInEveryBatch =
+      auditPass.nodeInternalIdsInEveryBatch.filter((id) =>
+        nodeInternalIds.includes(id)
+      );
     const scanStartTime = Date.now();
     const { incompleteBlocks, scannedBlockCount } = await getIncompleteBlocks({
+      auditedThroughBlockInternalIds: nodeInternalIds.map(
+        (id) => auditPass.auditState.auditedThroughBlockInternalIds.get(id) ?? 0
+      ),
       excludedBlockHashes: [],
       heightLowerBound,
       heightUpperBound,
       limit: incompleteBlockRepairBatchSize,
-      nodeInternalIds: this.getRegisteredNodeInternalIds(),
+      nodeInternalIds,
     });
     const scanDurationMs = Date.now() - scanStartTime;
     const scanRate =
@@ -1292,6 +1394,10 @@ export class Agent {
         : Math.round((scannedBlockCount / scanDurationMs) * msPerSecond);
     const scanPerformanceLog = `scanned ${scannedBlockCount.toLocaleString()} block(s) in ${scanDurationMs.toLocaleString()}ms (${scanRate.toLocaleString()} blocks/s)`;
     if (incompleteBlocks.length === 0) {
+      auditPass.auditedBlockCount += scannedBlockCount;
+      if (heightUpperBound === finalHeight) {
+        await this.completeIncompleteBlockAuditPass();
+      }
       this.updateIncompleteBlockRepairProgress({
         finalHeight,
         heightLowerBound,
