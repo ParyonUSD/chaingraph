@@ -2748,13 +2748,15 @@ const createdByAcceptedSql = /* sql */ `
 const scenarioHash = (byte: string) => `e7${byte.repeat(31)}`;
 const scenarioTransaction = (
   byte: string,
-  spends: number[],
+  spends: (number | [string, number])[],
   outputCount = 1
 ): ChaingraphTransaction => ({
   hash: scenarioHash(byte),
-  inputs: spends.map((outpointIndex) => ({
-    outpointIndex,
-    outpointTransactionHash: scenarioHash('f0'),
+  inputs: spends.map((spend) => ({
+    outpointIndex: typeof spend === 'number' ? spend : spend[1],
+    outpointTransactionHash: scenarioHash(
+      typeof spend === 'number' ? 'f0' : spend[0]
+    ),
     sequenceNumber: 0,
     unlockingBytecode: '51',
   })),
@@ -2844,7 +2846,7 @@ const runUnspentTrackingScenario = async (
     // fund:0 stays unspent; fund:1 is spent in the same block
     await saveBlockFor(
       block('b1', [
-        scenarioTransaction('f0', [], 6),
+        scenarioTransaction('f0', [], 10),
         scenarioTransaction('a1', [1]),
       ]),
       nodeA
@@ -2880,6 +2882,44 @@ const runUnspentTrackingScenario = async (
       transactionInternalId: await transactionId('a5'),
     });
     await check('first of a cross-node double-spend dropped');
+    // child-before-parent across two saves: a mempool child, then its parent
+    await saveMempoolTransaction(scenarioTransaction('c1', [['b0', 0]]), nodeA);
+    await check('mempool child saved before its parent');
+    await saveBlockFor(
+      block('b6', [scenarioTransaction('b0', [['ff', 0]], 2)]),
+      nodeA
+    );
+    await check('parent saved after its mempool child (policy A)');
+    // child-before-parent across two blocks
+    await saveBlockFor(
+      block('b7', [scenarioTransaction('c2', [['b1', 0]])]),
+      nodeA
+    );
+    await saveBlockFor(
+      block('b8', [scenarioTransaction('b1', [['ff', 1]], 1)]),
+      nodeA
+    );
+    await check('parent block saved after its child block (policy A)');
+    // a later mempool-only spender must not replace a block-accepted one
+    await saveMempoolTransaction(scenarioTransaction('e1', [1]), nodeB);
+    await check('conflicting mempool spender of a mined output');
+    // a block-accepted spender replaces a mempool-only one
+    await saveMempoolTransaction(scenarioTransaction('a7', [6]), nodeA);
+    await saveBlockFor(block('b9', [scenarioTransaction('a8', [6])]), nodeA);
+    await check('block spender replaces a mempool spender');
+    // re-org replacing the spender: replacement block saved first
+    const replacedBlock = block('ba', [scenarioTransaction('91', [7])]);
+    await saveBlockFor(replacedBlock, nodeA);
+    await saveBlockFor(block('bb', [scenarioTransaction('92', [7])]), nodeA);
+    await check('competing block spender while the first is accepted');
+    await db.removeStaleBlocksForNode(nodeA, [replacedBlock.hash]);
+    await check('re-org replaced the spender (replacement saved first)');
+    // re-org replacing the spender: stale block removed first
+    const staleFirstBlock = block('bc', [scenarioTransaction('93', [8])]);
+    await saveBlockFor(staleFirstBlock, nodeA);
+    await db.removeStaleBlocksForNode(nodeA, [staleFirstBlock.hash]);
+    await saveBlockFor(block('bd', [scenarioTransaction('94', [8])]), nodeA);
+    await check('re-org replaced the spender (stale removed first)');
   } finally {
     await db.pool.end();
     if (originalPostgresConnectionString === undefined) {
@@ -2911,13 +2951,23 @@ test.serial(
         WHERE EXISTS (SELECT 1 FROM block_transaction bt WHERE bt.transaction_internal_id = t.internal_id)
            OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = t.internal_id)
            OR EXISTS (SELECT 1 FROM node_transaction_history h WHERE h.transaction_internal_id = t.internal_id))`;
+    /*
+     * `settable` writes no set rows while POLICY A cannot run (initial sync,
+     * no spent_by_index): those outputs are unaudited, so the comparison
+     * starts at the transactions saved after this point.
+     */
+    const settableWatermark = (
+      await client.query<{ id: string }>(
+        /* sql */ `SELECT COALESCE(max(internal_id), 0) AS id FROM transaction;`
+      )
+    ).rows[0]!.id;
     const domain = async () =>
       new Set(
         await rows(
           /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o WHERE ${trackedDomain}${
             unspentTrackingMode === 'marker'
               ? ' AND o.spent_by_transaction_internal_id IS NOT NULL'
-              : ''
+              : ` AND o.transaction_hash IN (SELECT hash FROM transaction WHERE internal_id > ${settableWatermark})`
           }`
         )
       );
@@ -2938,6 +2988,11 @@ test.serial(
         )
       );
     const check = async (step: string) => {
+      /*
+       * Fresh statistics: with stale estimates the reference query can plan
+       * correlated scans instead of hashed sub-plans (minutes, not ms).
+       */
+      await client.query('ANALYZE;');
       if (unspentTrackingMode === 'off') {
         t.is(
           await count(
@@ -2950,7 +3005,11 @@ test.serial(
         return;
       }
       const expected = await reference();
-      t.true(expected.length > 0, step);
+      t.true(
+        expected.length > 0 ||
+          (unspentTrackingMode === 'settable' && step === 'e2e chain state'),
+        step
+      );
       t.deepEqual(await stored(), expected, step);
       if (unspentTrackingMode === 'marker') {
         t.is(
@@ -2961,6 +3020,17 @@ test.serial(
               AND ${anyNodeAccepts('i.transaction_internal_id')})`),
           0,
           `${step}: every marker points at an accepted spender of that output`
+        );
+        t.is(
+          await count(/* sql */ `
+          SELECT count(*) AS n FROM output o WHERE o.spent_by_transaction_internal_id > 0
+            AND NOT EXISTS (SELECT 1 FROM block_transaction bt JOIN node_block nb ON nb.block_internal_id = bt.block_internal_id
+              WHERE bt.transaction_internal_id = o.spent_by_transaction_internal_id)
+            AND EXISTS (SELECT 1 FROM input i JOIN block_transaction bt ON bt.transaction_internal_id = i.transaction_internal_id
+              JOIN node_block nb ON nb.block_internal_id = bt.block_internal_id
+              WHERE i.outpoint_transaction_hash = o.transaction_hash AND i.outpoint_index = o.output_index)`),
+          0,
+          `${step}: a block-accepted spender is preferred over a mempool-only one`
         );
       }
     };
@@ -2978,7 +3048,15 @@ test.serial(
     );
     t.deepEqual(
       scenarioOutpoints.map((outpoint) => outpoint.split(':')[1]),
-      ['0', '3']
+      ['0', '3', '9']
+    );
+    t.deepEqual(
+      (await reference()).filter((outpoint) =>
+        [scenarioHash('b0'), scenarioHash('b1')].some((hash) =>
+          outpoint.startsWith(hash)
+        )
+      ),
+      [`${scenarioHash('b0')}:1`]
     );
     const cases = {
       droppedSpender: await count(/* sql */ `

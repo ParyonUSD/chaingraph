@@ -19,6 +19,7 @@ import { copyFromBuffers } from './components/pg-binary-copy.js';
 import {
   buildDeleteSpentFromSetSql,
   buildMarkSpentOutputsSql,
+  buildResolveNewOutputsSql,
   collectBlockSpends,
   configureUnspentTrackingTriggersSql,
   deleteStagedSpentFromSetSql,
@@ -26,6 +27,8 @@ import {
   markStagedSpentOutputsSql,
   outputMarkerInsertParts,
   reacceptSpendsSql,
+  resolveMempoolOutputsSql,
+  resolveStagedNewOutputsSql,
   unspentSetInsertCte,
   unspentTrackingTriggerNames,
 } from './components/unspent-tracking.js';
@@ -34,6 +37,7 @@ import {
   postgresConnectionString,
   postgresMaxConnections,
   postgresSynchronousCommit,
+  unspentResolveNewOutputs,
   unspentTracking,
 } from './config.js';
 import type {
@@ -47,10 +51,89 @@ export const pool = new pg.Pool({
 });
 
 /**
- * `CHAINGRAPH_UNSPENT_TRACKING` (experiment): extra column/value for output
- * inserts (empty in `off` and `settable` modes).
+ * `CHAINGRAPH_UNSPENT_TRACKING` (experiment): how new outputs are written.
+ * - `none`: mode `off`;
+ * - `unaudited`: `spent_by_index` or `block_inclusions_index` is missing
+ *   (initial sync), so POLICY A cannot run: new outputs get a NULL marker / no
+ *   set row (POLICY B's "unaudited", to be audited later);
+ * - `resolve`: new outputs written as unspent, then resolved (POLICY A);
+ * - `trust`: as `resolve` without the resolve statement (cost measurement only,
+ *   `CHAINGRAPH_UNSPENT_RESOLVE_NEW_OUTPUTS=false`).
  */
-const outputMarker = outputMarkerInsertParts(unspentTracking);
+type NewOutputPolicy = 'none' | 'resolve' | 'trust' | 'unaudited';
+// eslint-disable-next-line functional/no-let
+let resolveIndexesPresent = false;
+// eslint-disable-next-line functional/no-let
+let resolveIndexesCheckedAt = 0;
+const resolveIndexesRecheckMs = 30_000;
+const refreshResolveIndexesPresent = async (client: pg.PoolClient) => {
+  const now = Date.now();
+  if (
+    resolveIndexesPresent ||
+    now - resolveIndexesCheckedAt <= resolveIndexesRecheckMs
+  ) {
+    return;
+  }
+  resolveIndexesCheckedAt = now;
+  const present =
+    (
+      await client.query<{ present: boolean }>(
+        /* sql */ `SELECT to_regclass('public.spent_by_index') IS NOT NULL AND to_regclass('public.block_inclusions_index') IS NOT NULL AS present;`
+      )
+    ).rows[0]?.present === true;
+  // eslint-disable-next-line require-atomic-updates -- a cache flag; once true it stays true
+  resolveIndexesPresent = present;
+};
+const newOutputPolicy = async (
+  client: pg.PoolClient
+): Promise<NewOutputPolicy> => {
+  if (unspentTracking === 'off') {
+    return 'none';
+  }
+  await refreshResolveIndexesPresent(client);
+  if (!resolveIndexesPresent) {
+    return 'unaudited';
+  }
+  return unspentResolveNewOutputs ? 'resolve' : 'trust';
+};
+const tracksNewOutputs = (policy: NewOutputPolicy) =>
+  policy === 'resolve' || policy === 'trust';
+/**
+ * Extra column/value for output inserts (empty unless `marker` mode tracks
+ * new outputs).
+ */
+const outputMarkerFor = (policy: NewOutputPolicy) =>
+  outputMarkerInsertParts(tracksNewOutputs(policy) ? unspentTracking : 'off');
+const setInsertCteFor = (
+  policy: NewOutputPolicy,
+  outputSource: string,
+  newTransactions: string
+) =>
+  unspentSetInsertCte(
+    tracksNewOutputs(policy) ? unspentTracking : 'off',
+    outputSource,
+    newTransactions
+  );
+
+/**
+ * Per-save timings of the tracking statements (ms), for the agent's log.
+ */
+export interface UnspentTrackingTimings {
+  markMs: number;
+  policy: NewOutputPolicy;
+  resolveMs: number;
+}
+const timed = async (
+  sql: string | undefined,
+  run: (query: string) => Promise<unknown>
+) => {
+  if (sql === undefined) {
+    return 0;
+  }
+  const start = Date.now();
+  await run(sql);
+  return Date.now() - start;
+};
 
 /**
  * Re-mark (or remove from the set) the outpoints spent by transactions that
@@ -58,9 +141,10 @@ const outputMarker = outputMarkerInsertParts(unspentTracking);
  */
 const reacceptSpends = async (
   client: pg.PoolClient,
-  transactionInternalIds: (number | string)[]
+  transactionInternalIds: (number | string)[],
+  blockAccepted = false
 ) => {
-  const sql = reacceptSpendsSql(unspentTracking);
+  const sql = reacceptSpendsSql(unspentTracking, blockAccepted);
   if (sql === undefined || transactionInternalIds.length === 0) {
     return;
   }
@@ -619,6 +703,13 @@ export const saveTransactionForNodes = async (
     validatedAt: Date;
   }[]
 ) => {
+  const client = await pool.connect();
+  const policy = await newOutputPolicy(client).catch(async (err: unknown) => {
+    client.release();
+    // eslint-disable-next-line functional/no-promise-reject
+    return Promise.reject(err);
+  });
+  const outputMarker = outputMarkerFor(policy);
   const saveTransaction = /* sql */ `
 WITH transaction_values (hash, version, locktime, size_bytes, is_coinbase) AS (
   VALUES ('${hexToByteaString(transaction.hash)}'::bytea, ${
@@ -674,8 +765,8 @@ WITH transaction_values (hash, version, locktime, size_bytes, is_coinbase) AS (
     SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category::bytea, fungible_token_amount::bigint, nonfungible_token_capability::enum_nonfungible_token_capability, nonfungible_token_commitment::bytea${
       outputMarker.value
     } FROM output_values CROSS JOIN new_transaction
-)${unspentSetInsertCte(
-    unspentTracking,
+)${setInsertCteFor(
+    policy,
     '(SELECT transaction_hash, output_index, token_category, locking_bytecode FROM output_values CROSS JOIN new_transaction) AS new_outputs',
     '(SELECT transaction_hash AS hash FROM new_transaction) AS new_hashes'
   )}, insert_inputs AS (
@@ -699,7 +790,6 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
   SELECT node_internal_id, $1::bigint, validated_at FROM node_transaction_values
   ON CONFLICT ON CONSTRAINT "node_transaction_pkey" DO NOTHING;
 `;
-  const client = await pool.connect();
   // eslint-disable-next-line functional/no-try-statement
   try {
     await client.query('BEGIN;');
@@ -720,6 +810,11 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
     }
     await client.query(saveNodeValidations, [transactionInternalId]);
     await reacceptSpends(client, [transactionInternalId]);
+    if (policy === 'resolve') {
+      await client.query(resolveMempoolOutputsSql(unspentTracking)!, [
+        Buffer.from(transaction.hash, 'hex'),
+      ]);
+    }
     await client.query('COMMIT;');
   } catch (err) {
     await client.query('ROLLBACK;');
@@ -862,7 +957,9 @@ const clientsWithStageTables = new WeakSet<pg.PoolClient>();
  * cheaply; it is deliberately not a named prepared statement, so each block
  * is planned with the current size of the staging tables.
  */
-const addAllStagedTransactions = /* sql */ `
+const buildAddAllStagedTransactions = (policy: NewOutputPolicy) => {
+  const outputMarker = outputMarkerFor(policy);
+  return /* sql */ `
 WITH newly_saved_transactions (hash, internal_id) AS (
   INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
     SELECT hash, version, locktime, size_bytes, is_coinbase FROM pg_temp.chaingraph_stage_transaction
@@ -877,17 +974,24 @@ newly_saved_outputs AS (
       outputMarker.value
     } FROM pg_temp.chaingraph_stage_output
     WHERE transaction_hash IN (SELECT hash FROM newly_saved_transactions)
-)${unspentSetInsertCte(
-  unspentTracking,
-  'pg_temp.chaingraph_stage_output',
-  'newly_saved_transactions'
-)},
+)${setInsertCteFor(
+    policy,
+    'pg_temp.chaingraph_stage_output',
+    'newly_saved_transactions'
+  )},
 newly_saved_inputs AS (
   INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
     SELECT internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode
     FROM pg_temp.chaingraph_stage_input val INNER JOIN newly_saved_transactions txs ON val.transaction_hash = txs.hash
 )
 SELECT COUNT(*) FROM newly_saved_transactions;`;
+};
+const addAllStagedTransactions = Object.fromEntries(
+  (['none', 'resolve', 'trust', 'unaudited'] as const).map((policy) => [
+    policy,
+    buildAddAllStagedTransactions(policy),
+  ])
+) as { [policy in NewOutputPolicy]: string };
 
 /**
  * The `copy` write path's block statement: the same CTE as `addBlockQuery` in
@@ -994,6 +1098,7 @@ const saveBlockViaCopy = async ({
       await client.query(createStageTablesSql);
       clientsWithStageTables.add(client);
     }
+    const policy = await newOutputPolicy(client);
     await client.query('BEGIN;');
     await copyFromBuffers(client, [
       {
@@ -1015,7 +1120,7 @@ const saveBlockViaCopy = async ({
       ...stagedSpendCopies(stagedSpends),
     ]);
     const saveTransactionsResult = await client.query<{ count: string }>(
-      addAllStagedTransactions
+      addAllStagedTransactions[policy]
     );
     const savedTransactionCount = Number(saveTransactionsResult.rows[0]!.count);
     const transactionCacheMisses =
@@ -1030,13 +1135,19 @@ const saveBlockViaCopy = async ({
       block,
       Number(addBlockResult.rows[0]!.joinedTransactionCount)
     );
-    if (stagedSpendTrackingSql !== undefined) {
-      await client.query(stagedSpendTrackingSql);
-    }
+    const query = async (sql: string) => client.query(sql);
+    const markMs = await timed(stagedSpendTrackingSql, query);
+    const resolveMs = await timed(
+      policy === 'resolve'
+        ? resolveStagedNewOutputsSql(unspentTracking)
+        : undefined,
+      query
+    );
     await client.query('COMMIT;');
     return {
       attemptedSavedTransactions: unknownTransactions,
       transactionCacheMisses,
+      unspentTrackingTimings: { markMs, policy, resolveMs },
     };
   } catch (err) {
     await client.query('ROLLBACK;');
@@ -1097,6 +1208,13 @@ export const saveBlock = async ({
       unknownTransactions: blockTransactions.unknown,
     });
   }
+  const client = await pool.connect();
+  const policy = await newOutputPolicy(client).catch(async (err: unknown) => {
+    client.release();
+    // eslint-disable-next-line functional/no-promise-reject
+    return Promise.reject(err);
+  });
+  const outputMarker = outputMarkerFor(policy);
 
   const inputs: {
     inputIndex: number;
@@ -1199,8 +1317,8 @@ newly_saved_outputs AS (
       outputMarker.value
     } FROM unknown_output_values
     WHERE transaction_hash IN (SELECT hash FROM newly_saved_transactions)
-)${unspentSetInsertCte(
-    unspentTracking,
+)${setInsertCteFor(
+    policy,
     'unknown_output_values',
     'newly_saved_transactions'
   )},
@@ -1277,7 +1395,6 @@ SELECT
   (SELECT COUNT(*)::bigint FROM joined_transactions) AS "joinedTransactionCount",
   (SELECT COUNT(*)::bigint FROM inserted_block_transactions) AS "insertedBlockTransactionCount",
   (SELECT COUNT(*)::bigint FROM inserted_node_blocks) AS "insertedNodeBlockCount";`;
-  const client = await pool.connect();
   // eslint-disable-next-line functional/no-try-statement
   try {
     await client.query('BEGIN;');
@@ -1298,14 +1415,22 @@ SELECT
       block,
       Number(addBlockResult.rows[0]!.joinedTransactionCount)
     );
-    const spendTrackingSql = blockSpendTrackingSql(block);
-    if (spendTrackingSql !== undefined) {
-      await client.query(spendTrackingSql);
-    }
+    const query = async (sql: string) => client.query(sql);
+    const markMs = await timed(blockSpendTrackingSql(block), query);
+    const resolveMs = await timed(
+      policy === 'resolve'
+        ? buildResolveNewOutputsSql(
+            unspentTracking,
+            attemptedSavedTransactions.map((transaction) => transaction.hash)
+          )
+        : undefined,
+      query
+    );
     await client.query('COMMIT;');
     return {
       attemptedSavedTransactions,
       transactionCacheMisses,
+      unspentTrackingTimings: { markMs, policy, resolveMs },
     };
   } catch (err) {
     await client.query('ROLLBACK;');
@@ -1378,7 +1503,7 @@ export const acceptBlocksViaHeaders = async (
         nodeInternalId,
       ]
     );
-    await reacceptSpends(client, reaccepted.rows[0]?.ids ?? []);
+    await reacceptSpends(client, reaccepted.rows[0]?.ids ?? [], true);
     await client.query('COMMIT;');
     return nodeBlockInsertResult.rowCount;
   } catch (err) {

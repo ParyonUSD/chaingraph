@@ -48,6 +48,7 @@ const expectedOptions = [
   'CHAINGRAPH_POSTGRES_MAX_CONNECTIONS',
   'CHAINGRAPH_POSTGRES_SYNCHRONOUS_COMMIT',
   'CHAINGRAPH_TRUSTED_NODES',
+  'CHAINGRAPH_UNSPENT_RESOLVE_NEW_OUTPUTS',
   'CHAINGRAPH_UNSPENT_TRACKING',
   'CHAINGRAPH_USER_AGENT',
   'CHAINGRAPH_WRITE_PATH',
@@ -448,6 +449,14 @@ if (!isUnspentTrackingMode(configuration.CHAINGRAPH_UNSPENT_TRACKING)) {
  * `settable` (side table `unspent_output_set`). See `unspent-tracking.ts`.
  */
 const unspentTracking = configuration.CHAINGRAPH_UNSPENT_TRACKING;
+/**
+ * Set via `CHAINGRAPH_UNSPENT_RESOLVE_NEW_OUTPUTS` (experiment, default
+ * `true`): POLICY A, resolve each save's new outputs against `spent_by_index`
+ * (child-before-parent). `false` only to measure the policy's cost: new outputs
+ * are then trusted to be unspent.
+ */
+const unspentResolveNewOutputs =
+  configuration.CHAINGRAPH_UNSPENT_RESOLVE_NEW_OUTPUTS !== 'false';
 
 export {
   blockBufferTargetSizeMb,
@@ -467,5 +476,6 @@ export {
   postgresSynchronousCommit,
   isProduction,
   trustedNodes,
+  unspentResolveNewOutputs,
   unspentTracking,
 };

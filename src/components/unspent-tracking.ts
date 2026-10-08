@@ -95,6 +95,89 @@ newly_unspent_outputs AS (
 const bytea = (hex: string) => `'\\x${hex}'::bytea`;
 
 /**
+ * Conflicting spenders (block path; the new spender is block-accepted): set
+ * the marker when it is unset (NULL/0), or when the current spender is
+ * mempool-only. An existing block-accepted spender is never overwritten.
+ * `CASE` fixes the evaluation order, so the acceptance probe only runs for a
+ * conflicting marker.
+ */
+const markReplaces = (newSpender: string) => /* sql */ `CASE
+      WHEN o.spent_by_transaction_internal_id IS NULL OR o.spent_by_transaction_internal_id = 0 THEN true
+      WHEN o.spent_by_transaction_internal_id = ${newSpender} THEN false
+      ELSE NOT unspent_tracking_transaction_is_block_accepted(o.spent_by_transaction_internal_id)
+    END`;
+
+/**
+ * POLICY A (child-before-parent): new outputs are inserted as unspent (marker
+ * 0 / a set row), then one batched statement resolves them against
+ * `spent_by_index`: for each new transaction (`newTransactions`, a relation
+ * with a `hash` column), probe the inputs spending any of its outputs and keep
+ * an accepted spender (block-accepted first). Only outputs still marked 0 (or
+ * still in the set) change. Needs `spent_by_index` (production mode); the
+ * acceptance probe uses `block_inclusions_index`.
+ */
+const acceptedSpendersOf = (newTransactions: string) => /* sql */ `
+    SELECT DISTINCT ON (i.outpoint_transaction_hash, i.outpoint_index)
+           i.outpoint_transaction_hash, i.outpoint_index, i.transaction_internal_id AS spender_internal_id
+      FROM ${newTransactions}
+      CROSS JOIN LATERAL (
+        SELECT outpoint_transaction_hash, outpoint_index, transaction_internal_id FROM input
+          WHERE input.outpoint_transaction_hash = n.hash OFFSET 0
+      ) i
+      WHERE unspent_tracking_transaction_is_accepted(i.transaction_internal_id)
+      ORDER BY i.outpoint_transaction_hash, i.outpoint_index,
+        unspent_tracking_transaction_is_block_accepted(i.transaction_internal_id) DESC`;
+
+export const resolveNewOutputsSql = (
+  mode: UnspentTrackingMode,
+  newTransactions: string
+) =>
+  mode === 'marker'
+    ? /* sql */ `
+UPDATE output o SET spent_by_transaction_internal_id = s.spender_internal_id
+  FROM (${acceptedSpendersOf(newTransactions)}
+  ) s
+  WHERE o.transaction_hash = s.outpoint_transaction_hash
+    AND o.output_index = s.outpoint_index
+    AND o.spent_by_transaction_internal_id = 0;`
+    : mode === 'settable'
+    ? /* sql */ `
+DELETE FROM unspent_output_set u
+  USING (${acceptedSpendersOf(newTransactions)}
+  ) s
+  WHERE u.transaction_hash = s.outpoint_transaction_hash
+    AND u.output_index = s.outpoint_index;`
+    : undefined;
+
+/**
+ * `resolveNewOutputsSql` for the `sql` write path: the new transactions as a
+ * `VALUES` list. Returns `undefined` if there is nothing to resolve.
+ */
+export const buildResolveNewOutputsSql = (
+  mode: UnspentTrackingMode,
+  newTransactionHashes: string[]
+) =>
+  newTransactionHashes.length === 0
+    ? undefined
+    : resolveNewOutputsSql(
+        mode,
+        `(VALUES ${newTransactionHashes
+          .map((hash) => `(${bytea(hash)})`)
+          .join(',')}) AS n (hash)`
+      );
+
+/** `copy` write path: the staged (unknown) transactions. */
+export const resolveStagedNewOutputsSql = (mode: UnspentTrackingMode) =>
+  resolveNewOutputsSql(
+    mode,
+    '(SELECT hash FROM pg_temp.chaingraph_stage_transaction OFFSET 0) AS n'
+  );
+
+/** Mempool path: one transaction, `$1` its hash (`bytea`). */
+export const resolveMempoolOutputsSql = (mode: UnspentTrackingMode) =>
+  resolveNewOutputsSql(mode, '(SELECT $1::bytea AS hash) AS n');
+
+/**
  * `marker` mode, `sql` write path: one statement setting the spender of every
  * spent outpoint. The spender's internal_id is resolved by hash (the
  * transaction rows were inserted earlier in the same DB transaction). Rows
@@ -119,7 +202,7 @@ UPDATE output o SET spent_by_transaction_internal_id = spender.internal_id
   ) spender
   WHERE o.transaction_hash = v.outpoint_transaction_hash
     AND o.output_index = v.outpoint_index
-    AND o.spent_by_transaction_internal_id IS DISTINCT FROM spender.internal_id;`;
+    AND ${markReplaces('spender.internal_id')};`;
 
 /**
  * `settable` mode, `sql` write path: one statement deleting the set rows of
@@ -159,7 +242,7 @@ UPDATE output o SET spent_by_transaction_internal_id = s.spender_internal_id
   ) s
   WHERE o.transaction_hash = s.outpoint_transaction_hash
     AND o.output_index = s.outpoint_index
-    AND o.spent_by_transaction_internal_id IS DISTINCT FROM s.spender_internal_id;`;
+    AND ${markReplaces('s.spender_internal_id')};`;
 
 export const deleteStagedSpentFromSetSql = /* sql */ `
 DELETE FROM unspent_output_set u
@@ -170,11 +253,14 @@ DELETE FROM unspent_output_set u
 /**
  * Re-acceptance (a transaction or block that gains acceptance after its spends
  * may have been released): mark/delete from the saved inputs of the given
- * transactions. In `marker` mode only unset markers (NULL or 0) are written, so
- * an existing accepted spender is kept. `$1` is a `bigint[]` of transaction
+ * transactions. In `marker` mode a mempool acceptance only fills unset markers
+ * (NULL or 0); a block acceptance also replaces a mempool-only spender. `$1` is a `bigint[]` of transaction
  * internal IDs.
  */
-export const reacceptSpendsSql = (mode: UnspentTrackingMode) =>
+export const reacceptSpendsSql = (
+  mode: UnspentTrackingMode,
+  blockAccepted = false
+) =>
   mode === 'marker'
     ? /* sql */ `
 UPDATE output o SET spent_by_transaction_internal_id = i.transaction_internal_id
@@ -182,7 +268,11 @@ UPDATE output o SET spent_by_transaction_internal_id = i.transaction_internal_id
   JOIN input i ON i.transaction_internal_id = s.id
   WHERE o.transaction_hash = i.outpoint_transaction_hash
     AND o.output_index = i.outpoint_index
-    AND (o.spent_by_transaction_internal_id IS NULL OR o.spent_by_transaction_internal_id = 0);`
+    AND ${
+      blockAccepted
+        ? markReplaces('i.transaction_internal_id')
+        : '(o.spent_by_transaction_internal_id IS NULL OR o.spent_by_transaction_internal_id = 0)'
+    };`
     : mode === 'settable'
     ? /* sql */ `
 DELETE FROM unspent_output_set u

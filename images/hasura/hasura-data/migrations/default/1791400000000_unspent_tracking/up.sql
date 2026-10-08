@@ -49,6 +49,17 @@ CREATE FUNCTION unspent_tracking_transaction_is_accepted (transaction_internal_i
     OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = $1)
 $$;
 
+-- true if any node accepts the transaction in a block (mempool acceptance not
+-- counted): a block-accepted spender is preferred over a mempool-only one.
+CREATE FUNCTION unspent_tracking_transaction_is_block_accepted (transaction_internal_id bigint)
+  RETURNS boolean LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (
+      SELECT 1 FROM block_transaction bt
+        CROSS JOIN node n
+        JOIN node_block nb ON nb.node_internal_id = n.internal_id AND nb.block_internal_id = bt.block_internal_id
+        WHERE bt.transaction_internal_id = $1)
+$$;
+
 -- Called when acceptance rows of `spender_ids` were deleted: for each spender no
 -- node accepts any more, release the outputs it spent, unless another accepted
 -- spender exists (one probe of spent_by_index per released outpoint).
@@ -68,6 +79,7 @@ BEGIN
             AND other.outpoint_index = o.output_index
             AND other.transaction_internal_id <> released.transaction_internal_id
             AND unspent_tracking_transaction_is_accepted(other.transaction_internal_id)
+          ORDER BY unspent_tracking_transaction_is_block_accepted(other.transaction_internal_id) DESC
           LIMIT 1), 0)
       FROM released
       WHERE o.transaction_hash = released.outpoint_transaction_hash

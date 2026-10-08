@@ -58,7 +58,11 @@ import {
   saveBlock,
   saveTransactionForNodes,
 } from './db.js';
-import type { ExpiringMempoolTransaction, IncompleteBlock } from './db.js';
+import type {
+  ExpiringMempoolTransaction,
+  IncompleteBlock,
+  UnspentTrackingTimings,
+} from './db.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -246,6 +250,15 @@ interface Node {
  * After the initial sync, the agent maintains the node connections, updating
  * the database to keep it synchronized with each node.
  */
+/**
+ * Suffix for the block insert log: per-block timings of the
+ * `CHAINGRAPH_UNSPENT_TRACKING` statements (experiment).
+ */
+const formatUnspentTrackingTimings = (timings: UnspentTrackingTimings) =>
+  timings.policy === 'none'
+    ? ''
+    : ` | unspent tracking (${timings.policy}): mark ${timings.markMs} ms, resolve ${timings.resolveMs} ms`;
+
 export class Agent {
   logger: pino.BaseLogger;
 
@@ -1800,12 +1813,15 @@ export class Agent {
     );
 
     const startTime = Date.now();
-    const { attemptedSavedTransactions, transactionCacheMisses } =
-      await saveBlock({
-        block,
-        nodeAcceptances,
-        transactionCache: this.transactionCache,
-      });
+    const {
+      attemptedSavedTransactions,
+      transactionCacheMisses,
+      unspentTrackingTimings,
+    } = await saveBlock({
+      block,
+      nodeAcceptances,
+      transactionCache: this.transactionCache,
+    });
     this.blockDb?.add(block.hash);
     const completionTime = Date.now();
 
@@ -1861,7 +1877,10 @@ export class Agent {
     )} (${formatTransactionDuration(
       savedTransactionCount,
       durationMs
-    )}, ${formatTransactionRate(savedTransactionCount, durationMs)})`;
+    )}, ${formatTransactionRate(
+      savedTransactionCount,
+      durationMs
+    )})${formatUnspentTrackingTimings(unspentTrackingTimings)}`;
     if (isHistoricalSync) {
       this.logger.debug(blockSyncLog);
       this.logger.trace(blockInsertLog);

@@ -6,6 +6,7 @@ DROP FUNCTION IF EXISTS trigger_unspent_tracking_node_block_delete();
 DROP FUNCTION IF EXISTS trigger_unspent_tracking_node_transaction_delete();
 DROP FUNCTION IF EXISTS unspent_tracking_release_spenders(bigint[], text);
 DROP FUNCTION IF EXISTS unspent_tracking_transaction_is_accepted(bigint);
+DROP FUNCTION IF EXISTS unspent_tracking_transaction_is_block_accepted(bigint);
 DROP TABLE IF EXISTS unspent_output_set;
 DROP INDEX IF EXISTS output_unspent_search_index;
 DROP INDEX IF EXISTS output_unspent_token_category_index;

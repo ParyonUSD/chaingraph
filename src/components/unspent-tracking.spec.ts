@@ -15,10 +15,13 @@ import { decodeBinaryCopy } from './pg-binary-copy.js';
 import {
   buildDeleteSpentFromSetSql,
   buildMarkSpentOutputsSql,
+  buildResolveNewOutputsSql,
   collectBlockSpends,
   configureUnspentTrackingTriggersSql,
   outputMarkerInsertParts,
   reacceptSpendsSql,
+  resolveMempoolOutputsSql,
+  resolveStagedNewOutputsSql,
   unspentSetInsertCte,
   unspentTrackingTriggerNames,
 } from './unspent-tracking.js';
@@ -95,7 +98,12 @@ test('buildMarkSpentOutputsSql: one batched UPDATE over VALUES', (t) => {
   t.true(
     sql.includes('SET spent_by_transaction_internal_id = spender.internal_id')
   );
-  t.true(sql.includes('IS DISTINCT FROM spender.internal_id'));
+  t.true(
+    sql.includes(
+      'ELSE NOT unspent_tracking_transaction_is_block_accepted(o.spent_by_transaction_internal_id)'
+    ),
+    'a block-accepted marker is never overwritten'
+  );
   t.false(sql.includes(hash('00')), 'coinbase excluded');
 });
 
@@ -184,4 +192,49 @@ test('encodeStageSpends: binary rows match the staging table', (t) => {
       [hash('bb'), 0n, hash('cc')],
     ]
   );
+});
+
+test('resolve (policy A): one batched statement over the new transactions', (t) => {
+  t.is(buildResolveNewOutputsSql('marker', []), undefined);
+  t.is(resolveStagedNewOutputsSql('off'), undefined);
+  const marker = buildResolveNewOutputsSql('marker', [hash('bb'), hash('cc')])!;
+  t.is(marker.match(/UPDATE output o/gu)?.length, 1);
+  t.true(
+    marker.includes(
+      `(VALUES ('\\x${hash('bb')}'::bytea),('\\x${hash(
+        'cc'
+      )}'::bytea)) AS n (hash)`
+    ),
+    marker
+  );
+  t.true(
+    marker.includes('WHERE input.outpoint_transaction_hash = n.hash OFFSET 0')
+  );
+  t.true(
+    marker.includes(
+      'unspent_tracking_transaction_is_accepted(i.transaction_internal_id)'
+    )
+  );
+  t.true(
+    marker.includes(
+      'unspent_tracking_transaction_is_block_accepted(i.transaction_internal_id) DESC'
+    )
+  );
+  t.true(marker.includes('AND o.spent_by_transaction_internal_id = 0;'));
+  t.regex(
+    resolveStagedNewOutputsSql('settable')!,
+    /DELETE FROM unspent_output_set u[\s\S]*pg_temp\.chaingraph_stage_transaction/u
+  );
+  t.regex(
+    resolveMempoolOutputsSql('marker')!,
+    /\(SELECT \$1::bytea AS hash\) AS n/u
+  );
+});
+
+test('reacceptSpendsSql: a block acceptance may replace a mempool-only marker', (t) => {
+  t.regex(
+    reacceptSpendsSql('marker', true)!,
+    /ELSE NOT unspent_tracking_transaction_is_block_accepted/u
+  );
+  t.notRegex(reacceptSpendsSql('marker')!, /is_block_accepted/u);
 });

@@ -39,7 +39,7 @@ export class AgentProcess {
         CHAINGRAPH_TRUSTED_NODES: trustedNodes,
         // experiment knobs passed through from the gate's environment (agent defaults otherwise)
         ...Object.fromEntries(
-          ['CHAINGRAPH_UNSPENT_TRACKING', 'CHAINGRAPH_WRITE_PATH']
+          ['CHAINGRAPH_UNSPENT_RESOLVE_NEW_OUTPUTS', 'CHAINGRAPH_UNSPENT_TRACKING', 'CHAINGRAPH_WRITE_PATH']
             .filter((key) => process.env[key] !== undefined)
             .map((key) => [key, process.env[key]])
         ),
