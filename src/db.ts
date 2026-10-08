@@ -3,10 +3,20 @@ import pg from 'pg';
 
 import type { Agent } from './agent.js';
 import {
+  copyStageTableSql,
+  createStageTablesSql,
+  encodeStageBlockTransactions,
+  encodeStageInputs,
+  encodeStageOutputs,
+  encodeStageTransactions,
+} from './components/block-copy-rows.js';
+import {
   computeIndexCreationProgress,
   indexDefinitions,
 } from './components/db-utils.js';
+import { copyFromBuffers } from './components/pg-binary-copy.js';
 import {
+  chaingraphWritePath,
   postgresConnectionString,
   postgresMaxConnections,
   postgresSynchronousCommit,
@@ -676,6 +686,224 @@ export const recordNodeValidation = async (
 };
 
 /**
+ * Inside a block's DB transaction: throw (so the caller rolls back) unless
+ * every transaction of the block was found and linked via block_transaction.
+ */
+const verifyBlockTransactionsLinked = async (
+  client: pg.PoolClient,
+  block: ChaingraphBlock,
+  joinedTransactionCount: number
+) => {
+  const linkedBlockTransactionCount = Number(
+    (
+      await client.query<{ count: string }>(
+        /* sql */ `
+          SELECT COUNT(*)::bigint AS count
+            FROM block_transaction
+            INNER JOIN block ON block.internal_id = block_transaction.block_internal_id
+            WHERE block.hash = $1;
+        `,
+        [Buffer.from(block.hash, 'hex')]
+      )
+    ).rows[0]!.count
+  );
+  if (
+    joinedTransactionCount !== block.transactions.length ||
+    linkedBlockTransactionCount !== block.transactions.length
+  ) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `Failed to save all transactions for block ${block.height} (${block.hash}): joined ${joinedTransactionCount}/${block.transactions.length}, linked ${linkedBlockTransactionCount}/${block.transactions.length}.`
+    );
+  }
+};
+
+/**
+ * Pooled connections on which the `copy` write path's staging tables exist.
+ * (A replaced connection is a new client object, so it is set up again.)
+ */
+const clientsWithStageTables = new WeakSet<pg.PoolClient>();
+
+/**
+ * The `copy` write path's statement for transactions, outputs and inputs: the
+ * same CTE as `addAllTransactions` in `saveBlock`, reading the staged rows
+ * instead of `VALUES` lists. The text never changes, so Postgres parses it
+ * cheaply; it is deliberately not a named prepared statement, so each block
+ * is planned with the current size of the staging tables.
+ */
+const addAllStagedTransactions = /* sql */ `
+WITH newly_saved_transactions (hash, internal_id) AS (
+  INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
+    SELECT hash, version, locktime, size_bytes, is_coinbase FROM pg_temp.chaingraph_stage_transaction
+    ON CONFLICT ON CONSTRAINT "transaction_hash_key" DO NOTHING
+    RETURNING hash, internal_id
+),
+newly_saved_outputs AS (
+  INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment)
+    SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment FROM pg_temp.chaingraph_stage_output
+    WHERE transaction_hash IN (SELECT hash FROM newly_saved_transactions)
+),
+newly_saved_inputs AS (
+  INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
+    SELECT internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode
+    FROM pg_temp.chaingraph_stage_input val INNER JOIN newly_saved_transactions txs ON val.transaction_hash = txs.hash
+)
+SELECT COUNT(*) FROM newly_saved_transactions;`;
+
+/**
+ * The `copy` write path's block statement: the same CTE as `addBlockQuery` in
+ * `saveBlock`, with the block's transaction list read from the staging table
+ * and every other value passed as a parameter (so the text is fixed).
+ *
+ * `joined_transactions` is an index lookup per staged transaction (the
+ * `OFFSET 0` keeps the lateral subquery from being flattened into a join).
+ * Temporary tables have no statistics, and Postgres assumes at least 10 pages
+ * for a never-vacuumed table, so a small block's list is estimated at ~1,200
+ * rows; with a free choice the planner can pick a hash join over a full scan
+ * of `transaction`.
+ */
+const addStagedBlock = /* sql */ `
+WITH accepting_nodes (node_internal_id, accepted_at) AS (
+  SELECT * FROM unnest($10::bigint[], $11::timestamp[])
+),
+joined_transactions (internal_id, transaction_index) AS (
+  SELECT db.internal_id, val.transaction_index
+    FROM pg_temp.chaingraph_stage_block_transaction val
+    CROSS JOIN LATERAL (
+      SELECT internal_id FROM transaction WHERE transaction.hash = val.hash OFFSET 0
+    ) db
+),
+inserted_block (internal_id) AS (
+  INSERT INTO block (height, version, timestamp, hash, previous_block_hash, merkle_root, bits, nonce, size_bytes)
+    VALUES ($1::bigint, $2::bigint, $3::bigint, $4::bytea, $5::bytea, $6::bytea, $7::bigint, $8::bigint, $9::bigint)
+  ON CONFLICT ON CONSTRAINT "block_hash_key" DO NOTHING
+  RETURNING internal_id
+),
+new_or_existing_block (internal_id) AS (
+  SELECT COALESCE (
+    (SELECT internal_id FROM inserted_block),
+    (SELECT internal_id FROM block WHERE block.hash = $4::bytea)
+  )
+),
+inserted_block_transactions AS (
+  INSERT INTO block_transaction (block_internal_id, transaction_internal_id, transaction_index)
+    SELECT blk.internal_id, tx.internal_id, tx.transaction_index
+      FROM new_or_existing_block blk CROSS JOIN joined_transactions tx
+    ON CONFLICT ON CONSTRAINT "block_transaction_pkey" DO NOTHING
+    RETURNING transaction_internal_id
+),
+inserted_node_blocks AS (
+  INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
+  SELECT node.node_internal_id, blk.internal_id, node.accepted_at
+    FROM new_or_existing_block blk CROSS JOIN accepting_nodes node
+  ON CONFLICT ON CONSTRAINT "node_block_pkey" DO NOTHING
+  RETURNING block_internal_id
+)
+SELECT
+  (SELECT COUNT(*)::bigint FROM joined_transactions) AS "joinedTransactionCount",
+  (SELECT COUNT(*)::bigint FROM inserted_block_transactions) AS "insertedBlockTransactionCount",
+  (SELECT COUNT(*)::bigint FROM inserted_node_blocks) AS "insertedNodeBlockCount";`;
+
+/**
+ * The `copy` write path (`CHAINGRAPH_WRITE_PATH=copy`) of `saveBlock`: one DB
+ * transaction per block, as in the `sql` path. Rows are streamed with binary
+ * `COPY` into per-connection temporary staging tables, then inserted with the
+ * same statements, constraints and `ON CONFLICT DO NOTHING` handling.
+ */
+const saveBlockViaCopy = async ({
+  block,
+  nodeAcceptances,
+  unknownTransactions,
+}: {
+  block: ChaingraphBlock;
+  nodeAcceptances: {
+    nodeInternalId: number;
+    acceptedAt: Date | null;
+  }[];
+  unknownTransactions: ChaingraphTransaction[];
+}) => {
+  const stagedTransactions = encodeStageTransactions(unknownTransactions);
+  const stagedOutputs = encodeStageOutputs(unknownTransactions);
+  const stagedInputs = encodeStageInputs(unknownTransactions);
+  const stagedBlockTransactions = encodeStageBlockTransactions(block);
+  const blockParameters = [
+    block.height,
+    block.version,
+    block.timestamp,
+    Buffer.from(block.hash, 'hex'),
+    Buffer.from(block.previousBlockHash, 'hex'),
+    Buffer.from(block.merkleRoot, 'hex'),
+    block.bits,
+    block.nonce,
+    block.sizeBytes,
+    nodeAcceptances.map((acceptance) => acceptance.nodeInternalId),
+    nodeAcceptances.map((acceptance) =>
+      acceptance.acceptedAt === null
+        ? null
+        : acceptance.acceptedAt.toISOString()
+    ),
+  ];
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    if (!clientsWithStageTables.has(client)) {
+      /*
+       * Outside of the block's DB transaction, so a rolled-back block can't
+       * also roll back the table creation.
+       */
+      await client.query(createStageTablesSql);
+      clientsWithStageTables.add(client);
+    }
+    await client.query('BEGIN;');
+    await copyFromBuffers(client, [
+      {
+        messages: stagedTransactions,
+        statement: copyStageTableSql('chaingraph_stage_transaction'),
+      },
+      {
+        messages: stagedOutputs,
+        statement: copyStageTableSql('chaingraph_stage_output'),
+      },
+      {
+        messages: stagedInputs,
+        statement: copyStageTableSql('chaingraph_stage_input'),
+      },
+      {
+        messages: stagedBlockTransactions,
+        statement: copyStageTableSql('chaingraph_stage_block_transaction'),
+      },
+    ]);
+    const saveTransactionsResult = await client.query<{ count: string }>(
+      addAllStagedTransactions
+    );
+    const savedTransactionCount = Number(saveTransactionsResult.rows[0]!.count);
+    const transactionCacheMisses =
+      unknownTransactions.length - savedTransactionCount;
+    const addBlockResult = await client.query<{
+      insertedBlockTransactionCount: string;
+      insertedNodeBlockCount: string;
+      joinedTransactionCount: string;
+    }>(addStagedBlock, blockParameters);
+    await verifyBlockTransactionsLinked(
+      client,
+      block,
+      Number(addBlockResult.rows[0]!.joinedTransactionCount)
+    );
+    await client.query('COMMIT;');
+    return {
+      attemptedSavedTransactions: unknownTransactions,
+      transactionCacheMisses,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
+  } finally {
+    client.release();
+  }
+};
+
+/**
  * Save a block to the database, inserting all transactions which aren't already
  * known to exist in the database. (This method should only be used for blocks
  * which are not already saved to the database.)
@@ -717,6 +945,14 @@ export const saveBlock = async ({
     },
     { alreadySaved: [], unknown: [] }
   );
+
+  if (chaingraphWritePath === 'copy') {
+    return saveBlockViaCopy({
+      block,
+      nodeAcceptances,
+      unknownTransactions: blockTransactions.unknown,
+    });
+  }
 
   const inputs: {
     inputIndex: number;
@@ -905,31 +1141,11 @@ SELECT
       insertedNodeBlockCount: string;
       joinedTransactionCount: string;
     }>(addBlockQuery);
-    const joinedTransactionCount = Number(
-      addBlockResult.rows[0]!.joinedTransactionCount
+    await verifyBlockTransactionsLinked(
+      client,
+      block,
+      Number(addBlockResult.rows[0]!.joinedTransactionCount)
     );
-    const linkedBlockTransactionCount = Number(
-      (
-        await client.query<{ count: string }>(
-          /* sql */ `
-          SELECT COUNT(*)::bigint AS count
-            FROM block_transaction
-            INNER JOIN block ON block.internal_id = block_transaction.block_internal_id
-            WHERE block.hash = $1;
-        `,
-          [Buffer.from(block.hash, 'hex')]
-        )
-      ).rows[0]!.count
-    );
-    if (
-      joinedTransactionCount !== block.transactions.length ||
-      linkedBlockTransactionCount !== block.transactions.length
-    ) {
-      // eslint-disable-next-line functional/no-throw-statement
-      throw new Error(
-        `Failed to save all transactions for block ${block.height} (${block.hash}): joined ${joinedTransactionCount}/${block.transactions.length}, linked ${linkedBlockTransactionCount}/${block.transactions.length}.`
-      );
-    }
     await client.query('COMMIT;');
     return {
       attemptedSavedTransactions,

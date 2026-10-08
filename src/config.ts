@@ -49,6 +49,7 @@ const expectedOptions = [
   'CHAINGRAPH_POSTGRES_SYNCHRONOUS_COMMIT',
   'CHAINGRAPH_TRUSTED_NODES',
   'CHAINGRAPH_USER_AGENT',
+  'CHAINGRAPH_WRITE_PATH',
   'NODE_ENV',
 ] as const;
 const requireStringValues = (
@@ -409,6 +410,24 @@ const postgresSynchronousCommit =
  */
 const isProduction = configuration.NODE_ENV === 'production';
 
+const writePaths = ['sql', 'copy'] as const;
+const isWritePath = (value: string): value is (typeof writePaths)[number] =>
+  writePaths.includes(value as (typeof writePaths)[number]);
+if (!isWritePath(configuration.CHAINGRAPH_WRITE_PATH)) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_WRITE_PATH' environment variable: ${
+      configuration.CHAINGRAPH_WRITE_PATH
+    }. Must be one of the following: ${writePaths.join(', ')}`
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_WRITE_PATH` environment variable: `sql` (multi-row
+ * `INSERT … VALUES` statements) or `copy` (binary `COPY` into temporary
+ * staging tables, then `INSERT … SELECT`).
+ */
+const chaingraphWritePath = configuration.CHAINGRAPH_WRITE_PATH;
+
 export {
   blockBufferTargetSizeMb,
   chaingraphInternalApiPort,
@@ -417,6 +436,7 @@ export {
   chaingraphLogLevelStdout,
   chaingraphLogLevelPath,
   chaingraphUserAgent,
+  chaingraphWritePath,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
   mempoolTransactionExpirationMs,
