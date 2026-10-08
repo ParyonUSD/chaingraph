@@ -430,7 +430,7 @@ if (!isWritePath(configuration.CHAINGRAPH_WRITE_PATH)) {
  */
 const chaingraphWritePath = configuration.CHAINGRAPH_WRITE_PATH;
 
-const unspentTrackingModes = ['off', 'marker', 'settable'] as const;
+const unspentTrackingModes = ['off', 'marker', 'settable', 'bitmask'] as const;
 const isUnspentTrackingMode = (
   value: string
 ): value is (typeof unspentTrackingModes)[number] =>
@@ -445,8 +445,9 @@ if (!isUnspentTrackingMode(configuration.CHAINGRAPH_UNSPENT_TRACKING)) {
 }
 /**
  * Set via the `CHAINGRAPH_UNSPENT_TRACKING` environment variable (experiment):
- * `off` (default), `marker` (`output.spent_by_transaction_internal_id`) or
- * `settable` (side table `unspent_output_set`). See `unspent-tracking.ts`.
+ * `off` (default), `marker` (`output.spent_by_transaction_internal_id`),
+ * `settable` (side table `unspent_output_set`) or `bitmask`
+ * (`output.unspent_node_bits`). See `unspent-tracking.ts`.
  */
 const unspentTracking = configuration.CHAINGRAPH_UNSPENT_TRACKING;
 /**

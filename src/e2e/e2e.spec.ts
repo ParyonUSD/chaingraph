@@ -806,7 +806,13 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     }>(/* sql */ `
   SELECT indexname FROM pg_indexes WHERE schemaname = 'public' ORDER BY indexname;
   `)
-  ).rows.map((row) => row.indexname);
+  ).rows
+    .map((row) => row.indexname)
+    /*
+     * CHAINGRAPH_UNSPENT_TRACKING=bitmask adds one pair of partial indexes
+     * per node (checked by the unspent tracking test).
+     */
+    .filter((name) => !/^output_unspent_node_\d+_/u.test(name));
   t.deepEqual(indexes, [
     'block_hash_key',
     'block_height_index',
@@ -2724,6 +2730,31 @@ const anyNodeAccepts = (transactionInternalId: string) => /* sql */ `
              JOIN node_block nb ON nb.node_internal_id = n.internal_id AND nb.block_internal_id = bt.block_internal_id
              WHERE bt.transaction_internal_id = ${transactionInternalId})
    OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = ${transactionInternalId}))`;
+const nodeAccepts = (
+  transactionInternalId: string,
+  nodeId: number
+) => /* sql */ `
+  (EXISTS (SELECT 1 FROM block_transaction bt
+             JOIN node_block nb ON nb.node_internal_id = ${nodeId} AND nb.block_internal_id = bt.block_internal_id
+             WHERE bt.transaction_internal_id = ${transactionInternalId})
+   OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = ${transactionInternalId} AND nt.node_internal_id = ${nodeId}))`;
+/**
+ * F1g for one node (`unspent_output(node)` with the node resolved to its id).
+ */
+const nodeUnspentReferenceSql = (nodeId: number) => /* sql */ `
+  SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
+    WHERE CASE
+      WHEN EXISTS (SELECT 1 FROM input i WHERE i.outpoint_transaction_hash = o.transaction_hash
+                     AND i.outpoint_index = o.output_index AND ${nodeAccepts(
+                       'i.transaction_internal_id',
+                       nodeId
+                     )})
+      THEN false
+      ELSE EXISTS (SELECT 1 FROM transaction t WHERE t.hash = o.transaction_hash AND ${nodeAccepts(
+        't.internal_id',
+        nodeId
+      )})
+    END`;
 const unspentReferenceSql = /* sql */ `
   SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
     WHERE CASE
@@ -2852,6 +2883,18 @@ const runUnspentTrackingScenario = async (
       nodeA
     );
     await check('mined spend');
+    /*
+     * node b also accepts block b1 (via headers); a transaction only node b
+     * accepts spends f0:9: unspent for node a only, its output for node b only
+     */
+    await db.acceptBlocksViaHeaders(
+      nodeB,
+      [{ hash: scenarioHash('b1'), height: 999_000 }],
+      new Date()
+    );
+    await check('block accepted by a second node via headers');
+    await saveMempoolTransaction(scenarioTransaction('e2', [9]), nodeB);
+    await check('transaction accepted by one node only');
     await saveMempoolTransaction(scenarioTransaction('a2', [2]), nodeA);
     await check('mempool spend');
     await saveMempoolTransaction(scenarioTransaction('a3', [3]), nodeA);
@@ -2967,6 +3010,8 @@ test.serial(
           /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o WHERE ${trackedDomain}${
             unspentTrackingMode === 'marker'
               ? ' AND o.spent_by_transaction_internal_id IS NOT NULL'
+              : unspentTrackingMode === 'bitmask'
+              ? ' AND o.unspent_node_bits IS NOT NULL'
               : ` AND o.transaction_hash IN (SELECT hash FROM transaction WHERE internal_id > ${settableWatermark})`
           }`
         )
@@ -2987,6 +3032,7 @@ test.serial(
             WHERE ${createdByAcceptedSql}`
         )
       );
+    // eslint-disable-next-line complexity
     const check = async (step: string) => {
       /*
        * Fresh statistics: with stale estimates the reference query can plan
@@ -2996,12 +3042,34 @@ test.serial(
       if (unspentTrackingMode === 'off') {
         t.is(
           await count(
-            `SELECT count(*) AS n FROM output WHERE spent_by_transaction_internal_id IS NOT NULL`
+            `SELECT count(*) AS n FROM output WHERE spent_by_transaction_internal_id IS NOT NULL OR unspent_node_bits IS NOT NULL`
           ),
           0,
           step
         );
         t.is(await count(`SELECT count(*) AS n FROM unspent_output_set`), 0);
+        return;
+      }
+      if (unspentTrackingMode === 'bitmask') {
+        const nodeIds = (
+          await client.query<{ id: string }>(
+            /* sql */ `SELECT internal_id AS id FROM node ORDER BY internal_id;`
+          )
+        ).rows.map((row) => Number(row.id));
+        await nodeIds.reduce<Promise<unknown>>(
+          async (chain, nodeId) =>
+            chain.then(async () => {
+              t.deepEqual(
+                await inDomain(
+                  await rows(/* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
+                  WHERE (o.unspent_node_bits & (1::bigint << ${nodeId})) <> 0`)
+                ),
+                await inDomain(await rows(nodeUnspentReferenceSql(nodeId))),
+                `${step}: node ${nodeId}`
+              );
+            }),
+          Promise.resolve()
+        );
         return;
       }
       const expected = await reference();
@@ -3048,7 +3116,7 @@ test.serial(
     );
     t.deepEqual(
       scenarioOutpoints.map((outpoint) => outpoint.split(':')[1]),
-      ['0', '3', '9']
+      ['0', '3']
     );
     t.deepEqual(
       (await reference()).filter((outpoint) =>

@@ -19,7 +19,12 @@ import type {
   ChaingraphTransaction,
 } from '../types/chaingraph.js';
 
-export const unspentTrackingModes = ['off', 'marker', 'settable'] as const;
+export const unspentTrackingModes = [
+  'off',
+  'marker',
+  'settable',
+  'bitmask',
+] as const;
 export type UnspentTrackingMode = (typeof unspentTrackingModes)[number];
 
 export interface Spend {
@@ -60,6 +65,9 @@ export const newOutputMarkerValue = (mode: UnspentTrackingMode) =>
  * Column-list and select-list suffixes for `INSERT INTO output`.
  */
 export const outputMarkerInsertParts = (mode: UnspentTrackingMode) => {
+  if (mode === 'bitmask') {
+    return { column: ', unspent_node_bits', value: ', 0::bigint' };
+  }
   const value = newOutputMarkerValue(mode);
   return value === undefined
     ? { column: '', value: '' }
@@ -299,8 +307,15 @@ SELECT array_agg(DISTINCT bt.transaction_internal_id)::text[] AS ids
     );`;
 
 const triggers: {
-  [mode in 'marker' | 'settable']: readonly (readonly [string, string])[];
+  [mode in 'bitmask' | 'marker' | 'settable']: readonly (readonly [
+    string,
+    string
+  ])[];
 } = {
+  bitmask: [
+    ['node_block', 'trigger_unspent_bitmask_node_block_delete'],
+    ['node_transaction', 'trigger_unspent_bitmask_node_transaction_delete'],
+  ],
   marker: [
     ['node_block', 'trigger_unspent_marker_node_block_delete'],
     ['node_transaction', 'trigger_unspent_marker_node_transaction_delete'],
@@ -321,7 +336,7 @@ export const configureUnspentTrackingTriggersSql = (
   mode: UnspentTrackingMode,
   existingTriggers: { [name: string]: boolean }
 ) =>
-  (['marker', 'settable'] as const).flatMap((triggerMode) =>
+  (['marker', 'settable', 'bitmask'] as const).flatMap((triggerMode) =>
     triggers[triggerMode]
       .filter(
         ([, name]) =>
@@ -339,4 +354,35 @@ export const configureUnspentTrackingTriggersSql = (
 export const unspentTrackingTriggerNames = [
   ...triggers.marker.map(([, name]) => name),
   ...triggers.settable.map(([, name]) => name),
+  ...triggers.bitmask.map(([, name]) => name),
 ];
+
+/**
+ * `bitmask` mode: node `$1` starts accepting the transactions `$2` (call
+ * before recording the acceptance; see migration `unspent_bits_accept`).
+ */
+export const bitmaskAcceptSql = /* sql */ `SELECT unspent_bits_accept($1::bigint, $2::bytea[]);`;
+/**
+ * Headers path: called after inserting the node_block rows `$3` (their
+ * acceptance is ignored), so a block committed by a concurrent save is seen.
+ */
+export const bitmaskAcceptBlocksSql = /* sql */ `SELECT unspent_bits_accept($1::bigint, (SELECT array_agg(t.hash) FROM block_transaction bt JOIN transaction t ON t.internal_id = bt.transaction_internal_id WHERE bt.block_internal_id = ANY ($2::bigint[])), $2::bigint[]);`;
+/** Headers path, POLICY A for the same blocks. */
+export const bitmaskResolveBlocksSql = /* sql */ `SELECT unspent_bits_resolve($1::bigint, (SELECT array_agg(t.hash) FROM block_transaction bt JOIN transaction t ON t.internal_id = bt.transaction_internal_id WHERE bt.block_internal_id = ANY ($2::bigint[])));`;
+/** `bitmask` mode, POLICY A: call after recording the acceptance. */
+export const bitmaskResolveSql = /* sql */ `SELECT unspent_bits_resolve($1::bigint, $2::bytea[]);`;
+/** Node internal IDs map directly to bits: `bitmask` refuses IDs ≥ 64. */
+export const bitmaskMaxNodeInternalId = 63;
+/**
+ * The per-node partial indexes of `bitmask` mode (created at start-up for
+ * every node, like managed indexes).
+ */
+export const bitmaskNodeIndexDefinitions = (nodeInternalId: number) => {
+  // eslint-disable-next-line no-bitwise
+  const bit = (1n << BigInt(nodeInternalId)).toString();
+  const predicate = `(unspent_node_bits & ${bit}::bigint) <> 0`;
+  return {
+    [`output_unspent_node_${nodeInternalId}_search_index`]: `CREATE INDEX output_unspent_node_${nodeInternalId}_search_index ON output USING btree (substring(locking_bytecode, 0, 26)) WHERE ${predicate};`,
+    [`output_unspent_node_${nodeInternalId}_token_category_index`]: `CREATE INDEX output_unspent_node_${nodeInternalId}_token_category_index ON output USING btree (token_category) WHERE ${predicate};`,
+  };
+};

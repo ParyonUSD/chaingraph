@@ -17,6 +17,12 @@ import {
 } from './components/db-utils.js';
 import { copyFromBuffers } from './components/pg-binary-copy.js';
 import {
+  bitmaskAcceptBlocksSql,
+  bitmaskAcceptSql,
+  bitmaskMaxNodeInternalId,
+  bitmaskNodeIndexDefinitions,
+  bitmaskResolveBlocksSql,
+  bitmaskResolveSql,
   buildDeleteSpentFromSetSql,
   buildMarkSpentOutputsSql,
   buildResolveNewOutputsSql,
@@ -65,7 +71,7 @@ type NewOutputPolicy = 'none' | 'resolve' | 'trust' | 'unaudited';
 let resolveIndexesPresent = false;
 // eslint-disable-next-line functional/no-let
 let resolveIndexesCheckedAt = 0;
-const resolveIndexesRecheckMs = 30_000;
+const resolveIndexesRecheckMs = 5_000;
 const refreshResolveIndexesPresent = async (client: pg.PoolClient) => {
   const now = Date.now();
   if (
@@ -102,8 +108,27 @@ const tracksNewOutputs = (policy: NewOutputPolicy) =>
  * Extra column/value for output inserts (empty unless `marker` mode tracks
  * new outputs).
  */
-const outputMarkerFor = (policy: NewOutputPolicy) =>
-  outputMarkerInsertParts(tracksNewOutputs(policy) ? unspentTracking : 'off');
+const outputMarkerFor = (
+  policy: NewOutputPolicy,
+  acceptingNodeIds: number[] = []
+) => {
+  const parts = outputMarkerInsertParts(
+    tracksNewOutputs(policy) ? unspentTracking : 'off'
+  );
+  if (unspentTracking !== 'bitmask' || !tracksNewOutputs(policy)) {
+    return parts;
+  }
+  /*
+   * bitmask: new outputs are inserted with the bits of the nodes accepting
+   * this save, so `unspent_bits_accept` has nothing to set on them.
+   */
+  const mask = acceptingNodeIds.reduce(
+    // eslint-disable-next-line no-bitwise
+    (bits, id) => bits | (1n << BigInt(id)),
+    0n
+  );
+  return { column: parts.column, value: `, ${mask.toString()}::bigint` };
+};
 const setInsertCteFor = (
   policy: NewOutputPolicy,
   outputSource: string,
@@ -136,6 +161,65 @@ const timed = async (
 };
 
 /**
+ * `bitmask` mode: node acceptance (call before recording it) and POLICY A
+ * (call after), batched per save: one statement per accepting node. Returns
+ * the elapsed ms (0 if not applicable).
+ */
+/* eslint-disable max-params */
+const bitmaskStep = async (
+  client: pg.PoolClient,
+  sql: string,
+  policy: NewOutputPolicy,
+  nodeInternalIds: number[],
+  transactionHashes: string[]
+) => {
+  if (
+    unspentTracking !== 'bitmask' ||
+    !tracksNewOutputs(policy) ||
+    transactionHashes.length === 0
+  ) {
+    return 0;
+  }
+  const hashes = transactionHashes.map((hash) => Buffer.from(hash, 'hex'));
+  const start = Date.now();
+  await nodeInternalIds.reduce<Promise<unknown>>(
+    async (chain, nodeInternalId) =>
+      chain.then(async () => client.query(sql, [nodeInternalId, hashes])),
+    Promise.resolve()
+  );
+  return Date.now() - start;
+};
+const bitmaskAccept = async (
+  client: pg.PoolClient,
+  policy: NewOutputPolicy,
+  nodeInternalIds: number[],
+  transactionHashes: string[]
+) =>
+  bitmaskStep(
+    client,
+    bitmaskAcceptSql,
+    policy,
+    nodeInternalIds,
+    transactionHashes
+  );
+const bitmaskResolve = async (
+  client: pg.PoolClient,
+  policy: NewOutputPolicy,
+  nodeInternalIds: number[],
+  transactionHashes: string[]
+) =>
+  policy === 'resolve'
+    ? bitmaskStep(
+        client,
+        bitmaskResolveSql,
+        policy,
+        nodeInternalIds,
+        transactionHashes
+      )
+    : 0;
+/* eslint-enable max-params */
+
+/**
  * Re-mark (or remove from the set) the outpoints spent by transactions that
  * just gained an acceptance. No-op in `off` mode.
  */
@@ -149,6 +233,38 @@ const reacceptSpends = async (
     return;
   }
   await client.query(sql, [transactionInternalIds]);
+};
+
+/**
+ * `bitmask` mode: node internal IDs are the bit positions, so start-up is
+ * refused if any node has an ID above 63. Returns the per-node partial index
+ * statements still missing.
+ */
+const bitmaskIndexStatements = async (client: pg.PoolClient) => {
+  const nodeIds = (
+    await client.query<{ id: string }>(
+      /* sql */ `SELECT internal_id AS id FROM node ORDER BY internal_id;`
+    )
+  ).rows.map((row) => Number(row.id));
+  const tooHigh = nodeIds.filter((id) => id > bitmaskMaxNodeInternalId);
+  if (tooHigh.length > 0) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `CHAINGRAPH_UNSPENT_TRACKING=bitmask needs node internal IDs <= ${bitmaskMaxNodeInternalId} (bit positions); found ${tooHigh.join(
+        ', '
+      )}.`
+    );
+  }
+  const existingIndexes = (
+    await client.query<{ name: string }>(
+      /* sql */ `SELECT indexname AS name FROM pg_indexes WHERE schemaname = 'public';`
+    )
+  ).rows.map((row) => row.name);
+  return nodeIds.flatMap((id) =>
+    Object.entries(bitmaskNodeIndexDefinitions(id))
+      .filter(([name]) => !existingIndexes.includes(name))
+      .map(([, definition]) => definition)
+  );
 };
 
 /**
@@ -179,12 +295,14 @@ export const configureUnspentTracking = async () => {
       unspentTracking,
       existing
     );
-    await statements.reduce<Promise<unknown>>(
+    const indexStatements =
+      unspentTracking === 'bitmask' ? await bitmaskIndexStatements(client) : [];
+    await [...statements, ...indexStatements].reduce<Promise<unknown>>(
       async (chain, statement) =>
         chain.then(async () => client.query(statement)),
       Promise.resolve()
     );
-    return statements;
+    return [...statements, ...indexStatements];
   } finally {
     client.release();
   }
@@ -709,7 +827,10 @@ export const saveTransactionForNodes = async (
     // eslint-disable-next-line functional/no-promise-reject
     return Promise.reject(err);
   });
-  const outputMarker = outputMarkerFor(policy);
+  const outputMarker = outputMarkerFor(
+    policy,
+    nodeValidations.map((validation) => validation.nodeInternalId)
+  );
   const saveTransaction = /* sql */ `
 WITH transaction_values (hash, version, locktime, size_bytes, is_coinbase) AS (
   VALUES ('${hexToByteaString(transaction.hash)}'::bytea, ${
@@ -808,13 +929,19 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
         `Failed to save or find transaction while recording node validation: ${transaction.hash}`
       );
     }
+    const validatingNodeIds = nodeValidations.map(
+      (validation) => validation.nodeInternalId
+    );
+    await bitmaskAccept(client, policy, validatingNodeIds, [transaction.hash]);
     await client.query(saveNodeValidations, [transactionInternalId]);
     await reacceptSpends(client, [transactionInternalId]);
-    if (policy === 'resolve') {
-      await client.query(resolveMempoolOutputsSql(unspentTracking)!, [
+    const mempoolResolveSql = resolveMempoolOutputsSql(unspentTracking);
+    if (policy === 'resolve' && mempoolResolveSql !== undefined) {
+      await client.query(mempoolResolveSql, [
         Buffer.from(transaction.hash, 'hex'),
       ]);
     }
+    await bitmaskResolve(client, policy, validatingNodeIds, [transaction.hash]);
     await client.query('COMMIT;');
   } catch (err) {
     await client.query('ROLLBACK;');
@@ -842,6 +969,14 @@ export const recordNodeValidation = async (
    */
   // eslint-disable-next-line functional/no-try-statement
   try {
+    const policy = await newOutputPolicy(client);
+    await client.query('BEGIN;');
+    await bitmaskAccept(
+      client,
+      policy,
+      [validation.nodeInternalId],
+      [transactionHash]
+    );
     await client.query(/* sql */ `
     WITH node_transaction_values (node_internal_id, validated_at) AS (
       VALUES (
@@ -869,6 +1004,17 @@ export const recordNodeValidation = async (
         known.rows.map((row) => row.internalId)
       );
     }
+    await bitmaskResolve(
+      client,
+      policy,
+      [validation.nodeInternalId],
+      [transactionHash]
+    );
+    await client.query('COMMIT;');
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
   } finally {
     client.release();
   }
@@ -940,7 +1086,7 @@ const stagedSpendCopies = (stagedSpends: Buffer | undefined) =>
       ];
 
 const encodeStagedSpendsIfTracked = (block: ChaingraphBlock) =>
-  unspentTracking === 'off'
+  unspentTracking === 'off' || unspentTracking === 'bitmask'
     ? undefined
     : encodeStageSpends(collectBlockSpends(block));
 
@@ -957,8 +1103,11 @@ const clientsWithStageTables = new WeakSet<pg.PoolClient>();
  * cheaply; it is deliberately not a named prepared statement, so each block
  * is planned with the current size of the staging tables.
  */
-const buildAddAllStagedTransactions = (policy: NewOutputPolicy) => {
-  const outputMarker = outputMarkerFor(policy);
+const buildAddAllStagedTransactions = (
+  policy: NewOutputPolicy,
+  acceptingNodeIds: number[] = []
+) => {
+  const outputMarker = outputMarkerFor(policy, acceptingNodeIds);
   return /* sql */ `
 WITH newly_saved_transactions (hash, internal_id) AS (
   INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
@@ -1120,11 +1269,25 @@ const saveBlockViaCopy = async ({
       ...stagedSpendCopies(stagedSpends),
     ]);
     const saveTransactionsResult = await client.query<{ count: string }>(
-      addAllStagedTransactions[policy]
+      unspentTracking === 'bitmask'
+        ? buildAddAllStagedTransactions(
+            policy,
+            nodeAcceptances.map((acceptance) => acceptance.nodeInternalId)
+          )
+        : addAllStagedTransactions[policy]
     );
     const savedTransactionCount = Number(saveTransactionsResult.rows[0]!.count);
     const transactionCacheMisses =
       unknownTransactions.length - savedTransactionCount;
+    const acceptingNodeIds = nodeAcceptances.map(
+      (acceptance) => acceptance.nodeInternalId
+    );
+    const bitmaskAcceptMs = await bitmaskAccept(
+      client,
+      policy,
+      acceptingNodeIds,
+      block.transactions.map((transaction) => transaction.hash)
+    );
     const addBlockResult = await client.query<{
       insertedBlockTransactionCount: string;
       insertedNodeBlockCount: string;
@@ -1136,13 +1299,21 @@ const saveBlockViaCopy = async ({
       Number(addBlockResult.rows[0]!.joinedTransactionCount)
     );
     const query = async (sql: string) => client.query(sql);
-    const markMs = await timed(stagedSpendTrackingSql, query);
-    const resolveMs = await timed(
-      policy === 'resolve'
-        ? resolveStagedNewOutputsSql(unspentTracking)
-        : undefined,
-      query
-    );
+    const markMs =
+      bitmaskAcceptMs + (await timed(stagedSpendTrackingSql, query));
+    const resolveMs =
+      (await timed(
+        policy === 'resolve'
+          ? resolveStagedNewOutputsSql(unspentTracking)
+          : undefined,
+        query
+      )) +
+      (await bitmaskResolve(
+        client,
+        policy,
+        acceptingNodeIds,
+        unknownTransactions.map((transaction) => transaction.hash)
+      ));
     await client.query('COMMIT;');
     return {
       attemptedSavedTransactions: unknownTransactions,
@@ -1214,7 +1385,10 @@ export const saveBlock = async ({
     // eslint-disable-next-line functional/no-promise-reject
     return Promise.reject(err);
   });
-  const outputMarker = outputMarkerFor(policy);
+  const outputMarker = outputMarkerFor(
+    policy,
+    nodeAcceptances.map((acceptance) => acceptance.nodeInternalId)
+  );
 
   const inputs: {
     inputIndex: number;
@@ -1405,6 +1579,15 @@ SELECT
     const savedTransactionCount = Number(saveTransactionsResult.rows[0]!.count);
     const transactionCacheMisses =
       attemptedSavedTransactions.length - savedTransactionCount;
+    const acceptingNodeIds = nodeAcceptances.map(
+      (acceptance) => acceptance.nodeInternalId
+    );
+    const bitmaskAcceptMs = await bitmaskAccept(
+      client,
+      policy,
+      acceptingNodeIds,
+      block.transactions.map((transaction) => transaction.hash)
+    );
     const addBlockResult = await client.query<{
       insertedBlockTransactionCount: string;
       insertedNodeBlockCount: string;
@@ -1416,16 +1599,18 @@ SELECT
       Number(addBlockResult.rows[0]!.joinedTransactionCount)
     );
     const query = async (sql: string) => client.query(sql);
-    const markMs = await timed(blockSpendTrackingSql(block), query);
-    const resolveMs = await timed(
-      policy === 'resolve'
-        ? buildResolveNewOutputsSql(
-            unspentTracking,
-            attemptedSavedTransactions.map((transaction) => transaction.hash)
-          )
-        : undefined,
-      query
+    const newHashes = attemptedSavedTransactions.map(
+      (transaction) => transaction.hash
     );
+    const markMs =
+      bitmaskAcceptMs + (await timed(blockSpendTrackingSql(block), query));
+    const resolveMs =
+      (await timed(
+        policy === 'resolve'
+          ? buildResolveNewOutputsSql(unspentTracking, newHashes)
+          : undefined,
+        query
+      )) + (await bitmaskResolve(client, policy, acceptingNodeIds, newHashes));
     await client.query('COMMIT;');
     return {
       attemptedSavedTransactions,
@@ -1446,6 +1631,7 @@ SELECT
  *
  * Returns the number of node_blocks inserted.
  */
+/* eslint-disable complexity */
 export const acceptBlocksViaHeaders = async (
   nodeInternalId: number,
   acceptedBlocks: {
@@ -1493,9 +1679,29 @@ export const acceptBlocksViaHeaders = async (
      * released (stale for every node, then accepted again): re-mark them.
      */
     await client.query('BEGIN;');
+    const policy = await newOutputPolicy(client);
     const nodeBlockInsertResult = await client.query<{
       blockInternalId: string;
     }>(insertNodeBlocks);
+    const insertedBlockIds = nodeBlockInsertResult.rows.map(
+      (row) => row.blockInternalId
+    );
+    if (
+      unspentTracking === 'bitmask' &&
+      policy !== 'unaudited' &&
+      insertedBlockIds.length > 0
+    ) {
+      await client.query(bitmaskAcceptBlocksSql, [
+        nodeInternalId,
+        insertedBlockIds,
+      ]);
+      if (policy === 'resolve') {
+        await client.query(bitmaskResolveBlocksSql, [
+          nodeInternalId,
+          insertedBlockIds,
+        ]);
+      }
+    }
     const reaccepted = await client.query<{ ids: string[] | null }>(
       firstAcceptedBlockTransactionsSql,
       [
@@ -1516,6 +1722,7 @@ export const acceptBlocksViaHeaders = async (
     client.release();
   }
 };
+/* eslint-enable complexity */
 
 /**
  * Remove a list of stale blocks for the specified node. This is called during
@@ -1647,7 +1854,13 @@ export const createIndexes = async (
     client.release();
     return res.rowCount;
   });
-  return Promise.all(indexCreations);
+  const created = await Promise.all(indexCreations);
+  /*
+   * `CHAINGRAPH_UNSPENT_TRACKING`: POLICY A needs spent_by_index and
+   * block_inclusions_index; re-check on the next save.
+   */
+  resolveIndexesCheckedAt = 0;
+  return created;
 };
 
 /**
