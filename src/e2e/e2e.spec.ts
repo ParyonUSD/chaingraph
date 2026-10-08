@@ -28,6 +28,7 @@ import got from 'got';
 import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
+import type * as DbModule from '../db.js';
 import type { ChaingraphTransaction } from '../types/chaingraph.js';
 
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
@@ -87,6 +88,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
+  migration('default/1791200000000_add_incomplete_block_audit/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -809,6 +811,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'block_internal_id_key',
     'block_pkey',
     'block_transaction_pkey',
+    'incomplete_block_audit_pkey',
     'input_pkey',
     'node_block_history_pkey',
     'node_block_pkey',
@@ -2394,6 +2397,186 @@ test.serial(
       ),
       historicalRepairBlock.transactions.length
     );
+  }
+);
+
+const getIncompleteBlockAuditMarkers = async () =>
+  (
+    await client.query<{
+      auditedThroughBlockInternalId: string;
+      nodeInternalId: number;
+      nodeName: string;
+    }>(/* sql */ `
+      SELECT node.name AS "nodeName",
+             node.internal_id AS "nodeInternalId",
+             incomplete_block_audit.audited_through_block_internal_id
+               AS "auditedThroughBlockInternalId"
+        FROM incomplete_block_audit
+        INNER JOIN node
+          ON node.internal_id = incomplete_block_audit.node_internal_id
+        ORDER BY node.name;
+    `)
+  ).rows;
+
+const waitForIncompleteBlockAuditMarker = async (
+  nodeName: string,
+  remainingAttempts = blockRepairPollingAttempts
+): Promise<Awaited<ReturnType<typeof getIncompleteBlockAuditMarkers>>> => {
+  const markers = await getIncompleteBlockAuditMarkers();
+  if (
+    remainingAttempts <= 0 ||
+    markers.some((marker) => marker.nodeName === nodeName)
+  ) {
+    return markers;
+  }
+  await sleep(blockRepairPollingIntervalMs);
+  return waitForIncompleteBlockAuditMarker(nodeName, remainingAttempts - 1);
+};
+
+test.serial(
+  '[e2e] records incomplete block audit markers and skips audited blocks on restart',
+  async (t) => {
+    t.timeout(oneMinute);
+    const markers = await waitForIncompleteBlockAuditMarker('node4');
+    const markersByNode = new Map(
+      markers.map((marker) => [marker.nodeName, marker])
+    );
+    ['node1', 'node2', 'node4'].forEach((nodeName) => {
+      t.true(markersByNode.has(nodeName), `missing marker for ${nodeName}`);
+    });
+    const maxBlockInternalId = Number(
+      (
+        await client.query<{ max: string }>(
+          /* sql */ `SELECT MAX(internal_id) AS max FROM block;`
+        )
+      ).rows[0]!.max
+    );
+    markers.forEach((marker) => {
+      const auditedThrough = Number(marker.auditedThroughBlockInternalId);
+      t.true(auditedThrough > 0 && auditedThrough <= maxBlockInternalId);
+    });
+    /*
+     * The previous agent process completed a scan for node1 and node2, so this
+     * process loaded their markers (and skipped their audited blocks); node4 is
+     * new, so all of its blocks were audited (which repaired the incomplete
+     * historical block above).
+     */
+    t.regex(
+      stdoutBuffer,
+      new RegExp(
+        `starting incomplete block repair scan;[^\\n]*${
+          markersByNode.get('node1')!.nodeInternalId
+        }: \\d+[^\\n]*${markersByNode.get('node4')!.nodeInternalId}: none`,
+        'u'
+      )
+    );
+  }
+);
+
+test.serial(
+  '[e2e] getIncompleteBlocks skips blocks already audited for a node',
+  async (t) => {
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+      postgresE2eConnectionStringTestDb;
+    /*
+     * An earlier test ends the shared `db.js` pool, so load a fresh module
+     * instance (with its own pool) for this test.
+     */
+    const freshDbModuleUrl = `../db.js?incomplete-block-audit=${Date.now()}`;
+    const { getIncompleteBlocks, pool: freshDbPool } = (await import(
+      freshDbModuleUrl
+    )) as typeof DbModule;
+    const markersByNode = new Map(
+      (await getIncompleteBlockAuditMarkers()).map((marker) => [
+        marker.nodeName,
+        marker,
+      ])
+    );
+    const auditedNode1 = markersByNode.get('node1')!;
+    const auditedNode4 = markersByNode.get('node4')!;
+    const removedRow = (
+      await client.query<{
+        blockInternalId: string;
+        transactionIndex: number;
+        transactionInternalId: string;
+      }>(
+        /* sql */ `
+        DELETE FROM block_transaction
+          USING block
+          WHERE block.internal_id = block_transaction.block_internal_id
+            AND block.hash = $1
+            AND block_transaction.transaction_index = $2
+          RETURNING block_transaction.block_internal_id AS "blockInternalId",
+            block_transaction.transaction_internal_id
+              AS "transactionInternalId",
+            block_transaction.transaction_index AS "transactionIndex";
+      `,
+        [hexToBin(historicalRepairBlockHash), historicalRepairTransactionIndex]
+      )
+    ).rows[0]!;
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      t.true(
+        Number(removedRow.blockInternalId) <=
+          Number(auditedNode1.auditedThroughBlockInternalId)
+      );
+      const height = historicalRepairTipIndex + splitHeight + 1;
+      const scan = async (
+        nodeInternalIds: number[],
+        auditedThroughBlockInternalIds?: number[]
+      ) =>
+        getIncompleteBlocks({
+          auditedThroughBlockInternalIds,
+          excludedBlockHashes: [],
+          heightLowerBound: height,
+          heightUpperBound: height + 1,
+          limit: 10,
+          nodeInternalIds,
+        });
+      t.deepEqual(
+        await scan(
+          [auditedNode1.nodeInternalId],
+          [Number(auditedNode1.auditedThroughBlockInternalId)]
+        ),
+        { incompleteBlocks: [], scannedBlockCount: 0 }
+      );
+      const unaudited = await scan([auditedNode1.nodeInternalId]);
+      t.deepEqual(unaudited.scannedBlockCount, 1);
+      t.deepEqual(
+        unaudited.incompleteBlocks.map((block) => block.hash),
+        [historicalRepairBlockHash]
+      );
+      const oneNodeUnaudited = await scan(
+        [auditedNode1.nodeInternalId, auditedNode4.nodeInternalId],
+        [Number(auditedNode1.auditedThroughBlockInternalId), 0]
+      );
+      t.deepEqual(
+        oneNodeUnaudited.incompleteBlocks.map((block) => block.hash),
+        [historicalRepairBlockHash]
+      );
+    } finally {
+      await client.query(
+        /* sql */ `
+        INSERT INTO block_transaction
+          (block_internal_id, transaction_internal_id, transaction_index)
+          VALUES ($1, $2, $3);
+      `,
+        [
+          removedRow.blockInternalId,
+          removedRow.transactionInternalId,
+          removedRow.transactionIndex,
+        ]
+      );
+      await freshDbPool.end();
+      if (originalPostgresConnectionString === undefined) {
+        delete process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+      } else {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
   }
 );
 

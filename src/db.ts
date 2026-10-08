@@ -128,14 +128,27 @@ export interface ArchivedMempoolTransaction {
  * Find blocks for which the locally saved block_transaction rows don't sum to
  * the block's saved byte size. This avoids the SQL block encoder so it can
  * detect incomplete blocks even if encoder functions have bugs (e.g. #75).
+ *
+ * Only blocks accepted by one of `nodeInternalIds` are checked, and for each
+ * node only blocks with an `internal_id` above the matching entry of
+ * `auditedThroughBlockInternalIds` (0 if the node has never completed an
+ * audit). Summing `transaction.size_bytes` reads every linked transaction row,
+ * so on a large, already-audited database this filter is what keeps the scan
+ * from re-reading the whole `transaction` table on every startup.
  */
 export const getIncompleteBlocks = async ({
+  auditedThroughBlockInternalIds,
   heightLowerBound,
   heightUpperBound,
   limit,
   nodeInternalIds,
   excludedBlockHashes,
 }: {
+  /**
+   * Aligned with `nodeInternalIds`; defaults to 0 (audit every block) for
+   * each node.
+   */
+  auditedThroughBlockInternalIds?: number[];
   excludedBlockHashes: string[];
   heightLowerBound: number;
   heightUpperBound: number;
@@ -145,6 +158,37 @@ export const getIncompleteBlocks = async ({
   if (nodeInternalIds.length === 0) {
     return { incompleteBlocks: [], scannedBlockCount: 0 };
   }
+  // cspell:ignore unnest
+  const auditedThrough = nodeInternalIds.map(
+    (_, index) => auditedThroughBlockInternalIds?.[index] ?? 0
+  );
+  /*
+   * If any node has never completed an audit, every block it accepted must be
+   * audited anyway, so use the original (unbounded) filter: on a full audit
+   * it is measurably cheaper than the per-node join (E13, 831k blocks: 413 s
+   * vs 552 s for the same bytes read). The per-node bounded filter is used
+   * only when every node has a marker.
+   */
+  const minimumAuditedThrough = Math.min(...auditedThrough);
+  const auditEveryBlock = minimumAuditedThrough === 0;
+  const acceptedByNodeFilter = auditEveryBlock
+    ? /* sql */ `
+      AND EXISTS (
+        SELECT 1 FROM node_block
+          WHERE node_block.block_internal_id = block.internal_id
+            AND node_block.node_internal_id = ANY($1::integer[])
+      )`
+    : /* sql */ `
+      AND block.internal_id > $7
+      AND EXISTS (
+        SELECT 1 FROM node_block
+          INNER JOIN unnest($1::integer[], $6::bigint[])
+            AS audited_node (node_internal_id, audited_through_block_internal_id)
+            ON audited_node.node_internal_id = node_block.node_internal_id
+          WHERE node_block.block_internal_id = block.internal_id
+            AND block.internal_id >
+              audited_node.audited_through_block_internal_id
+      )`;
   const client = await pool.connect();
   // eslint-disable-next-line functional/no-try-statement
   try {
@@ -176,12 +220,7 @@ WITH linked_transactions AS (
       ON transaction.internal_id = block_transaction.transaction_internal_id
     WHERE block.height >= $2
       AND block.height < $3
-      AND NOT (encode(block.hash, 'hex') = ANY($5::text[]))
-      AND EXISTS (
-        SELECT 1 FROM node_block
-          WHERE node_block.block_internal_id = block.internal_id
-            AND node_block.node_internal_id = ANY($1::integer[])
-      )
+      AND NOT (encode(block.hash, 'hex') = ANY($5::text[]))${acceptedByNodeFilter}
     GROUP BY block.internal_id
 ),
 linked_block_sizes AS (
@@ -237,6 +276,7 @@ SELECT
         heightUpperBound,
         limit,
         excludedBlockHashes,
+        ...(auditEveryBlock ? [] : [auditedThrough, minimumAuditedThrough]),
       ]
     );
     const scan = incompleteBlockScan.rows[0]!;
@@ -250,6 +290,116 @@ SELECT
       })),
       scannedBlockCount: Number(scan.scannedBlockCount),
     };
+  } finally {
+    client.release();
+  }
+};
+
+export interface IncompleteBlockAuditState {
+  /**
+   * False if the database schema predates the `incomplete_block_audit` table;
+   * the agent then audits every block on each startup (and saves nothing).
+   */
+  auditTableExists: boolean;
+  /**
+   * Per node internal_id, the block internal_id through which a previous audit
+   * completed.
+   */
+  auditedThroughBlockInternalIds: Map<number, number>;
+  /**
+   * The highest block internal_id currently saved (0 if there are no blocks).
+   * Recorded as the new audit marker once this audit completes.
+   */
+  maxBlockInternalId: number;
+}
+
+/**
+ * Load the incomplete block audit markers for the provided nodes, along with
+ * the current highest block internal_id.
+ */
+export const getIncompleteBlockAuditState = async (
+  nodeInternalIds: number[]
+): Promise<IncompleteBlockAuditState> => {
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const { auditTableExists, maxBlockInternalId } = (
+      await client.query<{
+        auditTableExists: boolean;
+        maxBlockInternalId: string;
+      }>(/* sql */ `
+SELECT
+  to_regclass('incomplete_block_audit') IS NOT NULL AS "auditTableExists",
+  COALESCE((SELECT MAX(internal_id) FROM block), 0)::bigint AS "maxBlockInternalId";
+`)
+    ).rows[0]!;
+    if (!auditTableExists) {
+      return {
+        auditTableExists,
+        auditedThroughBlockInternalIds: new Map(),
+        maxBlockInternalId: Number(maxBlockInternalId),
+      };
+    }
+    const markers = await client.query<{
+      auditedThroughBlockInternalId: string;
+      nodeInternalId: number;
+    }>(
+      /* sql */ `
+SELECT node_internal_id AS "nodeInternalId",
+       audited_through_block_internal_id AS "auditedThroughBlockInternalId"
+  FROM incomplete_block_audit
+  WHERE node_internal_id = ANY($1::integer[]);
+`,
+      [nodeInternalIds]
+    );
+    return {
+      auditTableExists,
+      auditedThroughBlockInternalIds: new Map(
+        markers.rows.map((row) => [
+          row.nodeInternalId,
+          Number(row.auditedThroughBlockInternalId),
+        ])
+      ),
+      maxBlockInternalId: Number(maxBlockInternalId),
+    };
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Record that every block accepted by each of `nodeInternalIds` with an
+ * internal_id at or below `auditedThroughBlockInternalId` has been audited.
+ * Markers never move backwards.
+ */
+export const saveIncompleteBlockAudit = async ({
+  auditedThroughBlockInternalId,
+  nodeInternalIds,
+}: {
+  auditedThroughBlockInternalId: number;
+  nodeInternalIds: number[];
+}) => {
+  if (nodeInternalIds.length === 0) {
+    return;
+  }
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    await client.query(
+      /* sql */ `
+INSERT INTO incomplete_block_audit
+  (node_internal_id, audited_through_block_internal_id, completed_at)
+  SELECT node_internal_id, $2::bigint, now()
+    FROM unnest($1::integer[]) AS audited_node (node_internal_id)
+  ON CONFLICT (node_internal_id) DO UPDATE
+    SET audited_through_block_internal_id = GREATEST(
+          incomplete_block_audit.audited_through_block_internal_id,
+          EXCLUDED.audited_through_block_internal_id
+        ),
+        completed_at = EXCLUDED.completed_at;
+`,
+      [nodeInternalIds, auditedThroughBlockInternalId]
+    );
   } finally {
     client.release();
   }

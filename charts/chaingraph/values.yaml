@@ -25,7 +25,7 @@ agent:
   # For best performance, this should be around `maxConnections * maximum block size`, while leaving enough memory available to the host machine. If left unset (recommended), Chaingraph will measure free memory at startup and attempt to select a reasonable value.
   blockBufferTargetSizeMb: ''
   # Self-healing for https://github.com/bitauth/chaingraph/issues/74: after initial sync, the agent scans saved blocks in batches to find blocks whose linked transactions don't match the saved block size, then repairs those blocks by re-requesting them from trusted nodes.
-  # Set to 0 to disable the startup repair task.
+  # Set to 0 to disable the startup repair task. Completed scans are recorded per node in the incomplete_block_audit table, so later startups only audit blocks saved since the last completed scan; delete its rows to force a full re-audit.
   repairBlocksBatchSize: 10000
   # A mapping of network magic bytes to hex-encoded genesis blocks.
   # Format: `NETWORK_MAGIC:RAW_GENESIS_BLOCK_HEX`, comma separated.
