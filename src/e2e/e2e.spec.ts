@@ -87,6 +87,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
+  migration('default/1791300000000_unspent_output_root/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -2023,15 +2024,13 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   t.pass();
 });
 
-test.serial(
-  '[e2e] new block saved after reorg',
-  async (t) => {
-    const acceptedBlocks = (
-      await client.query<{
-        hash: string;
-        nodeName: string;
-      }>(
-        /* sql */ `
+test.serial('[e2e] new block saved after reorg', async (t) => {
+  const acceptedBlocks = (
+    await client.query<{
+      hash: string;
+      nodeName: string;
+    }>(
+      /* sql */ `
       SELECT node.name AS "nodeName", encode(block.hash, 'hex') AS hash
         FROM node_block
         INNER JOIN node
@@ -2042,14 +2041,13 @@ test.serial(
           AND block.height = $1
         ORDER BY block.hash;
     `,
-        [splitHeight + 1]
-      )
-    ).rows;
-    t.deepEqual(acceptedBlocks, [
-      { hash: tipA[0]!.header.hash, nodeName: 'node3' },
-    ]);
-  }
-);
+      [splitHeight + 1]
+    )
+  ).rows;
+  t.deepEqual(acceptedBlocks, [
+    { hash: tipA[0]!.header.hash, nodeName: 'node3' },
+  ]);
+});
 
 test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
   const tipStartIndex = 2;
@@ -3309,3 +3307,299 @@ test.serial(
     });
   }
 );
+
+/* eslint-disable @typescript-eslint/no-magic-numbers */
+// cspell:ignore unnest
+/* cspell: disable */
+const unspentFixtureCategory =
+  'c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0';
+const unspentFixtureOtherCategory =
+  'c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1';
+/* cspell: enable */
+const unspentFixtureNodeA = 'unspent-fixture-a';
+const unspentFixtureNodeB = 'unspent-fixture-b';
+/**
+ * Transactions of the unspent_output fixture. `outputs` lists one entry per
+ * output: `ft` (fixture category), `other` (a different category) or `nft`
+ * (fixture category, mutable NFT); `spends` lists spent outpoints.
+ */
+const unspentFixtureTransactions = {
+  /** mined in block a (accepted by node a) */
+  fund: {
+    byte: 'd0',
+    outputs: ['ft', 'ft', 'ft', 'ft', 'ft', 'ft', 'other', 'nft'],
+    spends: [],
+  },
+  /** was in node a's mempool, then dropped: its output is not unspent */
+  fundDropped: { byte: 'd7', outputs: ['ft'], spends: [] },
+  /** in node a's mempool: one unspent output */
+  fundMempool: { byte: 'd6', outputs: ['ft'], spends: [] },
+  /** mined in block b (accepted by node b only) */
+  fundOtherNode: { byte: 'd8', outputs: ['ft'], spends: [] },
+  /** was in node a's mempool, then dropped (archived): spends fund:3 */
+  spendDropped: { byte: 'd3', outputs: [], spends: [['fund', 3]] },
+  /** in node a's mempool: spends fund:2 */
+  spendMempool: { byte: 'd2', outputs: [], spends: [['fund', 2]] },
+  /** mined in block a: spends fund:1 */
+  spendMined: { byte: 'd1', outputs: [], spends: [['fund', 1]] },
+  /** mined in block b (accepted by node b only): spends fund:4 */
+  spendOtherNode: { byte: 'd4', outputs: [], spends: [['fund', 4]] },
+  /** mined in block r, which node a later removed (reorg): spends fund:5 */
+  spendReorged: { byte: 'd5', outputs: [], spends: [['fund', 5]] },
+} as const;
+type UnspentFixtureTransaction = keyof typeof unspentFixtureTransactions;
+const unspentFixtureBlocks: [string, UnspentFixtureTransaction[]][] = [
+  ['e1', ['fund', 'spendMined']],
+  ['e2', ['spendOtherNode', 'fundOtherNode']],
+  ['e3', ['spendReorged']],
+];
+const unspentFixtureHash = (name: UnspentFixtureTransaction) =>
+  hexToBin(unspentFixtureTransactions[name].byte.repeat(32));
+
+/**
+ * The generic accepted-and-unspent query (the shape Hasura compiles from an
+ * output query filtered on transaction acceptance and on spent_by), against
+ * which unspent_output is compared.
+ */
+const acceptedAndUnspentReference = /* sql */ `
+  (SELECT o.* FROM output o
+    WHERE EXISTS (
+        SELECT 1 FROM transaction t WHERE t.hash = o.transaction_hash
+          AND (EXISTS (SELECT 1 FROM node_transaction nt JOIN node n ON n.internal_id = nt.node_internal_id
+                 WHERE nt.transaction_internal_id = t.internal_id AND n.name = $1)
+            OR EXISTS (SELECT 1 FROM block_transaction bt JOIN node_block nb ON nb.block_internal_id = bt.block_internal_id
+                 JOIN node n ON n.internal_id = nb.node_internal_id
+                 WHERE bt.transaction_internal_id = t.internal_id AND n.name = $1)))
+      AND NOT EXISTS (
+        SELECT 1 FROM input i JOIN transaction st ON st.internal_id = i.transaction_internal_id
+          WHERE i.outpoint_transaction_hash = o.transaction_hash AND i.outpoint_index = o.output_index
+            AND (EXISTS (SELECT 1 FROM node_transaction nt JOIN node n ON n.internal_id = nt.node_internal_id
+                   WHERE nt.transaction_internal_id = st.internal_id AND n.name = $1)
+              OR EXISTS (SELECT 1 FROM block_transaction bt JOIN node_block nb ON nb.block_internal_id = bt.block_internal_id
+                   JOIN node n ON n.internal_id = nb.node_internal_id
+                   WHERE bt.transaction_internal_id = st.internal_id AND n.name = $1))))`;
+
+const sequentially = async <T>(
+  items: readonly T[],
+  action: (item: T, index: number) => Promise<unknown>
+) =>
+  items.reduce<Promise<unknown>>(
+    async (chain, item, index) => chain.then(async () => action(item, index)),
+    Promise.resolve(undefined)
+  );
+
+const insertUnspentFixtureTransaction = async (
+  name: UnspentFixtureTransaction
+) => {
+  const { outputs, spends } = unspentFixtureTransactions[name];
+  const { id } = (
+    await client.query<{ id: string }>(
+      /* sql */ `INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase) VALUES ($1, 2, 0, 0, false) RETURNING internal_id AS id;`,
+      [unspentFixtureHash(name)]
+    )
+  ).rows[0]!;
+  await sequentially<string>(outputs, async (kind, index) =>
+    client.query(
+      /* sql */ `INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment) VALUES ($1, $2, 1000, '\\x51', $3, $4, $5, $6);`,
+      [
+        unspentFixtureHash(name),
+        index,
+        hexToBin(
+          kind === 'other'
+            ? unspentFixtureOtherCategory
+            : unspentFixtureCategory
+        ),
+        kind === 'nft' ? null : 1,
+        kind === 'nft' ? 'mutable' : null,
+        kind === 'nft' ? hexToBin('01') : null,
+      ]
+    )
+  );
+  await sequentially<readonly [UnspentFixtureTransaction, number]>(
+    spends,
+    async ([spent, outpointIndex], inputIndex) =>
+      client.query(
+        /* sql */ `INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode) VALUES ($1, $2, $3, 0, $4, '\\x');`,
+        [id, inputIndex, outpointIndex, unspentFixtureHash(spent)]
+      )
+  );
+  return [name, id] as const;
+};
+
+/**
+ * Insert the unspent_output fixture: nodes a and b; block e1 accepted by node
+ * a, block e2 accepted by node b, block e3 accepted by node a and then removed
+ * (reorg); two mempool transactions of node a still present and two dropped.
+ */
+const insertUnspentFixture = async () => {
+  await client.query(
+    /* sql */ `INSERT INTO node (name, protocol_version, user_agent) VALUES ($1, 70016, '/unspent-fixture/'), ($2, 70016, '/unspent-fixture/');`,
+    [unspentFixtureNodeA, unspentFixtureNodeB]
+  );
+  const inserted: (readonly [string, string])[] = [];
+  await sequentially(
+    Object.keys(unspentFixtureTransactions) as UnspentFixtureTransaction[],
+    async (name) =>
+      insertUnspentFixtureTransaction(name).then((entry) =>
+        inserted.push(entry)
+      )
+  );
+  const transactionIds = Object.fromEntries(inserted) as {
+    [name in UnspentFixtureTransaction]: string;
+  };
+  await sequentially(unspentFixtureBlocks, async ([hashByte, names]) => {
+    const blockId = (
+      await client.query<{ id: string }>(
+        /* sql */ `INSERT INTO block (height, version, timestamp, hash, previous_block_hash, merkle_root, bits, nonce, size_bytes) VALUES (1, 1, 0, $1, $2, $2, 0, 0, 0) RETURNING internal_id AS id;`,
+        [hexToBin(hashByte.repeat(32)), hexToBin('00'.repeat(32))]
+      )
+    ).rows[0]!.id;
+    await sequentially(names, async (name, index) =>
+      client.query(
+        /* sql */ `INSERT INTO block_transaction (block_internal_id, transaction_internal_id, transaction_index) VALUES ($1, $2, $3);`,
+        [blockId, transactionIds[name], index]
+      )
+    );
+  });
+  const nodeId = /* sql */ `(SELECT internal_id FROM node WHERE name = $1)`;
+  const blockId = /* sql */ `(SELECT internal_id FROM block WHERE hash = $2)`;
+  const blockHash = (hashByte: string) => hexToBin(hashByte.repeat(32));
+  await sequentially(
+    [
+      [unspentFixtureNodeA, 'e1'],
+      [unspentFixtureNodeB, 'e2'],
+      [unspentFixtureNodeA, 'e3'],
+    ] as const,
+    async ([node, hashByte]) =>
+      client.query(
+        /* sql */ `INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at) VALUES (${nodeId}, ${blockId}, now());`,
+        [node, blockHash(hashByte)]
+      )
+  );
+  // node a removes block e3 in a reorg (archived to node_block_history)
+  await client.query(
+    /* sql */ `DELETE FROM node_block WHERE node_internal_id = ${nodeId} AND block_internal_id = ${blockId};`,
+    [unspentFixtureNodeA, blockHash('e3')]
+  );
+  await client.query(
+    /* sql */ `INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at) SELECT ${nodeId}, unnest($2::bigint[]), now();`,
+    [
+      unspentFixtureNodeA,
+      [
+        transactionIds.spendMempool,
+        transactionIds.spendDropped,
+        transactionIds.fundMempool,
+        transactionIds.fundDropped,
+      ],
+    ]
+  );
+  // node a drops two transactions from its mempool (as on expiry), archiving them
+  await client.query(
+    /* sql */ `WITH dropped AS (DELETE FROM node_transaction WHERE node_internal_id = ${nodeId} AND transaction_internal_id = ANY ($2::bigint[]) RETURNING node_internal_id, transaction_internal_id, validated_at)
+      INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id, validated_at, replaced_at) SELECT node_internal_id, transaction_internal_id, validated_at, NULL FROM dropped;`,
+    [
+      unspentFixtureNodeA,
+      [transactionIds.spendDropped, transactionIds.fundDropped],
+    ]
+  );
+};
+
+const unspentFixtureOutputName = (row: { hash: string; index: string }) => {
+  const name = Object.entries(unspentFixtureTransactions).find(
+    ([, { byte }]) => byte.repeat(32) === row.hash
+  )?.[0];
+  return `${name ?? row.hash}:${row.index}`;
+};
+
+/**
+ * Run `action` in a database transaction that is always rolled back.
+ */
+const inRolledBackTransaction = async <T>(action: () => Promise<T>) => {
+  await client.query('BEGIN;');
+  const rollback = async () => client.query('ROLLBACK;');
+  return action().then(
+    async (result) => rollback().then(() => result),
+    async (error: unknown) =>
+      // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+      rollback().then(async () => Promise.reject(error))
+  );
+};
+
+test.serial(
+  '[e2e] [sql] unspent_output: matches the accepted-and-unspent query, including mempool and reorg cases',
+  async (t) => {
+    const select = async (from: string, node: string) =>
+      (
+        await client.query<{ hash: string; index: string }>(
+          /* sql */ `SELECT encode(u.transaction_hash, 'hex') AS hash, u.output_index::text AS index FROM ${from} AS u WHERE u.token_category = $2 ORDER BY u.transaction_hash, u.output_index;`,
+          [node, hexToBin(unspentFixtureCategory)]
+        )
+      ).rows.map(unspentFixtureOutputName);
+    const nodes = [
+      unspentFixtureNodeA,
+      unspentFixtureNodeB,
+      'unspent-fixture-unknown',
+    ];
+    const results: { fn: string[]; node: string; reference: string[] }[] = [];
+    await inRolledBackTransaction(async () => {
+      await insertUnspentFixture();
+      await sequentially(nodes, async (node) =>
+        results.push({
+          fn: await select('unspent_output($1::text)', node),
+          node,
+          reference: await select(acceptedAndUnspentReference, node),
+        })
+      );
+    });
+    /**
+     * Node a: fund:1 is spent in a block and fund:2 in the mempool; fund:3's
+     * spender was dropped from the mempool, fund:4's spender is only accepted
+     * by node b and fund:5's spender is in a block node a removed, so those
+     * are unspent; fund:6 has another category; fund:7 is an NFT of the
+     * category; fundDropped and fundOtherNode were not accepted by node a.
+     */
+    const nodeAUnspent = [
+      'fund:0',
+      'fund:3',
+      'fund:4',
+      'fund:5',
+      'fund:7',
+      'fundMempool:0',
+    ];
+    t.deepEqual(results, [
+      { fn: nodeAUnspent, node: unspentFixtureNodeA, reference: nodeAUnspent },
+      {
+        fn: ['fundOtherNode:0'],
+        node: unspentFixtureNodeB,
+        reference: ['fundOtherNode:0'],
+      },
+      { fn: [], node: 'unspent-fixture-unknown', reference: [] },
+    ]);
+  }
+);
+
+test.serial(
+  '[e2e] [sql] unspent_output: is inlined, so a token_category filter uses token_category_index',
+  async (t) => {
+    const plan = await inRolledBackTransaction(async () => {
+      await client.query(
+        indexDefinitions.token_category_index.replace(
+          'CREATE INDEX token_category_index',
+          'CREATE INDEX test_token_category_index'
+        )
+      );
+      // cspell: disable-next-line
+      await client.query('SET LOCAL enable_seqscan = off;');
+      return (
+        await client.query<{ [column: string]: string }>(
+          `EXPLAIN (COSTS OFF) SELECT * FROM unspent_output('node1') WHERE token_category = '\\x${unspentFixtureCategory}'::bytea`
+        )
+      ).rows
+        .map((row) => Object.values(row).join(''))
+        .join('\n');
+    });
+    t.true(plan.includes('token_category_index'), plan);
+    t.false(plan.includes('Function Scan'), plan);
+  }
+);
+/* eslint-enable @typescript-eslint/no-magic-numbers */
