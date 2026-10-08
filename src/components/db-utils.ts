@@ -2,6 +2,7 @@
 export const indexDefinitions = {
   block_height_index: /* sql */ `CREATE INDEX block_height_index ON block USING btree (height);`,
   block_inclusions_index: /* sql */ `CREATE INDEX block_inclusions_index ON block_transaction USING btree (transaction_internal_id);`,
+  output_mutable_bytecode_index: /* sql */ `CREATE INDEX output_mutable_bytecode_index ON output USING btree (locking_bytecode) INCLUDE (token_category, transaction_hash, output_index) WHERE nonfungible_token_capability = 'mutable';`,
   output_search_index: /* sql */ `CREATE INDEX output_search_index ON output USING btree (substring(locking_bytecode, 0, 26));`,
   spent_by_index: /* sql */ `CREATE INDEX spent_by_index ON input USING btree (outpoint_transaction_hash, outpoint_index);`,
   token_category_index: /* sql */ `CREATE INDEX token_category_index ON output USING btree (token_category);`,

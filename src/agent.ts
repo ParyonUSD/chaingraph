@@ -379,6 +379,7 @@ export class Agent {
   managedIndexes: (keyof typeof indexDefinitions)[] = [
     'block_height_index',
     'block_inclusions_index',
+    'output_mutable_bytecode_index',
     'output_search_index',
     'spent_by_index',
     'token_category_index',
