@@ -10,6 +10,7 @@ import type {
 } from '../types/chaingraph.js';
 
 import { BinaryCopyWriter } from './pg-binary-copy.js';
+import type { Spend } from './unspent-tracking.js';
 
 /**
  * Temporary staging tables, created once per pooled connection. Rows are
@@ -42,6 +43,11 @@ export const stageTableColumns = {
     ['fungible_token_amount', 'bigint'],
     ['nonfungible_token_capability', 'enum_nonfungible_token_capability'],
     ['nonfungible_token_commitment', 'bytea'],
+  ],
+  chaingraph_stage_spend: [
+    ['outpoint_transaction_hash', 'bytea'],
+    ['outpoint_index', 'bigint'],
+    ['spender_hash', 'bytea'],
   ],
   chaingraph_stage_transaction: [
     ['hash', 'bytea'],
@@ -195,6 +201,26 @@ export const encodeStageBlockTransactions = (block: ChaingraphBlock) => {
       .startRow(stageTableColumns.chaingraph_stage_block_transaction.length)
       .hexBytea(transaction.hash)
       .int8(transactionIndex);
+  });
+  return writer.finish();
+};
+
+const spendRowBytes = 2 + 3 * 4 + 2 * hashBytes + 8;
+
+/**
+ * Every outpoint spent by the block (`CHAINGRAPH_UNSPENT_TRACKING` modes other
+ * than `off`), with the spending transaction's hash.
+ */
+export const encodeStageSpends = (spends: Spend[]) => {
+  const writer = new BinaryCopyWriter(
+    spends.length * spendRowBytes + copyHeaderAndTrailerBytes
+  );
+  spends.forEach((spend) => {
+    writer
+      .startRow(stageTableColumns.chaingraph_stage_spend.length)
+      .hexBytea(spend.outpointTransactionHash)
+      .int8(spend.outpointIndex)
+      .hexBytea(spend.spenderHash);
   });
   return writer.finish();
 };

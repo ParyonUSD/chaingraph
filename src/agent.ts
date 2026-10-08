@@ -41,6 +41,7 @@ import {
   acceptBlocksViaHeaders,
   archiveMempoolTransaction,
   archiveMempoolTransactionsAcceptedByBlocks,
+  configureUnspentTracking,
   createIndexes,
   getAllKnownBlockHashes,
   getIncompleteBlocks,
@@ -841,6 +842,14 @@ export class Agent {
         .then((disabled) => {
           if (disabled) {
             this.logger.debug('Disabled synchronous_commit for initial sync.');
+          }
+        })
+        .then(async () => configureUnspentTracking())
+        .then((statements) => {
+          if (statements.length > 0) {
+            this.logger.info(
+              `Configured unspent tracking: ${statements.join(' ')}`
+            );
           }
         })
         .catch((err) => {

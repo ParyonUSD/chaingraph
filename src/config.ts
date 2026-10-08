@@ -48,6 +48,7 @@ const expectedOptions = [
   'CHAINGRAPH_POSTGRES_MAX_CONNECTIONS',
   'CHAINGRAPH_POSTGRES_SYNCHRONOUS_COMMIT',
   'CHAINGRAPH_TRUSTED_NODES',
+  'CHAINGRAPH_UNSPENT_TRACKING',
   'CHAINGRAPH_USER_AGENT',
   'CHAINGRAPH_WRITE_PATH',
   'NODE_ENV',
@@ -428,6 +429,26 @@ if (!isWritePath(configuration.CHAINGRAPH_WRITE_PATH)) {
  */
 const chaingraphWritePath = configuration.CHAINGRAPH_WRITE_PATH;
 
+const unspentTrackingModes = ['off', 'marker', 'settable'] as const;
+const isUnspentTrackingMode = (
+  value: string
+): value is (typeof unspentTrackingModes)[number] =>
+  unspentTrackingModes.includes(value as (typeof unspentTrackingModes)[number]);
+if (!isUnspentTrackingMode(configuration.CHAINGRAPH_UNSPENT_TRACKING)) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_UNSPENT_TRACKING' environment variable: ${
+      configuration.CHAINGRAPH_UNSPENT_TRACKING
+    }. Must be one of the following: ${unspentTrackingModes.join(', ')}`
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_UNSPENT_TRACKING` environment variable (experiment):
+ * `off` (default), `marker` (`output.spent_by_transaction_internal_id`) or
+ * `settable` (side table `unspent_output_set`). See `unspent-tracking.ts`.
+ */
+const unspentTracking = configuration.CHAINGRAPH_UNSPENT_TRACKING;
+
 export {
   blockBufferTargetSizeMb,
   chaingraphInternalApiPort,
@@ -446,4 +467,5 @@ export {
   postgresSynchronousCommit,
   isProduction,
   trustedNodes,
+  unspentTracking,
 };

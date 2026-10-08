@@ -28,7 +28,11 @@ import got from 'got';
 import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
-import type { ChaingraphTransaction } from '../types/chaingraph.js';
+import type * as DbModule from '../db.js';
+import type {
+  ChaingraphBlock,
+  ChaingraphTransaction,
+} from '../types/chaingraph.js';
 
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
 import {
@@ -87,6 +91,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
+  migration('default/1791400000000_unspent_tracking/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -819,10 +824,15 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'node_transaction_pkey',
     'output_pkey',
     'output_search_index',
+    'output_unspent_search_index',
+    'output_unspent_token_category_index',
     'spent_by_index',
     'token_category_index',
     'transaction_hash_key',
     'transaction_pkey',
+    'unspent_output_set_pkey',
+    'unspent_output_set_prefix_index',
+    'unspent_output_set_token_category_index',
   ]);
   // cspell:ignore tgenabled tgname
   const triggers = (
@@ -2023,15 +2033,13 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   t.pass();
 });
 
-test.serial(
-  '[e2e] new block saved after reorg',
-  async (t) => {
-    const acceptedBlocks = (
-      await client.query<{
-        hash: string;
-        nodeName: string;
-      }>(
-        /* sql */ `
+test.serial('[e2e] new block saved after reorg', async (t) => {
+  const acceptedBlocks = (
+    await client.query<{
+      hash: string;
+      nodeName: string;
+    }>(
+      /* sql */ `
       SELECT node.name AS "nodeName", encode(block.hash, 'hex') AS hash
         FROM node_block
         INNER JOIN node
@@ -2042,14 +2050,13 @@ test.serial(
           AND block.height = $1
         ORDER BY block.hash;
     `,
-        [splitHeight + 1]
-      )
-    ).rows;
-    t.deepEqual(acceptedBlocks, [
-      { hash: tipA[0]!.header.hash, nodeName: 'node3' },
-    ]);
-  }
-);
+      [splitHeight + 1]
+    )
+  ).rows;
+  t.deepEqual(acceptedBlocks, [
+    { hash: tipA[0]!.header.hash, nodeName: 'node3' },
+  ]);
+});
 
 test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
   const tipStartIndex = 2;
@@ -2702,6 +2709,303 @@ test.serial('[e2e] [api] /send-transaction: valid', async (t) => {
   );
 });
 /* eslint-enable @typescript-eslint/naming-convention, camelcase */
+
+/**
+ * `CHAINGRAPH_UNSPENT_TRACKING` (experiment): after every scenario above
+ * (mempool spends, double-spends, expired and replaced mempool transactions,
+ * stale blocks and re-orgs on several nodes), the stored read model must equal
+ * the F1g `unspent_output` reference. The read model tracks spends across all
+ * nodes, so the reference uses "accepted by any node" in place of one node.
+ * Run the e2e suite once per mode (`CHAINGRAPH_UNSPENT_TRACKING=off|marker|settable`).
+ */
+const unspentTrackingMode = process.env.CHAINGRAPH_UNSPENT_TRACKING ?? 'off';
+const anyNodeAccepts = (transactionInternalId: string) => /* sql */ `
+  (EXISTS (SELECT 1 FROM block_transaction bt CROSS JOIN node n
+             JOIN node_block nb ON nb.node_internal_id = n.internal_id AND nb.block_internal_id = bt.block_internal_id
+             WHERE bt.transaction_internal_id = ${transactionInternalId})
+   OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = ${transactionInternalId}))`;
+const unspentReferenceSql = /* sql */ `
+  SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
+    WHERE CASE
+      WHEN EXISTS (SELECT 1 FROM input i WHERE i.outpoint_transaction_hash = o.transaction_hash
+                     AND i.outpoint_index = o.output_index AND ${anyNodeAccepts(
+                       'i.transaction_internal_id'
+                     )})
+      THEN false
+      ELSE EXISTS (SELECT 1 FROM transaction t WHERE t.hash = o.transaction_hash AND ${anyNodeAccepts(
+        't.internal_id'
+      )})
+    END`;
+const createdByAcceptedSql = /* sql */ `
+  EXISTS (SELECT 1 FROM transaction t WHERE t.hash = o.transaction_hash AND ${anyNodeAccepts(
+    't.internal_id'
+  )})`;
+
+/* eslint-disable @typescript-eslint/no-magic-numbers */
+/**
+ * Hash for the explicit unspent-tracking scenario (`e7` + one distinct byte).
+ */
+const scenarioHash = (byte: string) => `e7${byte.repeat(31)}`;
+const scenarioTransaction = (
+  byte: string,
+  spends: number[],
+  outputCount = 1
+): ChaingraphTransaction => ({
+  hash: scenarioHash(byte),
+  inputs: spends.map((outpointIndex) => ({
+    outpointIndex,
+    outpointTransactionHash: scenarioHash('f0'),
+    sequenceNumber: 0,
+    unlockingBytecode: '51',
+  })),
+  isCoinbase: false,
+  locktime: 0,
+  outputs: Array.from({ length: outputCount }, () => ({
+    lockingBytecode: '51',
+    valueSatoshis: 1000n,
+  })),
+  sizeBytes: 60,
+  version: 2,
+});
+
+/**
+ * Drive the agent's own DB functions (as the agent calls them) through the
+ * cases the read model must follow, on top of the e2e chain state: a mined
+ * spend, a mempool spend, a dropped mempool spender, a block spender removed by a re-org
+ * and its re-acceptance via headers on another node, and a cross-node
+ * double-spend whose first spender is dropped. After each step, `check()`
+ * compares the read model with the reference.
+ */
+const runUnspentTrackingScenario = async (
+  check: (step: string) => Promise<void>
+) => {
+  const originalPostgresConnectionString =
+    process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+  process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+    postgresE2eConnectionStringTestDb;
+  /*
+   * A fresh module instance: an earlier test ends the shared module's pool.
+   */
+  const scenarioDbModule = '../db.js?unspent-tracking-scenario';
+  const db = (await import(scenarioDbModule)) as typeof DbModule;
+  const nodeId = async (name: string) =>
+    Number(
+      (
+        await client.query<{ id: string }>(
+          /* sql */ `SELECT internal_id AS id FROM node WHERE name = $1;`,
+          [name]
+        )
+      ).rows[0]!.id
+    );
+  const [nodeA, nodeB] = [await nodeId('node1'), await nodeId('node2')];
+  const block = (byte: string, transactions: ChaingraphTransaction[]) => ({
+    bits: 0,
+    hash: scenarioHash(byte),
+    height: 999_000,
+    merkleRoot: '00'.repeat(32),
+    nonce: 0,
+    previousBlockHash: '00'.repeat(32),
+    sizeBytes: 0,
+    timestamp: 0,
+    transactions,
+    version: 1,
+  });
+  const saveBlockFor = async (
+    blockToSave: ChaingraphBlock,
+    nodeInternalId: number
+  ) =>
+    db.saveBlock({
+      block: blockToSave,
+      nodeAcceptances: [
+        { acceptedAt: new Date(), nodeInternalId, nodeName: 'scenario' },
+      ],
+      transactionCache: new Map() as unknown as Parameters<
+        typeof db.saveBlock
+      >[0]['transactionCache'],
+    });
+  const saveMempoolTransaction = async (
+    transaction: ChaingraphTransaction,
+    nodeInternalId: number
+  ) =>
+    db.saveTransactionForNodes(transaction, [
+      { nodeInternalId, validatedAt: new Date() },
+    ]);
+  const transactionId = async (byte: string) =>
+    Number(
+      (
+        await client.query<{ id: string }>(
+          /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+          [hexToBin(scenarioHash(byte))]
+        )
+      ).rows[0]!.id
+    );
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    // fund:0 stays unspent; fund:1 is spent in the same block
+    await saveBlockFor(
+      block('b1', [
+        scenarioTransaction('f0', [], 6),
+        scenarioTransaction('a1', [1]),
+      ]),
+      nodeA
+    );
+    await check('mined spend');
+    await saveMempoolTransaction(scenarioTransaction('a2', [2]), nodeA);
+    await check('mempool spend');
+    await saveMempoolTransaction(scenarioTransaction('a3', [3]), nodeA);
+    await check('mempool spend before drop');
+    await db.archiveMempoolTransaction({
+      nodeInternalId: nodeA,
+      replacedAt: new Date(),
+      transactionInternalId: await transactionId('a3'),
+    });
+    await check('dropped mempool spender');
+    const staleBlock = block('b2', [scenarioTransaction('a4', [4])]);
+    await saveBlockFor(staleBlock, nodeA);
+    await check('block spend before re-org');
+    await db.removeStaleBlocksForNode(nodeA, [staleBlock.hash]);
+    await check('block spender removed by a re-org');
+    await db.acceptBlocksViaHeaders(
+      nodeB,
+      [{ hash: staleBlock.hash, height: staleBlock.height }],
+      new Date()
+    );
+    await check('stale block re-accepted via headers by another node');
+    await saveMempoolTransaction(scenarioTransaction('a5', [5]), nodeA);
+    await saveMempoolTransaction(scenarioTransaction('a6', [5]), nodeB);
+    await check('cross-node double-spend');
+    await db.archiveMempoolTransaction({
+      nodeInternalId: nodeA,
+      replacedAt: new Date(),
+      transactionInternalId: await transactionId('a5'),
+    });
+    await check('first of a cross-node double-spend dropped');
+  } finally {
+    await db.pool.end();
+    if (originalPostgresConnectionString === undefined) {
+      delete process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    } else {
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+        originalPostgresConnectionString;
+    }
+  }
+};
+
+test.serial(
+  `[e2e] unspent tracking (${unspentTrackingMode}): read model equals the F1g reference`,
+  async (t) => {
+    const rows = async (sql: string) =>
+      (await client.query<{ outpoint: string }>(sql)).rows
+        .map((row) => row.outpoint)
+        .sort((a, b) => a.localeCompare(b));
+    const count = async (sql: string) =>
+      Number((await client.query<{ n: string }>(sql)).rows[0]!.n);
+    /*
+     * Outputs inserted directly by the fixtures above (not by the agent) are
+     * not tracked (NULL marker, no set row ever written). Compare on outputs
+     * of transactions some node ever accepted (current or history) and, for
+     * `marker`, with a non-NULL marker.
+     */
+    const trackedDomain = /* sql */ `
+      o.transaction_hash IN (SELECT t.hash FROM transaction t
+        WHERE EXISTS (SELECT 1 FROM block_transaction bt WHERE bt.transaction_internal_id = t.internal_id)
+           OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = t.internal_id)
+           OR EXISTS (SELECT 1 FROM node_transaction_history h WHERE h.transaction_internal_id = t.internal_id))`;
+    const domain = async () =>
+      new Set(
+        await rows(
+          /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o WHERE ${trackedDomain}${
+            unspentTrackingMode === 'marker'
+              ? ' AND o.spent_by_transaction_internal_id IS NOT NULL'
+              : ''
+          }`
+        )
+      );
+    const inDomain = async (outpoints: string[]) => {
+      const tracked = await domain();
+      return outpoints.filter((outpoint) => tracked.has(outpoint));
+    };
+    const reference = async () => inDomain(await rows(unspentReferenceSql));
+    const stored = async () =>
+      inDomain(
+        await rows(
+          unspentTrackingMode === 'marker'
+            ? /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
+            WHERE o.spent_by_transaction_internal_id = 0 AND ${createdByAcceptedSql}`
+            : /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint
+            FROM unspent_output_set u JOIN output o ON o.transaction_hash = u.transaction_hash AND o.output_index = u.output_index
+            WHERE ${createdByAcceptedSql}`
+        )
+      );
+    const check = async (step: string) => {
+      if (unspentTrackingMode === 'off') {
+        t.is(
+          await count(
+            `SELECT count(*) AS n FROM output WHERE spent_by_transaction_internal_id IS NOT NULL`
+          ),
+          0,
+          step
+        );
+        t.is(await count(`SELECT count(*) AS n FROM unspent_output_set`), 0);
+        return;
+      }
+      const expected = await reference();
+      t.true(expected.length > 0, step);
+      t.deepEqual(await stored(), expected, step);
+      if (unspentTrackingMode === 'marker') {
+        t.is(
+          await count(/* sql */ `
+          SELECT count(*) AS n FROM output o WHERE o.spent_by_transaction_internal_id > 0
+            AND NOT EXISTS (SELECT 1 FROM input i WHERE i.transaction_internal_id = o.spent_by_transaction_internal_id
+              AND i.outpoint_transaction_hash = o.transaction_hash AND i.outpoint_index = o.output_index
+              AND ${anyNodeAccepts('i.transaction_internal_id')})`),
+          0,
+          `${step}: every marker points at an accepted spender of that output`
+        );
+      }
+    };
+    await check('e2e chain state');
+    await runUnspentTrackingScenario(check);
+    /*
+     * The fixture now covers every case the read model must follow: an output
+     * whose only accepted spender is in a mempool, an output whose spender
+     * was dropped from every mempool (unspent again), an output whose spender
+     * is only in a stale (removed by a re-org) block (unspent again until re-accepted)
+     * and a re-accepted stale block.
+     */
+    const scenarioOutpoints = (await reference()).filter((outpoint) =>
+      outpoint.startsWith(scenarioHash('f0'))
+    );
+    t.deepEqual(
+      scenarioOutpoints.map((outpoint) => outpoint.split(':')[1]),
+      ['0', '3']
+    );
+    const cases = {
+      droppedSpender: await count(/* sql */ `
+        SELECT count(*) AS n FROM input i JOIN transaction s ON s.internal_id = i.transaction_internal_id
+          WHERE NOT ${anyNodeAccepts('s.internal_id')}
+            AND EXISTS (SELECT 1 FROM node_transaction_history h WHERE h.transaction_internal_id = s.internal_id)
+            AND (encode(i.outpoint_transaction_hash, 'hex') || ':' || i.outpoint_index) IN (${unspentReferenceSql})`),
+      mempoolSpend: await count(/* sql */ `
+        SELECT count(*) AS n FROM input i JOIN node_transaction nt ON nt.transaction_internal_id = i.transaction_internal_id
+          JOIN output o ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index`),
+      reacceptedStaleBlock: await count(/* sql */ `
+        SELECT count(*) AS n FROM node_block_history h JOIN node_block nb ON nb.block_internal_id = h.block_internal_id`),
+    };
+    t.log({
+      cases,
+      untracked: await count(
+        unspentTrackingMode === 'marker'
+          ? `SELECT count(*) AS n FROM output WHERE spent_by_transaction_internal_id IS NULL`
+          : `SELECT count(*) AS n FROM output o WHERE NOT (${trackedDomain})`
+      ),
+    });
+    t.true(cases.mempoolSpend > 0, 'fixture has a mempool spend');
+    t.true(cases.droppedSpender > 0, 'fixture has a dropped spender');
+    t.true(cases.reacceptedStaleBlock > 0, 'fixture has a re-org');
+  }
+);
+/* eslint-enable @typescript-eslint/no-magic-numbers */
 
 /**
  * The below tests run concurrently after all serial tests have completed.

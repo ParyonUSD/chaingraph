@@ -188,5 +188,5 @@ test('stage table SQL', (t) => {
     createStageTablesSql,
     /CREATE TEMP TABLE IF NOT EXISTS chaingraph_stage_output \(transaction_hash bytea, .*nonfungible_token_capability enum_nonfungible_token_capability, nonfungible_token_commitment bytea\) ON COMMIT DELETE ROWS;/u
   );
-  t.is(createStageTablesSql.split('\n').length, 4);
+  t.is(createStageTablesSql.split('\n').length, 5);
 });

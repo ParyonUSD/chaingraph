@@ -1,0 +1,12 @@
+DROP TRIGGER IF EXISTS trigger_unspent_marker_node_block_delete ON node_block;
+DROP TRIGGER IF EXISTS trigger_unspent_marker_node_transaction_delete ON node_transaction;
+DROP TRIGGER IF EXISTS trigger_unspent_settable_node_block_delete ON node_block;
+DROP TRIGGER IF EXISTS trigger_unspent_settable_node_transaction_delete ON node_transaction;
+DROP FUNCTION IF EXISTS trigger_unspent_tracking_node_block_delete();
+DROP FUNCTION IF EXISTS trigger_unspent_tracking_node_transaction_delete();
+DROP FUNCTION IF EXISTS unspent_tracking_release_spenders(bigint[], text);
+DROP FUNCTION IF EXISTS unspent_tracking_transaction_is_accepted(bigint);
+DROP TABLE IF EXISTS unspent_output_set;
+DROP INDEX IF EXISTS output_unspent_search_index;
+DROP INDEX IF EXISTS output_unspent_token_category_index;
+ALTER TABLE output DROP COLUMN IF EXISTS spent_by_transaction_internal_id;

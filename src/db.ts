@@ -8,6 +8,7 @@ import {
   encodeStageBlockTransactions,
   encodeStageInputs,
   encodeStageOutputs,
+  encodeStageSpends,
   encodeStageTransactions,
 } from './components/block-copy-rows.js';
 import {
@@ -16,10 +17,24 @@ import {
 } from './components/db-utils.js';
 import { copyFromBuffers } from './components/pg-binary-copy.js';
 import {
+  buildDeleteSpentFromSetSql,
+  buildMarkSpentOutputsSql,
+  collectBlockSpends,
+  configureUnspentTrackingTriggersSql,
+  deleteStagedSpentFromSetSql,
+  firstAcceptedBlockTransactionsSql,
+  markStagedSpentOutputsSql,
+  outputMarkerInsertParts,
+  reacceptSpendsSql,
+  unspentSetInsertCte,
+  unspentTrackingTriggerNames,
+} from './components/unspent-tracking.js';
+import {
   chaingraphWritePath,
   postgresConnectionString,
   postgresMaxConnections,
   postgresSynchronousCommit,
+  unspentTracking,
 } from './config.js';
 import type {
   ChaingraphBlock,
@@ -30,6 +45,66 @@ export const pool = new pg.Pool({
   connectionString: postgresConnectionString,
   max: postgresMaxConnections,
 });
+
+/**
+ * `CHAINGRAPH_UNSPENT_TRACKING` (experiment): extra column/value for output
+ * inserts (empty in `off` and `settable` modes).
+ */
+const outputMarker = outputMarkerInsertParts(unspentTracking);
+
+/**
+ * Re-mark (or remove from the set) the outpoints spent by transactions that
+ * just gained an acceptance. No-op in `off` mode.
+ */
+const reacceptSpends = async (
+  client: pg.PoolClient,
+  transactionInternalIds: (number | string)[]
+) => {
+  const sql = reacceptSpendsSql(unspentTracking);
+  if (sql === undefined || transactionInternalIds.length === 0) {
+    return;
+  }
+  await client.query(sql, [transactionInternalIds]);
+};
+
+/**
+ * Enable the spend-release triggers of the configured
+ * `CHAINGRAPH_UNSPENT_TRACKING` mode and disable the others. Returns the
+ * statements run (none if the migration is missing and the mode is `off`).
+ */
+export const configureUnspentTracking = async () => {
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const existing = Object.fromEntries(
+      (
+        await client.query<{ enabled: boolean; tgname: string }>(
+          // cspell:ignore tgname tgenabled
+          /* sql */ `SELECT tgname, tgenabled <> 'D' AS enabled FROM pg_trigger WHERE tgname = ANY ($1::text[]);`,
+          [unspentTrackingTriggerNames]
+        )
+      ).rows.map((row) => [row.tgname, row.enabled])
+    );
+    if (unspentTracking !== 'off' && Object.keys(existing).length === 0) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        `CHAINGRAPH_UNSPENT_TRACKING=${unspentTracking} requires migration 1791400000000_unspent_tracking.`
+      );
+    }
+    const statements = configureUnspentTrackingTriggersSql(
+      unspentTracking,
+      existing
+    );
+    await statements.reduce<Promise<unknown>>(
+      async (chain, statement) =>
+        chain.then(async () => client.query(statement)),
+      Promise.resolve()
+    );
+    return statements;
+  } finally {
+    client.release();
+  }
+};
 
 /**
  * Trim a Postgres "bytea"-formatted string (e.g. `\xc0de`), returning just the
@@ -593,9 +668,17 @@ WITH transaction_values (hash, version, locktime, size_bytes, is_coinbase) AS (
     ON CONFLICT ON CONSTRAINT "transaction_hash_key" DO NOTHING
     RETURNING hash AS transaction_hash, internal_id AS transaction_internal_id
 ), insert_outputs AS (
-  INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment)
-    SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category::bytea, fungible_token_amount::bigint, nonfungible_token_capability::enum_nonfungible_token_capability, nonfungible_token_commitment::bytea FROM output_values CROSS JOIN new_transaction
-), insert_inputs AS (
+  INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment${
+    outputMarker.column
+  })
+    SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category::bytea, fungible_token_amount::bigint, nonfungible_token_capability::enum_nonfungible_token_capability, nonfungible_token_commitment::bytea${
+      outputMarker.value
+    } FROM output_values CROSS JOIN new_transaction
+)${unspentSetInsertCte(
+    unspentTracking,
+    '(SELECT transaction_hash, output_index, token_category, locking_bytecode FROM output_values CROSS JOIN new_transaction) AS new_outputs',
+    '(SELECT transaction_hash AS hash FROM new_transaction) AS new_hashes'
+  )}, insert_inputs AS (
   INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
     SELECT transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode FROM input_values CROSS JOIN new_transaction
 )
@@ -636,6 +719,7 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
       );
     }
     await client.query(saveNodeValidations, [transactionInternalId]);
+    await reacceptSpends(client, [transactionInternalId]);
     await client.query('COMMIT;');
   } catch (err) {
     await client.query('ROLLBACK;');
@@ -680,6 +764,16 @@ export const recordNodeValidation = async (
         CROSS JOIN known_transaction
       ON CONFLICT ON CONSTRAINT "node_transaction_pkey" DO NOTHING;
   `);
+    if (unspentTracking !== 'off') {
+      const known = await client.query<{ internalId: string }>(
+        /* sql */ `SELECT internal_id AS "internalId" FROM transaction WHERE hash = $1;`,
+        [Buffer.from(transactionHash, 'hex')]
+      );
+      await reacceptSpends(
+        client,
+        known.rows.map((row) => row.internalId)
+      );
+    }
   } finally {
     client.release();
   }
@@ -719,6 +813,43 @@ const verifyBlockTransactionsLinked = async (
 };
 
 /**
+ * `CHAINGRAPH_UNSPENT_TRACKING`: the per-block spend statement of the `sql`
+ * write path (`undefined` in `off` mode or for a coinbase-only block).
+ */
+const blockSpendTrackingSql = (block: ChaingraphBlock) =>
+  unspentTracking === 'marker'
+    ? buildMarkSpentOutputsSql(collectBlockSpends(block))
+    : unspentTracking === 'settable'
+    ? buildDeleteSpentFromSetSql(collectBlockSpends(block))
+    : undefined;
+
+/**
+ * `CHAINGRAPH_UNSPENT_TRACKING`: the per-block spend statement of the `copy`
+ * write path (reads `pg_temp.chaingraph_stage_spend`).
+ */
+const stagedSpendTrackingSql =
+  unspentTracking === 'marker'
+    ? markStagedSpentOutputsSql
+    : unspentTracking === 'settable'
+    ? deleteStagedSpentFromSetSql
+    : undefined;
+
+const stagedSpendCopies = (stagedSpends: Buffer | undefined) =>
+  stagedSpends === undefined
+    ? []
+    : [
+        {
+          messages: stagedSpends,
+          statement: copyStageTableSql('chaingraph_stage_spend'),
+        },
+      ];
+
+const encodeStagedSpendsIfTracked = (block: ChaingraphBlock) =>
+  unspentTracking === 'off'
+    ? undefined
+    : encodeStageSpends(collectBlockSpends(block));
+
+/**
  * Pooled connections on which the `copy` write path's staging tables exist.
  * (A replaced connection is a new client object, so it is set up again.)
  */
@@ -739,10 +870,18 @@ WITH newly_saved_transactions (hash, internal_id) AS (
     RETURNING hash, internal_id
 ),
 newly_saved_outputs AS (
-  INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment)
-    SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment FROM pg_temp.chaingraph_stage_output
+  INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment${
+    outputMarker.column
+  })
+    SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment${
+      outputMarker.value
+    } FROM pg_temp.chaingraph_stage_output
     WHERE transaction_hash IN (SELECT hash FROM newly_saved_transactions)
-),
+)${unspentSetInsertCte(
+  unspentTracking,
+  'pg_temp.chaingraph_stage_output',
+  'newly_saved_transactions'
+)},
 newly_saved_inputs AS (
   INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
     SELECT internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode
@@ -826,6 +965,7 @@ const saveBlockViaCopy = async ({
   const stagedOutputs = encodeStageOutputs(unknownTransactions);
   const stagedInputs = encodeStageInputs(unknownTransactions);
   const stagedBlockTransactions = encodeStageBlockTransactions(block);
+  const stagedSpends = encodeStagedSpendsIfTracked(block);
   const blockParameters = [
     block.height,
     block.version,
@@ -872,6 +1012,7 @@ const saveBlockViaCopy = async ({
         messages: stagedBlockTransactions,
         statement: copyStageTableSql('chaingraph_stage_block_transaction'),
       },
+      ...stagedSpendCopies(stagedSpends),
     ]);
     const saveTransactionsResult = await client.query<{ count: string }>(
       addAllStagedTransactions
@@ -889,6 +1030,9 @@ const saveBlockViaCopy = async ({
       block,
       Number(addBlockResult.rows[0]!.joinedTransactionCount)
     );
+    if (stagedSpendTrackingSql !== undefined) {
+      await client.query(stagedSpendTrackingSql);
+    }
     await client.query('COMMIT;');
     return {
       attemptedSavedTransactions: unknownTransactions,
@@ -1048,10 +1192,18 @@ newly_saved_transactions (hash, internal_id) AS (
     RETURNING hash, internal_id
 ),
 newly_saved_outputs AS (
-  INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment)
-    SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category::bytea, fungible_token_amount::bigint, nonfungible_token_capability::enum_nonfungible_token_capability, nonfungible_token_commitment::bytea FROM unknown_output_values
+  INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment${
+    outputMarker.column
+  })
+    SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category::bytea, fungible_token_amount::bigint, nonfungible_token_capability::enum_nonfungible_token_capability, nonfungible_token_commitment::bytea${
+      outputMarker.value
+    } FROM unknown_output_values
     WHERE transaction_hash IN (SELECT hash FROM newly_saved_transactions)
-),
+)${unspentSetInsertCte(
+    unspentTracking,
+    'unknown_output_values',
+    'newly_saved_transactions'
+  )},
 newly_saved_inputs AS (
   INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
     SELECT internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode
@@ -1146,6 +1298,10 @@ SELECT
       block,
       Number(addBlockResult.rows[0]!.joinedTransactionCount)
     );
+    const spendTrackingSql = blockSpendTrackingSql(block);
+    if (spendTrackingSql !== undefined) {
+      await client.query(spendTrackingSql);
+    }
     await client.query('COMMIT;');
     return {
       attemptedSavedTransactions,
@@ -1198,11 +1354,42 @@ export const acceptBlocksViaHeaders = async (
       )} END
       FROM matching_blocks blk CROSS JOIN (VALUES (${nodeInternalId}::bigint)) n(id)
       ON CONFLICT DO NOTHING
+      RETURNING block_internal_id AS "blockInternalId"
   `;
   const client = await pool.connect();
-  const nodeBlockInsertResult = await client.query(insertNodeBlocks);
-  client.release();
-  return nodeBlockInsertResult.rowCount;
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    if (unspentTracking === 'off') {
+      const nodeBlockInsertResult = await client.query(insertNodeBlocks);
+      return nodeBlockInsertResult.rowCount;
+    }
+    /*
+     * A block that gains its first accepting node may have had its spends
+     * released (stale for every node, then accepted again): re-mark them.
+     */
+    await client.query('BEGIN;');
+    const nodeBlockInsertResult = await client.query<{
+      blockInternalId: string;
+    }>(insertNodeBlocks);
+    const reaccepted = await client.query<{ ids: string[] | null }>(
+      firstAcceptedBlockTransactionsSql,
+      [
+        nodeBlockInsertResult.rows.map((row) => row.blockInternalId),
+        nodeInternalId,
+      ]
+    );
+    await reacceptSpends(client, reaccepted.rows[0]?.ids ?? []);
+    await client.query('COMMIT;');
+    return nodeBlockInsertResult.rowCount;
+  } catch (err) {
+    if (unspentTracking !== 'off') {
+      await client.query('ROLLBACK;');
+    }
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
+  } finally {
+    client.release();
+  }
 };
 
 /**
