@@ -37,6 +37,12 @@ export class AgentProcess {
         CHAINGRAPH_POSTGRES_CONNECTION_STRING: connectionString,
         CHAINGRAPH_POSTGRES_MAX_CONNECTIONS: String(settings.postgresMaxConnections),
         CHAINGRAPH_TRUSTED_NODES: trustedNodes,
+        // experiment knobs passed through from the gate's environment (agent defaults otherwise)
+        ...Object.fromEntries(
+          ['CHAINGRAPH_UNSPENT_TRACKING', 'CHAINGRAPH_WRITE_PATH']
+            .filter((key) => process.env[key] !== undefined)
+            .map((key) => [key, process.env[key]])
+        ),
         HOME: process.env.HOME,
         INGESTION_GATE_HEAP_SAMPLES: this.heapSamplePath,
         NODE_ENV: 'production',
