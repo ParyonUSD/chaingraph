@@ -64,10 +64,20 @@ export const createStageTablesSql = Object.entries(stageTableColumns)
   )
   .join('\n');
 
-export const copyStageTableSql = (table: StageTable) =>
+const buildCopyStageTableSql = (table: StageTable) =>
   `COPY pg_temp.${table} (${stageTableColumns[table]
     .map(([name]) => name)
     .join(', ')}) FROM STDIN (FORMAT binary)`;
+
+const copyStageTableStatements = Object.fromEntries(
+  Object.keys(stageTableColumns).map((table) => [
+    table,
+    buildCopyStageTableSql(table as StageTable),
+  ])
+) as { [table in StageTable]: string };
+
+export const copyStageTableSql = (table: StageTable) =>
+  copyStageTableStatements[table];
 
 const hashBytes = 32;
 const copyHeaderAndTrailerBytes = 64;

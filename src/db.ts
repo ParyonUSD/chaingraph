@@ -14,7 +14,7 @@ import {
   computeIndexCreationProgress,
   indexDefinitions,
 } from './components/db-utils.js';
-import { copyFromBuffer } from './components/pg-binary-copy.js';
+import { copyFromBuffers } from './components/pg-binary-copy.js';
 import {
   chaingraphWritePath,
   postgresConnectionString,
@@ -754,17 +754,24 @@ SELECT COUNT(*) FROM newly_saved_transactions;`;
  * The `copy` write path's block statement: the same CTE as `addBlockQuery` in
  * `saveBlock`, with the block's transaction list read from the staging table
  * and every other value passed as a parameter (so the text is fixed).
+ *
+ * `joined_transactions` is an index lookup per staged transaction (the
+ * `OFFSET 0` keeps the lateral subquery from being flattened into a join).
+ * Temporary tables have no statistics, and Postgres assumes at least 10 pages
+ * for a never-vacuumed table, so a small block's list is estimated at ~1,200
+ * rows; with a free choice the planner can pick a hash join over a full scan
+ * of `transaction`.
  */
 const addStagedBlock = /* sql */ `
-WITH transactions_in_block (hash, transaction_index) AS (
-  SELECT hash, transaction_index FROM pg_temp.chaingraph_stage_block_transaction
-),
-accepting_nodes (node_internal_id, accepted_at) AS (
+WITH accepting_nodes (node_internal_id, accepted_at) AS (
   SELECT * FROM unnest($10::bigint[], $11::timestamp[])
 ),
 joined_transactions (internal_id, transaction_index) AS (
   SELECT db.internal_id, val.transaction_index
-    FROM transaction db INNER JOIN transactions_in_block val ON val.hash = db.hash
+    FROM pg_temp.chaingraph_stage_block_transaction val
+    CROSS JOIN LATERAL (
+      SELECT internal_id FROM transaction WHERE transaction.hash = val.hash OFFSET 0
+    ) db
 ),
 inserted_block (internal_id) AS (
   INSERT INTO block (height, version, timestamp, hash, previous_block_hash, merkle_root, bits, nonce, size_bytes)
@@ -848,26 +855,24 @@ const saveBlockViaCopy = async ({
       clientsWithStageTables.add(client);
     }
     await client.query('BEGIN;');
-    await copyFromBuffer(
-      client,
-      copyStageTableSql('chaingraph_stage_transaction'),
-      stagedTransactions
-    );
-    await copyFromBuffer(
-      client,
-      copyStageTableSql('chaingraph_stage_output'),
-      stagedOutputs
-    );
-    await copyFromBuffer(
-      client,
-      copyStageTableSql('chaingraph_stage_input'),
-      stagedInputs
-    );
-    await copyFromBuffer(
-      client,
-      copyStageTableSql('chaingraph_stage_block_transaction'),
-      stagedBlockTransactions
-    );
+    await copyFromBuffers(client, [
+      {
+        messages: stagedTransactions,
+        statement: copyStageTableSql('chaingraph_stage_transaction'),
+      },
+      {
+        messages: stagedOutputs,
+        statement: copyStageTableSql('chaingraph_stage_output'),
+      },
+      {
+        messages: stagedInputs,
+        statement: copyStageTableSql('chaingraph_stage_input'),
+      },
+      {
+        messages: stagedBlockTransactions,
+        statement: copyStageTableSql('chaingraph_stage_block_transaction'),
+      },
+    ]);
     const saveTransactionsResult = await client.query<{ count: string }>(
       addAllStagedTransactions
     );

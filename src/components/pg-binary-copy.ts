@@ -4,10 +4,13 @@
  * the `pg` driver, without additional dependencies.
  *
  * - `BinaryCopyWriter` encodes rows in the binary COPY file format
- *   (https://www.postgresql.org/docs/current/sql-copy.html#id-1.9.3.55.9.4).
- * - `CopyFromBufferQuery` is a `pg` "submittable" which runs a
- *   `COPY … FROM STDIN` statement and streams an already-encoded payload as CopyData
- *   messages (the same protocol hooks `pg-copy-streams` uses).
+ *   (https://www.postgresql.org/docs/current/sql-copy.html#id-1.9.3.55.9.4)
+ *   directly inside the frontend protocol messages which carry them (one
+ *   CopyData message followed by CopyDone), so they can be written to the
+ *   socket without another copy.
+ * - `CopyFromBuffersQuery` is a `pg` "submittable" which runs one or more
+ *   `COPY … FROM STDIN` statements and pipelines their encoded data (the same
+ *   protocol hooks `pg-copy-streams` uses).
  */
 import type pg from 'pg';
 
@@ -22,6 +25,20 @@ export const binaryCopySignature = Buffer.from([
 ]);
 const flagsAndExtensionBytes = 8;
 const headerBytes = binaryCopySignature.length + flagsAndExtensionBytes;
+/** A frontend message's type byte plus its int32 length. */
+const messageHeaderBytes = 5;
+const messageLengthBytes = 4;
+/** CopyData header before the data, CopyDone after it. */
+const framingBytes = messageHeaderBytes + messageHeaderBytes;
+/** `d` */
+const copyDataCode = 0x64;
+/** `c` */
+const copyDoneCode = 0x63;
+/**
+ * Postgres rejects messages over 1 GB (`PQ_LARGE_MESSAGE_LIMIT`); even a
+ * 32 MB block encodes to well under 100 MB per table.
+ */
+const maxCopyDataBytes = 0x3fff_fff0;
 const fieldCountBytes = 2;
 const fieldLengthBytes = 4;
 const int8Bytes = 8;
@@ -41,6 +58,10 @@ const growthFactor = 2;
  * the column order of the `COPY` statement. Integer types are written as
  * `int8`, so every integer column must be `bigint`; `enum` values are sent as
  * their label (that is the binary format of `enum_send`/`enum_recv`).
+ *
+ * The data is written after a reserved CopyData message header, and `finish`
+ * appends a CopyDone message: the result is ready to send as-is after a
+ * `COPY … FROM STDIN` Query message.
  */
 export class BinaryCopyWriter {
   buffer: Buffer;
@@ -51,12 +72,19 @@ export class BinaryCopyWriter {
 
   constructor(expectedSizeBytes = initialCapacity) {
     this.buffer = Buffer.allocUnsafe(
-      Math.max(expectedSizeBytes, headerBytes + fieldCountBytes)
+      Math.max(
+        expectedSizeBytes + framingBytes,
+        framingBytes + headerBytes + fieldCountBytes
+      )
     );
-    binaryCopySignature.copy(this.buffer, 0);
-    this.buffer.writeInt32BE(0, binaryCopySignature.length);
-    this.buffer.writeInt32BE(0, binaryCopySignature.length + fieldLengthBytes);
-    this.offset = headerBytes;
+    const start = messageHeaderBytes;
+    binaryCopySignature.copy(this.buffer, start);
+    this.buffer.writeInt32BE(0, start + binaryCopySignature.length);
+    this.buffer.writeInt32BE(
+      0,
+      start + binaryCopySignature.length + fieldLengthBytes
+    );
+    this.offset = start + headerBytes;
   }
 
   ensure(additionalBytes: number) {
@@ -164,21 +192,30 @@ export class BinaryCopyWriter {
   }
 
   /**
-   * Append the trailer and return the encoded payload (a view of the internal
-   * buffer). The writer must not be used afterwards.
+   * Append the trailer and return the frontend messages carrying the data: a
+   * CopyData message with the complete binary COPY payload, then CopyDone (a
+   * view of the internal buffer). The writer must not be used afterwards.
    */
   finish() {
-    this.ensure(fieldCountBytes);
+    this.ensure(fieldCountBytes + messageHeaderBytes);
     this.buffer.writeInt16BE(trailer, this.offset);
     this.offset += fieldCountBytes;
+    const payloadBytes = this.offset - messageHeaderBytes;
+    if (payloadBytes > maxCopyDataBytes) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new RangeError(
+        `COPY payload of ${payloadBytes} bytes exceeds the CopyData message limit.`
+      );
+    }
+    this.buffer[0] = copyDataCode;
+    this.buffer.writeInt32BE(messageLengthBytes + payloadBytes, 1);
+    this.buffer[this.offset] = copyDoneCode;
+    this.buffer.writeInt32BE(messageLengthBytes, this.offset + 1);
+    this.offset += messageHeaderBytes;
     return this.buffer.subarray(0, this.offset);
   }
 }
 
-/**
- * Decode a binary COPY payload. Only used to verify encoders: every non-null
- * field is returned as raw bytes, and `decodeField` may convert it.
- */
 const decodeRow = (payload: Buffer, start: number, fieldCount: number) => {
   const row: (Buffer | null)[] = [];
   // eslint-disable-next-line functional/no-let
@@ -194,7 +231,31 @@ const decodeRow = (payload: Buffer, start: number, fieldCount: number) => {
   return { offset, row };
 };
 
-export const decodeBinaryCopy = (payload: Buffer) => {
+/**
+ * Extract the binary COPY payload from the messages built by
+ * `BinaryCopyWriter.finish` (one CopyData message, then CopyDone).
+ */
+export const copyDataPayload = (messages: Buffer) => {
+  const copyDataLength = messages.readInt32BE(1);
+  const copyDoneOffset = 1 + copyDataLength;
+  if (
+    messages[0] !== copyDataCode ||
+    messages[copyDoneOffset] !== copyDoneCode ||
+    messages.readInt32BE(copyDoneOffset + 1) !== messageLengthBytes ||
+    copyDoneOffset + messageHeaderBytes !== messages.length
+  ) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error('Expected exactly one CopyData message and CopyDone.');
+  }
+  return messages.subarray(messageHeaderBytes, copyDoneOffset);
+};
+
+/**
+ * Decode the messages built by `BinaryCopyWriter.finish`. Only used to verify
+ * encoders: every non-null field is returned as raw bytes.
+ */
+export const decodeBinaryCopy = (messages: Buffer) => {
+  const payload = copyDataPayload(messages);
   if (
     !payload.subarray(0, binaryCopySignature.length).equals(binaryCopySignature)
   ) {
@@ -227,41 +288,57 @@ export const decodeBinaryCopy = (payload: Buffer) => {
   return rows;
 };
 
-/**
- * The CopyData chunk size. Postgres accepts much larger messages, but smaller
- * chunks keep each protocol message (and its copy in the serializer) small.
- */
-const copyChunkBytes = bytesPerKilobyte * bytesPerKilobyte;
-
+// eslint-disable-next-line functional/no-mixed-type
 interface CopyConnection {
   query: (text: string) => void;
-  sendCopyFromChunk: (chunk: Buffer) => void;
-  endCopyFrom: () => void;
-  sendCopyFail: (message: string) => void;
+  stream: {
+    cork: () => void;
+    uncork: () => void;
+    write: (chunk: Buffer) => boolean;
+  };
+}
+
+export interface CopyFromStdin {
+  /**
+   * A `COPY … FROM STDIN` statement (without trailing semicolon).
+   */
+  statement: string;
+  /**
+   * The CopyData and CopyDone messages for this statement, from
+   * `BinaryCopyWriter.finish`.
+   */
+  messages: Buffer;
 }
 
 /**
- * A `pg` submittable which runs `COPY … FROM STDIN` and sends `payload` as
- * CopyData messages. Use via `copyFromBuffer`.
+ * A `pg` submittable which runs one or more `COPY … FROM STDIN` statements in
+ * a single simple-protocol Query message and pipelines all of their data
+ * right behind it (Query, then CopyData + CopyDone per statement, in one
+ * corked socket write). This costs one round trip regardless of the number of
+ * statements, instead of one round trip per statement plus one per
+ * CopyInResponse.
+ *
+ * Pipelining is safe: if a statement fails, Postgres skips the rest of the
+ * Query message, sends ReadyForQuery and drops the remaining CopyData and
+ * CopyDone messages ("Copy-In Mode" in the protocol documentation).
+ *
+ * Use via `copyFromBuffers`.
  */
-export class CopyFromBufferQuery implements pg.Submittable {
-  text: string;
+export class CopyFromBuffersQuery implements pg.Submittable {
+  copies: CopyFromStdin[];
 
-  payload: Buffer;
-
-  rowCount: number | null = null;
+  rowCounts: (number | null)[] = [];
 
   error: Error | undefined;
 
   done = false;
 
   callback:
-    | ((err: Error | undefined, rowCount: number | null) => void)
+    | ((err: Error | undefined, rowCounts: (number | null)[]) => void)
     | undefined;
 
-  constructor(text: string, payload: Buffer) {
-    this.text = text;
-    this.payload = payload;
+  constructor(copies: CopyFromStdin[]) {
+    this.copies = copies;
   }
 
   finish(err: Error | undefined) {
@@ -269,27 +346,35 @@ export class CopyFromBufferQuery implements pg.Submittable {
       return;
     }
     this.done = true;
-    this.callback?.(err, this.rowCount);
+    this.callback?.(err, this.rowCounts);
   }
 
   submit(connection: pg.Connection) {
-    (connection as unknown as CopyConnection).query(this.text);
+    const copyConnection = connection as unknown as CopyConnection;
+    const { stream } = copyConnection;
+    stream.cork();
+    copyConnection.query(
+      this.copies.map((copy) => `${copy.statement};`).join('\n')
+    );
+    this.copies.forEach(({ messages }) => {
+      stream.write(messages);
+    });
+    stream.uncork();
   }
 
-  handleCopyInResponse(connection: CopyConnection) {
-    // eslint-disable-next-line functional/no-loop-statement, functional/no-let
-    for (let start = 0; start < this.payload.length; start += copyChunkBytes) {
-      connection.sendCopyFromChunk(
-        this.payload.subarray(start, start + copyChunkBytes)
-      );
-    }
-    connection.endCopyFrom();
+  /**
+   * The data was already sent in `submit`.
+   */
+  // eslint-disable-next-line class-methods-use-this
+  handleCopyInResponse() {
+    /* already sent */
   }
 
   handleCommandComplete(message: { text?: string }) {
     const match = /^COPY (?<count>\d+)$/u.exec(message.text ?? '');
-    this.rowCount =
-      match?.groups?.count === undefined ? null : Number(match.groups.count);
+    this.rowCounts.push(
+      match?.groups?.count === undefined ? null : Number(match.groups.count)
+    );
   }
 
   handleReadyForQuery() {
@@ -329,19 +414,18 @@ export class CopyFromBufferQuery implements pg.Submittable {
 }
 
 /**
- * Run `COPY <target> FROM STDIN (FORMAT binary)` on `client` with an encoded
- * payload. Resolves to the number of rows copied.
+ * Run `COPY … FROM STDIN` statements on `client` with already-encoded data,
+ * in one round trip. Resolves to the row count reported for each statement.
  */
-export const copyFromBuffer = async (
+export const copyFromBuffers = async (
   client: pg.ClientBase,
-  copyStatement: string,
-  payload: Buffer
+  copies: CopyFromStdin[]
 ) =>
-  new Promise<number | null>((resolve, reject) => {
-    const query = new CopyFromBufferQuery(copyStatement, payload);
-    query.callback = (err, rowCount) => {
+  new Promise<(number | null)[]>((resolve, reject) => {
+    const query = new CopyFromBuffersQuery(copies);
+    query.callback = (err, rowCounts) => {
       if (err === undefined) {
-        resolve(rowCount);
+        resolve(rowCounts);
       } else {
         reject(err);
       }

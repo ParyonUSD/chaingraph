@@ -4,7 +4,8 @@ import test from 'ava';
 import {
   binaryCopySignature,
   BinaryCopyWriter,
-  CopyFromBufferQuery,
+  copyDataPayload,
+  CopyFromBuffersQuery,
   decodeBinaryCopy,
 } from './pg-binary-copy.js';
 
@@ -14,10 +15,28 @@ const header = Buffer.concat([
 ]);
 const trailer = Buffer.from('ffff', 'hex');
 
-test('BinaryCopyWriter: empty payload is header + trailer', (t) => {
-  const payload = new BinaryCopyWriter().finish();
-  t.deepEqual(payload, Buffer.concat([header, trailer]));
-  t.deepEqual(decodeBinaryCopy(payload), []);
+const copyDone = Buffer.from('6300000004', 'hex');
+const copyData = (payload: Buffer) => {
+  const messageHeader = Buffer.alloc(5);
+  messageHeader[0] = 0x64;
+  messageHeader.writeInt32BE(4 + payload.length, 1);
+  return Buffer.concat([messageHeader, payload, copyDone]);
+};
+
+test('BinaryCopyWriter: empty payload is header + trailer, framed as CopyData + CopyDone', (t) => {
+  const messages = new BinaryCopyWriter().finish();
+  t.deepEqual(messages, copyData(Buffer.concat([header, trailer])));
+  t.deepEqual(copyDataPayload(messages), Buffer.concat([header, trailer]));
+  t.deepEqual(decodeBinaryCopy(messages), []);
+});
+
+test('copyDataPayload: rejects anything but one CopyData + CopyDone', (t) => {
+  const messages = new BinaryCopyWriter().finish();
+  t.throws(() => copyDataPayload(messages.subarray(0, messages.length - 1)));
+  t.throws(() => copyDataPayload(Buffer.concat([messages, copyDone])));
+  const wrongCode = Buffer.from(messages);
+  wrongCode[0] = 0x51;
+  t.throws(() => copyDataPayload(wrongCode));
 });
 
 test('BinaryCopyWriter: exact wire bytes for every field type', (t) => {
@@ -31,7 +50,7 @@ test('BinaryCopyWriter: exact wire bytes for every field type', (t) => {
     .null()
     .finish();
   t.deepEqual(
-    payload,
+    copyDataPayload(payload),
     Buffer.concat([
       header,
       Buffer.from('0006', 'hex'),
@@ -136,32 +155,86 @@ test('BinaryCopyWriter: grows past its initial capacity', (t) => {
   t.is(rows[rowCount - 1]![0]!.readBigInt64BE(0), BigInt(rowCount - 1));
 });
 
-test('CopyFromBufferQuery: sends the statement, chunks the payload, reports COPY count', (t) => {
-  const payload = Buffer.alloc(2.5 * 1024 * 1024, 1);
-  const sent: string[] = [];
-  const chunks: Buffer[] = [];
+const parseFrontendMessages = (bytes: Buffer) => {
+  const messages: { code: string; body: Buffer }[] = [];
+  // eslint-disable-next-line functional/no-let
+  let offset = 0;
+  // eslint-disable-next-line functional/no-loop-statement
+  while (offset < bytes.length) {
+    const code = String.fromCharCode(bytes[offset]!);
+    const length = bytes.readInt32BE(offset + 1);
+    messages.push({
+      body: bytes.subarray(offset + 5, offset + 1 + length),
+      code,
+    });
+    offset += 1 + length;
+  }
+  return messages;
+};
+
+const mockConnection = () => {
+  const writes: Buffer[] = [];
+  const events: string[] = [];
   const connection = {
-    endCopyFrom: () => sent.push('done'),
-    query: (text: string) => sent.push(text),
-    sendCopyFail: () => sent.push('fail'),
-    sendCopyFromChunk: (chunk: Buffer) => chunks.push(chunk),
+    query: (text: string) => {
+      const body = Buffer.from(`${text}\0`);
+      const queryHeader = Buffer.alloc(5);
+      queryHeader[0] = 'Q'.charCodeAt(0);
+      queryHeader.writeInt32BE(4 + body.length, 1);
+      writes.push(queryHeader, body);
+    },
+    stream: {
+      cork: () => events.push('cork'),
+      uncork: () => events.push('uncork'),
+      write: (chunk: Buffer) => {
+        writes.push(Buffer.from(chunk));
+        return true;
+      },
+    },
   };
-  const query = new CopyFromBufferQuery('COPY x FROM STDIN', payload);
-  const results: [Error | undefined, number | null][] = [];
-  query.callback = (err, rowCount) => results.push([err, rowCount]);
+  return { connection, events, writes };
+};
+
+test('CopyFromBuffersQuery: one corked write of Query + CopyData/CopyDone per statement', (t) => {
+  const first = new BinaryCopyWriter().startRow(1).int8(7).finish();
+  const second = new BinaryCopyWriter().finish();
+  const { connection, events, writes } = mockConnection();
+  const query = new CopyFromBuffersQuery([
+    { messages: first, statement: 'COPY a FROM STDIN' },
+    { messages: second, statement: 'COPY b FROM STDIN' },
+  ]);
+  const results: [Error | undefined, (number | null)[]][] = [];
+  query.callback = (err, rowCounts) => results.push([err, rowCounts]);
   query.submit(connection as never);
-  query.handleCopyInResponse(connection);
-  query.handleCommandComplete({ text: 'COPY 42' });
+  t.deepEqual(events, ['cork', 'uncork']);
+  const messages = parseFrontendMessages(Buffer.concat(writes));
+  t.deepEqual(
+    messages.map((message) => message.code),
+    ['Q', 'd', 'c', 'd', 'c']
+  );
+  t.is(
+    messages[0]!.body.toString(),
+    'COPY a FROM STDIN;\nCOPY b FROM STDIN;\0'
+  );
+  t.deepEqual(messages[1]!.body, copyDataPayload(first));
+  t.deepEqual(messages[3]!.body, copyDataPayload(second));
+  t.deepEqual(messages[2]!.body.length, 0);
+  query.handleCopyInResponse();
+  query.handleCommandComplete({ text: 'COPY 1' });
+  query.handleCopyInResponse();
+  query.handleCommandComplete({ text: 'COPY 0' });
   query.handleReadyForQuery();
   query.handleReadyForQuery();
-  t.deepEqual(sent, ['COPY x FROM STDIN', 'done']);
-  t.is(chunks.length, 3);
-  t.true(Buffer.concat(chunks).equals(payload));
-  t.deepEqual(results, [[undefined, 42]]);
+  t.deepEqual(results, [[undefined, [1, 0]]]);
 });
 
-test('CopyFromBufferQuery: errors reach the callback once', (t) => {
-  const query = new CopyFromBufferQuery('COPY x FROM STDIN', Buffer.alloc(0));
+test('CopyFromBuffersQuery: errors reach the callback once', (t) => {
+  const query = new CopyFromBuffersQuery([
+    {
+      messages: new BinaryCopyWriter().finish(),
+      statement: 'COPY x FROM STDIN',
+    },
+  ]);
   const results: (Error | undefined)[] = [];
   query.callback = (err) => results.push(err);
   const error = new Error('boom');
