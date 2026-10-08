@@ -162,6 +162,33 @@ export const getIncompleteBlocks = async ({
   const auditedThrough = nodeInternalIds.map(
     (_, index) => auditedThroughBlockInternalIds?.[index] ?? 0
   );
+  /*
+   * If any node has never completed an audit, every block it accepted must be
+   * audited anyway, so use the original (unbounded) filter: on a full audit
+   * it is measurably cheaper than the per-node join (E13, 831k blocks: 413 s
+   * vs 552 s for the same bytes read). The per-node bounded filter is used
+   * only when every node has a marker.
+   */
+  const minimumAuditedThrough = Math.min(...auditedThrough);
+  const auditEveryBlock = minimumAuditedThrough === 0;
+  const acceptedByNodeFilter = auditEveryBlock
+    ? /* sql */ `
+      AND EXISTS (
+        SELECT 1 FROM node_block
+          WHERE node_block.block_internal_id = block.internal_id
+            AND node_block.node_internal_id = ANY($1::integer[])
+      )`
+    : /* sql */ `
+      AND block.internal_id > $7
+      AND EXISTS (
+        SELECT 1 FROM node_block
+          INNER JOIN unnest($1::integer[], $6::bigint[])
+            AS audited_node (node_internal_id, audited_through_block_internal_id)
+            ON audited_node.node_internal_id = node_block.node_internal_id
+          WHERE node_block.block_internal_id = block.internal_id
+            AND block.internal_id >
+              audited_node.audited_through_block_internal_id
+      )`;
   const client = await pool.connect();
   // eslint-disable-next-line functional/no-try-statement
   try {
@@ -193,17 +220,7 @@ WITH linked_transactions AS (
       ON transaction.internal_id = block_transaction.transaction_internal_id
     WHERE block.height >= $2
       AND block.height < $3
-      AND block.internal_id > $7
-      AND NOT (encode(block.hash, 'hex') = ANY($5::text[]))
-      AND EXISTS (
-        SELECT 1 FROM node_block
-          INNER JOIN unnest($1::integer[], $6::bigint[])
-            AS audited_node (node_internal_id, audited_through_block_internal_id)
-            ON audited_node.node_internal_id = node_block.node_internal_id
-          WHERE node_block.block_internal_id = block.internal_id
-            AND block.internal_id >
-              audited_node.audited_through_block_internal_id
-      )
+      AND NOT (encode(block.hash, 'hex') = ANY($5::text[]))${acceptedByNodeFilter}
     GROUP BY block.internal_id
 ),
 linked_block_sizes AS (
@@ -259,8 +276,7 @@ SELECT
         heightUpperBound,
         limit,
         excludedBlockHashes,
-        auditedThrough,
-        Math.min(...auditedThrough),
+        ...(auditEveryBlock ? [] : [auditedThrough, minimumAuditedThrough]),
       ]
     );
     const scan = incompleteBlockScan.rows[0]!;
