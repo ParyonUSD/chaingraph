@@ -135,7 +135,7 @@ $$;
 -- Returns the number of rows changed.
 CREATE FUNCTION unspent_deferred_recompute_marker ()
   RETURNS bigint LANGUAGE plpgsql
-  SET enable_hashjoin = off SET enable_mergejoin = off SET jit = off AS $$
+  SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off SET jit = off AS $$
 DECLARE
   changed bigint;
 BEGIN
@@ -163,7 +163,7 @@ $$;
 
 CREATE FUNCTION unspent_deferred_recompute_bits ()
   RETURNS bigint LANGUAGE plpgsql
-  SET enable_hashjoin = off SET enable_mergejoin = off SET jit = off AS $$
+  SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off SET jit = off AS $$
 DECLARE
   changed bigint;
 BEGIN
@@ -239,7 +239,13 @@ BEGIN
 END;
 $$;
 
--- One job batch. Call inside a REPEATABLE READ transaction (one snapshot for
+-- One job batch. Every lookup is a keyed probe (hash/merge joins and sequential
+-- scans disabled; the job's own small tables grow between plans, so a plan
+-- cached while they were empty must not scan them per row). Probes of `output`
+-- by key never test the stored value inside the probe: a `… IS NULL` there
+-- matches the NULL partial indexes, which stale statistics (right after a
+-- large save) can make the planner scan once per row. Call inside a
+-- REPEATABLE READ transaction (one snapshot for
 -- every step) and commit; `tx_limit` / `block_limit` must be settled sequence
 -- values (every transaction that allocated an id at or below them has
 -- finished). `skip_stall_through`: inputs of transactions up to this id whose
@@ -250,7 +256,7 @@ CREATE FUNCTION unspent_deferred_run_batch (kind text, tx_limit bigint, block_li
   max_inputs integer, max_blocks integer, max_events integer, sweep_rows integer, skip_stall_through bigint,
   check_watch boolean DEFAULT true)
   RETURNS jsonb LANGUAGE plpgsql
-  SET enable_hashjoin = off SET enable_mergejoin = off SET jit = off AS $$
+  SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off SET jit = off AS $$
 DECLARE
   zero_hash constant bytea := '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea;
   w bigint;
@@ -439,32 +445,28 @@ BEGIN
         INSERT INTO unspent_deferred_fresh (h, i, creator)
           SELECT o.transaction_hash, o.output_index, t.internal_id
             FROM transaction t
-            CROSS JOIN LATERAL (SELECT transaction_hash, output_index FROM output
-                                  WHERE output.transaction_hash = t.hash
-                                    AND output.spent_by_transaction_internal_id IS NULL OFFSET 0) o
-            WHERE t.internal_id > w AND t.internal_id <= upper_tx;
+            CROSS JOIN LATERAL (SELECT transaction_hash, output_index, spent_by_transaction_internal_id AS stored FROM output
+                                  WHERE output.transaction_hash = t.hash OFFSET 0) o
+            WHERE t.internal_id > w AND t.internal_id <= upper_tx AND o.stored IS NULL;
         INSERT INTO unspent_deferred_affected (h, i)
           SELECT o.transaction_hash, o.output_index
             FROM transaction t
-            CROSS JOIN LATERAL (SELECT transaction_hash, output_index FROM output
-                                  WHERE output.transaction_hash = t.hash
-                                    AND output.spent_by_transaction_internal_id IS NOT NULL OFFSET 0) o
-            WHERE t.internal_id > w AND t.internal_id <= upper_tx;
+            CROSS JOIN LATERAL (SELECT transaction_hash, output_index, spent_by_transaction_internal_id AS stored FROM output
+                                  WHERE output.transaction_hash = t.hash OFFSET 0) o
+            WHERE t.internal_id > w AND t.internal_id <= upper_tx AND o.stored IS NOT NULL;
       ELSE
         INSERT INTO unspent_deferred_fresh (h, i, creator)
           SELECT o.transaction_hash, o.output_index, t.internal_id
             FROM transaction t
-            CROSS JOIN LATERAL (SELECT transaction_hash, output_index FROM output
-                                  WHERE output.transaction_hash = t.hash
-                                    AND output.unspent_node_bits IS NULL OFFSET 0) o
-            WHERE t.internal_id > w AND t.internal_id <= upper_tx;
+            CROSS JOIN LATERAL (SELECT transaction_hash, output_index, unspent_node_bits AS stored FROM output
+                                  WHERE output.transaction_hash = t.hash OFFSET 0) o
+            WHERE t.internal_id > w AND t.internal_id <= upper_tx AND o.stored IS NULL;
         INSERT INTO unspent_deferred_affected (h, i)
           SELECT o.transaction_hash, o.output_index
             FROM transaction t
-            CROSS JOIN LATERAL (SELECT transaction_hash, output_index FROM output
-                                  WHERE output.transaction_hash = t.hash
-                                    AND output.unspent_node_bits IS NOT NULL OFFSET 0) o
-            WHERE t.internal_id > w AND t.internal_id <= upper_tx;
+            CROSS JOIN LATERAL (SELECT transaction_hash, output_index, unspent_node_bits AS stored FROM output
+                                  WHERE output.transaction_hash = t.hash OFFSET 0) o
+            WHERE t.internal_id > w AND t.internal_id <= upper_tx AND o.stored IS NOT NULL;
       END IF;
       -- fresh outputs a passed (skipped) input spends: full recompute
       INSERT INTO unspent_deferred_affected (h, i)
@@ -554,7 +556,7 @@ BEGIN
               WHERE NOT EXISTS (SELECT 1 FROM pg_temp.unspent_deferred_affected a WHERE a.h = f.h AND a.i = f.i)
               ORDER BY f.h, f.i OFFSET 0) v
       WHERE o.transaction_hash = v.h AND o.output_index = v.i
-        AND o.spent_by_transaction_internal_id IS NULL;
+        AND o.spent_by_transaction_internal_id IS DISTINCT FROM 0;
   ELSE
     UPDATE output o SET unspent_node_bits = v.bits
       FROM (SELECT f.h, f.i,
@@ -570,7 +572,7 @@ BEGIN
               WHERE NOT EXISTS (SELECT 1 FROM pg_temp.unspent_deferred_affected a WHERE a.h = f.h AND a.i = f.i)
               ORDER BY f.h, f.i OFFSET 0) v
       WHERE o.transaction_hash = v.h AND o.output_index = v.i
-        AND o.unspent_node_bits IS NULL;
+        AND o.unspent_node_bits IS DISTINCT FROM v.bits;
   END IF;
   GET DIAGNOSTICS n_fresh = ROW_COUNT;
   n_affected := n_affected + n_fresh;
