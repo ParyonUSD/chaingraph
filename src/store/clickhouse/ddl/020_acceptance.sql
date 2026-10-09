@@ -3,9 +3,11 @@
 -- sum(sign) > 0 per key, which is order-independent (unmerged pairs, orphan -1 rows, double re-orgs).
 --
 -- Choices where the plan is silent (also in README.md):
---   * `version` is the commit_seq of the +1 row. A -1 row copies the version of the +1 it cancels
---     (so VCMT can collapse the pair) and carries its own commit_seq (so the gate hides an
---     uncommitted re-org). Re-acceptance writes +1 with a new version = its own commit_seq.
+--   * WP5a: `version` is the row's OWN commit_seq, for +1 and -1 rows alike. (WP2 had a -1 copy the
+--     version of the +1 it cancels; a background merge then deletes both rows physically, even
+--     while the -1's commit is uncommitted or after it was aborted, and the gate cannot bring the +1
+--     back.) VCMT therefore only collapses pairs written by one commit; cross-commit pairs stay
+--     until a compaction job removes them (docs/clickhouse-port/wp5a-core.md §2).
 --   * Collapsing tables are unpartitioned: VCMT only collapses within a partition.
 --   * tx_acceptance has a projection on a VCMT table, which ClickHouse refuses unless
 --     deduplicate_merge_projection_mode is set; 'rebuild' keeps the projection exact after collapses.

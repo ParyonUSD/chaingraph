@@ -3,10 +3,13 @@
 -- Reads: GROUP BY key HAVING sum(sign) > 0 (order-independent; correct with orphan -1 rows).
 --
 -- Choices where the plan is silent (also in README.md):
---   * `version` is a constant written by the agent (1, as in #83's build) for every utxo row: VCMT
---     only collapses equal-version pairs, and the sum semantics need no ordering. A per-transition
---     version would stop -1/+1 pairs from ever collapsing.
---   * created_height UInt32, 0 = mempool. Unpartitioned (as #83; VCMT collapses within a partition).
+--   * WP5a: `version` is the row's own commit_seq (WP2 had a constant 1, which lets a merge delete a
+--     committed +1 together with an uncommitted or aborted -1; see 020_acceptance.sql). Pairs written
+--     by one commit (an output created and spent in one block, the horizon build) still collapse.
+--   * WP5a: created_height is always 0 (unspent_output / F1g returns output columns only; every row
+--     of an outpoint must carry identical non-key values so the views' any() is exact). Take the
+--     height from tx_acceptance. Kept for compatibility; a candidate for removal.
+--   * Unpartitioned (as #83; VCMT collapses within a partition).
 --   * Granularity left at 8192 (#83 measured 4 ms UTXO reads at the default); Phase 1 may revisit.
 
 CREATE TABLE IF NOT EXISTS cg.utxo
