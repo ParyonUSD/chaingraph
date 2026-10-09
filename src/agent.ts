@@ -1794,8 +1794,9 @@ export class Agent {
     const { attemptedSavedTransactions, transactionCacheMisses } =
       await saveBlock({
         block,
+        isSavedTransaction: (hash) =>
+          this.transactionCache.get(hash)?.db === true,
         nodeAcceptances,
-        transactionCache: this.transactionCache,
       });
     this.blockDb?.add(block.hash);
     const completionTime = Date.now();
