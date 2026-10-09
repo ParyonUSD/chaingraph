@@ -14,7 +14,7 @@
  *   row below a watermark can commit later.
  */
 
-export type UnspentDeferredKind = 'bitmask' | 'marker';
+export type UnspentDeferredKind = 'array' | 'bitmask' | 'marker';
 
 /**
  * The partial indexes of a deferred mode (created by the agent at start-up if
@@ -25,8 +25,13 @@ export type UnspentDeferredKind = 'bitmask' | 'marker';
  *   `marker` equivalents, `WHERE … = 0`, come with migration
  *   `1791400000000_unspent_tracking`).
  */
-export const deferredIndexDefinitions = (kind: UnspentDeferredKind) =>
-  kind === 'marker'
+export const deferredIndexDefinitions = (
+  kind: UnspentDeferredKind,
+  nodeInternalIds: number[] = []
+): { [name: string]: string } =>
+  kind === 'array'
+    ? arrayIndexDefinitions(nodeInternalIds)
+    : kind === 'marker'
     ? {
         /* eslint-disable @typescript-eslint/naming-convention */
         output_unspent_null_search_index: /* sql */ `CREATE INDEX output_unspent_null_search_index ON output USING btree (substring(locking_bytecode, 0, 26)) WHERE spent_by_transaction_internal_id IS NULL;`,
@@ -39,6 +44,32 @@ export const deferredIndexDefinitions = (kind: UnspentDeferredKind) =>
         output_unspent_bits_token_category_index: /* sql */ `CREATE INDEX output_unspent_bits_token_category_index ON output USING btree (token_category) WHERE unspent_node_bits <> 0;`,
         /* eslint-enable @typescript-eslint/naming-convention */
       };
+
+/**
+ * E17b `deferred-array`: per node, partial B-trees on the category, the
+ * category + capability and the 25-byte prefix `WHERE <n> = ANY
+ * (unspent_node_ids)`, plus the NULL (unprocessed) token-output index for the
+ * backlog correction. Created at start-up for every node, like the bitmask's.
+ */
+export const arrayIndexDefinitions = (nodeInternalIds: number[]) => ({
+  output_unspent_array_null_token_category_index: /* sql */ `CREATE INDEX output_unspent_array_null_token_category_index ON output USING btree (token_category) WHERE unspent_node_ids IS NULL AND token_category IS NOT NULL;`,
+  ...Object.fromEntries(
+    nodeInternalIds.flatMap((id) => [
+      [
+        `output_unspent_array_node_${id}_token_category_index`,
+        /* sql */ `CREATE INDEX output_unspent_array_node_${id}_token_category_index ON output USING btree (token_category) WHERE ${id} = ANY (unspent_node_ids);`,
+      ],
+      [
+        `output_unspent_array_node_${id}_category_capability_index`,
+        /* sql */ `CREATE INDEX output_unspent_array_node_${id}_category_capability_index ON output USING btree (token_category, nonfungible_token_capability) WHERE ${id} = ANY (unspent_node_ids);`,
+      ],
+      [
+        `output_unspent_array_node_${id}_search_index`,
+        /* sql */ `CREATE INDEX output_unspent_array_node_${id}_search_index ON output USING btree (substring(locking_bytecode, 0, 26)) WHERE ${id} = ANY (unspent_node_ids);`,
+      ],
+    ])
+  ),
+});
 
 /**
  * Names of every index a deferred mode may create (for tests and cleanup).
@@ -79,7 +110,9 @@ export const configureDeferredTriggersSql = (
  * Re-point the generic query root at the active kind (inlinable: one SQL
  * statement calling the kind's inlinable function).
  */
-export const deferredQueryRootSql = (kind: UnspentDeferredKind) => /* sql */ `
+export const deferredQueryRootSql = (kind: UnspentDeferredKind) => /* sql */ `${
+  kind === 'array' ? 'SELECT unspent_deferred_array_build_root();\n' : ''
+}
 CREATE OR REPLACE FUNCTION unspent_output_deferred (node_name text)
   RETURNS SETOF output LANGUAGE sql STABLE AS $$
   SELECT * FROM unspent_output_deferred_${kind}(node_name)

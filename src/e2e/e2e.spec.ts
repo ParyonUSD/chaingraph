@@ -95,6 +95,7 @@ const dbUpMigrationPaths = [
   migration('default/1791400000000_unspent_tracking/up.sql'),
   migration('default/1791400001000_unspent_post_commit/up.sql'),
   migration('default/1791400002000_unspent_deferred/up.sql'),
+  migration('default/1791400003000_unspent_deferred_array/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -822,7 +823,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
          * CHAINGRAPH_UNSPENT_TRACKING=deferred-* adds its partial indexes at
          * start-up (checked by the deferred tracking tests).
          */
-        !/^output_unspent_(null|bits)_/u.test(name)
+        !/^output_unspent_(null|bits|array)_/u.test(name)
     );
   t.deepEqual(indexes, [
     'block_hash_key',
@@ -3407,6 +3408,8 @@ const deferredKind =
     ? 'marker'
     : unspentTrackingMode === 'deferred-bitmask'
     ? 'bitmask'
+    : unspentTrackingMode === 'deferred-array'
+    ? 'array'
     : undefined;
 const deferredStallMaxMs = Number(
   process.env.CHAINGRAPH_UNSPENT_DEFERRED_STALL_MAX_MS ?? 600_000
@@ -3504,6 +3507,8 @@ const compareDeferredStored = async (
   const column =
     deferredKind === 'marker'
       ? 'spent_by_transaction_internal_id'
+      : deferredKind === 'array'
+      ? 'unspent_node_ids'
       : 'unspent_node_bits';
   t.is(
     Number(
@@ -3524,7 +3529,7 @@ const compareDeferredStored = async (
   );
   const inProcessed = (rows: string[]) =>
     rows.filter((row) => processed.has(row));
-  if (deferredKind === 'bitmask') {
+  if (deferredKind === 'bitmask' || deferredKind === 'array') {
     const nodes = await deferredNodes();
     await nodes.reduce<Promise<unknown>>(
       async (chain, node) =>
@@ -3532,7 +3537,11 @@ const compareDeferredStored = async (
           t.deepEqual(
             inProcessed(
               await deferredRows(/* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
-                WHERE (o.unspent_node_bits & (1::bigint << ${node.id})) <> 0`)
+                WHERE ${
+                  deferredKind === 'array'
+                    ? `${node.id} = ANY (o.unspent_node_ids)`
+                    : `(o.unspent_node_bits & (1::bigint << ${node.id})) <> 0`
+                }`)
             ),
             inProcessed(await deferredRows(nodeUnspentReferenceSql(node.id))),
             `${label}: stored bits, node ${node.name}`
@@ -3661,8 +3670,13 @@ test.serial(
         deferredKind === 'marker'
           ? indexes.includes('output_unspent_null_token_category_index') &&
               indexes.includes('output_unspent_null_search_index')
+          : deferredKind === 'array'
+          ? indexes.includes(
+              'output_unspent_array_null_token_category_index'
+            ) &&
+            indexes.includes('output_unspent_array_node_1_token_category_index')
           : indexes.includes('output_unspent_bits_token_category_index') &&
-              indexes.includes('output_unspent_bits_null_search_index'),
+            indexes.includes('output_unspent_bits_null_search_index'),
         indexes.join(', ')
       );
       // the job starts tracking at the current tip: the e2e chain stays unprocessed (NULL)
@@ -3886,6 +3900,8 @@ test.serial(
       const column =
         deferredKind === 'marker'
           ? `o.spent_by_transaction_internal_id = 0 AND ${createdByAcceptedSql}`
+          : deferredKind === 'array'
+          ? `${nodeA} = ANY (o.unspent_node_ids)`
           : `(o.unspent_node_bits & (1::bigint << ${nodeA})) <> 0`;
       const stored = await deferredRows(
         /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o WHERE ${column}`,

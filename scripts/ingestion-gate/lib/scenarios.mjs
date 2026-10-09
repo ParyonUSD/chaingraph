@@ -214,7 +214,7 @@ const unspentReadModelCheck = async (client, watermark) => {
         (
           await client.query(
             `SELECT count(*)::bigint AS n FROM output o JOIN transaction t ON t.hash = o.transaction_hash
-              WHERE t.internal_id > $1 AND ${unspentTrackingMode === 'marker' ? 'o.spent_by_transaction_internal_id' : 'o.unspent_node_bits'} IS NULL`,
+              WHERE t.internal_id > $1 AND ${unspentTrackingMode === 'marker' ? 'o.spent_by_transaction_internal_id' : unspentTrackingMode === 'array' ? 'o.unspent_node_ids' : 'o.unspent_node_bits'} IS NULL`,
             [watermark]
           )
         ).rows[0].n
@@ -222,7 +222,7 @@ const unspentReadModelCheck = async (client, watermark) => {
     : 0;
   const acceptedAnyNode = `(SELECT bt.transaction_internal_id AS id FROM block_transaction bt JOIN node_block nb ON nb.block_internal_id = bt.block_internal_id
                             UNION SELECT transaction_internal_id FROM node_transaction)`;
-  if (unspentTrackingMode === 'bitmask') {
+  if (unspentTrackingMode === 'bitmask' || unspentTrackingMode === 'array') {
     const nodes = (await client.query('SELECT internal_id::int AS id FROM node ORDER BY internal_id')).rows.map((row) => row.id);
     const perNode = {};
     for (const node of nodes) {
@@ -232,10 +232,10 @@ const unspentReadModelCheck = async (client, watermark) => {
         await client.query(`
           WITH acc AS MATERIALIZED ${acceptedByNode},
           spent AS (SELECT DISTINCT i.outpoint_transaction_hash AS h, i.outpoint_index AS i FROM input i JOIN acc ON acc.id = i.transaction_internal_id),
-          d AS (SELECT o.transaction_hash AS h, o.output_index AS i, (o.unspent_node_bits & (1::bigint << ${node})) <> 0 AS stored,
+          d AS (SELECT o.transaction_hash AS h, o.output_index AS i, ${unspentTrackingMode === 'array' ? `${node} = ANY (o.unspent_node_ids)` : `(o.unspent_node_bits & (1::bigint << ${node})) <> 0`} AS stored,
                        (t.internal_id IN (SELECT id FROM acc)) AS created
                   FROM output o JOIN transaction t ON t.hash = o.transaction_hash
-                  WHERE t.internal_id > $1 AND o.unspent_node_bits IS NOT NULL)
+                  WHERE t.internal_id > $1 AND o.${unspentTrackingMode === 'array' ? 'unspent_node_ids' : 'unspent_node_bits'} IS NOT NULL)
           SELECT count(*)::int AS outputs,
                  count(*) FILTER (WHERE d.stored AND NOT (d.created AND s.h IS NULL))::int AS stored_unspent_wrong,
                  count(*) FILTER (WHERE NOT d.stored AND d.created AND s.h IS NULL)::int AS stored_spent_wrong

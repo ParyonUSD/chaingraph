@@ -446,6 +446,7 @@ const unspentTrackingModes = [
   'bitmask',
   'deferred-marker',
   'deferred-bitmask',
+  'deferred-array',
 ] as const;
 const isUnspentTrackingMode = (
   value: string
@@ -472,7 +473,8 @@ const unspentTrackingSetting = configuration.CHAINGRAPH_UNSPENT_TRACKING;
  */
 const unspentTracking =
   unspentTrackingSetting === 'deferred-marker' ||
-  unspentTrackingSetting === 'deferred-bitmask'
+  unspentTrackingSetting === 'deferred-bitmask' ||
+  unspentTrackingSetting === 'deferred-array'
     ? 'off'
     : unspentTrackingSetting;
 /**
@@ -485,6 +487,8 @@ const unspentDeferredKind =
     ? ('marker' as const)
     : unspentTrackingSetting === 'deferred-bitmask'
     ? ('bitmask' as const)
+    : unspentTrackingSetting === 'deferred-array'
+    ? ('array' as const)
     : undefined;
 const nonNegativeInteger = (
   name: (typeof expectedOptions)[number],

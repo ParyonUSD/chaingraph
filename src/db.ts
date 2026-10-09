@@ -661,8 +661,13 @@ export const ensureUnspentDeferredIndexes = async () => {
         /* sql */ `SELECT indexname AS name FROM pg_indexes WHERE schemaname = 'public';`
       )
     ).rows.map((row) => row.name);
+    const nodeIds = (
+      await client.query<{ id: string }>(
+        /* sql */ `SELECT internal_id AS id FROM node ORDER BY internal_id;`
+      )
+    ).rows.map((row) => Number(row.id));
     const statements = Object.entries(
-      deferredIndexDefinitions(unspentDeferredKind)
+      deferredIndexDefinitions(unspentDeferredKind, nodeIds)
     )
       .filter(([name]) => !existingIndexes.includes(name))
       .map(([, definition]) => definition);
@@ -671,6 +676,12 @@ export const ensureUnspentDeferredIndexes = async () => {
         chain.then(async () => client.query(statement)),
       Promise.resolve()
     );
+    if (unspentDeferredKind === 'array') {
+      // the array root has one stored-set arm per node: rebuild it for the registered nodes
+      await client.query(
+        /* sql */ `SELECT unspent_deferred_array_build_root();`
+      );
+    }
     return statements;
   } finally {
     client.release();
