@@ -38,15 +38,6 @@ import {
 import type { Deferred, StoreOperation } from './node-state.js';
 import type { UtxoOutput } from './utxo.js';
 
-/** Kept for callers of WP5a-core; no method throws it any more. */
-export class MempoolNotImplementedError extends Error {
-  constructor(method: string) {
-    super(
-      `WP5a-mempool: ${method} is not implemented by the ClickHouse store yet.`
-    );
-  }
-}
-
 /** The node-agnostic facts of a transaction some node holds in its mempool. */
 export interface MempoolTxFacts {
   hash: TxKey;

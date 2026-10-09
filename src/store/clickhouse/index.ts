@@ -8,4 +8,3 @@ export {
   createClickHouseStore,
   StoreClosedError,
 } from './clickhouse-store.js';
-export { MempoolNotImplementedError } from './mempool-state.js';

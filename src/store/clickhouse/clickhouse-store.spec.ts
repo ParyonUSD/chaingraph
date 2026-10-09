@@ -23,7 +23,6 @@ import {
   linkedBlockSize,
 } from './clickhouse-store.js';
 import { ClickHouseClient } from './client.js';
-import { MempoolNotImplementedError } from './mempool-state.js';
 import { e2eClickHouseUrl } from './test-support.js';
 import { readSnapshot } from './visibility.js';
 
@@ -480,9 +479,8 @@ e2e(
     });
     t.deepEqual(incomplete, { incompleteBlocks: [], scannedBlockCount: 3 });
     const asStore: ChaingraphStore = store;
-    await t.throwsAsync(asStore.saveMempoolTransaction(chain.a, []), {
-      instanceOf: MempoolNotImplementedError,
-    });
+    // a known transaction with no validations changes nothing (Postgres: ON CONFLICT)
+    await t.notThrowsAsync(asStore.saveMempoolTransaction(chain.a, []));
     t.deepEqual(await store.enableMempoolTracking(), { schemaIsCurrent: true });
     t.deepEqual(Object.keys(store.poolStats()).sort(), [
       'clients',
