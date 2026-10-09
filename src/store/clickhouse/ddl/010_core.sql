@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS cg.input
     unlocking_bytecode                String CODEC(ZSTD(1)),
     value_satoshis                    Int64,
     token_category                    FixedString(32),
+    fungible_token_amount             Nullable(Int64),
     nonfungible_token_capability      Nullable(Enum8('none' = 1, 'mutable' = 2, 'minting' = 3)),
     nonfungible_token_commitment      Nullable(String),
     locking_bytecode                  String,
@@ -117,6 +118,10 @@ ENGINE = MergeTree
 PARTITION BY intDiv(commit_seq, 1048576)
 ORDER BY (transaction_hash, input_index)
 SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+
+-- WP5a: the spent output's fungible_token_amount (plan gap found by WP2), so inputs.outpoint FT filters need
+-- no join. Databases created before WP5a get the column here; see README item 23 for their projections.
+ALTER TABLE cg.input ADD COLUMN IF NOT EXISTS fungible_token_amount Nullable(Int64) AFTER token_category;
 
 -- node: a handful of rows. internal_id UInt32 (Postgres integer). Read with FINAL / argMax(updated_at).
 CREATE TABLE IF NOT EXISTS cg.node

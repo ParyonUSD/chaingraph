@@ -55,6 +55,7 @@ export const rowBinaryTableColumns = {
     ['unlocking_bytecode', 'String'],
     ['value_satoshis', 'Int64'],
     ['token_category', 'FixedString(32)'],
+    ['fungible_token_amount', 'Nullable(Int64)'],
     [
       'nonfungible_token_capability',
       "Nullable(Enum8('none' = 1, 'mutable' = 2, 'minting' = 3))",
@@ -124,6 +125,7 @@ export interface EncodedRows {
  */
 export type SpentOutput = Pick<
   ChaingraphOutput,
+  | 'fungibleTokenAmount'
   | 'lockingBytecode'
   | 'nonfungibleTokenCapability'
   | 'nonfungibleTokenCommitment'
@@ -176,7 +178,7 @@ const blockRowBytes = 3 * hashBytes + 8 + 4 * 7 + 8 + 8 + 8;
 const blockTransactionRowBytes = 8 + 4 + 8 + hashBytes + 8;
 const outputRowFixedBytes = 2 * hashBytes + 4 + 8 + 8 + 8 + 8 + rowSlackBytes;
 const inputRowFixedBytes =
-  3 * hashBytes + 4 + 8 + 4 + 4 + 8 + 8 + rowSlackBytes;
+  3 * hashBytes + 4 + 8 + 4 + 4 + 8 + 9 + 8 + rowSlackBytes;
 
 const internalIdAt = (
   internalIds: readonly (bigint | number)[],
@@ -340,6 +342,29 @@ export const encodeOutputRows = (
   return { data: writer.finish(), rowCount: writer.rowCount };
 };
 
+const writeInputRow = (
+  writer: RowBinaryWriter,
+  row: ResolvedInput & { commitSeq: bigint | number }
+) => {
+  writer
+    .fixedString32(row.transactionHash)
+    .uint32(row.inputIndex)
+    .uint64(row.transactionInternalId)
+    .fixedString32(row.input.outpointTransactionHash)
+    .uint32(row.input.outpointIndex)
+    .uint32(row.input.sequenceNumber)
+    .hexBytes(row.input.unlockingBytecode)
+    .int64(row.spent.valueSatoshis);
+  writeTokenCategory(writer, row.spent.tokenCategory).nullable(
+    row.spent.fungibleTokenAmount,
+    (w, amount) => w.int64(amount)
+  );
+  writeNonfungibleToken(writer, row.spent)
+    .hexBytes(row.spent.lockingBytecode)
+    .uint64(row.commitSeq)
+    .endRow();
+};
+
 /**
  * Input rows carry the attributes of the output they spend, from
  * `resolveSpentOutput` (the caller's lookup over this save's own outputs and
@@ -382,21 +407,51 @@ export const encodeInputRows = (
         pending.push({ inputIndex, transactionHash: transaction.hash });
         return;
       }
-      writer
-        .fixedString32(transaction.hash)
-        .uint32(inputIndex)
-        .uint64(transactionInternalId)
-        .fixedString32(input.outpointTransactionHash)
-        .uint32(input.outpointIndex)
-        .uint32(input.sequenceNumber)
-        .hexBytes(input.unlockingBytecode)
-        .int64(spent.valueSatoshis);
-      writeTokenCategory(writer, spent.tokenCategory);
-      writeNonfungibleToken(writer, spent)
-        .hexBytes(spent.lockingBytecode)
-        .uint64(commitSeq)
-        .endRow();
+      writeInputRow(writer, {
+        commitSeq,
+        input,
+        inputIndex,
+        spent,
+        transactionHash: transaction.hash,
+        transactionInternalId,
+      });
     });
   });
   return { data: writer.finish(), pending, rowCount: writer.rowCount };
+};
+
+/**
+ * One input to encode with its (now known) spent output: the late rows of a
+ * commit whose inputs were pending (`encodeInputRows` returned them in
+ * `pending`).
+ */
+export interface ResolvedInput {
+  transactionHash: string;
+  transactionInternalId: bigint | number;
+  inputIndex: number;
+  input: ChaingraphTransaction['inputs'][number];
+  spent: SpentOutput;
+}
+
+/**
+ * `input` rows for individually resolved inputs (same columns as
+ * `encodeInputRows`).
+ */
+export const encodeResolvedInputRows = (
+  inputs: readonly ResolvedInput[],
+  commitSeq: bigint | number
+): EncodedRows => {
+  const writer = new RowBinaryWriter(
+    inputs.reduce(
+      (total, { input }) =>
+        total +
+        inputRowFixedBytes +
+        input.unlockingBytecode.length / hexCharsPerByte,
+      0
+    )
+  );
+  inputs.forEach((resolved) => {
+    writeInputRow(writer, { ...resolved, commitSeq });
+  });
+  return { data: writer.finish(), rowCount: writer.rowCount };
 };

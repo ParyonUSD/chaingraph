@@ -272,6 +272,7 @@ const expectedRows = {
   input: [
     {
       commit_seq: '42',
+      fungible_token_amount: null,
       input_index: 0,
       locking_bytecode: '',
       nonfungible_token_capability: null,
@@ -287,6 +288,7 @@ const expectedRows = {
     },
     {
       commit_seq: '42',
+      fungible_token_amount: null,
       input_index: 0,
       locking_bytecode: '76a914',
       nonfungible_token_capability: null,
@@ -407,10 +409,10 @@ const encodeFixture = () => {
 const expectedRowBytes = {
   block: [32 + 8 + 4 + 4 + 4 + 32 + 32 + 4 + 4 + 4 + 4 + 8 + 8 + 8],
   block_transaction: [8 + 4 + 8 + 32 + 8, 8 + 4 + 8 + 32 + 8],
-  // hashes, ints, unlocking (1+n), value, category, 2 null flags, locking (1+n), commit_seq
+  // hashes, ints, unlocking (1+n), value, category, 3 null flags, locking (1+n), commit_seq
   input: [
-    32 + 4 + 8 + 32 + 4 + 4 + (1 + 4) + 8 + 32 + 1 + 1 + (1 + 0) + 8,
-    32 + 4 + 8 + 32 + 4 + 4 + (1 + 0) + 8 + 32 + 1 + 1 + (1 + 3) + 8,
+    32 + 4 + 8 + 32 + 4 + 4 + (1 + 4) + 8 + 32 + 1 + 1 + 1 + (1 + 0) + 8,
+    32 + 4 + 8 + 32 + 4 + 4 + (1 + 0) + 8 + 32 + 1 + 1 + 1 + (1 + 3) + 8,
   ],
   output: [
     32 + 4 + 8 + 8 + (1 + 3) + 32 + 1 + 1 + 1 + 8,

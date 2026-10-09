@@ -34,7 +34,7 @@ ALTER TABLE cg.output ADD PROJECTION IF NOT EXISTS p_category
 ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_outpoint
 (
     SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index,
-           sequence_number, value_satoshis, token_category, nonfungible_token_capability,
+           sequence_number, value_satoshis, token_category, fungible_token_amount, nonfungible_token_capability,
            nonfungible_token_commitment, locking_bytecode, commit_seq, locking_bytecode_prefix,
            nonfungible_token_commitment_key
     ORDER BY (outpoint_transaction_hash, outpoint_index)
@@ -43,7 +43,7 @@ ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_outpoint
 ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_spent_script
 (
     SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index,
-           sequence_number, value_satoshis, token_category, nonfungible_token_capability,
+           sequence_number, value_satoshis, token_category, fungible_token_amount, nonfungible_token_capability,
            nonfungible_token_commitment, locking_bytecode, commit_seq, locking_bytecode_prefix,
            nonfungible_token_commitment_key
     ORDER BY (locking_bytecode_prefix, transaction_hash, input_index)
@@ -52,7 +52,7 @@ ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_spent_script
 ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_spent_category
 (
     SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index,
-           sequence_number, value_satoshis, token_category, nonfungible_token_capability,
+           sequence_number, value_satoshis, token_category, fungible_token_amount, nonfungible_token_capability,
            nonfungible_token_commitment, locking_bytecode, commit_seq, locking_bytecode_prefix,
            nonfungible_token_commitment_key
     ORDER BY (token_category, nonfungible_token_commitment_key, transaction_hash, input_index)
