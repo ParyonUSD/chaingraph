@@ -1,0 +1,135 @@
+-- Core (node-agnostic) tables, plan §2.1.
+--
+-- Conventions (plan §2 "Conventions"):
+--   * hashes FixedString(32), bytewise order = Postgres bytea order; token_category zeros = no token.
+--   * bytecode String (raw bytes); unlocking_bytecode ZSTD(1).
+--   * UInt32 heights/indexes/locktime/sequence/bits; Int64 satoshis and FT amounts; UInt64 internal ids.
+--   * Nullable only on non-key columns.
+--   * every row carries commit_seq UInt64 (the save that wrote it, §3.1); the gate views (050) hide
+--     rows of unresolved/aborted commits, so these engines never need FINAL.
+--   * index_granularity = 1024 on point-lookup/join tables (plan §2). 256 is the Phase 1 comparison arm.
+--
+-- Choices where the plan is silent (also listed in README.md):
+--   * Timestamps are DateTime64(3, 'UTC'): the agent writes JS Dates (ms), so ms is exact.
+--   * Derived sort columns (locking_bytecode_prefix, nonfungible_token_commitment_key) are MATERIALIZED,
+--     so the writer cannot get them wrong and -1 rows always match +1 rows.
+--   * non_replicated_deduplication_window = 10000 on every agent-written MergeTree table, so
+--     insert_deduplication_token works on plain MergeTree (§3.4); 10000 mirrors the replicated default.
+--   * block and block_transaction also get granularity 1024 (point lookups / joins);
+--     block_transaction is partitioned like transaction (420 M rows, GC by commit_seq); block is not (1.3 M).
+--   * transaction/block version is Int32 (plan), Postgres stored bigint; values fit the 4-byte field.
+
+CREATE TABLE IF NOT EXISTS cg.block
+(
+    hash                      FixedString(32),
+    internal_id               UInt64,
+    height                    UInt32,
+    version                   Int32,
+    timestamp                 UInt32,
+    previous_block_hash       FixedString(32),
+    merkle_root               FixedString(32),
+    bits                      UInt32,
+    nonce                     UInt32,
+    size_bytes                UInt32,
+    transaction_count         UInt32,
+    output_value_satoshis     Int64,
+    generated_value_satoshis  Int64,
+    commit_seq                UInt64
+)
+ENGINE = MergeTree
+ORDER BY hash
+SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+
+CREATE TABLE IF NOT EXISTS cg.transaction
+(
+    hash                   FixedString(32),
+    internal_id            UInt64,
+    version                Int32,
+    locktime               UInt32,
+    size_bytes             UInt32,
+    is_coinbase            Bool,
+    input_count            UInt32,
+    output_count           UInt32,
+    output_value_satoshis  Int64,
+    commit_seq             UInt64
+)
+ENGINE = MergeTree
+PARTITION BY intDiv(commit_seq, 1048576)
+ORDER BY hash
+SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+
+CREATE TABLE IF NOT EXISTS cg.block_transaction
+(
+    block_internal_id        UInt64 CODEC(Delta, ZSTD(1)),
+    transaction_index        UInt32 CODEC(Delta, ZSTD(1)),
+    transaction_internal_id  UInt64,
+    transaction_hash         FixedString(32),
+    commit_seq               UInt64
+)
+ENGINE = MergeTree
+PARTITION BY intDiv(commit_seq, 1048576)
+ORDER BY (block_internal_id, transaction_index)
+SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+
+CREATE TABLE IF NOT EXISTS cg.output
+(
+    transaction_hash                  FixedString(32),
+    output_index                      UInt32,
+    transaction_internal_id           UInt64,
+    value_satoshis                    Int64,
+    locking_bytecode                  String,
+    token_category                    FixedString(32),
+    fungible_token_amount             Nullable(Int64),
+    nonfungible_token_capability      Nullable(Enum8('none' = 1, 'mutable' = 2, 'minting' = 3)),
+    nonfungible_token_commitment      Nullable(String),
+    commit_seq                        UInt64,
+    locking_bytecode_prefix           String MATERIALIZED substring(locking_bytecode, 1, 25),
+    nonfungible_token_commitment_key  String MATERIALIZED ifNull(nonfungible_token_commitment, ''),
+    INDEX bf_locking_bytecode locking_bytecode TYPE bloom_filter GRANULARITY 4
+)
+ENGINE = MergeTree
+PARTITION BY intDiv(commit_seq, 1048576)
+ORDER BY (transaction_hash, output_index)
+SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+
+-- input carries the spent output's attributes (plan §2.1 "Why input carries the spent output's attributes").
+-- Rows for inputs whose outpoint is not yet stored are written by the fill_pending commit (see README).
+CREATE TABLE IF NOT EXISTS cg.input
+(
+    transaction_hash                  FixedString(32),
+    input_index                       UInt32,
+    transaction_internal_id           UInt64,
+    outpoint_transaction_hash         FixedString(32),
+    outpoint_index                    UInt32,
+    sequence_number                   UInt32,
+    unlocking_bytecode                String CODEC(ZSTD(1)),
+    value_satoshis                    Int64,
+    token_category                    FixedString(32),
+    nonfungible_token_capability      Nullable(Enum8('none' = 1, 'mutable' = 2, 'minting' = 3)),
+    nonfungible_token_commitment      Nullable(String),
+    locking_bytecode                  String,
+    commit_seq                        UInt64,
+    locking_bytecode_prefix           String MATERIALIZED substring(locking_bytecode, 1, 25),
+    nonfungible_token_commitment_key  String MATERIALIZED ifNull(nonfungible_token_commitment, ''),
+    INDEX bf_outpoint_transaction_hash outpoint_transaction_hash TYPE bloom_filter GRANULARITY 4
+)
+ENGINE = MergeTree
+PARTITION BY intDiv(commit_seq, 1048576)
+ORDER BY (transaction_hash, input_index)
+SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+
+-- node: a handful of rows. internal_id UInt32 (Postgres integer). Read with FINAL / argMax(updated_at).
+CREATE TABLE IF NOT EXISTS cg.node
+(
+    internal_id                 UInt32,
+    name                        String,
+    protocol_version            Int32,
+    user_agent                  String,
+    first_connected_at          DateTime64(3, 'UTC'),
+    latest_connection_began_at  DateTime64(3, 'UTC'),
+    updated_at                  DateTime64(3, 'UTC'),
+    commit_seq                  UInt64
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY internal_id
+SETTINGS non_replicated_deduplication_window = 10000;
