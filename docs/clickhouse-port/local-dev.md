@@ -106,3 +106,15 @@ timing-dependent: once auto-vacuum has analyzed `output` the planner picks
 `output_search_index` instead of the test copy. It failed reproducibly on the
 long-lived ch1-pg and passed on a fresh container; fixed in 4ef9e3f by
 accepting either index.
+
+## Applying the DDL (CLI)
+
+`yarn build`, then (env only; password never logged; idempotent; exit 0/1):
+
+```sh
+CHAINGRAPH_CLICKHOUSE_URL=http://localhost:18123 CHAINGRAPH_CLICKHOUSE_DATABASE=cg yarn clickhouse:ddl
+```
+
+Same step from the agent image (`node bin/chaingraph-clickhouse-ddl.js`, URL
+`http://host.docker.internal:18123`), building the image and the pod env: [image.md](image.md).
+`src/store/clickhouse/ddl/apply.sh` (curl) still works from a checkout.

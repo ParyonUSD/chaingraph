@@ -1,0 +1,84 @@
+# Agent image with the ClickHouse store
+
+`images/agent/Dockerfile` builds the agent (`node bin/chaingraph.js`, the default `CMD`) and,
+since WP5c, ships the ClickHouse DDL and a standalone DDL step:
+
+- `build/store/clickhouse/ddl/` in the image: `NNN_*.sql`, `README.md`, `apply.sh` (copied from
+  `src/store/clickhouse/ddl`). `apply.sh` needs bash/curl/perl, which the alpine image does not
+  have; in the image use the node CLI below.
+- `bin/chaingraph-clickhouse-ddl.js` (`yarn clickhouse:ddl` in a checkout, after `yarn build`):
+  applies every `NNN_*.sql` in order to `CHAINGRAPH_CLICKHOUSE_DATABASE` (created if missing),
+  then lists the database's tables. Idempotent (every statement is `IF NOT EXISTS` /
+  `CREATE OR REPLACE`), exit 0 on success, 1 on any failure. Reads only the
+  `CHAINGRAPH_CLICKHOUSE_*` env vars (not `config.ts`, so no Postgres connection string). The
+  password is never logged; the URL is logged without credentials, and error messages are redacted.
+- `ddl-apply.ts` finds the DDL via `CHAINGRAPH_CLICKHOUSE_DDL_DIR` if set, else `./ddl` next to
+  the compiled file (the image), else `src/store/clickhouse/ddl` of a source checkout.
+
+## Build (linux/amd64)
+
+`.yarn` is a git submodule, so `git archive` does not include it: copy the working `.yarn` in.
+Build from an export of a commit so uncommitted edits never reach the image:
+
+```sh
+bash -c 'set -eu; SHA=$(git rev-parse --short HEAD); B=$(mktemp -d)
+git archive HEAD | tar -x -C $B
+rsync -a --exclude .git .yarn/ $B/.yarn/
+cd $B && docker buildx build --platform linux/amd64 -f images/agent/Dockerfile \
+  -t <registry>/chaingraph-agent:clickhouse-$SHA .'
+# add --push to publish, or --load to keep it in the local daemon
+```
+
+The working `.yarn` matters: `@clickhouse/client-npm-1.24.1-*.zip` is in the local
+`.yarn/cache` but not committed to the `.yarn` submodule (`bitauth/chaingraph-dependencies`),
+and the Dockerfile installs with `--immutable --immutable-cache`. A build from a clean clone
+(`git submodule update`) fails with `YN0056 Cache entry required but missing for
+@clickhouse/client@npm:1.24.1`.
+
+## DDL step (init container or Job)
+
+Same image, different command:
+
+```sh
+docker run --rm \
+  -e CHAINGRAPH_CLICKHOUSE_URL=http://host.docker.internal:18123 \
+  -e CHAINGRAPH_CLICKHOUSE_DATABASE=cg \
+  <image> node bin/chaingraph-clickhouse-ddl.js
+```
+
+```yaml
+initContainers:
+  - name: clickhouse-ddl
+    image: <registry>/chaingraph-agent:clickhouse-<sha>@sha256:<digest>
+    command: ["node", "bin/chaingraph-clickhouse-ddl.js"]
+    env: # same CHAINGRAPH_CLICKHOUSE_* as the agent (below)
+```
+
+Output: one line naming endpoint, database, user, DDL directory and files; then
+`ok, 57 statement(s) in N ms; <db> has 45 table(s)/view(s): …`.
+
+## Pod environment (agent)
+
+| Var | Value |
+| --- | --- |
+| `CHAINGRAPH_STORE` | `clickhouse` |
+| `CHAINGRAPH_CLICKHOUSE_URL` | HTTP(S) endpoint, e.g. `http://clickhouse.<ns>.svc.cluster.local:8123` or Cloud `https://<host>:8443` (from a Secret if it embeds credentials) |
+| `CHAINGRAPH_CLICKHOUSE_DATABASE` | default `cg` |
+| `CHAINGRAPH_CLICKHOUSE_USER` / `_PASSWORD` | from a Secret; default `default` / empty. Credentials in the URL are used if these are empty |
+| `CHAINGRAPH_CLICKHOUSE_DDL_DIR` | optional (DDL CLI only), override the DDL directory |
+| `CHAINGRAPH_POSTGRES_CONNECTION_STRING` | still required by `src/config.ts` in ClickHouse mode; the image's `defaults.env` already supplies a `localhost` value, but set an explicit dummy so a manifest does not silently depend on it, e.g. `postgres://unused:unused@127.0.0.1:1/unused` |
+| `CHAINGRAPH_TRUSTED_NODES` etc. | as for the Postgres agent |
+
+## Verification (WP5c, 2026-10-09, image built from `f7b4481`, before the WP5a-mempool commits)
+
+MacBook (Apple M-series), Docker Desktop, buildx v0.37.0, cross-building linux/amd64 under emulation;
+build from `git archive HEAD` + working `.yarn`, only the base image cached.
+
+| Item | Result |
+| --- | --- |
+| `docker buildx build --platform linux/amd64 --load -t ch1-agent:local` | ok, 24 s (yarn install 8.7 s, tsc 8.6 s) |
+| Image | linux/amd64, 70.9 MB, node v24.21.0 (`node:24-alpine`) |
+| DDL CLI in the container → `http://host.docker.internal:18123`, db `ch1_wp5c_image` | exit 0, 57 statements, 45 tables/views (10 MergeTree, 4 Replacing, 6 VersionedCollapsing, 25 views); re-run exit 0 (idempotent); database dropped afterwards |
+| `CHAINGRAPH_CLICKHOUSE_DDL_DIR=/nope` | exit 1, clear message |
+| `build/config.js` in the image with `CHAINGRAPH_STORE=clickhouse` and no Postgres var | loads (defaults.env value) |
+| Clean `.yarn` submodule (no ClickHouse zip), `--target build-stage` | fails at `yarn install` (YN0056), see above |
