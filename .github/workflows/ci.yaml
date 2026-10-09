@@ -21,13 +21,13 @@ jobs:
     steps:
       - name: Check out repository code
         uses: actions/checkout@v3
-        with:
-          submodules: 'true'
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: '18'
-      - run: yarn install --immutable --immutable-cache
+          node-version: '24'
+      - name: Enable Corepack (Yarn from package.json packageManager)
+        run: corepack enable
+      - run: yarn install --immutable
       - run: yarn test
       - run: yarn cov:lcov
       - name: Upload test coverage
@@ -41,15 +41,15 @@ jobs:
           name: e2e-test-log
           path: data/chaingraph/log-e2e.ndjson
 
-  check-yarn-cache:
+  check-yarn-lockfile:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository code
         uses: actions/checkout@v3
-        with:
-          submodules: 'true'
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: '18'
-      - run: yarn install --immutable --immutable-cache --check-cache
+          node-version: '24'
+      - name: Enable Corepack (Yarn from package.json packageManager)
+        run: corepack enable
+      - run: yarn install --immutable --check-cache

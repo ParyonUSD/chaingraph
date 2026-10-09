@@ -1,5 +1,5 @@
 # Build context for images/agent/Dockerfile (docker build -f images/agent/Dockerfile .).
-# The Dockerfile copies only package.json, yarn.lock, .yarnrc.yml, .yarn, tsconfig.json,
+# The Dockerfile copies only package.json, yarn.lock, .yarnrc.yml, .yarn/plugins, tsconfig.json,
 # defaults.env, bin and src; keep large/secret local state out of the context.
 .git
 node_modules
