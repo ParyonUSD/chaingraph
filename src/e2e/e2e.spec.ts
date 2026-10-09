@@ -731,44 +731,46 @@ test.serial('[e2e] completes initial sync', async (t) => {
   t.pass();
 });
 
-test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
-  await waitForStdout('Agent: all managed indexes have been created.');
-  await waitForStdout('Agent: enabled mempool tracking.');
-  const indexes = (
-    await client.query<{
-      indexname: string;
-    }>(/* sql */ `
+test.serial(
+  '[e2e] [postgres] creates expected indexes after initial sync',
+  async (t) => {
+    await waitForStdout('Agent: all managed indexes have been created.');
+    await waitForStdout('Agent: enabled mempool tracking.');
+    const indexes = (
+      await client.query<{
+        indexname: string;
+      }>(/* sql */ `
   SELECT indexname FROM pg_indexes WHERE schemaname = 'public' ORDER BY indexname;
   `)
-  ).rows.map((row) => row.indexname);
-  t.deepEqual(indexes, [
-    'block_hash_key',
-    'block_height_index',
-    'block_inclusions_index',
-    'block_internal_id_key',
-    'block_pkey',
-    'block_transaction_pkey',
-    'input_pkey',
-    'node_block_history_pkey',
-    'node_block_pkey',
-    'node_internal_id_key',
-    'node_name_key',
-    'node_pkey',
-    'node_transaction_history_pkey',
-    'node_transaction_pkey',
-    'output_pkey',
-    'output_search_index',
-    'spent_by_index',
-    'token_category_index',
-    'transaction_hash_key',
-    'transaction_pkey',
-  ]);
-  // cspell:ignore tgenabled tgname
-  const triggers = (
-    await client.query<{
-      tgenabled: string;
-      tgname: string;
-    }>(/* sql */ `
+    ).rows.map((row) => row.indexname);
+    t.deepEqual(indexes, [
+      'block_hash_key',
+      'block_height_index',
+      'block_inclusions_index',
+      'block_internal_id_key',
+      'block_pkey',
+      'block_transaction_pkey',
+      'input_pkey',
+      'node_block_history_pkey',
+      'node_block_pkey',
+      'node_internal_id_key',
+      'node_name_key',
+      'node_pkey',
+      'node_transaction_history_pkey',
+      'node_transaction_pkey',
+      'output_pkey',
+      'output_search_index',
+      'spent_by_index',
+      'token_category_index',
+      'transaction_hash_key',
+      'transaction_pkey',
+    ]);
+    // cspell:ignore tgenabled tgname
+    const triggers = (
+      await client.query<{
+        tgenabled: string;
+        tgname: string;
+      }>(/* sql */ `
   SELECT tgname, tgenabled FROM pg_trigger
     WHERE tgname IN (
       'trigger_public_node_block_insert',
@@ -776,17 +778,18 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     )
     ORDER BY tgname;
   `)
-  ).rows;
-  t.deepEqual(triggers, [
-    { tgenabled: 'O', tgname: 'trigger_public_node_block_insert' },
-    {
-      tgenabled: 'O',
-      tgname: 'trigger_public_node_transaction_history_insert',
-    },
-  ]);
-  clearStdoutBuffer();
-  t.pass();
-});
+    ).rows;
+    t.deepEqual(triggers, [
+      { tgenabled: 'O', tgname: 'trigger_public_node_block_insert' },
+      {
+        tgenabled: 'O',
+        tgname: 'trigger_public_node_transaction_history_insert',
+      },
+    ]);
+    clearStdoutBuffer();
+    t.pass();
+  }
+);
 
 test.serial(
   '[e2e] getAllKnownBlockHashes returns hex hashes for every known block',
@@ -823,7 +826,7 @@ test.serial(
 );
 
 test.serial(
-  '[e2e] records node validation after concurrent transaction insert conflict',
+  '[e2e] [postgres] records node validation after concurrent transaction insert conflict',
   async (t) => {
     const transactionHash = 'c1'.repeat(repeatedHashByteLength);
     const validatedAt = new Date('2026-01-01T00:00:00.000Z');
@@ -953,7 +956,7 @@ test.serial(
 );
 
 test.serial(
-  '[e2e] cascades replaced mempool transaction history to same-node descendants',
+  '[e2e] [postgres] cascades replaced mempool transaction history to same-node descendants',
   async (t) => {
     await client.query(/* sql */ `BEGIN;`);
     // eslint-disable-next-line functional/no-try-statement
@@ -1093,7 +1096,7 @@ INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id,
 );
 
 test.serial(
-  '[e2e] archives expired mempool transactions and descendants',
+  '[e2e] [postgres] archives expired mempool transactions and descendants',
   async (t) => {
     await client.query(/* sql */ `
 WITH transaction_values (name, hash) AS (
@@ -1273,7 +1276,7 @@ DELETE FROM transaction
 );
 
 test.serial(
-  '[e2e] archives stale mempool transactions already accepted by blocks',
+  '[e2e] [postgres] archives stale mempool transactions already accepted by blocks',
   async (t) => {
     await client.query(/* sql */ `
 WITH transaction_values (name, hash) AS (
@@ -1460,7 +1463,7 @@ DELETE FROM transaction
 );
 
 test.serial(
-  '[e2e] backfills existing orphan mempool descendants with idempotence',
+  '[e2e] [postgres] backfills existing orphan mempool descendants with idempotence',
   async (t) => {
     await client.query(/* sql */ `BEGIN;`);
     // eslint-disable-next-line functional/no-try-statement
@@ -2973,7 +2976,7 @@ const searchFixtureMatches = async (query: string, parameter: unknown) => {
 };
 
 test.serial(
-  '[e2e] [sql] search_output: exact matches for locking bytecode of any length',
+  '[e2e] [postgres] [sql] search_output: exact matches for locking bytecode of any length',
   async (t) => {
     const search = async (scripts: string[]) =>
       searchFixtureMatches('search_output($1::text[])', scripts);
@@ -2996,7 +2999,7 @@ test.serial(
 
 /* cspell: disable */
 test.serial(
-  '[e2e] [sql] search_output_prefix: treats every byte literally and accepts prefixes longer than 25 bytes',
+  '[e2e] [postgres] [sql] search_output_prefix: treats every byte literally and accepts prefixes longer than 25 bytes',
   async (t) => {
     const search = async (prefix: string) =>
       searchFixtureMatches('search_output_prefix($1::text)', prefix);
@@ -3015,7 +3018,7 @@ test.serial(
 /* cspell: enable */
 
 test.serial(
-  '[e2e] [sql] search functions use the 25-byte locking bytecode prefix index',
+  '[e2e] [postgres] [sql] search functions use the 25-byte locking bytecode prefix index',
   async (t) => {
     const prefixIndexes = Object.entries(indexDefinitions).filter(
       ([, definition]) => definition.includes('locking_bytecode')
