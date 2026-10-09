@@ -852,6 +852,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'unspent_output_set_token_category_index',
     'unspent_tracking_events_pkey',
     'unspent_tracking_progress_pkey',
+    'unspent_tracking_skipped_pkey',
     'unspent_tracking_watch_pkey',
   ]);
   // cspell:ignore tgenabled tgname

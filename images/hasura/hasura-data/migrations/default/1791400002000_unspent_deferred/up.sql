@@ -679,10 +679,12 @@ END;
 $$;
 
 -- Transactions whose acceptance changed after the job's snapshot: those of
--- unconsumed events and of blocks above the block watermark.
+-- unconsumed events and of blocks above the block watermark. (These helpers
+-- force custom plans: a generic plan for `> watermark` estimates a third of
+-- the table and scans it.)
 CREATE FUNCTION unspent_deferred_dirty_transactions (kind text)
   RETURNS TABLE (id bigint) LANGUAGE plpgsql STABLE ROWS 100
-  SET enable_hashjoin = off SET enable_mergejoin = off AS $$
+  SET enable_hashjoin = off SET enable_mergejoin = off SET plan_cache_mode = force_custom_plan AS $$
 DECLARE
   wb bigint;
 BEGIN
@@ -707,7 +709,7 @@ $$;
 -- watermark) or by dirty transactions.
 CREATE FUNCTION unspent_deferred_recent_spends (kind text)
   RETURNS TABLE (outpoint_transaction_hash bytea, outpoint_index bigint) LANGUAGE plpgsql STABLE ROWS 1000
-  SET enable_hashjoin = off SET enable_mergejoin = off AS $$
+  SET enable_hashjoin = off SET enable_mergejoin = off SET plan_cache_mode = force_custom_plan AS $$
 DECLARE
   w bigint;
 BEGIN
@@ -731,7 +733,7 @@ $$;
 -- may have changed).
 CREATE FUNCTION unspent_deferred_dirty_creators (kind text)
   RETURNS TABLE (hash bytea) LANGUAGE plpgsql STABLE ROWS 100
-  SET enable_hashjoin = off SET enable_mergejoin = off AS $$
+  SET enable_hashjoin = off SET enable_mergejoin = off SET plan_cache_mode = force_custom_plan AS $$
 BEGIN
   RETURN QUERY
     SELECT DISTINCT t.hash FROM unspent_deferred_dirty_transactions(kind) d
@@ -743,7 +745,7 @@ $$;
 -- accepted any more (marker: by no node; bitmask: not by `node_name`).
 CREATE FUNCTION unspent_deferred_released_spends (kind text, node_name text)
   RETURNS TABLE (outpoint_transaction_hash bytea, outpoint_index bigint) LANGUAGE plpgsql STABLE ROWS 100
-  SET enable_hashjoin = off SET enable_mergejoin = off AS $$
+  SET enable_hashjoin = off SET enable_mergejoin = off SET plan_cache_mode = force_custom_plan AS $$
 DECLARE
   node_id bigint;
 BEGIN
