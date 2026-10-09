@@ -17,23 +17,21 @@ since WP5c, ships the ClickHouse DDL and a standalone DDL step:
 
 ## Build (linux/amd64)
 
-`.yarn` is a git submodule, so `git archive` does not include it: copy the working `.yarn` in.
-Build from an export of a commit so uncommitted edits never reach the image:
+Build from an export of a commit so uncommitted edits never reach the image. The export
+needs nothing besides tracked files: Yarn 3.3.1 comes from Corepack inside the build stage
+and packages are fetched from the npm registry (`yarn install --immutable` against
+`yarn.lock`); there is no `.yarn` submodule any more (`yarn-no-submodule.md`).
 
 ```sh
 bash -c 'set -eu; SHA=$(git rev-parse --short HEAD); B=$(mktemp -d)
 git archive HEAD | tar -x -C $B
-rsync -a --exclude .git .yarn/ $B/.yarn/
 cd $B && docker buildx build --platform linux/amd64 -f images/agent/Dockerfile \
   -t <registry>/chaingraph-agent:clickhouse-$SHA .'
 # add --push to publish, or --load to keep it in the local daemon
 ```
 
-The working `.yarn` matters: `@clickhouse/client-npm-1.24.1-*.zip` is in the local
-`.yarn/cache` but not committed to the `.yarn` submodule (`bitauth/chaingraph-dependencies`),
-and the Dockerfile installs with `--immutable --immutable-cache`. A build from a clean clone
-(`git submodule update`) fails with `YN0056 Cache entry required but missing for
-@clickhouse/client@npm:1.24.1`.
+The base image is `node:24-alpine` pinned by digest (`ARG NODE_IMAGE` in the Dockerfile);
+bump it deliberately (`docker buildx imagetools inspect node:24-alpine`).
 
 ## DDL step (init container or Job)
 
@@ -81,4 +79,16 @@ build from `git archive HEAD` + working `.yarn`, only the base image cached.
 | DDL CLI in the container → `http://host.docker.internal:18123`, db `ch1_wp5c_image` | exit 0, 57 statements, 45 tables/views (10 MergeTree, 4 Replacing, 6 VersionedCollapsing, 25 views); re-run exit 0 (idempotent); database dropped afterwards |
 | `CHAINGRAPH_CLICKHOUSE_DDL_DIR=/nope` | exit 1, clear message |
 | `build/config.js` in the image with `CHAINGRAPH_STORE=clickhouse` and no Postgres var | loads (defaults.env value) |
-| Clean `.yarn` submodule (no ClickHouse zip), `--target build-stage` | fails at `yarn install` (YN0056), see above |
+| Clean `.yarn` submodule (no ClickHouse zip), `--target build-stage` | fails at `yarn install` (YN0056); fixed by removing the submodule, see below |
+
+## Verification without the `.yarn` submodule (2026-10-10, image built from `a66f06e`)
+
+Same machine; `git archive HEAD` export with no `.yarn/releases` or `.yarn/cache` (only the
+tracked `.yarn/plugins`), `--no-cache` (base image cached).
+
+| Item | Result |
+| --- | --- |
+| `docker buildx build --platform linux/amd64 --no-cache --load -t ch1-agent:nosub` | ok, 52 s wall (yarn install from registry 37.8 s, tsc 5.8 s, prod-install 2.6 s) |
+| Image | linux/amd64, 66.0 MB, node v24.21.0 (pinned `node:24-alpine` digest) |
+| `import('@clickhouse/client')` / `require('@clickhouse/client')` in the container | ok |
+| `build/config.js` with `CHAINGRAPH_STORE=clickhouse` + `CHAINGRAPH_CLICKHOUSE_URL` | loads |

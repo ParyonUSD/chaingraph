@@ -3,6 +3,16 @@
 Everything runs on the laptop; no cloud. Container/volume names are prefixed
 `ch1-` so they can be stopped/removed without generic patterns.
 
+## Install
+
+Yarn 3.3.1 comes from Corepack (bundled with Node 24); there is no `.yarn` submodule
+(see `yarn-no-submodule.md`):
+
+```sh
+corepack enable          # once per Node install
+yarn install --immutable # must not change yarn.lock
+```
+
 ## Containers
 
 Postgres for the e2e suite and the ingestion gate (same image/env as CI,
