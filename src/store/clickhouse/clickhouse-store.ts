@@ -97,7 +97,13 @@ export interface ClickHouseStoreOptions {
   onError?: (error: unknown) => void;
 }
 
-const defaultLookupChunkSize = 2_000;
+/*
+ * Hex hashes per array query parameter: 1,000 × ~67 bytes stays under the
+ * server's `http_max_field_value_size` (128 KiB); 2,000 did not
+ * ("HTML Form Exception: Field value too long" on a 2,000-block header
+ * acceptance).
+ */
+const defaultLookupChunkSize = 1_000;
 const defaultPendingSpendTimeoutMs = 60_000;
 const defaultHorizonBatchHeights = 10_000;
 const defaultOrphanGraceMs = 1_000;
