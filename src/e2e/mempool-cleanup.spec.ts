@@ -1,11 +1,23 @@
 import { readFileSync } from 'fs';
 
-import type { TestFn } from 'ava';
+import type { ExecutionContext, TestFn } from 'ava';
 import baseTest from 'ava';
 
 import type * as database from '../db.js';
+import type { MempoolCleanupVector } from '../store/mempool-cleanup.vectors.js';
+import {
+  defaultValidatedAt,
+  mempoolCleanupVectors,
+  randomVector,
+  timestampToDate,
+  vectorInputs,
+  vectorNodeMempool,
+  vectorTxHash,
+  vectorTxId,
+} from '../store/mempool-cleanup.vectors.js';
+import { planMempoolExpiry } from '../store/mempool-graph.js';
 
-// cspell:words lpad
+// cspell:words lpad unnest savepoint
 const test = baseTest as TestFn<{ db: typeof database }>;
 const host = process.env.CHAINGRAPH_E2E_POSTGRES_HOST ?? 'localhost';
 const port = process.env.CHAINGRAPH_E2E_POSTGRES_PORT ?? '5432';
@@ -43,7 +55,7 @@ CREATE TEMP TABLE block_transaction (block_internal_id bigint,
   transaction_internal_id bigint,
   PRIMARY KEY (transaction_internal_id, block_internal_id));
 CREATE TEMP TABLE node_block (node_internal_id smallint,
-  block_internal_id bigint, accepted_at timestamp NOT NULL,
+  block_internal_id bigint, accepted_at timestamp,
   PRIMARY KEY (node_internal_id, block_internal_id));
 INSERT INTO node VALUES (1, 'alpha'), (2, 'beta');
 INSERT INTO transaction
@@ -79,165 +91,197 @@ test.after.always(async (t) => {
   await t.context.db.pool.end();
 });
 
-const repeatedHashBytes = 32;
-const hash = (byte: string) => byte.repeat(repeatedHashBytes);
-
 const membershipQuery = /* sql */ `
 SELECT node_internal_id AS node, transaction_internal_id::integer AS tx
   FROM node_transaction ORDER BY node, tx;
 `;
 const historyQuery = /* sql */ `
 SELECT node_internal_id AS node, transaction_internal_id::integer AS tx,
-       replaced_at::text AS replaced
+       replaced_at::text AS "replacedAt"
   FROM node_transaction_history ORDER BY node, tx;
 `;
 
-test.serial(
-  '[e2e] cleanup confirms a parent without invalidating descendants or another node',
-  async (t) => {
-    const { pool, archiveMempoolTransactionsAcceptedByBlocks: archive } =
-      t.context.db;
-    await pool.query(/* sql */ `
-INSERT INTO input
-  SELECT 2, 0, hash, 0 FROM transaction WHERE internal_id = 1
-  UNION ALL SELECT 3, 0, hash, 0 FROM transaction WHERE internal_id = 2;
-INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
-  SELECT node, tx FROM generate_series(1, 2) node, generate_series(1, 3) tx;
--- Duplicate accepted inclusions must still produce only one history row.
-INSERT INTO block_transaction VALUES (1, 1), (2, 1);
-INSERT INTO node_block VALUES (1, 1, '2026-01-02'), (1, 2, '2026-01-03');
-`);
-    t.deepEqual(await archive(), [
-      { hash: hash('01'), nodeName: 'alpha', replacedAt: null },
-    ]);
-    t.deepEqual((await pool.query(membershipQuery)).rows, [
-      { node: 1, tx: 2 },
-      { node: 1, tx: 3 },
-      { node: 2, tx: 1 },
-      { node: 2, tx: 2 },
-      { node: 2, tx: 3 },
-    ]);
-    t.deepEqual((await pool.query(historyQuery)).rows, [
-      { node: 1, replaced: null, tx: 1 },
-    ]);
-    t.deepEqual(await archive(), []);
-  }
-);
+type Pool = typeof database.pool;
 
-test.serial(
-  '[e2e] cleanup invalidates conflicts and descendants only for the accepting node',
-  async (t) => {
-    const { pool, archiveMempoolTransactionsAcceptedByBlocks: archive } =
-      t.context.db;
-    await pool.query(/* sql */ `
+/*
+ * The shared vectors (src/store/mempool-cleanup.vectors.ts) also run through
+ * the pure planner in src/store/mempool-graph.spec.ts, so these tests are the
+ * SQL half of a differential test.
+ */
+const loadVector = async (pool: Pool, vector: MempoolCleanupVector) => {
+  const inputs = vectorInputs(vector);
+  const outpointHashes = inputs.map((input) => vectorTxHash(input.outpointTx));
+  const outpointIndexes = inputs.map((input) => input.outpointIndex);
+  await pool.query(
+    /* sql */ `
 INSERT INTO input
-  SELECT 1, 0, hash, 0 FROM transaction WHERE internal_id = 10
-  UNION ALL SELECT 4, 0, hash, 0 FROM transaction WHERE internal_id = 10
-  UNION ALL SELECT 2, 0, hash, 0 FROM transaction WHERE internal_id = 1
-  UNION ALL SELECT 3, 0, hash, 0 FROM transaction WHERE internal_id = 2;
-INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
-  SELECT node, tx FROM generate_series(1, 2) node, generate_series(1, 3) tx;
-INSERT INTO block_transaction VALUES (1, 4), (2, 4);
-INSERT INTO node_block VALUES (1, 1, '2026-01-05'), (1, 2, '2026-01-02');
-`);
-    t.deepEqual(await archive(), [
-      {
-        hash: hash('01'),
-        nodeName: 'alpha',
-        replacedAt: new Date('2026-01-02T00:00:00.000Z'),
-      },
-    ]);
-    t.deepEqual((await pool.query(membershipQuery)).rows, [
-      { node: 2, tx: 1 },
-      { node: 2, tx: 2 },
-      { node: 2, tx: 3 },
-    ]);
-    t.deepEqual((await pool.query(historyQuery)).rows, [
-      { node: 1, replaced: '2026-01-02 00:00:00', tx: 1 },
-      { node: 1, replaced: '2026-01-02 00:00:00', tx: 2 },
-      { node: 1, replaced: '2026-01-02 00:00:00', tx: 3 },
-    ]);
-    t.deepEqual(await archive(), []);
-  }
-);
+  SELECT tx, input_index, decode(outpoint_hash, 'hex'), outpoint_index
+    FROM unnest($1::bigint[], $2::integer[], $3::text[], $4::integer[])
+      AS i (tx, input_index, outpoint_hash, outpoint_index);`,
+    [
+      inputs.map((input) => input.tx),
+      inputs.map((input) => input.inputIndex),
+      outpointHashes,
+      outpointIndexes,
+    ]
+  );
+  // Output 0 of every transaction exists; add any other spent output.
+  await pool.query(
+    /* sql */ `
+INSERT INTO output
+  SELECT DISTINCT decode(outpoint_hash, 'hex'), outpoint_index
+    FROM unnest($1::text[], $2::integer[]) AS o (outpoint_hash, outpoint_index)
+    WHERE decode(outpoint_hash, 'hex') IN (SELECT hash FROM transaction)
+  ON CONFLICT DO NOTHING;`,
+    [outpointHashes, outpointIndexes]
+  );
+  await pool.query(
+    /* sql */ `
+INSERT INTO node_transaction
+  SELECT node, tx, validated_at::timestamp
+    FROM unnest($1::smallint[], $2::bigint[], $3::text[])
+      AS n (node, tx, validated_at);`,
+    [
+      vector.nodeTransactions.map((row) => row.node),
+      vector.nodeTransactions.map((row) => row.tx),
+      vector.nodeTransactions.map(
+        (row) => row.validatedAt ?? defaultValidatedAt
+      ),
+    ]
+  );
+  await pool.query(
+    /* sql */ `
+INSERT INTO block_transaction SELECT * FROM unnest($1::bigint[], $2::bigint[]);`,
+    [
+      vector.blockTransactions.map((row) => row.block),
+      vector.blockTransactions.map((row) => row.tx),
+    ]
+  );
+  await pool.query(
+    /* sql */ `
+INSERT INTO node_block
+  SELECT node, block, accepted_at::timestamp
+    FROM unnest($1::smallint[], $2::bigint[], $3::text[])
+      AS b (node, block, accepted_at);`,
+    [
+      vector.nodeBlocks.map((row) => row.node),
+      vector.nodeBlocks.map((row) => row.block),
+      vector.nodeBlocks.map((row) => row.acceptedAt),
+    ]
+  );
+};
 
-test.serial(
-  '[e2e] cleanup gives confirmation precedence in mixed confirmation and invalidation batches',
-  async (t) => {
-    const { pool, archiveMempoolTransactionsAcceptedByBlocks: archive } =
-      t.context.db;
-    await pool.query(/* sql */ `
-INSERT INTO input
-  SELECT 1, 0, hash, 0 FROM transaction WHERE internal_id = 10
-  UNION ALL SELECT 4, 0, hash, 0 FROM transaction WHERE internal_id = 10
-  UNION ALL SELECT 2, 0, hash, 0 FROM transaction WHERE internal_id = 1
-  UNION ALL SELECT 5, 0, hash, 0 FROM transaction WHERE internal_id = 11
-  UNION ALL SELECT 8, 0, hash, 0 FROM transaction WHERE internal_id = 11
-  UNION ALL SELECT 6, 0, hash, 0 FROM transaction WHERE internal_id = 5
-  UNION ALL SELECT 7, 0, hash, 0 FROM transaction WHERE internal_id = 6;
-INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
-  VALUES (1, 1), (1, 2), (1, 5), (1, 6), (1, 7);
--- Deliberately inconsistent historical acceptance tests NULL precedence.
-INSERT INTO block_transaction VALUES (1, 1), (2, 4), (3, 8);
-INSERT INTO node_block VALUES
-  (1, 1, '2026-01-02'), (1, 2, '2026-01-03'), (1, 3, '2026-01-04');
-`);
-    t.deepEqual(await archive(), [
-      { hash: hash('01'), nodeName: 'alpha', replacedAt: null },
-      {
-        hash: hash('05'),
-        nodeName: 'alpha',
-        replacedAt: new Date('2026-01-04T00:00:00.000Z'),
-      },
-    ]);
-    t.deepEqual((await pool.query(membershipQuery)).rows, [{ node: 1, tx: 2 }]);
-    t.deepEqual((await pool.query(historyQuery)).rows, [
-      { node: 1, replaced: null, tx: 1 },
-      { node: 1, replaced: '2026-01-04 00:00:00', tx: 5 },
-      { node: 1, replaced: '2026-01-04 00:00:00', tx: 6 },
-      { node: 1, replaced: '2026-01-04 00:00:00', tx: 7 },
-    ]);
-  }
-);
+const nodeName = (vector: MempoolCleanupVector, node: number) =>
+  vector.nodes.find((candidate) => candidate.internalId === node)!.name;
 
-test.serial(
-  '[e2e] cleanup ignores other-node confirmations, self, coinbase and unconfirmed conflicts',
-  async (t) => {
-    const { pool, archiveMempoolTransactionsAcceptedByBlocks: archive } =
-      t.context.db;
-    await pool.query(/* sql */ `
-INSERT INTO input
-  SELECT 1, 0, hash, 0 FROM transaction WHERE internal_id = 10
-  UNION ALL SELECT 2, 0, decode(repeat('00', 32), 'hex'), 0
-  UNION ALL SELECT 3, 0, decode(repeat('00', 32), 'hex'), 0
-  UNION ALL SELECT 4, 0, hash, 0 FROM transaction WHERE internal_id = 11
-  UNION ALL SELECT 5, 0, hash, 0 FROM transaction WHERE internal_id = 11
-  UNION ALL SELECT 6, 0, hash, 0 FROM transaction WHERE internal_id = 12
-  UNION ALL SELECT 7, 0, hash, 0 FROM transaction WHERE internal_id = 12
-  UNION ALL SELECT 8, 0, hash, 1 FROM transaction WHERE internal_id = 13
-  UNION ALL SELECT 9, 0, hash, 0 FROM transaction WHERE internal_id = 13;
-INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
-  VALUES (1, 1), (1, 2), (1, 4), (1, 6), (1, 8);
-INSERT INTO block_transaction VALUES (1, 1), (2, 3), (3, 5), (4, 9);
-INSERT INTO node_block VALUES
-  (2, 1, '2026-01-02'), (1, 2, '2026-01-02'),
-  (2, 3, '2026-01-02'), (1, 4, '2026-01-02');
-`);
-    t.deepEqual(await archive(), []);
-    t.deepEqual((await pool.query(historyQuery)).rows, []);
-    t.deepEqual((await pool.query(membershipQuery)).rows, [
-      { node: 1, tx: 1 },
-      { node: 1, tx: 2 },
-      { node: 1, tx: 4 },
-      { node: 1, tx: 6 },
-      { node: 1, tx: 8 },
-    ]);
-  }
-);
+/**
+ * The vector's expected direct archive rows in the shape returned by
+ * `archiveMempoolTransactionsAcceptedByBlocks`.
+ */
+const expectedArchiveResult = (vector: MempoolCleanupVector) =>
+  vector.expected.archived.map((row) => ({
+    hash: vectorTxHash(row.tx),
+    nodeName: nodeName(vector, row.node),
+    replacedAt:
+      row.replacedAt === null ? null : timestampToDate(row.replacedAt),
+  }));
 
-test.serial('[e2e] cleanup accepts an empty mempool', async (t) => {
+const sweepAndCompare = async (
+  t: ExecutionContext<{ db: typeof database }>,
+  vector: MempoolCleanupVector
+) => {
+  const { pool, archiveMempoolTransactionsAcceptedByBlocks: archive } =
+    t.context.db;
+  await loadVector(pool, vector);
+  t.deepEqual(await archive(), expectedArchiveResult(vector), vector.name);
   t.deepEqual(
-    await t.context.db.archiveMempoolTransactionsAcceptedByBlocks(),
-    []
+    (await pool.query(membershipQuery)).rows,
+    vector.expected.remaining,
+    vector.name
+  );
+  t.deepEqual(
+    (await pool.query(historyQuery)).rows,
+    vector.expected.history,
+    vector.name
+  );
+  t.deepEqual(await archive(), [], `${vector.name}: second sweep`);
+};
+
+mempoolCleanupVectors.forEach((vector) => {
+  test.serial(
+    `[e2e] [postgres] ${vector.description} (vector ${vector.name})`,
+    async (t) => {
+      await sweepAndCompare(t, vector);
+    }
   );
 });
+
+/* eslint-disable no-await-in-loop */
+const randomSeeds = Array.from({ length: 60 }, (_, i) => i + 1);
+
+test.serial(
+  '[e2e] [postgres] cleanup and expiry match the planner on random vectors',
+  async (t) => {
+    const { pool, archiveMempoolTransaction } = t.context.db;
+    // eslint-disable-next-line functional/no-loop-statement
+    for (const seed of randomSeeds) {
+      const vector = randomVector(seed);
+      await pool.query('SAVEPOINT random_vector;');
+      await sweepAndCompare(t, vector);
+      /*
+       * Expire the first remaining transaction of each node, one node at a
+       * time, and compare the new history rows with the planner's expiry.
+       */
+      const replacedAt = timestampToDate('2026-02-01 00:00:00');
+      // eslint-disable-next-line functional/no-loop-statement
+      for (const { internalId: node } of vector.nodes) {
+        const remaining = vector.expected.remaining.filter(
+          (row) => row.node === node
+        );
+        // eslint-disable-next-line no-continue
+        if (remaining.length === 0) continue;
+        const remainingMempool = {
+          txs: new Map(
+            [...vectorNodeMempool(vector, node).txs].filter(([tx]) =>
+              remaining.some((row) => row.tx === vectorTxId(tx))
+            )
+          ),
+        };
+        const expired = remaining[0]!.tx;
+        const plan = planMempoolExpiry(remainingMempool, {
+          replacedAt,
+          tx: vectorTxHash(expired),
+        });
+        const before = (await pool.query(historyQuery)).rows.length;
+        t.is(
+          await archiveMempoolTransaction({
+            nodeInternalId: node,
+            replacedAt,
+            transactionInternalId: expired,
+          }),
+          1
+        );
+        const history = (
+          await pool.query<{ node: number; tx: number; replacedAt: string }>(
+            historyQuery
+          )
+        ).rows;
+        t.is(history.length - before, plan.length, `seed ${seed} expiry`);
+        t.deepEqual(
+          history
+            .filter(
+              (row) =>
+                row.node === node && row.replacedAt === '2026-02-01 00:00:00'
+            )
+            .map((row) => row.tx),
+          plan.map((archive) => vectorTxId(archive.tx)).sort((a, b) => a - b),
+          `seed ${seed} expiry`
+        );
+      }
+      await pool.query(
+        'ROLLBACK TO SAVEPOINT random_vector; RELEASE SAVEPOINT random_vector;'
+      );
+    }
+  }
+);
+/* eslint-enable no-await-in-loop */
