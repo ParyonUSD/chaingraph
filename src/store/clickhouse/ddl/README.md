@@ -143,12 +143,9 @@ Both servers default `async_insert = 1`, `insert_deduplicate = 1`, `deduplicate_
 5. Partitioning: `block_transaction` is partitioned like `transaction` (420 M rows; GC by `commit_seq`).
    `block` (1.3 M) and every collapsing / Replacing table are unpartitioned: collapsing only happens within a
    partition.
-6. VCMT `version` on acceptance tables (node_block, node_transaction, tx_acceptance, pending_spend) is the
-   `commit_seq` of the +1 row. A −1 row copies the version of the +1 it cancels (so the pair collapses) and
-   carries its own `commit_seq` (so an uncommitted re-org stays hidden). Re-acceptance writes +1 with a new
-   version.
-7. On `utxo` / `utxo_by_script`, `version` is a constant (1, as #83). A per-transition version would stop
-   −1/+1 pairs from ever collapsing; the sum semantics need no ordering.
+6. ~~VCMT `version` on acceptance tables is the `commit_seq` of the +1 row; a −1 copies it.~~
+   **Superseded by item 24 (WP5a).**
+7. ~~On `utxo` / `utxo_by_script`, `version` is a constant (1, as #83).~~ **Superseded by item 24 (WP5a).**
 8. `tx_acceptance` has a projection on a VCMT table, which ClickHouse refuses unless
    `deduplicate_merge_projection_mode` is set; it is `'rebuild'`.
 9. `commit_log.state` adds `incomplete` (§3.5). `state_rank` is MATERIALIZED from the enum
@@ -180,6 +177,26 @@ WP4 amendments (design: `docs/clickhouse-port/wp4-commit-and-visibility.md`):
     writer_lease` before re-applying** (the `CREATE … IF NOT EXISTS` keeps the old key otherwise).
 22. Views are `CREATE OR REPLACE`; every node-scoped and node-agnostic view has a pinned `*_at` twin.
 
+WP5a-core amendments (design: `docs/clickhouse-port/wp5a-core.md`):
+
+23. `input.fungible_token_amount Nullable(Int64)` (after `token_category`): the spent output's FT amount,
+    the plan gap WP2 found. `010_core.sql` creates it and also runs `ALTER TABLE … ADD COLUMN IF NOT EXISTS`
+    for older databases. The three `input` projections list it. **Databases created before WP5a** keep their
+    old projections (`ADD PROJECTION IF NOT EXISTS`): on an empty table run
+    `ALTER TABLE input DROP PROJECTION p_outpoint` (and `p_spent_script`, `p_spent_category`) and re-apply;
+    on a filled one, re-add and `MATERIALIZE PROJECTION`. Local `cg` was migrated this way (empty) on 2026-10-09.
+24. **`version` is the row's own `commit_seq` on every per-node VersionedCollapsingMergeTree table**
+    (`node_block`, `node_transaction`, `tx_acceptance`, `utxo`, `utxo_by_script`, `pending_spend`), for
+    +1 and −1 rows alike. Items 6/7 let a background merge delete a committed +1 together with a −1 whose
+    commit is still open or was aborted: merges ignore `commit_seq`, and the gate cannot restore deleted
+    rows (seen in the WP5a e2e re-org test; regression test `[e2e] … merges never collapse an uncommitted
+    or aborted −1`). Readers already use `sum(sign)`, so answers are unchanged; pairs written by ONE commit
+    still collapse. Cross-commit pairs (re-orgs, tip-mode spends of older outputs, and mempool rows in
+    WP5a-mempool) accumulate until a compaction job removes them (wp5a-core.md §2: proposed, not built).
+25. `utxo.created_height` / `utxo_by_script.created_height` are always written as 0 (wp5a-core.md
+    decision (i)): `unspent_output(node)` (F1g) returns output columns only, and every row of one outpoint
+    must carry identical non-key values for the views' `any()` to be exact. Use `tx_acceptance_at` for heights.
+
 ## Differences: Cloud 26.6 vs local 26.8
 
 - Every statement in 001–060 was accepted unchanged by both. No statement was rejected by 26.6.
@@ -203,7 +220,8 @@ WP4 amendments (design: `docs/clickhouse-port/wp4-commit-and-visibility.md`):
   (NULL = confirmed).
 - **7 Naming.** Node-scoped views cannot be queried without `node`.
 
-**At risk (for WP3–WP5 to resolve).**
+**At risk (for WP3–WP5 to resolve).** *WP5a-core answers: item 25 (created_height), item 24 (collapse
+safety), wp5a-core.md §6 (checklist review).*
 - **4: `utxo.created_height` is not exact.** The plan writes no UTXO rows when a tx moves from mempool to a
   block, so an output created in the mempool keeps `created_height = 0` after confirmation. Either drop the
   column from answers or take the height from `tx_acceptance_v`.
@@ -236,4 +254,4 @@ WP4 amendments (design: `docs/clickhouse-port/wp4-commit-and-visibility.md`):
   node-scoped answer.
 - `commit_log.node_scope` (an array, not a key): bookkeeping for the watermark, not an answer.
 - `input`'s denormalised spent-output attributes are immutable output facts, not acceptance facts.
-- Plan gap noted, not changed: `input` does not denormalise `fungible_token_amount` (the plan's list omits it).
+- Plan gap: `input` did not denormalise `fungible_token_amount` (the plan's list omits it). *Fixed in WP5a (item 23).*
