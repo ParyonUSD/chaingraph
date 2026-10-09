@@ -883,7 +883,7 @@ export class MempoolCommitter {
         });
       }
     } else {
-      const blockIds = [...blocks.keys()];
+      const blockIds = [...blocks.keys()].map((id) => BigInt(id));
       const wanted = [...new Set([...candidates, ...creators])];
       for (const blockChunk of chunked(blockIds, lookupChunkSize)) {
         for (const chunk of chunked(wanted, lookupChunkSize)) {
@@ -1508,9 +1508,13 @@ export class MempoolCommitter {
       throw error;
     } finally {
       this.end(operation);
-    }
-    if (waitFor !== undefined) {
-      await waitFor;
+      /*
+       * Parked (an orphan, or merged into one): resolve once the parked
+       * attempt is saved. In `finally`, because the parked paths return.
+       */
+      if (waitFor !== undefined) {
+        await waitFor;
+      }
     }
   }
 
