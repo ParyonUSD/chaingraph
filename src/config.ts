@@ -1,3 +1,4 @@
+// cspell:ignore clickhouse
 /**
  * Note: this file only logs to STDOUT and STDERR, as logging relies on the
  * `CHAINGRAPH_LOG_PATH` configuration.
@@ -405,6 +406,97 @@ const postgresSynchronousCommit =
   configuration.CHAINGRAPH_POSTGRES_SYNCHRONOUS_COMMIT !== 'false';
 
 /**
+ * Options which may be absent from both `defaults.env` and the environment.
+ */
+const optionalOptions = configuration as { [x: string]: string | undefined };
+
+const allowedStores = ['postgres', 'clickhouse'] as const;
+const isValidStore = (store: string): store is (typeof allowedStores)[number] =>
+  allowedStores.includes(store as unknown as (typeof allowedStores)[number]);
+const chaingraphStoreValue =
+  optionalOptions.CHAINGRAPH_STORE === undefined ||
+  optionalOptions.CHAINGRAPH_STORE === ''
+    ? 'postgres'
+    : optionalOptions.CHAINGRAPH_STORE;
+if (!isValidStore(chaingraphStoreValue)) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_STORE' environment variable: ${chaingraphStoreValue}. Must be one of the following: ${allowedStores.join(
+      ', '
+    )}`
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_STORE` environment variable (default: `postgres`).
+ * Selects the storage backend used by the agent.
+ */
+const chaingraphStore = chaingraphStoreValue;
+
+const optionalString = (value: string | undefined, fallback: string) =>
+  value === undefined || value === '' ? fallback : value;
+
+/**
+ * Set via the `CHAINGRAPH_CLICKHOUSE_URL` environment variable (HTTP
+ * interface, e.g. `http://localhost:8123`). Required if `CHAINGRAPH_STORE` is
+ * `clickhouse`.
+ */
+const clickhouseUrl = optionalString(
+  optionalOptions.CHAINGRAPH_CLICKHOUSE_URL,
+  ''
+);
+if (chaingraphStore === 'clickhouse') {
+  if (clickhouseUrl === '') {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `The 'CHAINGRAPH_CLICKHOUSE_URL' environment variable is required when CHAINGRAPH_STORE is 'clickhouse'.`
+    );
+  }
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    // eslint-disable-next-line no-new
+    new URL(clickhouseUrl);
+  } catch {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `Invalid value provided in the 'CHAINGRAPH_CLICKHOUSE_URL' environment variable (value not shown, it may contain credentials). Must be a URL, e.g. http://localhost:8123`
+    );
+  }
+}
+
+/**
+ * Set via the `CHAINGRAPH_CLICKHOUSE_DATABASE` environment variable (default:
+ * `cg`).
+ */
+const clickhouseDatabase = optionalString(
+  optionalOptions.CHAINGRAPH_CLICKHOUSE_DATABASE,
+  'cg'
+);
+if (!/^[A-Za-z_][0-9A-Za-z_]*$/u.test(clickhouseDatabase)) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_CLICKHOUSE_DATABASE' environment variable: ${clickhouseDatabase}. Must be a plain identifier (letters, digits and underscores).`
+  );
+}
+
+/**
+ * Set via the `CHAINGRAPH_CLICKHOUSE_USER` environment variable (default:
+ * `default`).
+ */
+const clickhouseUser = optionalString(
+  optionalOptions.CHAINGRAPH_CLICKHOUSE_USER,
+  'default'
+);
+
+/**
+ * Set via the `CHAINGRAPH_CLICKHOUSE_PASSWORD` environment variable (default:
+ * empty). Never log this value.
+ */
+const clickhousePassword = optionalString(
+  optionalOptions.CHAINGRAPH_CLICKHOUSE_PASSWORD,
+  ''
+);
+
+/**
  * `true` if the `NODE_ENV` environment variable is `production`.
  */
 const isProduction = configuration.NODE_ENV === 'production';
@@ -416,7 +508,12 @@ export {
   chaingraphLogPath,
   chaingraphLogLevelStdout,
   chaingraphLogLevelPath,
+  chaingraphStore,
   chaingraphUserAgent,
+  clickhouseDatabase,
+  clickhousePassword,
+  clickhouseUrl,
+  clickhouseUser,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
   mempoolTransactionExpirationMs,
