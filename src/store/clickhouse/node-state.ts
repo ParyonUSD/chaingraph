@@ -1,4 +1,4 @@
-/* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, max-params, @typescript-eslint/parameter-properties, @typescript-eslint/member-ordering, @typescript-eslint/no-invalid-void-type */
+/* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, max-params, @typescript-eslint/parameter-properties, @typescript-eslint/member-ordering, @typescript-eslint/no-invalid-void-type, class-methods-use-this */
 // cspell:ignore clickhouse seqs
 /**
  * Per-node in-memory state of the ClickHouse writer (WP5a-core):
@@ -133,6 +133,48 @@ export class StoreOperation {
 }
 
 export class DependencyFailedError extends Error {}
+
+/** In-flight work was abandoned (store shutdown): nothing was committed. */
+export class AbandonedError extends Error {}
+
+/**
+ * Shutdown signal: once `abandon` is called, every wait raced against it
+ * (pending spends, commit dependencies) and every commit step rejects with
+ * `AbandonedError`; the commit is aborted and recovery redoes nothing (the
+ * agent re-downloads what was not committed).
+ */
+export class AbandonSignal {
+  abandoned = false;
+
+  readonly promise: Promise<never>;
+
+  private rejectWith: (error: AbandonedError) => void = () => undefined;
+
+  constructor() {
+    this.promise = new Promise<never>((_, reject) => {
+      this.rejectWith = reject;
+    });
+    this.promise.catch(() => undefined);
+  }
+
+  abandon(reason = 'store shutdown') {
+    if (this.abandoned) return;
+    this.abandoned = true;
+    this.rejectWith(new AbandonedError(`Abandoned: ${reason}.`));
+  }
+
+  assertNotAbandoned() {
+    if (this.abandoned) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new AbandonedError('Abandoned: store shutdown.');
+    }
+  }
+
+  async race<T>(work: Promise<T>): Promise<T> {
+    this.assertNotAbandoned();
+    return Promise.race([work, this.promise]);
+  }
+}
 
 /**
  * The registry of live operations. Registration is synchronous, so the order

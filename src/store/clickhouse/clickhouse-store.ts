@@ -1,10 +1,10 @@
-/* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, functional/no-mixed-type, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, functional/no-loop-statement, no-await-in-loop, @typescript-eslint/member-ordering, max-params, @typescript-eslint/parameter-properties, functional/no-let, @typescript-eslint/init-declarations, class-methods-use-this, prefer-destructuring, @typescript-eslint/no-invalid-void-type, functional/no-promise-reject */
+/* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, functional/no-mixed-type, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, functional/no-loop-statement, no-await-in-loop, @typescript-eslint/member-ordering, max-params, @typescript-eslint/parameter-properties, functional/no-let, @typescript-eslint/init-declarations, prefer-destructuring, @typescript-eslint/no-invalid-void-type */
 // cspell:ignore clickhouse dedup unhex seqs milli varint
 /**
  * The ClickHouse `ChaingraphStore` (WP5a-core): nodes, blocks, header
  * acceptance, re-org release, the per-node UTXO set and incomplete-block
- * repair. The mempool methods are WP5a-mempool (they throw
- * `MempoolNotImplementedError`).
+ * repair (WP5a-core), and the per-node mempools (WP5a-mempool:
+ * mempool-commit.ts, docs/clickhouse-port/wp5a-mempool.md).
  *
  * Every per-node fact carries the node in its key; a call for node A never
  * writes a fact for node B; every call that changes facts is one commit
@@ -12,13 +12,19 @@
  * Design, invariants and the plan §1 checklist review:
  * docs/clickhouse-port/wp5a-core.md.
  */
-import type { ChaingraphBlock } from '../../types/chaingraph.js';
 import type {
+  ChaingraphBlock,
+  ChaingraphTransaction,
+} from '../../types/chaingraph.js';
+import type {
+  ArchivedMempoolTransaction,
   ChaingraphStore,
+  ExpiringMempoolTransaction,
   FinishInitialSyncHooks,
   IncompleteBlock,
   IncompleteBlockScan,
   NodeAcceptance,
+  NodeValidation,
   StorePoolStats,
 } from '../types.js';
 
@@ -34,7 +40,9 @@ import { ClickHouseClient } from './client.js';
 import type { OpenCommit } from './commit-log.js';
 import { CommitLog } from './commit-log.js';
 import { ClickHouseReservationStore, IdAllocator } from './id-allocator.js';
-import { MempoolNotImplementedError, MempoolState } from './mempool-state.js';
+import { changeRows, MempoolCommitter } from './mempool-commit.js';
+import type { NodeMempoolChange } from './mempool-state.js';
+import { isEmptyChange, MempoolState } from './mempool-state.js';
 import type {
   NodeBlockHistoryRow,
   NodeBlockRow,
@@ -43,6 +51,7 @@ import type {
   StoreOperation,
 } from './node-state.js';
 import {
+  AbandonSignal,
   acceptanceColumns,
   awaitDependencies,
   deferred,
@@ -78,6 +87,10 @@ export interface ClickHouseStoreOptions {
   horizonBatchHeights?: number;
   recentOutputCapacity?: number;
   recentTransactionCapacity?: number;
+  /** How long a mempool tx spending an unknown output waits in the orphan pool. */
+  orphanGraceMs?: number;
+  /** Orphan pool bound (the oldest is released early when full). */
+  maxOrphans?: number;
   /** Test hook: called between the steps of every commit. */
   fault?: FaultInjector;
   /** Background errors (watermark publishing, lease loss). */
@@ -87,6 +100,9 @@ export interface ClickHouseStoreOptions {
 const defaultLookupChunkSize = 2_000;
 const defaultPendingSpendTimeoutMs = 60_000;
 const defaultHorizonBatchHeights = 10_000;
+const defaultOrphanGraceMs = 1_000;
+const closeDrainTimeoutMs = 5_000;
+const defaultMaxOrphans = 10_000;
 const twoHoursSeconds = 7_200;
 const msPerSecond = 1_000;
 const headerVarintThresholds = [252, 65_535, 4_294_967_295];
@@ -174,11 +190,16 @@ export class ClickHouseStore implements ChaingraphStore {
 
   readonly mempool = new MempoolState();
 
+  /** Shutdown: abandon in-flight work (`abandonInFlightWork`). */
+  private readonly abandonSignal = new AbandonSignal();
+
   readonly outputs: OutputRegistry<StoreOperation>;
 
   readonly transactions: TransactionRegistry;
 
   private committerInstance: BlockCommitter | undefined;
+
+  private mempoolCommitter: MempoolCommitter | undefined;
 
   private readonly lookupChunkSize: number;
 
@@ -243,6 +264,7 @@ export class ClickHouseStore implements ChaingraphStore {
     this.publisher = publisher;
     const { ids } = this;
     this.committerInstance = new BlockCommitter({
+      abandon: this.abandonSignal,
       client,
       commitLog,
       fault: async (step, context) => this.fault(step, context),
@@ -250,10 +272,37 @@ export class ClickHouseStore implements ChaingraphStore {
       ids,
       lookupChunkSize: this.lookupChunkSize,
       mempool: this.mempool,
+      mempoolHooks: () => this.mempoolCommitter,
       mode: () => this.mode,
       onCommitted: () => undefined,
       operationOfSeq: (seq) => this.operationOfSeq(seq),
       operations: this.operations,
+      outputs: this.outputs,
+      pendingSpendTimeoutMs:
+        this.options.pendingSpendTimeoutMs ?? defaultPendingSpendTimeoutMs,
+      transactions: this.transactions,
+    });
+    this.mempoolCommitter = new MempoolCommitter({
+      abandon: this.abandonSignal,
+      beginOperation: async (kind, operationNodes) =>
+        this.beginOperation(kind, operationNodes),
+      client,
+      commitLog,
+      endOperation: (operation) => {
+        this.operations.end(operation);
+      },
+      fault: async (step, context) => this.fault(step, context),
+      fence: () => this.fenceArray,
+      ids,
+      lookupChunkSize: this.lookupChunkSize,
+      maxOrphans: this.options.maxOrphans ?? defaultMaxOrphans,
+      mempool: this.mempool,
+      mode: () => this.mode,
+      nodes: this.nodes,
+      onCommitted: () => undefined,
+      operationOfSeq: (seq) => this.operationOfSeq(seq),
+      operations: this.operations,
+      orphanGraceMs: this.options.orphanGraceMs ?? defaultOrphanGraceMs,
       outputs: this.outputs,
       pendingSpendTimeoutMs:
         this.options.pendingSpendTimeoutMs ?? defaultPendingSpendTimeoutMs,
@@ -276,6 +325,7 @@ export class ClickHouseStore implements ChaingraphStore {
       this.mode = 'bulk';
       this.bulkStartSeq = BigInt(last.commit_seq);
     }
+    await this.mempoolCommitter.rebuild();
   }
 
   async close(): Promise<void> {
@@ -283,6 +333,19 @@ export class ClickHouseStore implements ChaingraphStore {
       return;
     }
     this.closed = true;
+    this.mempoolCommitter?.dropOrphans(
+      new StoreClosedError('The ClickHouse store is closed.')
+    );
+    if (this.operations.activeCount > 0) {
+      // background work (parked child blocks): abandon it and let it abort
+      this.abandonSignal.abandon('store closed');
+      await Promise.race([
+        this.operations.drain(),
+        new Promise((resolve) => {
+          setTimeout(resolve, closeDrainTimeoutMs);
+        }),
+      ]);
+    }
     this.publisher?.stop();
     await this.publisher?.publishWatermark().catch(() => undefined);
     this.lease?.stopHeartbeat();
@@ -300,6 +363,25 @@ export class ClickHouseStore implements ChaingraphStore {
     this.publisher?.stop();
     this.lease?.stopHeartbeat();
     await this.client?.close();
+  }
+
+  /**
+   * Shutdown: stop waiting and abandon every operation that has not
+   * committed yet (pending-spend waits, dependency waits, later steps). An
+   * abandoned block save is aborted and resolves as handled (so the agent's
+   * block buffer drains); abandoned mempool saves reject; orphans are
+   * dropped. Nothing abandoned is committed, so the next start restores the
+   * chain without it and the agent downloads it again. Wired to SIGINT /
+   * SIGTERM by `createStore` (the agent's shutdown drains the block buffer
+   * before it closes the store, and a block waiting for a parent that will
+   * never be downloaded would otherwise hold the drain for
+   * `pendingSpendTimeoutMs`).
+   */
+  abandonInFlightWork(reason = 'store shutdown') {
+    this.abandonSignal.abandon(reason);
+    this.mempoolCommitter?.dropOrphans(
+      new StoreClosedError(`Orphan dropped: ${reason}.`)
+    );
   }
 
   /** Publish watermarks now (tests; the publisher also runs on its own). */
@@ -386,6 +468,17 @@ export class ClickHouseStore implements ChaingraphStore {
 
   async getAllKnownBlockHashes(): Promise<string[]> {
     this.assertOpen();
+    if (this.client === undefined) {
+      /*
+       * A reader that never ran init() (it holds no lease and knows no open
+       * commits): read through the gated node-agnostic view.
+       */
+      this.client = new ClickHouseClient(this.options.connection);
+      const viewRows = await this.client.query<{ hash_hex: string }>(
+        'SELECT DISTINCT lower(hex(hash)) AS hash_hex FROM block_v'
+      );
+      return viewRows.map((row) => row.hash_hex);
+    }
     const rows = await this.requireClient().query<{ hash_hex: string }>(
       `SELECT lower(hex(hash)) AS hash_hex FROM block WHERE ${committedSql()}`,
       { fence: this.fenceArray, open: this.openSeqs() }
@@ -403,18 +496,41 @@ export class ClickHouseStore implements ChaingraphStore {
     isSavedTransaction: (hash: string) => boolean;
   }): Promise<SaveBlockResult> {
     this.assertOpen();
+    if (this.abandonSignal.abandoned) {
+      return { attemptedSavedTransactions: [], transactionCacheMisses: 0 };
+    }
     const nodes = [
       ...new Set(args.nodeAcceptances.map((item) => item.nodeInternalId)),
     ];
     const operation = await this.beginOperation('block', nodes);
-    try {
-      if (this.committerInstance === undefined) {
-        throw new StoreClosedError('ClickHouseStore.init() has not run.');
+    const parked = deferred<SaveBlockResult>();
+    parked.promise.catch(() => undefined);
+    let reportedEarly = false;
+    const full = (async () => {
+      try {
+        if (this.committerInstance === undefined) {
+          throw new StoreClosedError('ClickHouseStore.init() has not run.');
+        }
+        return await this.committerInstance.save(operation, args, (result) => {
+          reportedEarly = true;
+          parked.resolve(result);
+        });
+      } finally {
+        this.mempool.removeModifier(operation);
+        this.operations.end(operation);
       }
-      return await this.committerInstance.save(operation, args);
-    } finally {
-      this.operations.end(operation);
-    }
+    })();
+    full.catch((error: unknown) => {
+      if (reportedEarly && !(error instanceof SimulatedCrash)) {
+        this.options.onError?.(error);
+      }
+    });
+    /*
+     * A child block waiting for its parent's outputs resolves once its
+     * commit is `incomplete` (block-commit.ts); everything else resolves on
+     * commit.
+     */
+    return Promise.race([full, parked.promise]);
   }
 
   /**
@@ -494,7 +610,44 @@ export class ClickHouseStore implements ChaingraphStore {
         operation.markDone();
         return 0;
       }
-      this.mempool.assertNoMempoolForHeaderAcceptance(nodeInternalId);
+      const nullifyBefore = Math.round(
+        acceptedAt.getTime() / msPerSecond - twoHoursSeconds
+      );
+      /* the node's mempool cleanup for the accepted blocks, in this commit */
+      const hooks = this.requireMempoolCommitter();
+      await hooks.ensureFresh(operation, [nodeInternalId]);
+      const mempoolChanges: NodeMempoolChange[] = [];
+      if (!this.mempool.isEmpty(nodeInternalId)) {
+        const blocksAccepted = new Map<string, Date | null>(
+          toAccept.map((row) => [
+            row.internal_id,
+            Number(row.timestamp) < nullifyBefore ? null : acceptedAt,
+          ])
+        );
+        const { inclusions, outputsOf } = await hooks.loadInclusions(
+          nodeInternalId,
+          blocksAccepted,
+          operation,
+          dependencies
+        );
+        const known = await hooks.knownOutputsForConfirmed(
+          nodeInternalId,
+          inclusions,
+          operation,
+          dependencies
+        );
+        const change = this.mempool.planBlockAcceptance(
+          nodeInternalId,
+          inclusions,
+          outputsOf,
+          (spent) => known.get(spent)
+        );
+        if (!isEmptyChange(change)) {
+          mempoolChanges.push(change);
+        }
+      }
+      hooks.applyChanges(operation, mempoolChanges);
+      const historyIds = await hooks.historyIds(mempoolChanges);
       commit = await this.requireCommitLog().beginCommit({
         kind: 'header_accept',
         nodeScope: [nodeInternalId],
@@ -502,9 +655,6 @@ export class ClickHouseStore implements ChaingraphStore {
       // eslint-disable-next-line require-atomic-updates
       operation.seq = commit.seq;
       await this.fault('intent', { kind: 'header_accept', seq: commit.seq });
-      const nullifyBefore = Math.round(
-        acceptedAt.getTime() / msPerSecond - twoHoursSeconds
-      );
       const nodeBlockRows: NodeBlockRow[] = toAccept.map((row) => ({
         acceptedAt: Number(row.timestamp) < nullifyBefore ? null : acceptedAt,
         blockHash: row.hash_hex,
@@ -576,13 +726,25 @@ export class ClickHouseStore implements ChaingraphStore {
         kind: 'header_accept',
         seq: commit.seq,
       });
+      if (mempoolChanges.length > 0) {
+        await hooks.insertChangeRows(
+          commit,
+          'header_accept',
+          changeRows(mempoolChanges, historyIds),
+          'm',
+          rowCounts
+        );
+      }
       operation.markRowsWritten();
-      await awaitDependencies(dependencies);
+      await this.abandonSignal.race(awaitDependencies(dependencies));
       await this.requireCommitLog().markCommitted(commit.seq, rowCounts);
       operation.markCommitted();
       await this.fault('committed', { kind: 'header_accept', seq: commit.seq });
       return toAccept.length;
     } catch (error) {
+      if (!(error instanceof SimulatedCrash)) {
+        this.mempool.markStale(operation);
+      }
       await this.failOperation(
         operation,
         commit,
@@ -591,6 +753,7 @@ export class ClickHouseStore implements ChaingraphStore {
       );
       throw error;
     } finally {
+      this.mempool.removeModifier(operation);
       this.operations.end(operation);
     }
   }
@@ -765,7 +928,7 @@ export class ClickHouseStore implements ChaingraphStore {
       );
       await this.fault('tx_acceptance', { kind: 'reorg', seq: commit.seq });
       operation.markRowsWritten();
-      await awaitDependencies(dependencies);
+      await this.abandonSignal.race(awaitDependencies(dependencies));
       await this.requireCommitLog().markCommitted(commit.seq, rowCounts);
       operation.markCommitted();
       await this.fault('committed', { kind: 'reorg', seq: commit.seq });
@@ -1040,36 +1203,50 @@ export class ClickHouseStore implements ChaingraphStore {
   /* mempool: WP5a-mempool                                               */
   /* ------------------------------------------------------------------ */
 
-  async saveMempoolTransaction(): Promise<void> {
-    return Promise.reject(
-      new MempoolNotImplementedError('saveMempoolTransaction')
+  async saveMempoolTransaction(
+    transaction: ChaingraphTransaction,
+    nodeValidations: NodeValidation[]
+  ): Promise<void> {
+    this.assertOpen();
+    return this.requireMempoolCommitter().saveTransaction(
+      transaction,
+      nodeValidations
     );
   }
 
-  async recordNodeValidation(): Promise<void> {
-    return Promise.reject(
-      new MempoolNotImplementedError('recordNodeValidation')
+  async recordNodeValidation(
+    transactionHash: string,
+    validation: NodeValidation
+  ): Promise<void> {
+    this.assertOpen();
+    return this.requireMempoolCommitter().recordValidation(
+      transactionHash,
+      validation
     );
   }
 
-  async archiveMempoolTransactionsAcceptedByBlocks(): Promise<never> {
-    return Promise.reject(
-      new MempoolNotImplementedError(
-        'archiveMempoolTransactionsAcceptedByBlocks'
-      )
-    );
+  async archiveMempoolTransactionsAcceptedByBlocks(): Promise<
+    ArchivedMempoolTransaction[]
+  > {
+    this.assertOpen();
+    return this.requireMempoolCommitter().sweep();
   }
 
-  async getMempoolTransactionsExpiringBefore(): Promise<never> {
-    return Promise.reject(
-      new MempoolNotImplementedError('getMempoolTransactionsExpiringBefore')
-    );
+  async getMempoolTransactionsExpiringBefore(args: {
+    expirationMs: number;
+    expiresBefore: Date;
+  }): Promise<ExpiringMempoolTransaction[]> {
+    this.assertOpen();
+    return Promise.resolve(this.requireMempoolCommitter().expiringBefore(args));
   }
 
-  async archiveMempoolTransaction(): Promise<never> {
-    return Promise.reject(
-      new MempoolNotImplementedError('archiveMempoolTransaction')
-    );
+  async archiveMempoolTransaction(args: {
+    nodeInternalId: number;
+    replacedAt: Date;
+    transactionInternalId: number;
+  }): Promise<number> {
+    this.assertOpen();
+    return this.requireMempoolCommitter().expire(args);
   }
 
   /* ------------------------------------------------------------------ */
@@ -1083,6 +1260,7 @@ export class ClickHouseStore implements ChaingraphStore {
     if (this.fatal instanceof SimulatedCrash) {
       throw this.fatal;
     }
+    this.abandonSignal.assertNotAbandoned();
     await this.options.fault?.(step, context);
   }
 
@@ -1178,6 +1356,13 @@ export class ClickHouseStore implements ChaingraphStore {
       throw new StoreClosedError('ClickHouseStore.init() has not run.');
     }
     return this.ids;
+  }
+
+  private requireMempoolCommitter(): MempoolCommitter {
+    if (this.mempoolCommitter === undefined) {
+      throw new StoreClosedError('ClickHouseStore.init() has not run.');
+    }
+    return this.mempoolCommitter;
   }
 
   private requirePublisher(): VisibilityPublisher {

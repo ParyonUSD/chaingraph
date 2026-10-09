@@ -1,4 +1,4 @@
-/* eslint-disable max-classes-per-file, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, @typescript-eslint/parameter-properties, no-await-in-loop, functional/no-loop-statement, max-params, functional/no-let, @typescript-eslint/init-declarations, class-methods-use-this, @typescript-eslint/no-loop-func, prefer-destructuring, require-atomic-updates */
+/* eslint-disable max-classes-per-file, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, @typescript-eslint/parameter-properties, no-await-in-loop, functional/no-loop-statement, max-params, functional/no-let, @typescript-eslint/init-declarations, class-methods-use-this, @typescript-eslint/no-loop-func, prefer-destructuring, require-atomic-updates, functional/no-mixed-type, no-continue */
 // cspell:ignore clickhouse dedup unhex seqs varint
 /**
  * `saveBlock` for the ClickHouse store (WP5a-core): one block = one commit
@@ -19,8 +19,12 @@ import type { NodeAcceptance } from '../types.js';
 import type { ClickHouseClient } from './client.js';
 import type { CommitLog, OpenCommit } from './commit-log.js';
 import type { IdAllocator } from './id-allocator.js';
-import type { MempoolState } from './mempool-state.js';
+import type { MempoolCommitter } from './mempool-commit.js';
+import { changeRows } from './mempool-commit.js';
+import type { MempoolState, NodeMempoolChange } from './mempool-state.js';
+import { isEmptyChange } from './mempool-state.js';
 import type {
+  AbandonSignal,
   Deferred,
   NodeBlockRow,
   OperationRegistry,
@@ -30,6 +34,7 @@ import type {
   TxAcceptanceRow,
 } from './node-state.js';
 import {
+  AbandonedError,
   acceptanceColumns,
   awaitDependencies,
   deferred,
@@ -38,6 +43,7 @@ import {
   encodeTxAcceptanceRows,
   waitForPredecessorRows,
 } from './node-state.js';
+import { RowBinaryWriter } from './row-binary.js';
 import type { ResolvedInput, SpentOutput } from './row-encoders.js';
 import {
   encodeBlockRows,
@@ -59,6 +65,7 @@ import {
   outpointKey,
   utxoByScriptColumns,
   utxoColumns,
+  utxoFromChaingraphOutput,
   utxoRowsForTransition,
   validCommitSql,
 } from './utxo.js';
@@ -79,6 +86,12 @@ export type FaultInjector = (
 ) => Promise<void> | void;
 
 const coinbaseHash = '00'.repeat(32);
+
+/** Written on `input` rows whose spent output never became known. */
+const unknownSpentOutput: SpentOutput = {
+  lockingBytecode: '',
+  valueSatoshis: 0n,
+};
 
 export const chunked = <T>(items: readonly T[], size: number): T[][] => {
   const chunks: T[][] = [];
@@ -172,6 +185,10 @@ export interface WriterContext {
   fault: FaultInjector;
   lookupChunkSize: number;
   pendingSpendTimeoutMs: number;
+  /** The mempool committer (block acceptance cleans the node's mempool). */
+  mempoolHooks?: () => MempoolCommitter | undefined;
+  /** Shutdown: abandon waits and uncommitted work. */
+  abandon?: AbandonSignal;
 }
 
 /** Postgres's saveBlock result semantics. */
@@ -423,6 +440,13 @@ const inclusionsOf = (
   }));
 
 export class BlockCommitter {
+  /**
+   * Block hash → the live operation saving it. A concurrent save of the same
+   * block (the agent saves the genesis block once per node) waits for it,
+   * then finds the stored block (one `block` row, as Postgres's ON CONFLICT).
+   */
+  private readonly inFlight = new Map<string, StoreOperation>();
+
   constructor(private readonly context: WriterContext) {}
 
   /**
@@ -439,11 +463,18 @@ export class BlockCommitter {
       block: ChaingraphBlock;
       nodeAcceptances: readonly NodeAcceptance[];
       isSavedTransaction: (hash: string) => boolean;
-    }
+    },
+    onParked?: (result: SaveBlockResult) => void
   ): Promise<SaveBlockResult> {
     const { context } = this;
     let commit: OpenCommit | undefined;
     const pendingIds = new Map<string, Deferred<bigint>>();
+    for (;;) {
+      const other = this.inFlight.get(block.hash);
+      if (other === undefined || other === operation || other.finished) break;
+      await other.committed.catch(() => undefined);
+    }
+    this.inFlight.set(block.hash, operation);
     try {
       const result = await this.run(
         operation,
@@ -451,7 +482,8 @@ export class BlockCommitter {
         pendingIds,
         (opened) => {
           commit = opened;
-        }
+        },
+        onParked
       );
       context.outputs.release(operation, true);
       await context.transactions.release(operation, true);
@@ -464,6 +496,26 @@ export class BlockCommitter {
         });
         throw error;
       }
+      if (error instanceof AbandonedError) {
+        /*
+         * Shutdown: abort, and report the block as handled so the agent's
+         * block buffer drains; nothing of it is committed, so the next start
+         * restores the chain without it and downloads it again.
+         */
+        if (commit !== undefined) {
+          await context.commitLog
+            .markAborted(commit.seq, String(error))
+            .catch(() => undefined);
+        }
+        operation.markFailed(error);
+        pendingIds.forEach((id) => {
+          id.reject(error);
+        });
+        context.outputs.release(operation, false);
+        await context.transactions.release(operation, false);
+        return { attemptedSavedTransactions: [], transactionCacheMisses: 0 };
+      }
+      context.mempool.markStale(operation);
       if (commit !== undefined) {
         await context.commitLog
           .markAborted(commit.seq, `saveBlock failed: ${String(error)}`)
@@ -476,6 +528,10 @@ export class BlockCommitter {
       context.outputs.release(operation, false);
       await context.transactions.release(operation, false);
       throw error;
+    } finally {
+      if (this.inFlight.get(block.hash) === operation) {
+        this.inFlight.delete(block.hash);
+      }
     }
   }
 
@@ -491,7 +547,8 @@ export class BlockCommitter {
       isSavedTransaction: (hash: string) => boolean;
     },
     pendingIds: Map<string, Deferred<bigint>>,
-    onCommit: (commit: OpenCommit) => void
+    onCommit: (commit: OpenCommit) => void,
+    onParked?: (result: SaveBlockResult) => void
   ): Promise<SaveBlockResult> {
     const { context } = this;
     const tipMode = context.mode() === 'tip';
@@ -612,8 +669,14 @@ export class BlockCommitter {
      * nodes (tip mode: UTXO transitions; any mode: re-accepting a stored block).
      */
     const requestedNodes = [...acceptanceByNode.keys()].sort((a, b) => a - b);
-    if (tipMode || blockExists) {
+    const hooks = context.mempoolHooks?.();
+    if (
+      tipMode ||
+      blockExists ||
+      requestedNodes.some((node) => context.mempool.mayHaveMempool(node))
+    ) {
       await waitForPredecessorRows(operation);
+      await hooks?.ensureFresh(operation, requestedNodes);
     }
     const blockInternalId = blockExists
       ? BigInt(storedBlock.internal_id)
@@ -629,7 +692,19 @@ export class BlockCommitter {
     const acceptingNodes = requestedNodes.filter(
       (node) => !liveNodes.has(node)
     );
-    if (blockExists && acceptingNodes.length === 0) {
+    /*
+     * Re-saving a stored block (incomplete-block repair) re-inserts the
+     * `block_transaction` links that are missing, as Postgres's
+     * ON CONFLICT DO NOTHING insert does.
+     */
+    const missingLinks = blockExists
+      ? await this.missingLinks(blockInternalId, block, operation, dependencies)
+      : [];
+    if (
+      blockExists &&
+      acceptingNodes.length === 0 &&
+      missingLinks.length === 0
+    ) {
       // Postgres: every insert hits ON CONFLICT DO NOTHING
       operation.markDone();
       return { attemptedSavedTransactions, transactionCacheMisses };
@@ -650,11 +725,51 @@ export class BlockCommitter {
         operation
       );
     }
-    acceptingNodes.forEach((node) => {
-      context.mempool.planBlockAcceptance(node, () =>
-        inclusionsOf(block, acceptanceByNode.get(node)!.acceptedAt)
+    /*
+     * 2b. Each accepting node's mempool cleanup, in this commit: confirmed,
+     * conflicting and cascading entries, and outstanding spends of entries
+     * whose creator this block makes accepted (wp5a-mempool.md).
+     */
+    const blockTxByHash = new Map(
+      block.transactions.map((transaction) => [transaction.hash, transaction])
+    );
+    const creatorOutputs = (hash: string) => {
+      const transaction = blockTxByHash.get(hash);
+      return transaction === undefined
+        ? undefined
+        : transaction.outputs.map((output, index) =>
+            utxoFromChaingraphOutput(hash, index, idByHash.get(hash)!, output)
+          );
+    };
+    const mempoolChanges: NodeMempoolChange[] = [];
+    for (const node of acceptingNodes) {
+      context.mempool.modifiersOf(node, operation).forEach((modifier) => {
+        dependencies.add(modifier);
+      });
+      if (hooks === undefined || context.mempool.isEmpty(node)) continue;
+      const inclusions = inclusionsOf(
+        block,
+        acceptanceByNode.get(node)!.acceptedAt
       );
-    });
+      const known = await hooks.knownOutputsForConfirmed(
+        node,
+        inclusions,
+        operation,
+        dependencies
+      );
+      const change = context.mempool.planBlockAcceptance(
+        node,
+        inclusions,
+        creatorOutputs,
+        (spent) => known.get(spent)
+      );
+      if (!isEmptyChange(change)) {
+        mempoolChanges.push(change);
+      }
+    }
+    hooks?.applyChanges(operation, mempoolChanges);
+    const historyIds =
+      hooks === undefined ? [] : await hooks.historyIds(mempoolChanges);
 
     /*
      * 3. Resolve spent outputs: for new transactions (input rows), for the
@@ -781,6 +896,21 @@ export class BlockCommitter {
         columnsOf('block_transaction'),
         encodeBlockTransactionRows(block, blockInternalId, allContext)
       );
+    } else if (missingLinks.length > 0) {
+      const writer = new RowBinaryWriter(missingLinks.length * 64);
+      missingLinks.forEach((index) => {
+        writer
+          .uint64(blockInternalId)
+          .uint32(index)
+          .uint64(internalIds[index]!)
+          .fixedString32(block.transactions[index]!.hash)
+          .uint64(commit.seq)
+          .endRow();
+      });
+      await insert('block_transaction', columnsOf('block_transaction'), {
+        data: writer.finish(),
+        rowCount: writer.rowCount,
+      });
     }
 
     const nodeBlockRows: NodeBlockRow[] = acceptingNodes.map((node) => ({
@@ -816,6 +946,21 @@ export class BlockCommitter {
     );
 
     const utxoRows: UtxoRow[] = [];
+    if (hooks !== undefined && mempoolChanges.length > 0) {
+      const mempoolRows = changeRows(mempoolChanges, historyIds);
+      /*
+       * mempool-originated UTXO rows are written in every mode (the bulk
+       * horizon build only covers transactions in bulk-period blocks)
+       */
+      utxoRows.push(...mempoolRows.utxo);
+      await hooks.insertChangeRows(
+        commit,
+        'block',
+        { ...mempoolRows, utxo: [] },
+        'm',
+        rowCounts
+      );
+    }
     const pendingUtxo: {
       node: number;
       spender: string;
@@ -892,6 +1037,15 @@ export class BlockCommitter {
       );
       await context.commitLog.markIncomplete(commit.seq);
       await context.fault('incomplete', { kind: 'block', seq: commit.seq });
+      /*
+       * Every row but the fill is written and the commit is `incomplete`
+       * (it holds its nodes' watermarks): the caller may report the block as
+       * handled now, so the agent's bounded block buffer keeps downloading
+       * (the parent may still be queued behind this block). The commit
+       * completes in the background; if the process stops first, recovery
+       * aborts it and the next start downloads the block again.
+       */
+      onParked?.({ attemptedSavedTransactions, transactionCacheMisses });
       const filled = await this.waitForPending(unresolved);
       filled.forEach((spend, key) => {
         resolved.set(key, spend);
@@ -900,15 +1054,20 @@ export class BlockCommitter {
         }
       });
       const fillInputs: ResolvedInput[] = pendingInputs.map(
-        ({ input, inputIndex, transaction }) => ({
-          input,
-          inputIndex,
-          spent: spentOutputOf(
-            resolveSpent(input.outpointTransactionHash, input.outpointIndex)!
-          ),
-          transactionHash: transaction.hash,
-          transactionInternalId: idByHash.get(transaction.hash)!,
-        })
+        ({ input, inputIndex, transaction }) => {
+          const spent = resolveSpent(
+            input.outpointTransactionHash,
+            input.outpointIndex
+          );
+          return {
+            input,
+            inputIndex,
+            spent:
+              spent === undefined ? unknownSpentOutput : spentOutputOf(spent),
+            transactionHash: transaction.hash,
+            transactionInternalId: idByHash.get(transaction.hash)!,
+          };
+        }
       );
       await insert(
         'input',
@@ -916,13 +1075,15 @@ export class BlockCommitter {
         encodeResolvedInputRows(fillInputs, commit.seq),
         'f0'
       );
-      const fillUtxo = pendingUtxo.map(
-        (item): UtxoRow => ({
-          nodeInternalId: item.node,
-          output: resolved.get(item.key)!.output,
-          sign: -1,
-        })
-      );
+      const fillUtxo = pendingUtxo
+        .filter((item) => resolved.has(item.key))
+        .map(
+          (item): UtxoRow => ({
+            nodeInternalId: item.node,
+            output: resolved.get(item.key)!.output,
+            sign: -1,
+          })
+        );
       const encodedFill = encodeUtxoRows(fillUtxo, commit.seq);
       await insert(
         'utxo',
@@ -946,7 +1107,8 @@ export class BlockCommitter {
                 block,
                 generatedValueSatoshis: this.generatedValue(
                   block,
-                  resolveSpent
+                  resolveSpent,
+                  true
                 ),
                 internalId: blockInternalId,
               },
@@ -968,7 +1130,8 @@ export class BlockCommitter {
     await context.fault('rows-written', { kind: 'block', seq: commit.seq });
 
     /* 6. Commit once every commit this one read from is committed. */
-    await awaitDependencies(dependencies);
+    await (context.abandon?.race(awaitDependencies(dependencies)) ??
+      awaitDependencies(dependencies));
     await context.commitLog.markCommitted(commit.seq, rowCounts);
     operation.markCommitted();
     context.onCommitted(operation);
@@ -979,7 +1142,8 @@ export class BlockCommitter {
   /** Σ outputs − Σ spent outputs (coinbase inputs spend nothing). */
   private generatedValue(
     block: ChaingraphBlock,
-    resolveSpent: (hash: string, index: number) => UtxoOutput | undefined
+    resolveSpent: (hash: string, index: number) => UtxoOutput | undefined,
+    unknownAsZero = false
   ) {
     return block.transactions.reduce((total, transaction) => {
       const outputs = transaction.outputs.reduce(
@@ -993,6 +1157,9 @@ export class BlockCommitter {
               input.outpointTransactionHash,
               input.outpointIndex
             );
+            if (output === undefined && unknownAsZero) {
+              return sum;
+            }
             if (output === undefined) {
               throw new Error(
                 `Spent output ${input.outpointTransactionHash}:${input.outpointIndex} is unknown.`
@@ -1002,6 +1169,32 @@ export class BlockCommitter {
           }, 0n);
       return total + outputs - spent;
     }, 0n);
+  }
+
+  /** Indexes of `block`'s transactions with no valid `block_transaction` link. */
+  private async missingLinks(
+    blockInternalId: bigint,
+    block: ChaingraphBlock,
+    operation: StoreOperation,
+    dependencies: Set<StoreOperation>
+  ): Promise<number[]> {
+    const rows = await this.context.client.query<{
+      idx: number;
+      seq: string;
+    }>(
+      `SELECT transaction_index AS idx, commit_seq AS seq FROM block_transaction
+       WHERE block_internal_id = {block:UInt64} AND ${validCommitSql()}`,
+      { block: blockInternalId, fence: this.context.fence() }
+    );
+    const linked = new Set<number>();
+    rows.forEach((row) => {
+      linked.add(Number(row.idx));
+      const owner = this.context.operationOfSeq(BigInt(row.seq));
+      if (owner !== undefined && owner !== operation) dependencies.add(owner);
+    });
+    return block.transactions
+      .map((_, index) => index)
+      .filter((index) => !linked.has(index));
   }
 
   /** Nodes already accepting a stored block (live `node_block` rows). */
@@ -1150,40 +1343,44 @@ export class BlockCommitter {
      * check and subscribe in one synchronous pass: a save that registered
      * the outpoint since `resolveSpends` is found here, a later one wakes us
      */
+    const result = new Map<string, ResolvedSpend>();
     const waits = keys.map((key) => {
       const known = context.outputs.lookup(key);
-      return known === undefined
-        ? { key, ...context.outputs.waitFor(key) }
-        : { cancel: () => undefined, key, promise: Promise.resolve(known) };
+      const wait =
+        known === undefined
+          ? { key, ...context.outputs.waitFor(key) }
+          : { cancel: () => undefined, key, promise: Promise.resolve(known) };
+      return {
+        ...wait,
+        promise: wait.promise.then(async (entry) => {
+          result.set(key, {
+            output: {
+              ...entry.output,
+              transactionInternalId: await entry.internalId,
+            },
+            owner: entry.owner?.finished === true ? undefined : entry.owner,
+          });
+        }),
+      };
     });
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        reject(
-          new PendingSpendTimeoutError(
-            `${keys.length} spent output(s) did not arrive within ${
-              context.pendingSpendTimeoutMs
-            } ms (e.g. ${keys[0] ?? ''}).`
-          )
-        );
-      }, context.pendingSpendTimeoutMs);
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, context.pendingSpendTimeoutMs);
     });
     try {
-      const entries = await Promise.race([
+      /*
+       * After the timeout the outputs still missing are taken as unknown
+       * (a block spending outputs Chaingraph never sees: test chains, or a
+       * parent that never arrives): their inputs are written with a
+       * coinbase-like stand-in (value 0, no token, empty bytecode) and no
+       * UTXO row, as Postgres stores such inputs (no output to join).
+       */
+      await Promise.race([
         Promise.all(waits.map(async ({ promise }) => promise)),
         timeout,
+        ...(context.abandon === undefined ? [] : [context.abandon.promise]),
       ]);
-      const result = new Map<string, ResolvedSpend>();
-      for (const [index, entry] of entries.entries()) {
-        result.set(waits[index]!.key, {
-          output: {
-            ...entry.output,
-            transactionInternalId: await entry.internalId,
-          },
-          owner: entry.owner?.finished === true ? undefined : entry.owner,
-        });
-      }
-      return result;
+      return new Map(result);
     } finally {
       clearTimeout(timer);
       waits.forEach(({ cancel }) => {

@@ -57,6 +57,12 @@ export interface ClickHouseConnectionConfig {
   password: string;
   /** Per-request timeout. */
   requestTimeoutMs: number;
+  /**
+   * HTTP sockets (the library default is 10). The writer runs many commits
+   * concurrently and a block's commit waits for its parent's, so a small pool
+   * turns queueing into commit latency. Default 64.
+   */
+  maxOpenConnections?: number;
 }
 
 export interface QueryParams {
@@ -75,6 +81,7 @@ export interface IdempotentInsertOptions {
 const defaultDatabase = 'cg';
 const defaultRequestTimeoutMs = 300_000;
 const defaultInsertRetries = 3;
+const defaultMaxOpenConnections = 64;
 const retryBaseDelayMs = 100;
 const identifierPattern = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 
@@ -200,6 +207,8 @@ export class ClickHouseClient {
       },
       database: clean.database,
       log: { level: ClickHouseLogLevel.OFF },
+      max_open_connections:
+        config.maxOpenConnections ?? defaultMaxOpenConnections,
       password: clean.password,
       request_timeout: clean.requestTimeoutMs,
       url: clean.url,
