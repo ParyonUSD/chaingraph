@@ -3604,6 +3604,48 @@ test.serial(
         0,
         'events consumed'
       );
+      /*
+       * Backfill of the pre-tracking outputs (the whole e2e chain): only
+       * outputs unspent for some node are written; spent ones stay NULL and
+       * read as spent once the backfill is complete.
+       */
+      t.false(
+        (
+          await client.query<{ done: boolean }>(
+            `SELECT backfill_complete AS done FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.done
+      );
+      const backfillPass = async (remaining: number): Promise<void> => {
+        await db.runUnspentNodeIdsJobPass({
+          backfill: true,
+          maxMs: 60_000,
+          settleWaitMs: 2_000,
+        });
+        const done = (
+          await client.query<{ done: boolean }>(
+            `SELECT backfill_complete AS done FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.done;
+        if (!done && remaining > 0) {
+          await backfillPass(remaining - 1);
+        }
+      };
+      await backfillPass(50);
+      t.true(
+        (
+          await client.query<{ done: boolean }>(
+            `SELECT backfill_complete AS done FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.done,
+        'backfill complete'
+      );
+      const nullSpent = await client.query<{ n: string; spent: string }>(
+        `SELECT count(*) AS n FROM output WHERE unspent_node_ids IS NULL;`
+      );
+      t.log({ nullAfterBackfill: nullSpent.rows[0]!.n });
+      await client.query('ANALYZE;');
+      await compareDeferredQueryRoot(t, 'backfill complete (whole table)');
     } finally {
       await db.pool.end();
       await db.unspentNodeIdsJobPool.end();

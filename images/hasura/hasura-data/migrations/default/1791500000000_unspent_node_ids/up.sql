@@ -143,9 +143,13 @@ $$;
 
 -- Recompute every output collected in pg_temp.unspent_node_ids_affected from
 -- scratch: (nodes accepting the creator) EXCEPT (nodes accepting any spender),
--- sorted. Only rows whose value changes are written, in key order. Returns the
--- number of rows changed.
-CREATE FUNCTION unspent_node_ids_recompute ()
+-- sorted. Only rows whose value changes are written, in key order. With
+-- `keep_null_when_empty` (backfill of pre-tracking outputs), a NULL row whose
+-- value is '{}' (spent for every node) stays NULL: once the backfill is
+-- complete the query root reads a pre-tracking NULL as spent for every node,
+-- so a backfill writes only the UTXO set, not every historical output.
+-- Returns the number of rows changed.
+CREATE FUNCTION unspent_node_ids_recompute (keep_null_when_empty boolean DEFAULT false)
   RETURNS bigint LANGUAGE plpgsql
   SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off SET jit = off AS $$
 DECLARE
@@ -179,7 +183,8 @@ BEGIN
               SELECT internal_id FROM transaction WHERE transaction.hash = a.h OFFSET 0) ct
           OFFSET 0) v
     WHERE o.transaction_hash = v.h AND o.output_index = v.i
-      AND o.unspent_node_ids IS DISTINCT FROM v.ids;
+      AND o.unspent_node_ids IS DISTINCT FROM v.ids
+      AND NOT (keep_null_when_empty AND o.unspent_node_ids IS NULL AND v.ids = '{}');
   GET DIAGNOSTICS changed = ROW_COUNT;
   RETURN changed;
 END;
@@ -448,7 +453,9 @@ COMMENT ON FUNCTION unspent_node_ids_run_batch (integer, integer, bigint, bigint
 -- Backfill of pre-tracking outputs (created by transactions at or below the
 -- tracking start) for one partition: the next `max_transactions` transactions
 -- above the partition's backfill cursor; every NULL output of this partition
--- among them is fully recomputed. Call in a REPEATABLE READ transaction.
+-- among them is fully recomputed, and written only if it is unspent for some
+-- node (spent outputs stay NULL, read as spent once the backfill is complete).
+-- Call in a REPEATABLE READ transaction.
 -- Marks backfill_complete once every partition has passed the tracking start.
 CREATE FUNCTION unspent_node_ids_backfill_batch (part integer, part_count integer, max_transactions integer)
   RETURNS jsonb LANGUAGE plpgsql
@@ -487,7 +494,7 @@ BEGIN
         AND ((get_byte(t.hash, 0) * part_count) >> 8) = part AND o.stored IS NULL;
   GET DIAGNOSTICS n_affected = ROW_COUNT;
   IF n_affected > 0 THEN
-    n_changed := unspent_node_ids_recompute();
+    n_changed := unspent_node_ids_recompute(true);
   END IF;
   UPDATE unspent_tracking_progress SET backfill_transaction_internal_id = upper_tx, updated_at = now()
     WHERE partition_index = part;

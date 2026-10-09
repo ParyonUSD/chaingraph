@@ -15,7 +15,7 @@ DROP FUNCTION IF EXISTS unspent_node_ids_backfill_scope (bytea, bytea);
 DROP FUNCTION IF EXISTS unspent_node_ids_backfill_batch (integer, integer, integer);
 DROP FUNCTION IF EXISTS unspent_node_ids_run_batch (integer, integer, bigint, bigint, integer, integer, integer, bigint, boolean);
 DROP FUNCTION IF EXISTS unspent_node_ids_temp_tables ();
-DROP FUNCTION IF EXISTS unspent_node_ids_recompute ();
+DROP FUNCTION IF EXISTS unspent_node_ids_recompute (boolean);
 DROP FUNCTION IF EXISTS unspent_node_ids_accepting (bigint);
 DROP TRIGGER IF EXISTS trigger_unspent_tracking_node_block_delete ON node_block;
 DROP TRIGGER IF EXISTS trigger_unspent_tracking_node_transaction_delete ON node_transaction;
