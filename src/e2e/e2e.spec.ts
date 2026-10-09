@@ -3190,7 +3190,7 @@ test.serial(
       t.is(indexes.length, nodeCount * 3, indexes.join(', '));
       t.true(
         indexes.includes('output_unspent_node_1_category_index') &&
-          indexes.includes('output_unspent_node_1_category_long_index') &&
+          indexes.includes('output_unspent_node_1_category_rest_index') &&
           indexes.includes('output_unspent_node_1_search_index'),
         indexes.join(', ')
       );

@@ -808,11 +808,15 @@ $$;
 -- matches that node's partial indexes; the other nodes' arms are removed at
 -- plan time by `node_name = '<name>'`):
 --   (a1) stored token outputs with a locking bytecode up to 1,000 bytes:
---        index-only through the covering per-node index;
---   (a2) stored token outputs with a longer locking bytecode;
---   (a3) stored outputs without a token (25-byte prefix index);
---   each re-checked live (F1g) when spent above the watermark or by a dirty
---   transaction, or created by a dirty transaction.
+--        index-only through the covering per-node category index;
+--   (a2) every other stored output (no token, or a longer locking bytecode):
+--        the per-node "rest" index, keyed on the category too, so a category
+--        filter is an index condition there (no token: NULL keys, deduplicated);
+--   both also reachable through the per-node 25-byte prefix index; each row
+--   re-checked live (F1g) when spent above the watermark or by a dirty
+--   transaction, or created by a dirty transaction. The two arm predicates
+--   are complementary and spelled exactly as the index predicates, so the
+--   planner matches them.
 -- Shared arms (node resolved once):
 --   (b1) unprocessed outputs of transactions above the minimum input watermark;
 --   (b2) pre-tracking NULL outputs while the backfill is incomplete (the
@@ -877,8 +881,7 @@ BEGIN
       || format(stored_arm, node.name, node.internal_id,
            'o.token_category IS NOT NULL AND octet_length(o.locking_bytecode) <= 1000', f1g_literal)
       || format(stored_arm, node.name, node.internal_id,
-           'o.token_category IS NOT NULL AND octet_length(o.locking_bytecode) > 1000', f1g_literal)
-      || format(stored_arm, node.name, node.internal_id, 'o.token_category IS NULL', f1g_literal);
+           '(o.token_category IS NULL OR octet_length(o.locking_bytecode) > 1000)', f1g_literal);
     names := names || CASE WHEN names = '' THEN '' ELSE ', ' END || quote_literal(node.name);
   END LOOP;
   -- a node registered after this build is answered by F1g until the next build

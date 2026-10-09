@@ -18,14 +18,17 @@ test('nodeIndexDefinitions: three partial indexes per node, keyed on the node id
   const definitions = nodeIndexDefinitions(7);
   t.deepEqual(Object.keys(definitions), [
     'output_unspent_node_7_category_index',
-    'output_unspent_node_7_category_long_index',
+    'output_unspent_node_7_category_rest_index',
     'output_unspent_node_7_search_index',
   ]);
   Object.entries(definitions).forEach(([name, definition]) => {
     t.true(nodeIndexNamePattern.test(name));
     t.true(definition.startsWith(`CREATE INDEX ${name} ON output`));
     t.true(definition.includes('WHERE 7 = ANY (unspent_node_ids)'));
-    t.false(definition.includes('IS NULL'), 'no NULL (unprocessed) index');
+    t.false(
+      definition.includes('unspent_node_ids IS NULL'),
+      'no NULL (unprocessed) index'
+    );
   });
   t.true(
     definitions.output_unspent_node_7_category_index!.includes(
@@ -38,8 +41,8 @@ test('nodeIndexDefinitions: three partial indexes per node, keyed on the node id
     )
   );
   t.true(
-    definitions.output_unspent_node_7_category_long_index!.includes(
-      `octet_length(locking_bytecode) > ${coveringBytecodeMaxBytes}`
+    definitions.output_unspent_node_7_category_rest_index!.includes(
+      `(token_category IS NULL OR octet_length(locking_bytecode) > ${coveringBytecodeMaxBytes})`
     )
   );
   t.true(

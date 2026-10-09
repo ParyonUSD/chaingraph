@@ -27,13 +27,17 @@ export const coveringBytecodeMaxBytes = 1000;
  * - `category`: token outputs by (category, capability), covering every
  *   column the usual token queries read (index-only scans), for locking
  *   bytecode up to {@link coveringBytecodeMaxBytes};
- * - `category_long`: the remaining token outputs, by category;
+ * - `category_rest`: every other stored output (no token, or a longer
+ *   locking bytecode), by (category, capability), so a category filter is an
+ *   index condition on both stored arms of the query root (the outputs
+ *   without a token share the NULL key and deduplicate);
  * - `search`: every stored output by the 25-byte locking bytecode prefix (as
  *   `output_search_index`).
+ * The predicates are spelled exactly as the query root's arms.
  */
 export const nodeIndexDefinitions = (nodeInternalId: number) => ({
   [`output_unspent_node_${nodeInternalId}_category_index`]: /* sql */ `CREATE INDEX output_unspent_node_${nodeInternalId}_category_index ON output USING btree (token_category, nonfungible_token_capability) INCLUDE (transaction_hash, output_index, value_satoshis, fungible_token_amount, nonfungible_token_commitment, locking_bytecode) WHERE ${nodeInternalId} = ANY (unspent_node_ids) AND token_category IS NOT NULL AND octet_length(locking_bytecode) <= ${coveringBytecodeMaxBytes};`,
-  [`output_unspent_node_${nodeInternalId}_category_long_index`]: /* sql */ `CREATE INDEX output_unspent_node_${nodeInternalId}_category_long_index ON output USING btree (token_category, nonfungible_token_capability) WHERE ${nodeInternalId} = ANY (unspent_node_ids) AND token_category IS NOT NULL AND octet_length(locking_bytecode) > ${coveringBytecodeMaxBytes};`,
+  [`output_unspent_node_${nodeInternalId}_category_rest_index`]: /* sql */ `CREATE INDEX output_unspent_node_${nodeInternalId}_category_rest_index ON output USING btree (token_category, nonfungible_token_capability) WHERE ${nodeInternalId} = ANY (unspent_node_ids) AND (token_category IS NULL OR octet_length(locking_bytecode) > ${coveringBytecodeMaxBytes});`,
   [`output_unspent_node_${nodeInternalId}_search_index`]: /* sql */ `CREATE INDEX output_unspent_node_${nodeInternalId}_search_index ON output USING btree (substring(locking_bytecode, 0, 26)) WHERE ${nodeInternalId} = ANY (unspent_node_ids);`,
 });
 
