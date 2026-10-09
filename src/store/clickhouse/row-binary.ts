@@ -21,6 +21,7 @@ const initialCapacity = initialCapacityKilobytes * bytesPerKilobyte;
 const growthFactor = 2;
 const uint32Range = 0x1_0000_0000;
 const hexCharsPerByte = 2;
+const hashBytes = 32;
 /** The longest unsigned LEB128 encoding of a value below 2^64. */
 const maxLeb128Bytes = 10;
 const leb128ContinuationBit = 0x80;
@@ -344,6 +345,13 @@ export class RowBinaryWriter {
     }
     this.offset += byteLength;
     return this;
+  }
+
+  /**
+   * `FixedString(32)` (a hash) from raw bytes or a hex string.
+   */
+  fixedString32(value: Buffer | string) {
+    return this.fixedString(hashBytes, value);
   }
 
   /**
