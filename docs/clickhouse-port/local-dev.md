@@ -89,3 +89,20 @@ directly comparable with the reference table in `docs/ingestion-gate.md`.
 | max-block (31.80 MB, 100,001 txs) | PASS | wall 6.07 s | 16,480 | 224.9 MB | 1,092 MB | 9.4 s |
 
 max-block fits in the 8 GB VM when run alone (burst, 3 blocks, would not).
+
+## After WP1a (StoreChecker port)
+
+`e2e.spec.ts` still has 92 tests, all green on ch1-pg; the file runs in ~8 s
+(was ~13 s) because fixed 1 s sleeps after agent events became
+`eventually()` polls. 47 of the 92 carry `[postgres]` (37 SQL-function macro
+and encoder tests, `transaction_data_carrier_outputs`, 3 `search_output*`,
+indexes/triggers, concurrent-conflict, cascade, expiry, confirmed-archive,
+backfill).
+
+Run only this file: `npx ava build/e2e/e2e.spec.js --match='*[e2e]*'`.
+
+Note: the `search functions use the 25-byte … prefix index` EXPLAIN test was
+timing-dependent: once auto-vacuum has analyzed `output` the planner picks
+`output_search_index` instead of the test copy. It failed reproducibly on the
+long-lived ch1-pg and passed on a fresh container; fixed in 4ef9e3f by
+accepting either index.
