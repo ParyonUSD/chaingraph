@@ -1,4 +1,5 @@
 /* eslint-disable max-lines */
+// cspell:ignore clickhouse
 import { readFileSync } from 'fs';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -28,9 +29,14 @@ import got from 'got';
 import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
+import { createChecker } from '../store/checker-factory.js';
 import type { StoreChecker } from '../store/checker.js';
+import { ClickHouseClient } from '../store/clickhouse/client.js';
+import {
+  applyClickHouseDdl,
+  dropClickHouseDatabase,
+} from '../store/clickhouse/ddl-apply.js';
 import { eventually } from '../store/eventually.js';
-import { createPostgresChecker } from '../store/postgres/checker.js';
 import type { ChaingraphTransaction } from '../types/chaingraph.js';
 
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
@@ -49,6 +55,15 @@ import {
   testnetGenesisBlockRaw,
   Transaction,
 } from './e2e.spec.mockchain.helper.js';
+import {
+  dropStaleClickHouseE2eDatabases,
+  e2eClickHouseDatabase,
+  e2eClickHouseServer,
+  e2eStore,
+  e2eStoreEnvironment,
+  isClickHouseE2e,
+  postgresTest,
+} from './e2e.spec.store.helper.js';
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
 const { Pool, internalBitcore } = bitcoreP2pCash;
@@ -174,6 +189,7 @@ const e2eEnvVariables = {
   CHAINGRAPH_TRUSTED_NODES: e2eTrustedNodesSet1,
   NODE_ENV: 'production',
   /* eslint-enable @typescript-eslint/naming-convention */
+  ...e2eStoreEnvironment(),
 };
 
 const e2eEnvVariables2 = {
@@ -202,18 +218,57 @@ test.afterEach((t) => {
   logger.debug(`Completed test: ${t.title}`);
 });
 
+/**
+ * Postgres only (`[postgres]` tests and the Postgres checker); not connected
+ * when CHAINGRAPH_E2E_STORE=clickhouse.
+ */
 // eslint-disable-next-line functional/no-let, @typescript-eslint/init-declarations
 let client: pg.Client;
 /**
- * Backend-neutral reads. Built on `client`, so (on Postgres) it also sees rows
- * of a fixture transaction the test has open.
+ * ClickHouse only: the checker's client on `cg_e2e_<pid>`.
+ */
+// eslint-disable-next-line functional/no-let, @typescript-eslint/init-declarations
+let clickHouseClient: ClickHouseClient | undefined;
+/**
+ * Backend-neutral reads. On Postgres it is built on `client`, so it also sees
+ * rows of a fixture transaction the test has open.
  */
 // eslint-disable-next-line functional/no-let, @typescript-eslint/init-declarations
 let checker: StoreChecker;
+
 /**
- * Before connecting to the e2e test database, drop and recreate it:
+ * ClickHouse: create `cg_e2e_<pid>` fresh and apply the DDL.
  */
-test.before(async () => {
+const setUpClickHouse = async () => {
+  const stale = await dropStaleClickHouseE2eDatabases();
+  if (stale.length > 0) {
+    logger.info(`Dropped stale ClickHouse databases: ${stale.join(', ')}`);
+  }
+  const statements = await applyClickHouseDdl(
+    e2eClickHouseServer,
+    e2eClickHouseDatabase,
+    { recreate: true }
+  );
+  logger.info(
+    `Created ClickHouse database ${e2eClickHouseDatabase} (${statements} DDL statements)`
+  );
+  clickHouseClient = new ClickHouseClient({
+    database: e2eClickHouseDatabase,
+    password: e2eClickHouseServer.password ?? '',
+    requestTimeoutMs: 60_000,
+    url: e2eClickHouseServer.url,
+    username: e2eClickHouseServer.username ?? '',
+  });
+  checker = createChecker({
+    backend: 'clickhouse',
+    client: clickHouseClient,
+  });
+};
+
+/**
+ * Postgres: drop and recreate the e2e test database, then apply migrations.
+ */
+const setUpPostgres = async () => {
   if (recreateDbOnStartup) {
     const defaultClient = new pg.Client({
       connectionString: postgresE2eConnectionStringDefaultDb,
@@ -231,7 +286,7 @@ test.before(async () => {
     connectionString: postgresE2eConnectionStringTestDb,
   });
   await client.connect();
-  checker = createPostgresChecker(client);
+  checker = createChecker({ backend: 'postgres', db: client });
   if (recreateDbOnStartup) {
     await dbUpMigrationPaths.reduce<Promise<pg.QueryResult | undefined>>(
       async (chain, path) => {
@@ -241,6 +296,14 @@ test.before(async () => {
       Promise.resolve(undefined)
     );
   }
+};
+
+/**
+ * Before connecting to the e2e test database, drop and recreate it:
+ */
+test.before(async () => {
+  logger.info(`E2E store backend: ${e2eStore}`);
+  await (isClickHouseE2e ? setUpClickHouse() : setUpPostgres());
 
   node1.listen();
   node2.listen();
@@ -463,6 +526,26 @@ let chaingraphProcess3: ExecaChildProcess | undefined;
 let stdoutBuffer = '';
 // eslint-disable-next-line functional/no-let
 let waitingForStdout: { pattern: RegExp | string; resolver: () => void }[] = [];
+
+/**
+ * ClickHouse: stop the agent (it holds the writer lease on the run's
+ * database), then drop `cg_e2e_<pid>`.
+ */
+test.after.always(async () => {
+  if (!isClickHouseE2e) {
+    return;
+  }
+  [chaingraphProcess, chaingraphProcess2, chaingraphProcess3].forEach(
+    (agentProcess) => {
+      if (agentProcess !== undefined && agentProcess.exitCode === null) {
+        agentProcess.kill('SIGKILL');
+      }
+    }
+  );
+  await clickHouseClient?.close();
+  await dropClickHouseDatabase(e2eClickHouseServer, e2eClickHouseDatabase);
+  logger.info(`Dropped ClickHouse database ${e2eClickHouseDatabase}`);
+});
 
 const handleStdout = () => {
   waitingForStdout = waitingForStdout.filter((task) => {
@@ -731,7 +814,7 @@ test.serial('[e2e] completes initial sync', async (t) => {
   t.pass();
 });
 
-test.serial(
+postgresTest.serial(
   '[e2e] [postgres] creates expected indexes after initial sync',
   async (t) => {
     await waitForStdout('Agent: all managed indexes have been created.');
@@ -791,6 +874,34 @@ test.serial(
   }
 );
 
+/**
+ * The store's own `getAllKnownBlockHashes` (not the checker): Postgres via the
+ * `../db.js` shim, ClickHouse via a read-only `createStore` instance on the
+ * run's database (never `init()`ed, so it never takes the writer lease).
+ */
+const storeKnownBlockHashes = async () => {
+  if (!isClickHouseE2e) {
+    const { getAllKnownBlockHashes } = await import('../db.js');
+    return getAllKnownBlockHashes();
+  }
+  const { createStore } = await import('../store/index.js');
+  const store = createStore({
+    backend: 'clickhouse',
+    clickhouse: {
+      database: e2eClickHouseDatabase,
+      password: e2eClickHouseServer.password ?? '',
+      url: e2eClickHouseServer.url,
+      user: e2eClickHouseServer.username ?? '',
+    },
+  });
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    return await store.getAllKnownBlockHashes();
+  } finally {
+    await store.close();
+  }
+};
+
 test.serial(
   '[e2e] getAllKnownBlockHashes returns hex hashes for every known block',
   async (t) => {
@@ -798,10 +909,9 @@ test.serial(
       process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
     process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
       postgresE2eConnectionStringTestDb;
-    const { getAllKnownBlockHashes } = await import('../db.js');
     // eslint-disable-next-line functional/no-try-statement
     try {
-      const hashes = await getAllKnownBlockHashes();
+      const hashes = await storeKnownBlockHashes();
       /*
        * Convert client-side (the previous implementation) to verify the
        * SQL-side `encode(...)` used by `getAllKnownBlockHashes` matches it.
@@ -825,7 +935,7 @@ test.serial(
   }
 );
 
-test.serial(
+postgresTest.serial(
   '[e2e] [postgres] records node validation after concurrent transaction insert conflict',
   async (t) => {
     const transactionHash = 'c1'.repeat(repeatedHashByteLength);
@@ -955,7 +1065,7 @@ test.serial(
   }
 );
 
-test.serial(
+postgresTest.serial(
   '[e2e] [postgres] cascades replaced mempool transaction history to same-node descendants',
   async (t) => {
     await client.query(/* sql */ `BEGIN;`);
@@ -1095,7 +1205,7 @@ INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id,
   }
 );
 
-test.serial(
+postgresTest.serial(
   '[e2e] [postgres] archives expired mempool transactions and descendants',
   async (t) => {
     await client.query(/* sql */ `
@@ -1275,7 +1385,7 @@ DELETE FROM transaction
   }
 );
 
-test.serial(
+postgresTest.serial(
   '[e2e] [postgres] archives stale mempool transactions already accepted by blocks',
   async (t) => {
     await client.query(/* sql */ `
@@ -1462,7 +1572,7 @@ DELETE FROM transaction
   }
 );
 
-test.serial(
+postgresTest.serial(
   '[e2e] [postgres] backfills existing orphan mempool descendants with idempotence',
   async (t) => {
     await client.query(/* sql */ `BEGIN;`);
@@ -1730,7 +1840,7 @@ test.serial(
   }
 );
 
-test.serial(
+postgresTest.serial(
   '[e2e] [postgres] transaction_data_carrier_outputs ignores empty locking bytecode',
   async (t) => {
     const txHash =
@@ -1961,22 +2071,30 @@ test.serial('[e2e] records stale blocks', async (t) => {
 });
 /* eslint-enable @typescript-eslint/no-magic-numbers */
 
+const doubleSpendSaveTimeoutMs = 5_000;
 test.serial(
   '[e2e] records double-spends accepted via mempool and via block',
   async (t) => {
     // eslint-disable-next-line prefer-destructuring
     const tx1 = tipA[160]!.transactions[1];
     const mock1 = generateMockDoubleSpend(tx1!.inputs, true);
-    // TODO: race condition – this should work without a delay?
-    const delay = 1000;
     peers.node1.sendMessage(new peers.node1.messages.Transaction(tx1));
     logger.debug(
       `node1: sent original transaction to double-spend: ${tx1!.hash}`
     );
-    await sleep(delay);
+    /*
+     * Wait (instead of a fixed 1 s sleep) until each transaction is in
+     * node1's mempool before sending the next message.
+     */
+    const inNode1Mempool = async (hash: string) =>
+      eventually(async () => checker.mempoolMembership('node1', [hash]), {
+        isDone: (members) => members.has(hash),
+        timeoutMs: doubleSpendSaveTimeoutMs,
+      });
+    await inNode1Mempool(tx1!.hash);
     peers.node1.sendMessage(new peers.node1.messages.Transaction(mock1));
     logger.debug(`node1: sent double-spending transaction: ${mock1.hash}`);
-    await sleep(delay);
+    await inNode1Mempool(mock1.hash);
     newBlocks('node1', [tipA[160]!]);
     newBlocks('node2', [tipB[160]!]);
     newBlocks('node3', [tipA[160]!]);
@@ -2502,28 +2620,28 @@ const bytecodeFunctionReturnsNull = test.macro<[string, string]>({
     `[e2e] [postgres] ${functionName} – ${bytecodeHex}: ${providedTitle ?? ''}`,
 });
 
-test(
+postgresTest.concurrent(
   'P2PKH',
   bytecodeFunction,
   'parse_bytecode_pattern',
   '76a914000000000000000000000000000000000000000088ac',
   '76a91488ac'
 );
-test(
+postgresTest.concurrent(
   'P2SH',
   bytecodeFunction,
   'parse_bytecode_pattern',
   'a914000000000000000000000000000000000000000087',
   'a91487'
 );
-test(
+postgresTest.concurrent(
   'OP_RETURN (fixed pushes)',
   bytecodeFunction,
   'parse_bytecode_pattern',
   '6a04000000005120000000000000000000000000000000000000000000000000000000000000000004000000000400000000',
   '6a0451200404'
 );
-test(
+postgresTest.concurrent(
   'OP_RETURN with OP_PUSHDATA1',
   bytecodeFunction,
   'parse_bytecode_pattern',
@@ -2533,7 +2651,7 @@ test(
 
 const allOnes = 0x11;
 const minPushData2 = 256;
-test(
+postgresTest.concurrent(
   'OP_RETURN with OP_PUSHDATA2',
   bytecodeFunction,
   'parse_bytecode_pattern',
@@ -2544,7 +2662,7 @@ test(
 );
 
 const minPushData4 = 65536;
-test(
+postgresTest.concurrent(
   'OP_RETURN with OP_PUSHDATA4',
   bytecodeFunction,
   'parse_bytecode_pattern',
@@ -2554,28 +2672,28 @@ test(
   '6a4e515151'
 );
 
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHBYTES',
   bytecodeFunction,
   'parse_bytecode_pattern',
   '515102',
   '515102'
 );
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHDATA1',
   bytecodeFunction,
   'parse_bytecode_pattern',
   '51514c',
   '51514c'
 );
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHDATA2',
   bytecodeFunction,
   'parse_bytecode_pattern',
   '51514d11',
   '51514d'
 );
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHDATA4',
   bytecodeFunction,
   'parse_bytecode_pattern',
@@ -2583,28 +2701,28 @@ test(
   '51514e'
 );
 
-test(
+postgresTest.concurrent(
   'P2PKH',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
   '76a914000000000000000000000000000000000000000088ac',
   '76a91488ac'
 );
-test(
+postgresTest.concurrent(
   'P2SH',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
   'a914000000000000000000000000000000000000000087',
   'a91487'
 );
-test(
+postgresTest.concurrent(
   'OP_RETURN (fixed pushes)',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
   '6a04000000005120000000000000000000000000000000000000000000000000000000000000000004000000000400000000',
   '6a0451200404'
 );
-test(
+postgresTest.concurrent(
   'OP_RETURN with OP_PUSHDATA1 (memo.cash)',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
@@ -2612,21 +2730,21 @@ test(
   '6a02094c5c'
 );
 
-test(
+postgresTest.concurrent(
   'zero-length OP_PUSHDATA1',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
   '4c00',
   '4c00'
 );
-test(
+postgresTest.concurrent(
   'zero-length OP_PUSHDATA2',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
   '4d0000',
   '4d0000'
 );
-test(
+postgresTest.concurrent(
   'zero-length OP_PUSHDATA4',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
@@ -2634,7 +2752,7 @@ test(
   '4e00000000'
 );
 
-test(
+postgresTest.concurrent(
   'OP_RETURN with OP_PUSHDATA2',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
@@ -2644,7 +2762,7 @@ test(
   '6a4d0001515151'
 );
 
-test(
+postgresTest.concurrent(
   'OP_RETURN with OP_PUSHDATA4',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
@@ -2654,28 +2772,28 @@ test(
   '6a4e00000100515151'
 );
 
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHBYTES',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
   '515102',
   '515102'
 );
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHDATA1',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
   '51514c',
   '51514c'
 );
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHDATA2',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
   '51514d11',
   '51514d'
 );
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHDATA4',
   bytecodeFunction,
   'parse_bytecode_pattern_with_pushdata_lengths',
@@ -2683,14 +2801,14 @@ test(
   '51514e'
 );
 
-test(
+postgresTest.concurrent(
   'no redeem',
   bytecodeFunctionReturnsNull,
   'parse_bytecode_pattern_redeem',
   `0002000051`
 );
 
-test(
+postgresTest.concurrent(
   'OP_PUSHBYTES redeem',
   bytecodeFunction,
   'parse_bytecode_pattern_redeem',
@@ -2699,7 +2817,7 @@ test(
 );
 
 const minPushData1 = 76;
-test(
+postgresTest.concurrent(
   'OP_PUSHDATA1 redeem',
   bytecodeFunction,
   'parse_bytecode_pattern_redeem',
@@ -2715,7 +2833,7 @@ test(
   '004c515253'
 );
 
-test(
+postgresTest.concurrent(
   'OP_PUSHDATA2 redeem',
   bytecodeFunction,
   'parse_bytecode_pattern_redeem',
@@ -2731,7 +2849,7 @@ test(
   '004d515253'
 );
 
-test(
+postgresTest.concurrent(
   'OP_PUSHDATA4 redeem',
   bytecodeFunction,
   'parse_bytecode_pattern_redeem',
@@ -2747,32 +2865,32 @@ test(
   '004e515253'
 );
 
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHDATA1 redeem',
   bytecodeFunctionReturnsNull,
   'parse_bytecode_pattern_redeem',
   '4c'
 );
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHDATA2 redeem',
   bytecodeFunctionReturnsNull,
   'parse_bytecode_pattern_redeem',
   '4d11'
 );
-test(
+postgresTest.concurrent(
   'malformed OP_PUSHDATA4 redeem',
   bytecodeFunctionReturnsNull,
   'parse_bytecode_pattern_redeem',
   '4e112233'
 );
-test(
+postgresTest.concurrent(
   'oversized OP_PUSHDATA4 redeem',
   bytecodeFunctionReturnsNull,
   'parse_bytecode_pattern_redeem',
   '4effffffff'
 );
 
-test('[e2e] [postgres] encode_uint16le', async (t) => {
+postgresTest.concurrent('[e2e] [postgres] encode_uint16le', async (t) => {
   const query = async (encoded: number) =>
     (
       await client.query<{ encode: string }>(
@@ -2794,7 +2912,7 @@ test('[e2e] [postgres] encode_uint16le', async (t) => {
   /* eslint-enable @typescript-eslint/no-magic-numbers */
 });
 
-test('[e2e] [postgres] encode_uint32le', async (t) => {
+postgresTest.concurrent('[e2e] [postgres] encode_uint32le', async (t) => {
   const query = async (encoded: number) =>
     (
       await client.query<{ encode: string }>(
@@ -2823,7 +2941,7 @@ test('[e2e] [postgres] encode_uint32le', async (t) => {
   /* eslint-enable @typescript-eslint/no-magic-numbers */
 });
 
-test('[e2e] [postgres] encode_int32le', async (t) => {
+postgresTest.concurrent('[e2e] [postgres] encode_int32le', async (t) => {
   const query = async (encoded: number) =>
     (
       await client.query<{ encode: string }>(
@@ -2849,7 +2967,7 @@ test('[e2e] [postgres] encode_int32le', async (t) => {
   /* eslint-enable @typescript-eslint/no-magic-numbers, line-comment-position */
 });
 
-test('[e2e] [postgres] encode_uint64le', async (t) => {
+postgresTest.concurrent('[e2e] [postgres] encode_uint64le', async (t) => {
   const query = async (encoded: bigint | number) =>
     (
       await client.query<{ encode: string }>(
@@ -2873,7 +2991,7 @@ test('[e2e] [postgres] encode_uint64le', async (t) => {
   /* eslint-enable @typescript-eslint/no-magic-numbers */
 });
 
-test('[e2e] [postgres] encode_compact_uint', async (t) => {
+postgresTest.concurrent('[e2e] [postgres] encode_compact_uint', async (t) => {
   const query = async (encoded: bigint | number) =>
     (
       await client.query<{ encode: string }>(
@@ -2975,7 +3093,7 @@ const searchFixtureMatches = async (query: string, parameter: unknown) => {
   );
 };
 
-test.serial(
+postgresTest.serial(
   '[e2e] [postgres] [sql] search_output: exact matches for locking bytecode of any length',
   async (t) => {
     const search = async (scripts: string[]) =>
@@ -2998,7 +3116,7 @@ test.serial(
 );
 
 /* cspell: disable */
-test.serial(
+postgresTest.serial(
   '[e2e] [postgres] [sql] search_output_prefix: treats every byte literally and accepts prefixes longer than 25 bytes',
   async (t) => {
     const search = async (prefix: string) =>
@@ -3017,7 +3135,7 @@ test.serial(
 );
 /* cspell: enable */
 
-test.serial(
+postgresTest.serial(
   '[e2e] [postgres] [sql] search functions use the 25-byte locking bytecode prefix index',
   async (t) => {
     const prefixIndexes = Object.entries(indexDefinitions).filter(
