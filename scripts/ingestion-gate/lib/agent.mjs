@@ -40,6 +40,7 @@ export class AgentProcess {
         // experiment knobs passed through from the gate's environment (agent defaults otherwise)
         ...Object.fromEntries(
           ['CHAINGRAPH_UNSPENT_POST_COMMIT', 'CHAINGRAPH_UNSPENT_RESOLVE_NEW_OUTPUTS', 'CHAINGRAPH_UNSPENT_TRACKING', 'CHAINGRAPH_WRITE_PATH']
+            .concat(Object.keys(process.env).filter((key) => key.startsWith('CHAINGRAPH_UNSPENT_DEFERRED_')))
             .filter((key) => process.env[key] !== undefined)
             .map((key) => [key, process.env[key]])
         ),

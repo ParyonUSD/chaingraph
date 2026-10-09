@@ -48,6 +48,14 @@ const expectedOptions = [
   'CHAINGRAPH_POSTGRES_MAX_CONNECTIONS',
   'CHAINGRAPH_POSTGRES_SYNCHRONOUS_COMMIT',
   'CHAINGRAPH_TRUSTED_NODES',
+  'CHAINGRAPH_UNSPENT_DEFERRED_BATCH_INPUTS',
+  'CHAINGRAPH_UNSPENT_DEFERRED_GRACE_MS',
+  'CHAINGRAPH_UNSPENT_DEFERRED_INTERVAL_MS',
+  'CHAINGRAPH_UNSPENT_DEFERRED_JOB',
+  'CHAINGRAPH_UNSPENT_DEFERRED_PASS_MAX_MS',
+  'CHAINGRAPH_UNSPENT_DEFERRED_STALL_MAX_MS',
+  'CHAINGRAPH_UNSPENT_DEFERRED_START',
+  'CHAINGRAPH_UNSPENT_DEFERRED_SWEEP_ROWS',
   'CHAINGRAPH_UNSPENT_POST_COMMIT',
   'CHAINGRAPH_UNSPENT_RESOLVE_NEW_OUTPUTS',
   'CHAINGRAPH_UNSPENT_TRACKING',
@@ -431,7 +439,14 @@ if (!isWritePath(configuration.CHAINGRAPH_WRITE_PATH)) {
  */
 const chaingraphWritePath = configuration.CHAINGRAPH_WRITE_PATH;
 
-const unspentTrackingModes = ['off', 'marker', 'settable', 'bitmask'] as const;
+const unspentTrackingModes = [
+  'off',
+  'marker',
+  'settable',
+  'bitmask',
+  'deferred-marker',
+  'deferred-bitmask',
+] as const;
 const isUnspentTrackingMode = (
   value: string
 ): value is (typeof unspentTrackingModes)[number] =>
@@ -450,7 +465,73 @@ if (!isUnspentTrackingMode(configuration.CHAINGRAPH_UNSPENT_TRACKING)) {
  * `settable` (side table `unspent_output_set`) or `bitmask`
  * (`output.unspent_node_bits`). See `unspent-tracking.ts`.
  */
-const unspentTracking = configuration.CHAINGRAPH_UNSPENT_TRACKING;
+const unspentTrackingSetting = configuration.CHAINGRAPH_UNSPENT_TRACKING;
+/**
+ * The inline tracking mode (E15-B/E16): the deferred modes (E17) write
+ * nothing extra on the ingestion path, so for the inline code they are `off`.
+ */
+const unspentTracking =
+  unspentTrackingSetting === 'deferred-marker' ||
+  unspentTrackingSetting === 'deferred-bitmask'
+    ? 'off'
+    : unspentTrackingSetting;
+/**
+ * Experiment (E17, `CHAINGRAPH_UNSPENT_TRACKING=deferred-marker|deferred-bitmask`):
+ * the stored value maintained by the agent's recurring tracking job, or
+ * `undefined` when no deferred mode is configured.
+ */
+const unspentDeferredKind =
+  unspentTrackingSetting === 'deferred-marker'
+    ? ('marker' as const)
+    : unspentTrackingSetting === 'deferred-bitmask'
+    ? ('bitmask' as const)
+    : undefined;
+const nonNegativeInteger = (
+  name: (typeof expectedOptions)[number],
+  defaultValue: number
+) => {
+  const raw = configuration[name];
+  if (raw === '') {
+    return defaultValue;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `Invalid value provided in the '${name}' environment variable: ${raw}. Must be a non-negative integer.`
+    );
+  }
+  return value;
+};
+/**
+ * Settings of the E17 tracking job (see `defaults.env`).
+ */
+/* eslint-disable @typescript-eslint/no-magic-numbers */
+const unspentDeferredJob = {
+  batchInputs: nonNegativeInteger(
+    'CHAINGRAPH_UNSPENT_DEFERRED_BATCH_INPUTS',
+    50_000
+  ),
+  enabled: configuration.CHAINGRAPH_UNSPENT_DEFERRED_JOB !== 'false',
+  graceMs: nonNegativeInteger('CHAINGRAPH_UNSPENT_DEFERRED_GRACE_MS', 200),
+  intervalMs: nonNegativeInteger(
+    'CHAINGRAPH_UNSPENT_DEFERRED_INTERVAL_MS',
+    5_000
+  ),
+  passMaxMs: nonNegativeInteger(
+    'CHAINGRAPH_UNSPENT_DEFERRED_PASS_MAX_MS',
+    30_000
+  ),
+  stallMaxMs: nonNegativeInteger(
+    'CHAINGRAPH_UNSPENT_DEFERRED_STALL_MAX_MS',
+    600_000
+  ),
+  startAtGenesis: configuration.CHAINGRAPH_UNSPENT_DEFERRED_START === 'genesis',
+  sweepRows: nonNegativeInteger(
+    'CHAINGRAPH_UNSPENT_DEFERRED_SWEEP_ROWS',
+    1_000
+  ),
+};
 /**
  * Set via `CHAINGRAPH_UNSPENT_RESOLVE_NEW_OUTPUTS` (experiment, default
  * `true`): POLICY A, resolve each save's new outputs against `spent_by_index`
@@ -486,7 +567,10 @@ export {
   postgresSynchronousCommit,
   isProduction,
   trustedNodes,
+  unspentDeferredJob,
+  unspentDeferredKind,
   unspentPostCommit,
   unspentResolveNewOutputs,
   unspentTracking,
+  unspentTrackingSetting,
 };

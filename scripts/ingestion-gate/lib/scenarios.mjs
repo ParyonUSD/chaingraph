@@ -104,6 +104,15 @@ const startEnvironment = async (context, label, nodeSpecs) => {
     await agent.waitForSteadyState();
     // let post-sync housekeeping (incomplete block repair, expiration scan) settle
     await new Promise((resolve) => setTimeout(resolve, 1000));
+    // E17 deferred modes: the tracking job starts after the initial sync; measure only once it has
+    // initialised its watermarks (as the replay does), so the measured blocks are tracked
+    if (deferredTracking) {
+      await waitFor(
+        async () =>
+          Number((await client.query(`SELECT count(*)::int AS n FROM unspent_tracking_progress WHERE tracking_kind = $1 AND node_internal_id = 0`, [unspentTrackingMode])).rows[0].n) === 1,
+        { description: 'deferred tracking job initialised', intervalMs: 100, timeoutMs: 120_000 }
+      );
+    }
   } catch (error) {
     await cleanup();
     throw error;
@@ -162,10 +171,55 @@ const measureIngestion = async ({ environment, node, blocks, announce, timeoutMs
  * nodes; bitmask is compared per node, creator acceptance included. Returns
  * mismatch counts in both directions (all 0 when correct; `null` in `off`).
  */
-const unspentTrackingMode = process.env.CHAINGRAPH_UNSPENT_TRACKING ?? 'off';
+const unspentTrackingSetting = process.env.CHAINGRAPH_UNSPENT_TRACKING ?? 'off';
+// E17 deferred modes store the same marker / bits (maintained by the agent's job)
+const deferredTracking = unspentTrackingSetting.startsWith('deferred-');
+const unspentTrackingMode = deferredTracking ? unspentTrackingSetting.slice('deferred-'.length) : unspentTrackingSetting;
+
+/**
+ * E17 deferred modes: wait (agent still running) until the tracking job has
+ * processed everything (input and block watermarks at the sequence values,
+ * no unconsumed events). Returns the wait in seconds and the final state.
+ */
+const waitForDeferredDrain = async (client, timeoutMs = 900_000) => {
+  if (!deferredTracking) return null;
+  const kind = unspentTrackingMode;
+  const started = Date.now();
+  const state = async () =>
+    (
+      await client.query(
+        `SELECT p.input_transaction_internal_id::bigint AS w, p.node_block_block_internal_id::bigint AS wb,
+                (SELECT COALESCE(max(internal_id), 0) FROM transaction)::bigint AS max_tx,
+                (SELECT COALESCE(max(internal_id), 0) FROM block)::bigint AS max_block,
+                (SELECT count(*) FROM unspent_tracking_events)::int AS events
+           FROM unspent_tracking_progress p WHERE p.tracking_kind = $1 AND p.node_internal_id = 0`,
+        [kind]
+      )
+    ).rows[0];
+  let last;
+  while (Date.now() - started < timeoutMs) {
+    last = await state();
+    if (last && Number(last.w) >= Number(last.max_tx) && Number(last.wb) >= Number(last.max_block) && last.events === 0) {
+      return { drained: true, seconds: (Date.now() - started) / 1000, state: last };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return { drained: false, seconds: (Date.now() - started) / 1000, state: last };
+};
 const unspentReadModelCheck = async (client, watermark) => {
   if (unspentTrackingMode === 'off') return null;
   await client.query('ANALYZE output; ANALYZE input; ANALYZE transaction; ANALYZE block_transaction;');
+  const unprocessed = deferredTracking
+    ? Number(
+        (
+          await client.query(
+            `SELECT count(*)::bigint AS n FROM output o JOIN transaction t ON t.hash = o.transaction_hash
+              WHERE t.internal_id > $1 AND ${unspentTrackingMode === 'marker' ? 'o.spent_by_transaction_internal_id' : 'o.unspent_node_bits'} IS NULL`,
+            [watermark]
+          )
+        ).rows[0].n
+      )
+    : 0;
   const acceptedAnyNode = `(SELECT bt.transaction_internal_id AS id FROM block_transaction bt JOIN node_block nb ON nb.block_internal_id = bt.block_internal_id
                             UNION SELECT transaction_internal_id FROM node_transaction)`;
   if (unspentTrackingMode === 'bitmask') {
@@ -193,11 +247,12 @@ const unspentReadModelCheck = async (client, watermark) => {
     }
     const values = Object.values(perNode);
     return {
-      mode: unspentTrackingMode,
+      mode: unspentTrackingSetting,
       outputs: Math.max(0, ...values.map((value) => value.outputs)),
       perNode,
-      storedSpentButUnspent: values.reduce((total, value) => total + value.stored_spent_wrong, 0),
+      storedSpentButUnspent: values.reduce((total, value) => total + value.stored_spent_wrong, 0) + unprocessed,
       storedUnspentButSpent: values.reduce((total, value) => total + value.stored_unspent_wrong, 0),
+      unprocessed,
     };
   }
   const stored =
@@ -219,10 +274,11 @@ const unspentReadModelCheck = async (client, watermark) => {
     )
   ).rows[0];
   return {
-    mode: unspentTrackingMode,
+    mode: unspentTrackingSetting,
     outputs: row.outputs,
-    storedSpentButUnspent: row.stored_spent_but_unspent,
+    storedSpentButUnspent: row.stored_spent_but_unspent + unprocessed,
     storedUnspentButSpent: row.stored_unspent_but_spent,
+    unprocessed,
   };
 };
 const transactionWatermark = async (client) =>
@@ -293,10 +349,12 @@ export const maxBlockScenario = async (context) => {
     context.log(`max-block: announcing ${(blocks[0].raw.length / 1e6).toFixed(2)} MB block with ${blocks[0].stats.transactions} txs`);
     const sinceMs = Date.now();
     const result = await measureIngestion({ announce: () => node.announceViaHeaders(blocks), blocks, environment, node, timeoutMs: 600_000 });
+    // E17: the tracking job runs inside the agent; wait for it before stopping
+    const deferredDrain = await waitForDeferredDrain(environment.client);
     // stop first: the post-commit pass runs after the node_block rows are visible
     await environment.agent.stop();
     const unspentReadModel = await unspentReadModelCheck(environment.client, watermark);
-    return { ...result, correct: result.correct && readModelCorrect(unspentReadModel), peakHeapBytes: result.heap.peakHeapUsed, tracking: await trackingTimingsAfterStop(environment.agent, sinceMs), unspentReadModel };
+    return { ...result, correct: result.correct && readModelCorrect(unspentReadModel), peakHeapBytes: result.heap.peakHeapUsed, tracking: await trackingTimingsAfterStop(environment.agent, sinceMs), unspentReadModel, deferredDrain };
   } finally {
     await environment.cleanup();
   }
@@ -320,10 +378,12 @@ export const burstScenario = async (context) => {
     const sinceMs = Date.now();
     const result = await measureIngestion({ announce: () => node.announceViaHeaders(blocks), blocks, environment, node, timeoutMs: 1_200_000 });
     // block n+1 spends block n and all three are saved concurrently: the parent/child race
+    // E17: the tracking job runs inside the agent; wait for it before stopping
+    const deferredDrain = await waitForDeferredDrain(environment.client);
     // stop first: the post-commit pass runs after the node_block rows are visible
     await environment.agent.stop();
     const unspentReadModel = await unspentReadModelCheck(environment.client, watermark);
-    return { ...result, correct: result.correct && readModelCorrect(unspentReadModel), drainSeconds: result.wallSeconds, peakHeapBytes: result.heap.peakHeapUsed, tracking: await trackingTimingsAfterStop(environment.agent, sinceMs), unspentReadModel };
+    return { ...result, correct: result.correct && readModelCorrect(unspentReadModel), drainSeconds: result.wallSeconds, peakHeapBytes: result.heap.peakHeapUsed, tracking: await trackingTimingsAfterStop(environment.agent, sinceMs), unspentReadModel, deferredDrain };
   } finally {
     await environment.cleanup();
   }
@@ -357,10 +417,12 @@ export const maxBlockSpendScenario = async (context) => {
     context.log(`max-block-spend: announcing ${(child.raw.length / 1e6).toFixed(2)} MB child block with ${child.stats.transactions} txs`);
     const sinceMs = Date.now();
     const result = await measureIngestion({ announce: () => node.announceViaHeaders([child]), blocks: [child], environment, node, timeoutMs: 600_000 });
+    // E17: the tracking job runs inside the agent; wait for it before stopping
+    const deferredDrain = await waitForDeferredDrain(environment.client);
     // stop first: the post-commit pass runs after the node_block rows are visible
     await environment.agent.stop();
     const unspentReadModel = await unspentReadModelCheck(environment.client, watermark);
-    return { ...result, correct: result.correct && readModelCorrect(unspentReadModel), peakHeapBytes: result.heap.peakHeapUsed, tracking: await trackingTimingsAfterStop(environment.agent, sinceMs, parentHeight + 1), unspentReadModel };
+    return { ...result, correct: result.correct && readModelCorrect(unspentReadModel), peakHeapBytes: result.heap.peakHeapUsed, tracking: await trackingTimingsAfterStop(environment.agent, sinceMs, parentHeight + 1), unspentReadModel, deferredDrain };
   } finally {
     await environment.cleanup();
   }
@@ -490,6 +552,9 @@ export const reorgScenario = async (context) => {
     const expectedTransactions = sumTransactions(chainB);
     checks[`block_transaction rows for B match (${expectedTransactions})`] = blockTransactionRows === expectedTransactions;
     checks['no node_transaction row is confirmed in a block accepted by the same node'] = (await confirmedButInMempoolCount(client)) === 0;
+    // E17: the job's own time to drain the re-org (release/acceptance events, new blocks), after convergence
+    const deferredDrain = await waitForDeferredDrain(client);
+    if (deferredDrain !== null) checks['deferred tracking job drained'] = deferredDrain.drained;
     await environment.agent.stop();
     const unspentReadModel = await unspentReadModelCheck(client, watermark);
     if (unspentReadModel !== null) checks['unspent read model equals the F1g reference'] = readModelCorrect(unspentReadModel);
@@ -505,6 +570,7 @@ export const reorgScenario = async (context) => {
       failedChecks,
       transactionsPerSecond: blockTransactionRows / seconds(wallMs),
       unspentReadModel,
+      deferredDrain,
       walBytes,
       wallSeconds: seconds(wallMs),
     };

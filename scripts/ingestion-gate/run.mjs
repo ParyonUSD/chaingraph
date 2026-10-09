@@ -248,9 +248,12 @@ const main = async () => {
   console.log(`\n${line(header)}\n${widths.map((width) => '-'.repeat(width)).join('-|-')}\n${rows.map(line).join('\n')}\n`);
   selectedScenarios.forEach((name) => (report.scenarios[name].result?.knownFailures ?? []).forEach((check) => log(`PASS* ${name}: known failing check (allow-listed in thresholds): ${check}`)));
   selectedScenarios.forEach((name) => {
-    const { tracking, unspentReadModel } = report.scenarios[name].result ?? {};
+    const { deferredDrain, tracking, unspentReadModel } = report.scenarios[name].result ?? {};
+    if (deferredDrain) {
+      log(`${name}: deferred tracking job drained=${deferredDrain.drained} in ${deferredDrain.seconds.toFixed(2)} s after ingestion (watermark ${deferredDrain.state?.w}/${deferredDrain.state?.max_tx}, events ${deferredDrain.state?.events})`);
+    }
     if (unspentReadModel) {
-      log(`${name}: unspent read model (${unspentReadModel.mode}) vs F1g over ${unspentReadModel.outputs} outputs: ${unspentReadModel.storedUnspentButSpent} stored unspent but spent, ${unspentReadModel.storedSpentButUnspent} stored spent but unspent`);
+      log(`${name}: unspent read model (${unspentReadModel.mode}) vs F1g over ${unspentReadModel.outputs} outputs: ${unspentReadModel.storedUnspentButSpent} stored unspent but spent, ${unspentReadModel.storedSpentButUnspent} stored spent but unspent${unspentReadModel.unprocessed ? ` (incl. ${unspentReadModel.unprocessed} unprocessed)` : ''}`);
     }
     if (tracking && tracking.blocks > 0) {
       log(`${name}: tracking over ${tracking.blocks} block(s): mark ${tracking.markMs} ms, resolve ${tracking.resolveMs} ms, post-commit ${tracking.postCommitMs} ms (max ${tracking.maxPostCommitMs} ms; fixed ${tracking.postCommitNewOutputsFixed} new-output + ${tracking.postCommitSpentOutputsFixed} spent-output rows; ${tracking.failedAttempts} retried)`);

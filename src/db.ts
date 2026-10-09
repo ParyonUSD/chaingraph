@@ -16,6 +16,33 @@ import {
   indexDefinitions,
 } from './components/db-utils.js';
 import { copyFromBuffers } from './components/pg-binary-copy.js';
+import type {
+  DeferredBatchResult,
+  SettleCandidate,
+  StallState,
+  UnspentDeferredKind,
+} from './components/unspent-deferred.js';
+import {
+  backlogSql,
+  batchDidWork,
+  blockReacceptedEventsSql,
+  configureDeferredTriggersSql,
+  deferredIndexDefinitions,
+  deferredQueryRootSql,
+  deferredTriggerNames,
+  formatBatchLog,
+  headersAcceptedEventsSql,
+  initializeSql,
+  nextSkipThrough,
+  nextStallState,
+  nextTransactionIdSql,
+  parseBatchResult,
+  progressSql,
+  readSequencesSql,
+  runBatchSql,
+  snapshotSettledSql,
+  transactionReacceptedEventsSql,
+} from './components/unspent-deferred.js';
 import {
   bitmaskAcceptBlocksSql,
   bitmaskAcceptSql,
@@ -49,6 +76,8 @@ import {
   postgresConnectionString,
   postgresMaxConnections,
   postgresSynchronousCommit,
+  unspentDeferredJob,
+  unspentDeferredKind,
   unspentPostCommit,
   unspentResolveNewOutputs,
   unspentTracking,
@@ -567,6 +596,88 @@ const bitmaskIndexStatements = async (client: pg.PoolClient) => {
 };
 
 /**
+ * E17 deferred modes: enable the release-event triggers (disable them in every
+ * other mode) and point the generic query root at the mode's function.
+ * Returns the statements to run.
+ */
+
+const deferredConfigurationStatements = async (
+  client: pg.PoolClient
+): Promise<string[]> => {
+  const existing = Object.fromEntries(
+    (
+      await client.query<{ enabled: boolean; tgname: string }>(
+        /* sql */ `SELECT tgname, tgenabled <> 'D' AS enabled FROM pg_trigger WHERE tgname = ANY ($1::text[]);`,
+        [deferredTriggerNames]
+      )
+    ).rows.map((row) => [row.tgname, row.enabled])
+  );
+  if (unspentDeferredKind === undefined) {
+    return configureDeferredTriggersSql(false, existing);
+  }
+  if (Object.keys(existing).length === 0) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `CHAINGRAPH_UNSPENT_TRACKING=deferred-${unspentDeferredKind} requires migration 1791400002000_unspent_deferred.`
+    );
+  }
+  if (unspentDeferredKind === 'bitmask') {
+    const tooHigh = (
+      await client.query<{ id: string }>(
+        /* sql */ `SELECT internal_id AS id FROM node WHERE internal_id > $1 ORDER BY internal_id;`,
+        [bitmaskMaxNodeInternalId]
+      )
+    ).rows.map((row) => row.id);
+    if (tooHigh.length > 0) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        `CHAINGRAPH_UNSPENT_TRACKING=deferred-bitmask needs node internal IDs <= ${bitmaskMaxNodeInternalId} (bit positions); found ${tooHigh.join(
+          ', '
+        )}.`
+      );
+    }
+  }
+  return [
+    ...configureDeferredTriggersSql(true, existing),
+    deferredQueryRootSql(unspentDeferredKind),
+  ];
+};
+
+/**
+ * E17 deferred modes: create the mode's partial indexes if missing. Called
+ * when the tracking job starts (after the initial sync and the managed
+ * indexes, like them), so the initial sync does not maintain them. Returns
+ * the statements run.
+ */
+export const ensureUnspentDeferredIndexes = async () => {
+  if (unspentDeferredKind === undefined) {
+    return [];
+  }
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const existingIndexes = (
+      await client.query<{ name: string }>(
+        /* sql */ `SELECT indexname AS name FROM pg_indexes WHERE schemaname = 'public';`
+      )
+    ).rows.map((row) => row.name);
+    const statements = Object.entries(
+      deferredIndexDefinitions(unspentDeferredKind)
+    )
+      .filter(([name]) => !existingIndexes.includes(name))
+      .map(([, definition]) => definition);
+    await statements.reduce<Promise<unknown>>(
+      async (chain, statement) =>
+        chain.then(async () => client.query(statement)),
+      Promise.resolve()
+    );
+    return statements;
+  } finally {
+    client.release();
+  }
+};
+
+/**
  * Enable the spend-release triggers of the configured
  * `CHAINGRAPH_UNSPENT_TRACKING` mode and disable the others. Returns the
  * statements run (none if the migration is missing and the mode is `off`).
@@ -596,12 +707,15 @@ export const configureUnspentTracking = async () => {
     );
     const indexStatements =
       unspentTracking === 'bitmask' ? await bitmaskIndexStatements(client) : [];
-    await [...statements, ...indexStatements].reduce<Promise<unknown>>(
+    const deferredStatements = await deferredConfigurationStatements(client);
+    await [...statements, ...indexStatements, ...deferredStatements].reduce<
+      Promise<unknown>
+    >(
       async (chain, statement) =>
         chain.then(async () => client.query(statement)),
       Promise.resolve()
     );
-    return [...statements, ...indexStatements];
+    return [...statements, ...indexStatements, ...deferredStatements];
   } finally {
     client.release();
   }
@@ -1219,7 +1333,9 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
   // eslint-disable-next-line functional/no-try-statement
   try {
     await client.query('BEGIN;');
-    await client.query(saveTransaction);
+    const savedTransactionResult = await client.query<{ count: string }>(
+      saveTransaction
+    );
     const transactionInternalIdResult = await client.query<{
       internalId: string;
     }>(
@@ -1239,6 +1355,19 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
     );
     await bitmaskAccept(client, policy, validatingNodeIds, [transaction.hash]);
     await client.query(saveNodeValidations, [transactionInternalId]);
+    if (
+      unspentDeferredKind !== undefined &&
+      Number(savedTransactionResult.rows[0]?.count ?? 0) === 0
+    ) {
+      /*
+       * E17: the transaction already existed (its id may be below the job's
+       * watermark): record the acceptance as an event.
+       */
+      await client.query(transactionReacceptedEventsSql, [
+        transactionInternalId,
+        validatingNodeIds,
+      ]);
+    }
     await reacceptSpends(client, [transactionInternalId]);
     const mempoolResolveSql = resolveMempoolOutputsSql(unspentTracking);
     if (policy === 'resolve' && mempoolResolveSql !== undefined) {
@@ -1309,7 +1438,7 @@ export const recordNodeValidation = async (
         CROSS JOIN known_transaction
       ON CONFLICT ON CONSTRAINT "node_transaction_pkey" DO NOTHING;
   `);
-    if (unspentTracking !== 'off') {
+    if (unspentTracking !== 'off' || unspentDeferredKind !== undefined) {
       const known = await client.query<{ internalId: string }>(
         /* sql */ `SELECT internal_id AS "internalId" FROM transaction WHERE hash = $1;`,
         [Buffer.from(transactionHash, 'hex')]
@@ -1318,6 +1447,13 @@ export const recordNodeValidation = async (
         client,
         known.rows.map((row) => row.internalId)
       );
+      if (unspentDeferredKind !== undefined && known.rows[0] !== undefined) {
+        // E17: a known transaction gains an acceptance
+        await client.query(transactionReacceptedEventsSql, [
+          known.rows[0].internalId,
+          [validation.nodeInternalId],
+        ]);
+      }
     }
     await bitmaskResolve(
       client,
@@ -1373,6 +1509,28 @@ const verifyBlockTransactionsLinked = async (
       `Failed to save all transactions for block ${block.height} (${block.hash}): joined ${joinedTransactionCount}/${block.transactions.length}, linked ${linkedBlockTransactionCount}/${block.transactions.length}.`
     );
   }
+};
+
+/**
+ * E17 deferred modes: a block save that added node_block rows to a block that
+ * already existed (its id may be below the job's block watermark) records the
+ * acceptance as events. New blocks need none: the job scans block ids above
+ * its watermark.
+ */
+
+const recordBlockReacceptance = async (
+  client: pg.PoolClient,
+  block: ChaingraphBlock,
+  acceptingNodeIds: number[],
+  insertedNodeBlockCount: number
+) => {
+  if (unspentDeferredKind === undefined || insertedNodeBlockCount === 0) {
+    return;
+  }
+  await client.query(blockReacceptedEventsSql, [
+    Buffer.from(block.hash, 'hex'),
+    acceptingNodeIds,
+  ]);
 };
 
 /**
@@ -1623,6 +1781,12 @@ const saveBlockViaCopy = async ({
       client,
       block,
       Number(addBlockResult.rows[0]!.joinedTransactionCount)
+    );
+    await recordBlockReacceptance(
+      client,
+      block,
+      acceptingNodeIds,
+      Number(addBlockResult.rows[0]!.insertedNodeBlockCount)
     );
     const query = async (sql: string) => client.query(sql);
     const bitmaskSteps = await bitmaskBlockSteps(client, policy, {
@@ -1935,6 +2099,12 @@ SELECT
       block,
       Number(addBlockResult.rows[0]!.joinedTransactionCount)
     );
+    await recordBlockReacceptance(
+      client,
+      block,
+      acceptingNodeIds,
+      Number(addBlockResult.rows[0]!.insertedNodeBlockCount)
+    );
     const query = async (sql: string) => client.query(sql);
     const newHashes = attemptedSavedTransactions.map(
       (transaction) => transaction.hash
@@ -2019,7 +2189,11 @@ export const acceptBlocksViaHeaders = async (
   // eslint-disable-next-line functional/no-try-statement
   try {
     if (unspentTracking === 'off') {
-      const nodeBlockInsertResult = await client.query(insertNodeBlocks);
+      const nodeBlockInsertResult = await client.query(
+        unspentDeferredKind === undefined
+          ? insertNodeBlocks
+          : headersAcceptedEventsSql(nodeInternalId, insertNodeBlocks)
+      );
       return nodeBlockInsertResult.rowCount;
     }
     /*
@@ -2242,4 +2416,342 @@ JOIN pg_stat_activity a ON p.pid = a.pid;
 `);
   client.release();
   return computeIndexCreationProgress(res.rows);
+};
+
+/* eslint-disable complexity, max-params, @typescript-eslint/no-magic-numbers, require-atomic-updates, @typescript-eslint/init-declarations, prefer-destructuring */
+/*
+ * E17 deferred unspent tracking: the recurring job (one instance per agent;
+ * `unspent_deferred_run_batch` also takes an advisory lock, so two agents
+ * never run it at once).
+ */
+
+/**
+ * Sequence values whose allocating transactions have all finished (see
+ * `readSequencesSql`), and the candidate being settled.
+ */
+// eslint-disable-next-line functional/no-let
+let deferredSettledLimits:
+  | { blockLimit: number; transactionLimit: number }
+  | undefined;
+// eslint-disable-next-line functional/no-let
+let deferredCandidate: SettleCandidate | undefined;
+// eslint-disable-next-line functional/no-let
+let deferredStall: StallState | undefined;
+// eslint-disable-next-line functional/no-let
+let deferredSkipThrough = 0;
+// eslint-disable-next-line functional/no-let
+let deferredPassInFlight: Promise<DeferredPassSummary> | undefined;
+
+export interface DeferredPassSummary {
+  batches: number;
+  busy: boolean;
+  caughtUp: boolean;
+  changed: number;
+  inputs: number;
+  kind: UnspentDeferredKind | undefined;
+  lastBatch?: DeferredBatchResult;
+  ms: number;
+}
+
+const settlePollMs = 25;
+
+/**
+ * Advance `deferredSettledLimits`: read the sequences (new candidate), wait
+ * the grace, take the next xid, then poll until every xid up to it has
+ * finished or `waitMs` elapsed (the candidate is kept for the next call).
+ */
+const settleDeferredLimits = async (client: pg.PoolClient, waitMs: number) => {
+  const start = Date.now();
+  if (deferredCandidate === undefined) {
+    const row = (
+      await client.query<{ blockLimit: string; transactionLimit: string }>(
+        readSequencesSql
+      )
+    ).rows[0]!;
+    deferredCandidate = {
+      blockLimit: Number(row.blockLimit),
+      readAt: Date.now(),
+      transactionLimit: Number(row.transactionLimit),
+    };
+  }
+  const candidate = deferredCandidate;
+  if (candidate.nextXid === undefined) {
+    const graceLeft =
+      unspentDeferredJob.graceMs - (Date.now() - candidate.readAt);
+    if (graceLeft > 0) {
+      await sleep(graceLeft);
+    }
+    candidate.nextXid = (
+      await client.query<{ nextXid: string }>(nextTransactionIdSql)
+    ).rows[0]!.nextXid;
+  }
+  const poll = async (): Promise<boolean> => {
+    const settled =
+      (
+        await client.query<{ settled: boolean }>(snapshotSettledSql, [
+          candidate.nextXid,
+        ])
+      ).rows[0]?.settled === true;
+    if (settled || Date.now() - start >= waitMs) {
+      return settled;
+    }
+    await sleep(settlePollMs);
+    return poll();
+  };
+  if (await poll()) {
+    deferredSettledLimits = {
+      blockLimit: candidate.blockLimit,
+      transactionLimit: candidate.transactionLimit,
+    };
+    deferredCandidate = undefined;
+    return true;
+  }
+  return false;
+};
+
+/**
+ * One batch in its own REPEATABLE READ transaction (one snapshot for every
+ * step; the stored values and the watermarks commit together).
+ */
+const runDeferredBatch = async (
+  client: pg.PoolClient,
+  kind: UnspentDeferredKind,
+  limits: { blockLimit: number; transactionLimit: number },
+  checkWatch: boolean
+) => {
+  const maxBlocks = 200;
+  const maxEvents = 20_000;
+  deferredSkipThrough = nextSkipThrough(
+    deferredSkipThrough,
+    deferredStall,
+    Date.now(),
+    unspentDeferredJob.stallMaxMs,
+    limits.transactionLimit
+  );
+  await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ;');
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const raw = (
+      await client.query<{ result: { [key: string]: unknown } }>(runBatchSql, [
+        kind,
+        limits.transactionLimit,
+        limits.blockLimit,
+        Math.max(unspentDeferredJob.batchInputs, 1),
+        maxBlocks,
+        maxEvents,
+        unspentDeferredJob.sweepRows,
+        deferredSkipThrough,
+        checkWatch,
+      ])
+    ).rows[0]!.result;
+    await client.query('COMMIT;');
+    const result = parseBatchResult(raw);
+    deferredStall = nextStallState(deferredStall, result.stalledAt, Date.now());
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
+  }
+};
+
+const ensureDeferredInitialized = async (
+  client: pg.PoolClient,
+  kind: UnspentDeferredKind,
+  limits: { blockLimit: number; transactionLimit: number }
+) => {
+  const existing = await client.query(progressSql, [kind]);
+  if (existing.rows.length > 0) {
+    return false;
+  }
+  const initialized =
+    (
+      await client.query<{ initialized: boolean }>(initializeSql, [
+        kind,
+        unspentDeferredJob.startAtGenesis ? 0 : limits.transactionLimit,
+        unspentDeferredJob.startAtGenesis ? 0 : limits.blockLimit,
+      ])
+    ).rows[0]?.initialized === true;
+  if (initialized) {
+    unspentTrackingInfo(
+      `Unspent deferred job (${kind}): tracking started at ${
+        unspentDeferredJob.startAtGenesis
+          ? 'genesis'
+          : `transaction ${limits.transactionLimit} / block ${limits.blockLimit}`
+      }; earlier outputs stay unprocessed (NULL) until swept or backfilled.`
+    );
+  }
+  return initialized;
+};
+
+/**
+ * One pass of the E17 tracking job: settle new limits, then run batches until
+ * the settled limits are reached (and nothing else is pending) or `maxMs`
+ * elapsed. Concurrent callers share the pass in flight.
+ */
+export const runUnspentDeferredJobPass = async (
+  options: { maxMs?: number; settleWaitMs?: number } = {}
+): Promise<DeferredPassSummary> => {
+  if (deferredPassInFlight !== undefined) {
+    return deferredPassInFlight;
+  }
+  const kind = unspentDeferredKind;
+  const start = Date.now();
+  const maxMs = options.maxMs ?? unspentDeferredJob.passMaxMs;
+  const pass = async (): Promise<DeferredPassSummary> => {
+    const summary: DeferredPassSummary = {
+      batches: 0,
+      busy: false,
+      caughtUp: false,
+      changed: 0,
+      inputs: 0,
+      kind,
+      ms: 0,
+    };
+    if (kind === undefined) {
+      return summary;
+    }
+    const client = await pool.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await settleDeferredLimits(
+        client,
+        options.settleWaitMs ?? Math.max(unspentDeferredJob.graceMs * 5, 1_000)
+      );
+      const limits = deferredSettledLimits;
+      if (limits === undefined) {
+        return summary;
+      }
+      await ensureDeferredInitialized(client, kind, limits);
+      const loop = async (): Promise<void> => {
+        const batchStart = Date.now();
+        // the watch set is re-checked once per pass (first batch)
+        const result = await runDeferredBatch(
+          client,
+          kind,
+          limits,
+          summary.batches === 0
+        );
+        summary.batches += 1;
+        summary.lastBatch = result;
+        if (result.busy === true || result.uninitialized === true) {
+          summary.busy = result.busy === true;
+          return;
+        }
+        summary.inputs += result.inputs;
+        summary.changed += result.changed;
+        const worked = batchDidWork(result);
+        if (worked || result.stalledAt !== null) {
+          unspentTrackingInfo(
+            formatBatchLog(kind, result, Date.now() - batchStart)
+          );
+        }
+        const reachedLimits =
+          result.inputWatermark >= limits.transactionLimit &&
+          result.blockWatermark >= limits.blockLimit;
+        if (!worked || (reachedLimits && result.events === 0)) {
+          summary.caughtUp = reachedLimits;
+          return;
+        }
+        if (Date.now() - start >= maxMs) {
+          return;
+        }
+        await loop();
+      };
+      await loop();
+      return summary;
+    } finally {
+      summary.ms = Date.now() - start;
+      client.release();
+    }
+  };
+  deferredPassInFlight = pass().finally(() => {
+    deferredPassInFlight = undefined;
+  });
+  return deferredPassInFlight;
+};
+
+/**
+ * Run passes until the job has processed everything committed before this
+ * call (tests, measurements): the settled limits reach the sequence values
+ * read now and a batch finds nothing left (a stalled input counts as done
+ * once its stall persists).
+ */
+export const drainUnspentDeferredJob = async (timeoutMs = 120_000) => {
+  const client = await pool.connect();
+  const target = await client
+    .query<{ blockLimit: string; transactionLimit: string }>(readSequencesSql)
+    .then((result) => result.rows[0]!)
+    .finally(() => {
+      client.release();
+    });
+  const start = Date.now();
+  const attempt = async (): Promise<DeferredPassSummary> => {
+    const summary = await runUnspentDeferredJobPass({
+      maxMs: timeoutMs,
+      settleWaitMs: 2_000,
+    });
+    const limits = deferredSettledLimits;
+    const done =
+      summary.kind === undefined ||
+      (limits !== undefined &&
+        limits.transactionLimit >= Number(target.transactionLimit) &&
+        limits.blockLimit >= Number(target.blockLimit) &&
+        summary.lastBatch !== undefined &&
+        !batchDidWork(summary.lastBatch) &&
+        (summary.lastBatch.inputWatermark >= limits.transactionLimit ||
+          summary.lastBatch.stalledAt !== null));
+    if (done) {
+      return summary;
+    }
+    if (Date.now() - start > timeoutMs) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        `Unspent deferred job did not drain within ${timeoutMs} ms (last batch: ${JSON.stringify(
+          summary.lastBatch
+        )}).`
+      );
+    }
+    return attempt();
+  };
+  return attempt();
+};
+
+/**
+ * The job's watermark and backlog (logs, metrics, tests).
+ */
+export const getUnspentDeferredStatus = async () => {
+  const kind = unspentDeferredKind;
+  if (kind === undefined) {
+    return undefined;
+  }
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const progress = (
+      await client.query<{
+        blockWatermark: string;
+        consumedEventId: string;
+        inputWatermark: string;
+      }>(progressSql, [kind])
+    ).rows[0];
+    const backlog = (
+      await client.query<{
+        events: string;
+        maxTransactionId: string;
+        oldestEventAgeSeconds: string;
+      }>(backlogSql)
+    ).rows[0]!;
+    return {
+      events: Number(backlog.events),
+      inputWatermark:
+        progress === undefined ? undefined : Number(progress.inputWatermark),
+      kind,
+      maxTransactionId: Number(backlog.maxTransactionId),
+      oldestEventAgeSeconds: Number(backlog.oldestEventAgeSeconds),
+      stalledAt: deferredStall?.transactionInternalId,
+    };
+  } finally {
+    client.release();
+  }
 };

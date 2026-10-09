@@ -36,6 +36,8 @@ import {
   mempoolTransactionExpirationScanIntervalMs,
   postgresMaxConnections,
   trustedNodes,
+  unspentDeferredJob,
+  unspentDeferredKind,
 } from './config.js';
 import {
   acceptBlocksViaHeaders,
@@ -44,6 +46,7 @@ import {
   configureUnspentTracking,
   createIndexes,
   drainUnspentTrackingPostCommits,
+  ensureUnspentDeferredIndexes,
   getAllKnownBlockHashes,
   getIncompleteBlocks,
   getIndexCreationProgress,
@@ -56,6 +59,7 @@ import {
   reenableMempoolCleaning,
   registerTrustedNodeWithDb,
   removeStaleBlocksForNode,
+  runUnspentDeferredJobPass,
   saveBlock,
   saveTransactionForNodes,
   setUnspentTrackingLoggers,
@@ -359,6 +363,18 @@ export class Agent {
     | undefined;
 
   incompleteBlockRepairTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  /**
+   * E17 deferred unspent tracking: the job's next scheduled pass, the pass in
+   * flight, and whether another pass was requested while one was running.
+   */
+  unspentDeferredJobTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  unspentDeferredJobRunning: Promise<void> | undefined;
+
+  unspentDeferredJobRequested = false;
+
+  unspentDeferredJobStarted = false;
 
   mempoolTransactionExpirationScanTimeout:
     | ReturnType<typeof setTimeout>
@@ -983,6 +999,7 @@ export class Agent {
                       this.saveInboundTransactions = true;
                       this.scheduleIncompleteBlockRepair();
                       this.scheduleMempoolTransactionExpirationScan();
+                      this.startUnspentDeferredJob();
                     });
                   })
                   .catch((err) => {
@@ -1194,6 +1211,84 @@ export class Agent {
         }; an accepted block already spends the same outpoint, archived with replaced_at ${transaction.replacedAt.toISOString()}.`
       );
     });
+  }
+
+  /**
+   * E17 (`CHAINGRAPH_UNSPENT_TRACKING=deferred-*`): start the recurring
+   * tracking job once the initial sync is complete and the managed indexes
+   * exist. It runs every `CHAINGRAPH_UNSPENT_DEFERRED_INTERVAL_MS` and after
+   * each block save; one pass at a time.
+   */
+  startUnspentDeferredJob() {
+    if (
+      unspentDeferredKind === undefined ||
+      !unspentDeferredJob.enabled ||
+      this.unspentDeferredJobStarted
+    ) {
+      return;
+    }
+    this.unspentDeferredJobStarted = true;
+    ensureUnspentDeferredIndexes()
+      .then((statements) => {
+        if (statements.length > 0) {
+          this.logger.info(
+            `Agent: created the deferred unspent tracking indexes: ${statements.join(
+              ' '
+            )}`
+          );
+        }
+        this.logger.info(
+          `Agent: starting the deferred unspent tracking job (${unspentDeferredKind}), every ${unspentDeferredJob.intervalMs} ms and after each block save.`
+        );
+        this.requestUnspentDeferredJobPass();
+      })
+      .catch((err: unknown) => {
+        this.logger.fatal(err);
+        this.shutdown().catch((shutdownErr) => {
+          this.logger.error(shutdownErr);
+        });
+      });
+  }
+
+  requestUnspentDeferredJobPass(delayMs = 0) {
+    if (!this.unspentDeferredJobStarted || this.willShutdown) {
+      return;
+    }
+    if (this.unspentDeferredJobRunning !== undefined) {
+      this.unspentDeferredJobRequested = true;
+      return;
+    }
+    if (this.unspentDeferredJobTimeout !== undefined) {
+      if (delayMs > 0) {
+        return;
+      }
+      clearTimeout(this.unspentDeferredJobTimeout);
+    }
+    this.unspentDeferredJobTimeout = setTimeout(() => {
+      this.unspentDeferredJobTimeout = undefined;
+      this.unspentDeferredJobRunning = runUnspentDeferredJobPass()
+        .then((summary) => {
+          if (summary.busy) {
+            this.logger.debug(
+              'Agent: deferred unspent tracking job busy (another instance holds the lock).'
+            );
+          }
+        })
+        .catch((err: unknown) => {
+          this.logger.error(
+            err,
+            'Agent: deferred unspent tracking job pass failed (retried next pass).'
+          );
+        })
+        .finally(() => {
+          this.unspentDeferredJobRunning = undefined;
+          const again = this.unspentDeferredJobRequested;
+          this.unspentDeferredJobRequested = false;
+          this.requestUnspentDeferredJobPass(
+            again ? 0 : unspentDeferredJob.intervalMs
+          );
+        });
+    }, delayMs);
   }
 
   canScheduleIncompleteBlockRepair() {
@@ -1850,6 +1945,7 @@ export class Agent {
     });
     this.blockDb?.add(block.hash);
     const completionTime = Date.now();
+    this.requestUnspentDeferredJobPass();
 
     const durationMs = completionTime - startTime;
     const transactions = attemptedSavedTransactions.length;
@@ -2280,6 +2376,9 @@ export class Agent {
     if (this.mempoolTransactionExpirationScanTimeout !== undefined) {
       clearTimeout(this.mempoolTransactionExpirationScanTimeout);
     }
+    if (this.unspentDeferredJobTimeout !== undefined) {
+      clearTimeout(this.unspentDeferredJobTimeout);
+    }
     this.mempoolTransactionExpirationTimers.forEach((timeout) => {
       clearTimeout(timeout);
     });
@@ -2290,6 +2389,7 @@ export class Agent {
     this.shutdownPromise = this.blockBuffer
       .drain()
       .then(async () => drainUnspentTrackingPostCommits())
+      .then(async () => this.unspentDeferredJobRunning)
       .then(async () => {
         this.logger.debug('Block buffer drained, stopping PG pool...');
         return pool.end();
