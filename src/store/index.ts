@@ -7,10 +7,13 @@ import {
   clickhouseUser,
 } from '../config.js';
 
+import { createClickHouseStore } from './clickhouse/index.js';
 import { createPostgresStore } from './postgres/postgres-store.js';
 import type { ChaingraphStore, ChaingraphStoreBackend } from './types.js';
 
 export type { ChaingraphStore, ChaingraphStoreBackend } from './types.js';
+
+const clickhouseRequestTimeoutMs = 300_000;
 
 export interface StoreConfig {
   backend: ChaingraphStoreBackend;
@@ -44,10 +47,15 @@ export const createStore = (
   config: StoreConfig = storeConfigFromEnvironment()
 ): ChaingraphStore => {
   if (config.backend === 'clickhouse') {
-    // eslint-disable-next-line functional/no-throw-statement
-    throw new Error(
-      'CHAINGRAPH_STORE=clickhouse is not implemented yet (WP5).'
-    );
+    return createClickHouseStore({
+      connection: {
+        database: config.clickhouse.database,
+        password: config.clickhouse.password,
+        requestTimeoutMs: clickhouseRequestTimeoutMs,
+        url: config.clickhouse.url,
+        username: config.clickhouse.user,
+      },
+    });
   }
   return createPostgresStore();
 };
