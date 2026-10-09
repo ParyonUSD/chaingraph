@@ -192,7 +192,8 @@
     "files": [
       "!charts",
       "!data",
-      "!images"
+      "!images",
+      "!**/test-support.*"
     ],
     "ignoredByWatcher": [
       "charts",
