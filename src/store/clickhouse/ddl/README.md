@@ -255,3 +255,23 @@ safety), wp5a-core.md §6 (checklist review).*
 - `commit_log.node_scope` (an array, not a key): bookkeeping for the watermark, not an answer.
 - `input`'s denormalised spent-output attributes are immutable output facts, not acceptance facts.
 - Plan gap: `input` did not denormalise `fungible_token_amount` (the plan's list omits it). *Fixed in WP5a (item 23).*
+
+## UTXO growth and compaction (WP5c, design only, not built)
+
+Full design, cost estimate and test plan: `docs/clickhouse-port/wp5c-hardening.md` §3.
+
+- **Growth.** `version` = own `commit_seq` (item 24) means a +1 and a −1 written by different commits never
+  collapse. At mainnet rates (6,000 spends/block, 144 blocks/day) that is up to 1.73 M dead rows per node per
+  table per day (≈ 95 MB at #83's 55 B/row), equal to the live set (59.1 M) after about a month.
+- **Rejected:** `ALTER … DELETE` of net-zero keys (not atomic across parts: deleting the −1 before the +1
+  resurrects a spent output; safe only as two ordered phases, each rewriting most parts) and the anti-pair
+  insert (reclaim depends on merges).
+- **Proposed:** add `generation UInt32 DEFAULT 0` and `PARTITION BY (generation, intDiv(commit_seq, 65536))` to
+  `utxo` / `utxo_by_script`, plus a tiny `utxo_compaction (generation, upto_seq, live_generations, …)` table.
+  Gate: `(generation = 0 AND commit_seq > upto) OR has(live_generations, generation)`. A job picks
+  S ≤ min `visible(n)` after a safety margin (aligned to a bucket), writes the per-key net (−1/0/+1; nothing for
+  0) of the live generations plus agent rows in `(upto, S]` into generation g+1 with `commit_seq = version =`
+  the highest committed seq ≤ S, flips with one `utxo_compaction` row (atomic for new snapshots; old snapshots
+  keep the old generation), and after another margin drops the old buckets and generations with
+  `DROP PARTITION` (also reclaiming aborted and fenced rows). Minor runs daily (seconds), major runs weekly
+  (≈ the #83 UTXO build, 5–15 min on 16 vCPU per node).
