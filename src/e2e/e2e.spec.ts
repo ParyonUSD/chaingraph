@@ -21,6 +21,7 @@ import type {
 import bitcoreP2pCash, {
   BitcoreInventoryType,
 } from '@chaingraph/bitcore-p2p-cash';
+import type { ExecutionContext } from 'ava';
 import test from 'ava';
 import type { ExecaChildProcess } from 'execa';
 import { execa } from 'execa';
@@ -28,7 +29,11 @@ import got from 'got';
 import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
-import type { ChaingraphTransaction } from '../types/chaingraph.js';
+import type * as DbModule from '../db.js';
+import type {
+  ChaingraphBlock,
+  ChaingraphTransaction,
+} from '../types/chaingraph.js';
 
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
 import {
@@ -87,6 +92,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
+  migration('default/1791500000000_unspent_node_ids/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -801,7 +807,13 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     }>(/* sql */ `
   SELECT indexname FROM pg_indexes WHERE schemaname = 'public' ORDER BY indexname;
   `)
-  ).rows.map((row) => row.indexname);
+  ).rows
+    .map((row) => row.indexname)
+    /*
+     * CHAINGRAPH_UNSPENT_NODE_IDS=true adds three partial indexes per node
+     * when its job starts (checked by the unspent tracking tests).
+     */
+    .filter((name) => !/^output_unspent_node_\d+_/u.test(name));
   t.deepEqual(indexes, [
     'block_hash_key',
     'block_height_index',
@@ -823,6 +835,11 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'token_category_index',
     'transaction_hash_key',
     'transaction_pkey',
+    'unspent_tracking_events_pkey',
+    'unspent_tracking_progress_pkey',
+    'unspent_tracking_settings_pkey',
+    'unspent_tracking_skipped_pkey',
+    'unspent_tracking_watch_pkey',
   ]);
   // cspell:ignore tgenabled tgname
   const triggers = (
@@ -2023,15 +2040,13 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   t.pass();
 });
 
-test.serial(
-  '[e2e] new block saved after reorg',
-  async (t) => {
-    const acceptedBlocks = (
-      await client.query<{
-        hash: string;
-        nodeName: string;
-      }>(
-        /* sql */ `
+test.serial('[e2e] new block saved after reorg', async (t) => {
+  const acceptedBlocks = (
+    await client.query<{
+      hash: string;
+      nodeName: string;
+    }>(
+      /* sql */ `
       SELECT node.name AS "nodeName", encode(block.hash, 'hex') AS hash
         FROM node_block
         INNER JOIN node
@@ -2042,14 +2057,13 @@ test.serial(
           AND block.height = $1
         ORDER BY block.hash;
     `,
-        [splitHeight + 1]
-      )
-    ).rows;
-    t.deepEqual(acceptedBlocks, [
-      { hash: tipA[0]!.header.hash, nodeName: 'node3' },
-    ]);
-  }
-);
+      [splitHeight + 1]
+    )
+  ).rows;
+  t.deepEqual(acceptedBlocks, [
+    { hash: tipA[0]!.header.hash, nodeName: 'node3' },
+  ]);
+});
 
 test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
   const tipStartIndex = 2;
@@ -2702,6 +2716,907 @@ test.serial('[e2e] [api] /send-transaction: valid', async (t) => {
   );
 });
 /* eslint-enable @typescript-eslint/naming-convention, camelcase */
+
+/* eslint-disable max-params, require-atomic-updates, @typescript-eslint/no-shadow, prefer-destructuring */
+/**
+ * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_NODE_IDS=true`): the
+ * reference is the F1g predicate (the semantics of `unspent_output(node)`)
+ * evaluated live for one node. Run the e2e suite with
+ * `CHAINGRAPH_UNSPENT_NODE_IDS=true` (the tests below pass trivially
+ * otherwise).
+ */
+const unspentNodeIdsEnabled =
+  process.env.CHAINGRAPH_UNSPENT_NODE_IDS === 'true';
+const nodeAccepts = (
+  transactionInternalId: string,
+  nodeId: number
+) => /* sql */ `
+  (EXISTS (SELECT 1 FROM block_transaction bt
+             JOIN node_block nb ON nb.node_internal_id = ${nodeId} AND nb.block_internal_id = bt.block_internal_id
+             WHERE bt.transaction_internal_id = ${transactionInternalId})
+   OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = ${transactionInternalId} AND nt.node_internal_id = ${nodeId}))`;
+/**
+ * F1g for one node (`unspent_output(node)` with the node resolved to its id).
+ */
+const nodeUnspentReferenceSql = (nodeId: number) => /* sql */ `
+  SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
+    WHERE CASE
+      WHEN EXISTS (SELECT 1 FROM input i WHERE i.outpoint_transaction_hash = o.transaction_hash
+                     AND i.outpoint_index = o.output_index AND ${nodeAccepts(
+                       'i.transaction_internal_id',
+                       nodeId
+                     )})
+      THEN false
+      ELSE EXISTS (SELECT 1 FROM transaction t WHERE t.hash = o.transaction_hash AND ${nodeAccepts(
+        't.internal_id',
+        nodeId
+      )})
+    END`;
+
+/* eslint-disable @typescript-eslint/no-magic-numbers */
+/**
+ * Hash for the explicit unspent-tracking scenario (`e7` + one distinct byte).
+ */
+const scenarioHash = (byte: string) => `e7${byte.repeat(31)}`;
+const scenarioTransaction = (
+  byte: string,
+  spends: (number | [string, number])[],
+  outputCount = 1
+): ChaingraphTransaction => ({
+  hash: scenarioHash(byte),
+  inputs: spends.map((spend) => ({
+    outpointIndex: typeof spend === 'number' ? spend : spend[1],
+    outpointTransactionHash: scenarioHash(
+      typeof spend === 'number' ? 'f0' : spend[0]
+    ),
+    sequenceNumber: 0,
+    unlockingBytecode: '51',
+  })),
+  isCoinbase: false,
+  locktime: 0,
+  outputs: Array.from({ length: outputCount }, () => ({
+    lockingBytecode: '51',
+    valueSatoshis: 1000n,
+  })),
+  sizeBytes: 60,
+  version: 2,
+});
+
+/**
+ * Drive the agent's own DB functions (as the agent calls them) through the
+ * cases the read model must follow, on top of the e2e chain state: a mined
+ * spend, a mempool spend, a dropped mempool spender, a block spender removed by a re-org
+ * and its re-acceptance via headers on another node, and a cross-node
+ * double-spend whose first spender is dropped. After each step, `check()`
+ * compares the read model with the reference.
+ */
+const runUnspentTrackingScenario = async (
+  check: (step: string, db: typeof DbModule) => Promise<void>
+) => {
+  const originalPostgresConnectionString =
+    process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+  process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+    postgresE2eConnectionStringTestDb;
+  /*
+   * A fresh module instance: an earlier test ends the shared module's pool.
+   */
+  const scenarioDbModule = '../db.js?unspent-tracking-scenario';
+  const db = (await import(scenarioDbModule)) as typeof DbModule;
+  const nodeId = async (name: string) =>
+    Number(
+      (
+        await client.query<{ id: string }>(
+          /* sql */ `SELECT internal_id AS id FROM node WHERE name = $1;`,
+          [name]
+        )
+      ).rows[0]!.id
+    );
+  const [nodeA, nodeB] = [await nodeId('node1'), await nodeId('node2')];
+  const block = (byte: string, transactions: ChaingraphTransaction[]) => ({
+    bits: 0,
+    hash: scenarioHash(byte),
+    height: 999_000,
+    merkleRoot: '00'.repeat(32),
+    nonce: 0,
+    previousBlockHash: '00'.repeat(32),
+    sizeBytes: 0,
+    timestamp: 0,
+    transactions,
+    version: 1,
+  });
+  const saveBlockFor = async (
+    blockToSave: ChaingraphBlock,
+    nodeInternalId: number
+  ) =>
+    db.saveBlock({
+      block: blockToSave,
+      nodeAcceptances: [
+        { acceptedAt: new Date(), nodeInternalId, nodeName: 'scenario' },
+      ],
+      transactionCache: new Map() as unknown as Parameters<
+        typeof db.saveBlock
+      >[0]['transactionCache'],
+    });
+  const saveMempoolTransaction = async (
+    transaction: ChaingraphTransaction,
+    nodeInternalId: number
+  ) =>
+    db.saveTransactionForNodes(transaction, [
+      { nodeInternalId, validatedAt: new Date() },
+    ]);
+  const transactionId = async (byte: string) =>
+    Number(
+      (
+        await client.query<{ id: string }>(
+          /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+          [hexToBin(scenarioHash(byte))]
+        )
+      ).rows[0]!.id
+    );
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    // fund:0 stays unspent; fund:1 is spent in the same block
+    await saveBlockFor(
+      block('b1', [
+        scenarioTransaction('f0', [], 10),
+        scenarioTransaction('a1', [1]),
+      ]),
+      nodeA
+    );
+    await check('mined spend', db);
+    /*
+     * node b also accepts block b1 (via headers); a transaction only node b
+     * accepts spends f0:9: unspent for node a only, its output for node b only
+     */
+    await db.acceptBlocksViaHeaders(
+      nodeB,
+      [{ hash: scenarioHash('b1'), height: 999_000 }],
+      new Date()
+    );
+    await check('block accepted by a second node via headers', db);
+    await saveMempoolTransaction(scenarioTransaction('e2', [9]), nodeB);
+    await check('transaction accepted by one node only', db);
+    await saveMempoolTransaction(scenarioTransaction('a2', [2]), nodeA);
+    await check('mempool spend', db);
+    await saveMempoolTransaction(scenarioTransaction('a3', [3]), nodeA);
+    await check('mempool spend before drop', db);
+    await db.archiveMempoolTransaction({
+      nodeInternalId: nodeA,
+      replacedAt: new Date(),
+      transactionInternalId: await transactionId('a3'),
+    });
+    await check('dropped mempool spender', db);
+    const staleBlock = block('b2', [scenarioTransaction('a4', [4])]);
+    await saveBlockFor(staleBlock, nodeA);
+    await check('block spend before re-org', db);
+    await db.removeStaleBlocksForNode(nodeA, [staleBlock.hash]);
+    await check('block spender removed by a re-org', db);
+    await db.acceptBlocksViaHeaders(
+      nodeB,
+      [{ hash: staleBlock.hash, height: staleBlock.height }],
+      new Date()
+    );
+    await check('stale block re-accepted via headers by another node', db);
+    await saveMempoolTransaction(scenarioTransaction('a5', [5]), nodeA);
+    await saveMempoolTransaction(scenarioTransaction('a6', [5]), nodeB);
+    await check('cross-node double-spend', db);
+    await db.archiveMempoolTransaction({
+      nodeInternalId: nodeA,
+      replacedAt: new Date(),
+      transactionInternalId: await transactionId('a5'),
+    });
+    await check('first of a cross-node double-spend dropped', db);
+    // child-before-parent across two saves: a mempool child, then its parent
+    await saveMempoolTransaction(scenarioTransaction('c1', [['b0', 0]]), nodeA);
+    await check('mempool child saved before its parent', db);
+    await saveBlockFor(
+      block('b6', [scenarioTransaction('b0', [['ff', 0]], 2)]),
+      nodeA
+    );
+    await check('parent saved after its mempool child', db);
+    // child-before-parent across two blocks
+    await saveBlockFor(
+      block('b7', [scenarioTransaction('c2', [['b1', 0]])]),
+      nodeA
+    );
+    await saveBlockFor(
+      block('b8', [scenarioTransaction('b1', [['ff', 1]], 1)]),
+      nodeA
+    );
+    await check('parent block saved after its child block', db);
+    // a later mempool-only spender must not replace a block-accepted one
+    await saveMempoolTransaction(scenarioTransaction('e1', [1]), nodeB);
+    await check('conflicting mempool spender of a mined output', db);
+    // a block-accepted spender replaces a mempool-only one
+    await saveMempoolTransaction(scenarioTransaction('a7', [6]), nodeA);
+    await saveBlockFor(block('b9', [scenarioTransaction('a8', [6])]), nodeA);
+    await check('block spender replaces a mempool spender', db);
+    // re-org replacing the spender: replacement block saved first
+    const replacedBlock = block('ba', [scenarioTransaction('91', [7])]);
+    await saveBlockFor(replacedBlock, nodeA);
+    await saveBlockFor(block('bb', [scenarioTransaction('92', [7])]), nodeA);
+    await check('competing block spender while the first is accepted', db);
+    await db.removeStaleBlocksForNode(nodeA, [replacedBlock.hash]);
+    await check('re-org replaced the spender (replacement saved first)', db);
+    // re-org replacing the spender: stale block removed first
+    const staleFirstBlock = block('bc', [scenarioTransaction('93', [8])]);
+    await saveBlockFor(staleFirstBlock, nodeA);
+    await db.removeStaleBlocksForNode(nodeA, [staleFirstBlock.hash]);
+    await saveBlockFor(block('bd', [scenarioTransaction('94', [8])]), nodeA);
+    await check('re-org replaced the spender (stale removed first)', db);
+  } finally {
+    await db.pool.end();
+    await db.unspentNodeIdsJobPool.end();
+    if (originalPostgresConnectionString === undefined) {
+      delete process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    } else {
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+        originalPostgresConnectionString;
+    }
+  }
+};
+
+/**
+ * `CHAINGRAPH_UNSPENT_TRACKING`: concurrent parent/child saves. The agent saves
+ * up to 16 blocks at once; under READ COMMITTED a child's spend statement
+ * cannot see its parent's uncommitted outputs, and the parent's resolve cannot
+ * see the child's uncommitted inputs. The post-commit pass must close that
+ * race. A chain of blocks (each spending the previous one) and mempool
+ * parent/child pairs (child save issued first) are all saved at once, with at
+ * least 16 saves in flight; the read model must then equal the F1g reference
+ * for every output they created.
+ */
+const concurrencyHash = (kind: number, group: number, index: number) =>
+  `e8${kind.toString(16).padStart(2, '0')}${group
+    .toString(16)
+    .padStart(4, '0')}${index.toString(16).padStart(4, '0')}${'00'.repeat(26)}`;
+const concurrencyTransaction = (
+  hash: string,
+  spends: [string, number][]
+): ChaingraphTransaction => ({
+  hash,
+  inputs: spends.map(([outpointTransactionHash, outpointIndex]) => ({
+    outpointIndex,
+    outpointTransactionHash,
+    sequenceNumber: 0,
+    unlockingBytecode: '51',
+  })),
+  isCoinbase: false,
+  locktime: 0,
+  outputs: [
+    { lockingBytecode: '51', valueSatoshis: 1000n },
+    { lockingBytecode: '52', valueSatoshis: 1000n },
+  ],
+  sizeBytes: 60,
+  version: 2,
+});
+
+/**
+ * The tracking job is driven from the tests (run the e2e suite with
+ * `CHAINGRAPH_UNSPENT_NODE_IDS_JOB=false`, so the spawned agents leave it
+ * alone, and a short `CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS`). After each
+ * step the query root is compared with the per-node F1g reference before the
+ * job runs (backlog correction), while it is stalled, and after it caught up,
+ * for every node and read tier; then the stored values are compared too.
+ */
+const deferredStallMaxMs = Number(
+  process.env.CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS ?? 600_000
+);
+const deferredReadTiers = ['auto', 'hash', 'probe', 'fallback'] as const;
+const deferredRows = async (sql: string, filter?: (row: string) => boolean) =>
+  (await client.query<{ outpoint: string }>(sql)).rows
+    .map((row) => row.outpoint)
+    .filter((outpoint) => filter === undefined || filter(outpoint))
+    .sort((a, b) => a.localeCompare(b));
+const deferredNodes = async () =>
+  (
+    await client.query<{ id: string; name: string }>(
+      /* sql */ `SELECT internal_id AS id, name FROM node ORDER BY internal_id;`
+    )
+  ).rows.map((row) => ({ id: Number(row.id), name: row.name }));
+const deferredSleep = async (ms: number) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+/**
+ * The query root equals the reference for every node and every read tier.
+ * Returns the number of comparisons.
+ */
+const compareDeferredQueryRoot = async (
+  t: ExecutionContext,
+  label: string,
+  filter?: (row: string) => boolean
+) => {
+  const nodes = await deferredNodes();
+  // eslint-disable-next-line functional/no-let
+  let comparisons = 0;
+  await nodes.reduce<Promise<unknown>>(
+    async (chain, node) =>
+      chain.then(async () => {
+        const expected = await deferredRows(
+          nodeUnspentReferenceSql(node.id),
+          filter
+        );
+        await deferredReadTiers.reduce<Promise<unknown>>(
+          async (tierChain, tier) =>
+            tierChain.then(async () => {
+              await client.query(
+                tier === 'auto'
+                  ? `RESET chaingraph.unspent_read_tier;`
+                  : `SET chaingraph.unspent_read_tier = '${tier}';`
+              );
+              const actual = await deferredRows(
+                /* sql */ `SELECT encode(u.transaction_hash, 'hex') || ':' || u.output_index AS outpoint
+                  FROM unspent_output_stored('${node.name}') u`,
+                filter
+              );
+              t.deepEqual(
+                actual,
+                expected,
+                `${label}: node ${node.name}, tier ${tier}`
+              );
+              comparisons += 1;
+            }),
+          Promise.resolve()
+        );
+        await client.query(`RESET chaingraph.unspent_read_tier;`);
+      }),
+    Promise.resolve()
+  );
+  return comparisons;
+};
+
+/**
+ * Stored values (rows the job has processed) equal the reference; nothing
+ * created at or after `fromTransactionId` is left unprocessed.
+ */
+const compareDeferredStored = async (
+  t: ExecutionContext,
+  label: string,
+  fromTransactionId: number,
+  filter?: (row: string) => boolean
+) => {
+  t.is(
+    Number(
+      (
+        await client.query<{ n: string }>(/* sql */ `
+        SELECT count(*) AS n FROM output o JOIN transaction t ON t.hash = o.transaction_hash
+          WHERE t.internal_id >= ${fromTransactionId} AND o.unspent_node_ids IS NULL`)
+      ).rows[0]!.n
+    ),
+    0,
+    `${label}: no unprocessed output created since tracking started`
+  );
+  const processed = new Set(
+    await deferredRows(
+      /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o WHERE o.unspent_node_ids IS NOT NULL`,
+      filter
+    )
+  );
+  const inProcessed = (rows: string[]) =>
+    rows.filter((row) => processed.has(row));
+  const nodes = await deferredNodes();
+  await nodes.reduce<Promise<unknown>>(
+    async (chain, node) =>
+      chain.then(async () => {
+        t.deepEqual(
+          inProcessed(
+            await deferredRows(/* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
+              WHERE ${node.id} = ANY (o.unspent_node_ids)`)
+          ),
+          inProcessed(await deferredRows(nodeUnspentReferenceSql(node.id))),
+          `${label}: stored node ids, node ${node.name}`
+        );
+      }),
+    Promise.resolve()
+  );
+};
+
+const deferredDbModule = async (name: string) => {
+  process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+    postgresE2eConnectionStringTestDb;
+  return (await import(`../db.js?${name}`)) as typeof DbModule;
+};
+
+/**
+ * Drain the job; while it is stalled on an input whose output is missing,
+ * check the query root, then wait for the stall limit and drain again.
+ * Returns whether it stalled.
+ */
+const drainDeferred = async (
+  t: ExecutionContext,
+  db: typeof DbModule,
+  label: string,
+  filter?: (row: string) => boolean
+) => {
+  const first = await db.drainUnspentNodeIdsJob(120_000);
+  const stalled = first.stalled;
+  if (stalled) {
+    await compareDeferredQueryRoot(t, `${label} (job stalled)`, filter);
+    await deferredSleep(deferredStallMaxMs + 100);
+    const second = await db.drainUnspentNodeIdsJob(120_000);
+    // fixtures spend outputs that never exist: the stall limit lets the job pass them
+    t.true(!second.stalled, `${label}: stall resolved`);
+  }
+  return stalled;
+};
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): deferred job and query root equal the F1g reference`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const setup = await deferredDbModule('unspent-deferred-setup');
+    // eslint-disable-next-line functional/no-let
+    let trackingStart = 0;
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      // write path: only the two release-event triggers among the tracking triggers
+      const enabledTriggers = (
+        await client.query<{ tgname: string }>(/* sql */ `
+        SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgenabled <> 'D'
+          AND (tgname LIKE 'trigger_unspent_%') ORDER BY tgname;`)
+      ).rows.map((row) => row.tgname);
+      t.deepEqual(enabledTriggers, [
+        'trigger_unspent_tracking_node_block_delete',
+        'trigger_unspent_tracking_node_transaction_delete',
+      ]);
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(/* sql */ `
+            SELECT count(*) AS n FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid
+              WHERE NOT tg.tgisinternal AND c.relname IN ('output', 'input', 'transaction', 'block_transaction')`)
+          ).rows[0]!.n
+        ),
+        0,
+        'no triggers on output, input, transaction or block_transaction'
+      );
+      // the agent creates them when its job starts (disabled in the e2e agents)
+      await setup.ensureUnspentNodeIdsIndexes();
+      const indexes = (
+        await client.query<{ indexname: string }>(
+          /* sql */ `SELECT indexname FROM pg_indexes WHERE indexname LIKE 'output_unspent_%' ORDER BY indexname;`
+        )
+      ).rows.map((row) => row.indexname);
+      const nodeCount = (await deferredNodes()).length;
+      t.is(indexes.length, nodeCount * 3, indexes.join(', '));
+      t.true(
+        indexes.includes('output_unspent_node_1_category_index') &&
+          indexes.includes('output_unspent_node_1_category_long_index') &&
+          indexes.includes('output_unspent_node_1_search_index'),
+        indexes.join(', ')
+      );
+      t.false(
+        indexes.some((name) => name.includes('null')),
+        'no NULL (unprocessed) partial index'
+      );
+      // the job starts tracking at the current tip: the e2e chain stays unprocessed (NULL)
+      await setup.drainUnspentNodeIdsJob(120_000);
+      trackingStart =
+        Number(
+          (
+            await client.query<{ w: string }>(
+              /* sql */ `SELECT min(input_transaction_internal_id) AS w FROM unspent_tracking_progress;`
+            )
+          ).rows[0]!.w
+        ) + 1;
+      await client.query('ANALYZE;');
+      await compareDeferredQueryRoot(t, 'e2e chain state');
+    } finally {
+      await setup.pool.end();
+      await setup.unspentNodeIdsJobPool.end();
+    }
+    const stalls: string[] = [];
+    // eslint-disable-next-line functional/no-let
+    let comparisons = 0;
+    await runUnspentTrackingScenario(async (step, db) => {
+      await client.query('ANALYZE;');
+      comparisons += await compareDeferredQueryRoot(t, `${step} (backlog)`);
+      if (await drainDeferred(t, db, step)) {
+        stalls.push(step);
+      }
+      comparisons += await compareDeferredQueryRoot(t, `${step} (caught up)`);
+      await compareDeferredStored(t, step, trackingStart);
+    });
+    t.log({ comparisons, stalls, trackingStart });
+    // child-before-parent: the mempool child (and the child block) stall the job until the parent is saved
+    t.true(
+      stalls.includes('mempool child saved before its parent'),
+      stalls.join('; ')
+    );
+    if (originalPostgresConnectionString !== undefined) {
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+        originalPostgresConnectionString;
+    }
+  }
+);
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): concurrent parent/child saves with the deferred job running`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    const blockCount = 24;
+    const transactionsPerBlock = 40;
+    const mempoolPairs = 24;
+    const minimumInFlight = 16;
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const db = await deferredDbModule('unspent-deferred-concurrency');
+    (db.pool as unknown as { options: { max: number } }).options.max = Math.max(
+      (db.pool as unknown as { options: { max: number } }).options.max,
+      minimumInFlight + 8
+    );
+    const nodeA = Number(
+      (
+        await client.query<{ id: string }>(
+          /* sql */ `SELECT internal_id AS id FROM node WHERE name = 'node1';`
+        )
+      ).rows[0]!.id
+    );
+    const kindByte = 0x10;
+    const blocks = Array.from({ length: blockCount }, (_, blockIndex) => ({
+      bits: 0,
+      hash: concurrencyHash(kindByte + 1, blockIndex, 0xffff),
+      height: 999_300 + blockIndex,
+      merkleRoot: '00'.repeat(32),
+      nonce: 0,
+      previousBlockHash: '00'.repeat(32),
+      sizeBytes: 0,
+      timestamp: 0,
+      transactions: Array.from(
+        { length: transactionsPerBlock },
+        (__, transactionIndex) =>
+          concurrencyTransaction(
+            concurrencyHash(kindByte + 2, blockIndex, transactionIndex),
+            blockIndex === 0
+              ? [[concurrencyHash(kindByte + 9, 0, transactionIndex), 0]]
+              : [
+                  [
+                    concurrencyHash(
+                      kindByte + 2,
+                      blockIndex - 1,
+                      transactionIndex
+                    ),
+                    0,
+                  ],
+                ]
+          )
+      ),
+      version: 1,
+    }));
+    const pairs = Array.from({ length: mempoolPairs }, (_, pairIndex) => {
+      const parent = concurrencyTransaction(
+        concurrencyHash(kindByte + 3, pairIndex, 0),
+        [[concurrencyHash(kindByte + 9, 1, pairIndex), 0]]
+      );
+      const child = concurrencyTransaction(
+        concurrencyHash(kindByte + 3, pairIndex, 1),
+        [[parent.hash, 0]]
+      );
+      return { child, parent };
+    });
+    // eslint-disable-next-line functional/no-let
+    let inFlight = 0;
+    // eslint-disable-next-line functional/no-let
+    let maxInFlight = 0;
+    // eslint-disable-next-line functional/no-let
+    let saving = true;
+    // eslint-disable-next-line functional/no-let
+    let passesDuringSaves = 0;
+    // eslint-disable-next-line functional/no-let
+    let passesWithBatches = 0;
+    const track = async <T>(work: () => Promise<T>) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        return await work();
+      } finally {
+        inFlight -= 1;
+      }
+    };
+    const jobLoop = async (): Promise<void> => {
+      if (!saving) {
+        return;
+      }
+      const pass = await db.runUnspentNodeIdsJobPass({
+        maxMs: 200,
+        settleWaitMs: 20,
+      });
+      if (pass.batches > 0) {
+        passesWithBatches += 1;
+      }
+      passesDuringSaves += 1;
+      await deferredSleep(5);
+      await jobLoop();
+    };
+    const created = new Set([
+      ...blocks.flatMap((block) =>
+        block.transactions.map((transaction) => transaction.hash)
+      ),
+      ...pairs.flatMap(({ child, parent }) => [child.hash, parent.hash]),
+    ]);
+    const createdHere = (outpoint: string) =>
+      created.has(outpoint.split(':')[0] ?? '');
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      const job = jobLoop();
+      await Promise.all([
+        ...blocks.map(async (block) =>
+          track(async () =>
+            db.saveBlock({
+              block,
+              nodeAcceptances: [
+                {
+                  acceptedAt: new Date(),
+                  nodeInternalId: nodeA,
+                  nodeName: 'concurrency',
+                },
+              ],
+              transactionCache: new Map() as unknown as Parameters<
+                typeof db.saveBlock
+              >[0]['transactionCache'],
+            })
+          )
+        ),
+        ...pairs.flatMap(({ child, parent }) => [
+          track(async () =>
+            db.saveTransactionForNodes(child, [
+              { nodeInternalId: nodeA, validatedAt: new Date() },
+            ])
+          ),
+          track(async () =>
+            db.saveTransactionForNodes(parent, [
+              { nodeInternalId: nodeA, validatedAt: new Date() },
+            ])
+          ),
+        ]),
+      ]);
+      saving = false;
+      await job;
+      t.true(maxInFlight >= minimumInFlight, `in flight: ${maxInFlight}`);
+      await client.query('ANALYZE;');
+      // before the job catches up: backlog correction
+      await compareDeferredQueryRoot(
+        t,
+        'concurrent saves (backlog)',
+        createdHere
+      );
+      const stalled = await drainDeferred(
+        t,
+        db,
+        'concurrent saves',
+        createdHere
+      );
+      await compareDeferredQueryRoot(
+        t,
+        'concurrent saves (caught up)',
+        createdHere
+      );
+      const expectedUnspent =
+        blockCount * transactionsPerBlock +
+        transactionsPerBlock +
+        3 * mempoolPairs;
+      const nodes = await deferredNodes();
+      const reference = await deferredRows(
+        nodeUnspentReferenceSql(nodeA),
+        createdHere
+      );
+      t.is(reference.length, expectedUnspent);
+      const column = `${nodeA} = ANY (o.unspent_node_ids)`;
+      const stored = await deferredRows(
+        /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o WHERE ${column}`,
+        createdHere
+      );
+      const mismatches =
+        stored.filter((row) => !reference.includes(row)).length +
+        reference.filter((row) => !stored.includes(row)).length;
+      t.is(mismatches, 0, 'stored values vs F1g after the job caught up');
+      t.log({
+        maxInFlight,
+        mismatches,
+        nodes: nodes.length,
+        passesDuringSaves,
+        passesWithBatches,
+        stalled,
+      });
+    } finally {
+      saving = false;
+      await db.pool.end();
+      await db.unspentNodeIdsJobPool.end();
+      if (originalPostgresConnectionString !== undefined) {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+  }
+);
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): query root equals the F1g reference with a backlog`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const db = await deferredDbModule('unspent-deferred-backlog');
+    const hash = (byte: string) => `e9${byte.repeat(31)}`;
+    const transaction = (
+      byte: string,
+      spends: [string, number][],
+      outputCount = 2
+    ): ChaingraphTransaction => ({
+      hash: hash(byte),
+      inputs: spends.map(([outpointTransactionHash, outpointIndex]) => ({
+        outpointIndex,
+        outpointTransactionHash,
+        sequenceNumber: 0,
+        unlockingBytecode: '51',
+      })),
+      isCoinbase: false,
+      locktime: 0,
+      outputs: Array.from({ length: outputCount }, () => ({
+        lockingBytecode: '51',
+        valueSatoshis: 1000n,
+      })),
+      sizeBytes: 60,
+      version: 2,
+    });
+    const block = (byte: string, transactions: ChaingraphTransaction[]) => ({
+      bits: 0,
+      hash: hash(byte),
+      height: 999_500,
+      merkleRoot: '00'.repeat(32),
+      nonce: 0,
+      previousBlockHash: '00'.repeat(32),
+      sizeBytes: 0,
+      timestamp: 0,
+      transactions,
+      version: 1,
+    });
+    const nodes = await deferredNodes();
+    const [nodeA, nodeB] = [nodes[0]!.id, nodes[1]!.id];
+    const saveBlockFor = async (
+      blockToSave: ChaingraphBlock,
+      nodeInternalId: number
+    ) =>
+      db.saveBlock({
+        block: blockToSave,
+        nodeAcceptances: [
+          { acceptedAt: new Date(), nodeInternalId, nodeName: 'backlog' },
+        ],
+        transactionCache: new Map() as unknown as Parameters<
+          typeof db.saveBlock
+        >[0]['transactionCache'],
+      });
+    const ours = (outpoint: string) => outpoint.startsWith('e9');
+    const transactionId = async (byte: string) =>
+      Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+            [hexToBin(hash(byte))]
+          )
+        ).rows[0]!.id
+      );
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      // a funding block, processed by the job (stored values exist)
+      await saveBlockFor(
+        block('a0', [transaction('f0', [[hash('ff'), 0]], 8)]),
+        nodeA
+      );
+      await db.acceptBlocksViaHeaders(
+        nodeB,
+        [{ hash: hash('a0'), height: 999_500 }],
+        new Date()
+      );
+      await drainDeferred(t, db, 'backlog funding');
+      await client.query('ANALYZE;');
+      await compareDeferredQueryRoot(t, 'backlog: funding processed', ours);
+      // job stopped: ingest a block spend, mempool spends, a drop, a re-org and a re-acceptance
+      await saveBlockFor(
+        block('a1', [
+          transaction('11', [[hash('f0'), 0]]),
+          transaction('12', [[hash('11'), 0]]),
+        ]),
+        nodeA
+      );
+      await db.saveTransactionForNodes(transaction('21', [[hash('f0'), 1]]), [
+        { nodeInternalId: nodeA, validatedAt: new Date() },
+      ]);
+      await db.saveTransactionForNodes(transaction('22', [[hash('f0'), 2]]), [
+        { nodeInternalId: nodeB, validatedAt: new Date() },
+      ]);
+      await db.archiveMempoolTransaction({
+        nodeInternalId: nodeB,
+        replacedAt: new Date(),
+        transactionInternalId: await transactionId('22'),
+      });
+      const stale = block('a2', [transaction('31', [[hash('f0'), 3]])]);
+      await saveBlockFor(stale, nodeA);
+      await db.removeStaleBlocksForNode(nodeA, [stale.hash]);
+      // the same spender re-accepted by node B via headers (a re-acceptance event)
+      await db.acceptBlocksViaHeaders(
+        nodeB,
+        [{ hash: stale.hash, height: 999_500 }],
+        new Date()
+      );
+      // a double-spend across nodes, then node A also accepts B's spender from its mempool (re-acceptance)
+      await db.saveTransactionForNodes(transaction('41', [[hash('f0'), 4]]), [
+        { nodeInternalId: nodeA, validatedAt: new Date() },
+      ]);
+      await db.saveTransactionForNodes(transaction('42', [[hash('f0'), 4]]), [
+        { nodeInternalId: nodeB, validatedAt: new Date() },
+      ]);
+      await db.archiveMempoolTransaction({
+        nodeInternalId: nodeA,
+        replacedAt: new Date(),
+        transactionInternalId: await transactionId('41'),
+      });
+      await db.saveTransactionForNodes(transaction('42', [[hash('f0'), 4]]), [
+        { nodeInternalId: nodeA, validatedAt: new Date() },
+      ]);
+      const events = Number(
+        (
+          await client.query<{ n: string }>(
+            `SELECT count(*) AS n FROM unspent_tracking_events;`
+          )
+        ).rows[0]!.n
+      );
+      t.true(events > 0, `unconsumed events: ${events}`);
+      await client.query('ANALYZE;');
+      await compareDeferredQueryRoot(t, 'backlog: job stopped', ours);
+      await compareDeferredQueryRoot(t, 'backlog: job stopped (whole table)');
+      await drainDeferred(t, db, 'backlog drained', ours);
+      await compareDeferredQueryRoot(t, 'backlog: job caught up', ours);
+      await compareDeferredStored(
+        t,
+        'backlog: job caught up',
+        await transactionId('f0'),
+        ours
+      );
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(
+              `SELECT count(*) AS n FROM unspent_tracking_events;`
+            )
+          ).rows[0]!.n
+        ),
+        0,
+        'events consumed'
+      );
+    } finally {
+      await db.pool.end();
+      await db.unspentNodeIdsJobPool.end();
+      if (originalPostgresConnectionString !== undefined) {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+  }
+);
+
+/* eslint-enable @typescript-eslint/no-magic-numbers */
+/* eslint-enable max-params, require-atomic-updates, @typescript-eslint/no-shadow, prefer-destructuring */
 
 /**
  * The below tests run concurrently after all serial tests have completed.

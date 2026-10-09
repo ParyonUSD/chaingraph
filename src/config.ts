@@ -48,6 +48,20 @@ const expectedOptions = [
   'CHAINGRAPH_POSTGRES_MAX_CONNECTIONS',
   'CHAINGRAPH_POSTGRES_SYNCHRONOUS_COMMIT',
   'CHAINGRAPH_TRUSTED_NODES',
+  'CHAINGRAPH_UNSPENT_NODE_IDS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL_TRANSACTIONS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_BATCH_INPUTS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_CONNECTIONS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_FALLBACK_EVENTS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_FALLBACK_TRANSACTIONS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_GRACE_MS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_HASH_MAX_TRANSACTIONS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_INTERVAL_MS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_JOB',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_PASS_MAX_MS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_START',
   'CHAINGRAPH_USER_AGENT',
   'NODE_ENV',
 ] as const;
@@ -409,6 +423,109 @@ const postgresSynchronousCommit =
  */
 const isProduction = configuration.NODE_ENV === 'production';
 
+const booleanSetting = (
+  name: (typeof expectedOptions)[number],
+  defaultValue: boolean
+) => {
+  const raw = configuration[name].toLowerCase();
+  if (raw === '') {
+    return defaultValue;
+  }
+  if (raw !== 'true' && raw !== 'false') {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `Invalid value provided in the '${name}' environment variable: ${configuration[name]}. Must be one of the following: true, false`
+    );
+  }
+  return raw === 'true';
+};
+
+const nonNegativeIntegerSetting = (
+  name: (typeof expectedOptions)[number],
+  defaultValue: number,
+  minimum = 0
+) => {
+  const raw = configuration[name];
+  if (raw === '') {
+    return defaultValue;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < minimum) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `Invalid value provided in the '${name}' environment variable: ${raw}. Must be an integer of at least ${minimum}.`
+    );
+  }
+  return value;
+};
+
+/* eslint-disable @typescript-eslint/no-magic-numbers */
+/**
+ * Stored per-node unspent set (`output.unspent_node_ids`, query root
+ * `unspent_output_stored`), maintained by a job inside the agent. Set via the
+ * `CHAINGRAPH_UNSPENT_NODE_IDS*` environment variables (see `defaults.env`).
+ */
+const unspentNodeIds = {
+  backfill: booleanSetting('CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL', false),
+  backfillTransactions: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL_TRANSACTIONS',
+    20_000,
+    1
+  ),
+  batchInputs: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_BATCH_INPUTS',
+    50_000,
+    1
+  ),
+  connections: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_CONNECTIONS',
+    4,
+    1
+  ),
+  enabled: booleanSetting('CHAINGRAPH_UNSPENT_NODE_IDS', false),
+  fallbackEvents: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_FALLBACK_EVENTS',
+    10_000
+  ),
+  fallbackTransactions: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_FALLBACK_TRANSACTIONS',
+    20_000
+  ),
+  graceMs: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_GRACE_MS',
+    200
+  ),
+  hashMaxTransactions: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_HASH_MAX_TRANSACTIONS',
+    20_000
+  ),
+  intervalMs: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_INTERVAL_MS',
+    5_000
+  ),
+  job: booleanSetting('CHAINGRAPH_UNSPENT_NODE_IDS_JOB', true),
+  passMaxMs: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_PASS_MAX_MS',
+    30_000
+  ),
+  stallMaxMs: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS',
+    600_000
+  ),
+  startAtGenesis: configuration.CHAINGRAPH_UNSPENT_NODE_IDS_START === 'genesis',
+};
+/* eslint-enable @typescript-eslint/no-magic-numbers */
+if (
+  !['', 'tip', 'genesis'].includes(
+    configuration.CHAINGRAPH_UNSPENT_NODE_IDS_START
+  )
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_UNSPENT_NODE_IDS_START' environment variable: ${configuration.CHAINGRAPH_UNSPENT_NODE_IDS_START}. Must be one of the following: tip, genesis`
+  );
+}
+
 export {
   blockBufferTargetSizeMb,
   chaingraphInternalApiPort,
@@ -426,4 +543,5 @@ export {
   postgresSynchronousCommit,
   isProduction,
   trustedNodes,
+  unspentNodeIds,
 };

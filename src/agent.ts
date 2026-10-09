@@ -36,12 +36,15 @@ import {
   mempoolTransactionExpirationScanIntervalMs,
   postgresMaxConnections,
   trustedNodes,
+  unspentNodeIds,
 } from './config.js';
 import {
   acceptBlocksViaHeaders,
   archiveMempoolTransaction,
   archiveMempoolTransactionsAcceptedByBlocks,
+  configureUnspentNodeIds,
   createIndexes,
+  ensureUnspentNodeIdsIndexes,
   getAllKnownBlockHashes,
   getIncompleteBlocks,
   getIndexCreationProgress,
@@ -54,8 +57,11 @@ import {
   reenableMempoolCleaning,
   registerTrustedNodeWithDb,
   removeStaleBlocksForNode,
+  runUnspentNodeIdsJobPass,
   saveBlock,
   saveTransactionForNodes,
+  setUnspentNodeIdsLoggers,
+  unspentNodeIdsJobPool,
 } from './db.js';
 import type { ExpiringMempoolTransaction, IncompleteBlock } from './db.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
@@ -329,6 +335,19 @@ export class Agent {
     | undefined;
 
   incompleteBlockRepairTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  /**
+   * Unspent tracking (`CHAINGRAPH_UNSPENT_NODE_IDS`): the job's next scheduled
+   * pass, the pass in flight, and whether another pass was requested while
+   * one was running.
+   */
+  unspentNodeIdsJobTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  unspentNodeIdsJobRunning: Promise<void> | undefined;
+
+  unspentNodeIdsJobRequested = false;
+
+  unspentNodeIdsJobStarted = false;
 
   mempoolTransactionExpirationScanTimeout:
     | ReturnType<typeof setTimeout>
@@ -843,6 +862,26 @@ export class Agent {
             this.logger.debug('Disabled synchronous_commit for initial sync.');
           }
         })
+        .then(async () => {
+          setUnspentNodeIdsLoggers({
+            info: (message) => {
+              this.logger.info(message);
+            },
+            warn: (message) => {
+              this.logger.warn(message);
+            },
+          });
+          return configureUnspentNodeIds();
+        })
+        .then((statements) => {
+          if (statements.length > 0) {
+            this.logger.info(
+              `Configured unspent tracking (CHAINGRAPH_UNSPENT_NODE_IDS=${String(
+                unspentNodeIds.enabled
+              )}): ${statements.join(' ')}`
+            );
+          }
+        })
         .catch((err) => {
           this.logger.error(err);
         })
@@ -935,6 +974,7 @@ export class Agent {
                       this.saveInboundTransactions = true;
                       this.scheduleIncompleteBlockRepair();
                       this.scheduleMempoolTransactionExpirationScan();
+                      this.startUnspentNodeIdsJob();
                     });
                   })
                   .catch((err) => {
@@ -1146,6 +1186,86 @@ export class Agent {
         }; an accepted block already spends the same outpoint, archived with replaced_at ${transaction.replacedAt.toISOString()}.`
       );
     });
+  }
+
+  /**
+   * Unspent tracking (`CHAINGRAPH_UNSPENT_NODE_IDS`): once the initial sync is
+   * complete and the managed indexes exist, create the per-node indexes and
+   * start the recurring job. It runs every
+   * `CHAINGRAPH_UNSPENT_NODE_IDS_INTERVAL_MS` and after each block save; one
+   * pass at a time.
+   */
+  startUnspentNodeIdsJob() {
+    if (
+      !unspentNodeIds.enabled ||
+      !unspentNodeIds.job ||
+      this.unspentNodeIdsJobStarted
+    ) {
+      return;
+    }
+    this.unspentNodeIdsJobStarted = true;
+    ensureUnspentNodeIdsIndexes()
+      .then((statements) => {
+        if (statements.length > 0) {
+          this.logger.info(
+            `Agent: created the unspent tracking indexes: ${statements.join(
+              ' '
+            )}`
+          );
+        }
+        this.logger.info(
+          `Agent: starting the unspent tracking job (${unspentNodeIds.connections} partitions), every ${unspentNodeIds.intervalMs} ms and after each block save.`
+        );
+        this.requestUnspentNodeIdsJobPass();
+      })
+      .catch((err: unknown) => {
+        this.logger.fatal(err);
+        this.shutdown().catch((shutdownErr) => {
+          this.logger.error(shutdownErr);
+        });
+      });
+  }
+
+  // eslint-disable-next-line complexity
+  requestUnspentNodeIdsJobPass(delayMs = 0) {
+    if (!this.unspentNodeIdsJobStarted || this.willShutdown) {
+      return;
+    }
+    if (this.unspentNodeIdsJobRunning !== undefined) {
+      this.unspentNodeIdsJobRequested = true;
+      return;
+    }
+    if (this.unspentNodeIdsJobTimeout !== undefined) {
+      if (delayMs > 0) {
+        return;
+      }
+      clearTimeout(this.unspentNodeIdsJobTimeout);
+    }
+    this.unspentNodeIdsJobTimeout = setTimeout(() => {
+      this.unspentNodeIdsJobTimeout = undefined;
+      this.unspentNodeIdsJobRunning = runUnspentNodeIdsJobPass()
+        .then((summary) => {
+          if (summary.busy) {
+            this.logger.debug(
+              'Agent: unspent tracking job busy (another instance holds a partition lock).'
+            );
+          }
+        })
+        .catch((err: unknown) => {
+          this.logger.error(
+            err,
+            'Agent: unspent tracking job pass failed (retried next pass).'
+          );
+        })
+        .finally(() => {
+          this.unspentNodeIdsJobRunning = undefined;
+          const again = this.unspentNodeIdsJobRequested;
+          this.unspentNodeIdsJobRequested = false;
+          this.requestUnspentNodeIdsJobPass(
+            again ? 0 : unspentNodeIds.intervalMs
+          );
+        });
+    }, delayMs);
   }
 
   canScheduleIncompleteBlockRepair() {
@@ -1798,6 +1918,7 @@ export class Agent {
         transactionCache: this.transactionCache,
       });
     this.blockDb?.add(block.hash);
+    this.requestUnspentNodeIdsJobPass();
     const completionTime = Date.now();
 
     const durationMs = completionTime - startTime;
@@ -2226,6 +2347,9 @@ export class Agent {
     if (this.mempoolTransactionExpirationScanTimeout !== undefined) {
       clearTimeout(this.mempoolTransactionExpirationScanTimeout);
     }
+    if (this.unspentNodeIdsJobTimeout !== undefined) {
+      clearTimeout(this.unspentNodeIdsJobTimeout);
+    }
     this.mempoolTransactionExpirationTimers.forEach((timeout) => {
       clearTimeout(timeout);
     });
@@ -2235,6 +2359,8 @@ export class Agent {
     });
     this.shutdownPromise = this.blockBuffer
       .drain()
+      .then(async () => this.unspentNodeIdsJobRunning)
+      .then(async () => unspentNodeIdsJobPool.end())
       .then(async () => {
         this.logger.debug('Block buffer drained, stopping PG pool...');
         return pool.end();

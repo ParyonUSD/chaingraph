@@ -6,10 +6,41 @@ import {
   computeIndexCreationProgress,
   indexDefinitions,
 } from './components/db-utils.js';
+import type {
+  BatchResult,
+  SettleCandidate,
+  StallState,
+} from './components/unspent-node-ids.js';
+import {
+  backfillBatchSql,
+  batchDidWork,
+  batchReachedLimits,
+  blockReacceptedEventsSql,
+  buildRootSql,
+  configureTrackingTriggersSql,
+  deleteConsumedEventsSql,
+  formatBatchLog,
+  headersAcceptedEventsSql,
+  initializeSql,
+  nextSkipThrough,
+  nextStallState,
+  nextTransactionIdSql,
+  nodeIndexDefinitions,
+  parseBatchResult,
+  progressSql,
+  readSequencesSql,
+  repartitionSql,
+  runBatchSql,
+  snapshotSettledSql,
+  trackingTriggerNames,
+  transactionReacceptedEventsSql,
+  writeSettingsSql,
+} from './components/unspent-node-ids.js';
 import {
   postgresConnectionString,
   postgresMaxConnections,
   postgresSynchronousCommit,
+  unspentNodeIds,
 } from './config.js';
 import type {
   ChaingraphBlock,
@@ -19,6 +50,16 @@ import type {
 export const pool = new pg.Pool({
   connectionString: postgresConnectionString,
   max: postgresMaxConnections,
+});
+
+/**
+ * Unspent tracking job: its own connections (one per partition, plus one for
+ * settling and bookkeeping), outside the agent's pool (block saves can hold
+ * every pooled connection for minutes during a sync).
+ */
+export const unspentNodeIdsJobPool = new pg.Pool({
+  connectionString: postgresConnectionString,
+  max: unspentNodeIds.connections + 1,
 });
 
 /**
@@ -527,6 +568,7 @@ export const registerTrustedNodeWithDb = async (node: {
  * `input` insertions will be skipped, and only the new `node_transaction`s will
  * be written.
  */
+// eslint-disable-next-line complexity
 export const saveTransactionForNodes = async (
   transaction: ChaingraphTransaction,
   nodeValidations: {
@@ -610,7 +652,9 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
   // eslint-disable-next-line functional/no-try-statement
   try {
     await client.query('BEGIN;');
-    await client.query(saveTransaction);
+    const savedTransactionResult = await client.query<{ count: string }>(
+      saveTransaction
+    );
     const transactionInternalIdResult = await client.query<{
       internalId: string;
     }>(
@@ -626,6 +670,19 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
       );
     }
     await client.query(saveNodeValidations, [transactionInternalId]);
+    if (
+      unspentNodeIds.enabled &&
+      Number(savedTransactionResult.rows[0]?.count ?? 0) === 0
+    ) {
+      /*
+       * Unspent tracking: the transaction already existed (its outputs may be
+       * processed already), so its new acceptances are recorded as events.
+       */
+      await client.query(transactionReacceptedEventsSql, [
+        transactionInternalId,
+        nodeValidations.map((validation) => validation.nodeInternalId),
+      ]);
+    }
     await client.query('COMMIT;');
   } catch (err) {
     await client.query('ROLLBACK;');
@@ -640,6 +697,7 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
  * Immediately mark a node as having validated a transaction already known to
  * exist in the database.
  */
+// eslint-disable-next-line complexity
 export const recordNodeValidation = async (
   transactionHash: string,
   validation: {
@@ -653,6 +711,9 @@ export const recordNodeValidation = async (
    */
   // eslint-disable-next-line functional/no-try-statement
   try {
+    if (unspentNodeIds.enabled) {
+      await client.query('BEGIN;');
+    }
     await client.query(/* sql */ `
     WITH node_transaction_values (node_internal_id, validated_at) AS (
       VALUES (
@@ -670,6 +731,26 @@ export const recordNodeValidation = async (
         CROSS JOIN known_transaction
       ON CONFLICT ON CONSTRAINT "node_transaction_pkey" DO NOTHING;
   `);
+    if (unspentNodeIds.enabled) {
+      // unspent tracking: a known transaction gains an acceptance
+      const known = await client.query<{ internalId: string }>(
+        /* sql */ `SELECT internal_id AS "internalId" FROM transaction WHERE hash = $1;`,
+        [Buffer.from(transactionHash, 'hex')]
+      );
+      if (known.rows[0] !== undefined) {
+        await client.query(transactionReacceptedEventsSql, [
+          known.rows[0].internalId,
+          [validation.nodeInternalId],
+        ]);
+      }
+      await client.query('COMMIT;');
+    }
+  } catch (err) {
+    if (unspentNodeIds.enabled) {
+      await client.query('ROLLBACK;');
+    }
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
   } finally {
     client.release();
   }
@@ -684,6 +765,7 @@ export const recordNodeValidation = async (
  * inserted data is of type `number`, `boolean`, or `Uint8Array`, we assume SQL
  * injections are not a concern.)
  */
+// eslint-disable-next-line complexity
 export const saveBlock = async ({
   block,
   nodeAcceptances,
@@ -908,6 +990,21 @@ SELECT
     const joinedTransactionCount = Number(
       addBlockResult.rows[0]!.joinedTransactionCount
     );
+    if (
+      unspentNodeIds.enabled &&
+      Number(addBlockResult.rows[0]!.insertedNodeBlockCount) > 0
+    ) {
+      /*
+       * Unspent tracking: node_block rows added to a block that already
+       * existed (its id may be below the job's block watermark) are recorded
+       * as events. New blocks need none: the job takes every block above its
+       * watermark.
+       */
+      await client.query(blockReacceptedEventsSql, [
+        Buffer.from(block.hash, 'hex'),
+        nodeAcceptances.map((acceptance) => acceptance.nodeInternalId),
+      ]);
+    }
     const linkedBlockTransactionCount = Number(
       (
         await client.query<{ count: string }>(
@@ -982,11 +1079,21 @@ export const acceptBlocksViaHeaders = async (
       )} END
       FROM matching_blocks blk CROSS JOIN (VALUES (${nodeInternalId}::bigint)) n(id)
       ON CONFLICT DO NOTHING
+      RETURNING block_internal_id AS "blockInternalId"
   `;
   const client = await pool.connect();
-  const nodeBlockInsertResult = await client.query(insertNodeBlocks);
-  client.release();
-  return nodeBlockInsertResult.rowCount;
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    // unspent tracking: the inserted node_block rows are re-acceptances
+    const nodeBlockInsertResult = await client.query(
+      unspentNodeIds.enabled
+        ? headersAcceptedEventsSql(nodeInternalId, insertNodeBlocks)
+        : insertNodeBlocks
+    );
+    return nodeBlockInsertResult.rowCount;
+  } finally {
+    client.release();
+  }
 };
 
 /**
@@ -1144,3 +1251,586 @@ JOIN pg_stat_activity a ON p.pid = a.pid;
   client.release();
   return computeIndexCreationProgress(res.rows);
 };
+
+/* eslint-disable complexity, max-params, @typescript-eslint/no-magic-numbers, require-atomic-updates, @typescript-eslint/init-declarations */
+/*
+ * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_NODE_IDS`): configuration,
+ * per-node indexes and the tracking job. See migration
+ * `1791500000000_unspent_node_ids`.
+ */
+
+const unspentTrackingLog: {
+  info: (message: string) => void;
+  warn: (message: string) => void;
+} = {
+  info: () => undefined,
+  warn: () => undefined,
+};
+export const setUnspentNodeIdsLoggers = (
+  loggers: typeof unspentTrackingLog
+) => {
+  unspentTrackingLog.info = loggers.info;
+  unspentTrackingLog.warn = loggers.warn;
+};
+
+const runStatements = async (client: pg.PoolClient, statements: string[]) =>
+  statements.reduce<Promise<unknown>>(
+    async (chain, statement) => chain.then(async () => client.query(statement)),
+    Promise.resolve()
+  );
+
+/**
+ * Enable the release-event triggers when tracking is on (disable them when
+ * off), write the read thresholds and rebuild the query root for the
+ * registered nodes. Returns the statements run (none if the migration is
+ * missing and tracking is off).
+ */
+export const configureUnspentNodeIds = async () => {
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const existing = Object.fromEntries(
+      (
+        await client.query<{ enabled: boolean; tgname: string }>(
+          // cspell:ignore tgname tgenabled
+          /* sql */ `SELECT tgname, tgenabled <> 'D' AS enabled FROM pg_trigger WHERE tgname = ANY ($1::text[]);`,
+          [trackingTriggerNames]
+        )
+      ).rows.map((row) => [row.tgname, row.enabled])
+    );
+    if (Object.keys(existing).length === 0) {
+      if (unspentNodeIds.enabled) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw new Error(
+          'CHAINGRAPH_UNSPENT_NODE_IDS=true requires migration 1791500000000_unspent_node_ids.'
+        );
+      }
+      return [];
+    }
+    const statements = configureTrackingTriggersSql(
+      unspentNodeIds.enabled,
+      existing
+    );
+    await runStatements(client, statements);
+    if (!unspentNodeIds.enabled) {
+      return statements;
+    }
+    await client.query(writeSettingsSql, [
+      unspentNodeIds.hashMaxTransactions,
+      unspentNodeIds.fallbackTransactions,
+      unspentNodeIds.fallbackEvents,
+    ]);
+    await client.query(buildRootSql);
+    return [...statements, writeSettingsSql, buildRootSql];
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Create the per-node partial indexes that are missing (after the initial
+ * sync and the managed indexes, so the initial sync does not maintain them),
+ * then rebuild the query root for the registered nodes. Returns the
+ * statements run.
+ */
+export const ensureUnspentNodeIdsIndexes = async () => {
+  if (!unspentNodeIds.enabled) {
+    return [];
+  }
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const existingIndexes = (
+      await client.query<{ name: string }>(
+        /* sql */ `SELECT indexname AS name FROM pg_indexes WHERE schemaname = 'public';`
+      )
+    ).rows.map((row) => row.name);
+    const nodeIds = (
+      await client.query<{ id: string }>(
+        /* sql */ `SELECT internal_id AS id FROM node ORDER BY internal_id;`
+      )
+    ).rows.map((row) => Number(row.id));
+    const statements = nodeIds.flatMap((id) =>
+      Object.entries(nodeIndexDefinitions(id))
+        .filter(([name]) => !existingIndexes.includes(name))
+        .map(([, definition]) => definition)
+    );
+    await runStatements(client, statements);
+    await client.query(buildRootSql);
+    return statements;
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Sequence values whose allocating transactions have all finished (see
+ * `readSequencesSql`), and the candidate being settled.
+ */
+// eslint-disable-next-line functional/no-let
+let settledLimits: { blockLimit: number; transactionLimit: number } | undefined;
+// eslint-disable-next-line functional/no-let
+let settleCandidate: SettleCandidate | undefined;
+const partitionStalls = new Map<number, StallState | undefined>();
+const partitionSkipThrough = new Map<number, number>();
+// eslint-disable-next-line functional/no-let
+let passInFlight: Promise<UnspentNodeIdsPassSummary> | undefined;
+
+export interface UnspentNodeIdsPassSummary {
+  backfillBatches: number;
+  backfillChanged: number;
+  batches: number;
+  busy: boolean;
+  caughtUp: boolean;
+  changed: number;
+  inputs: number;
+  lastBatches: (BatchResult | undefined)[];
+  ms: number;
+  partitions: number;
+  stalled: boolean;
+}
+
+const settlePollMs = 25;
+const sleep = async (ms: number) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+/**
+ * Advance `settledLimits`: read the sequences (new candidate), wait the grace,
+ * take the next xid, then poll until every xid up to it has finished or
+ * `waitMs` elapsed (the candidate is kept for the next call).
+ */
+const settleLimits = async (client: pg.PoolClient, waitMs: number) => {
+  const start = Date.now();
+  if (settleCandidate === undefined) {
+    const row = (
+      await client.query<{ blockLimit: string; transactionLimit: string }>(
+        readSequencesSql
+      )
+    ).rows[0]!;
+    settleCandidate = {
+      blockLimit: Number(row.blockLimit),
+      readAt: Date.now(),
+      transactionLimit: Number(row.transactionLimit),
+    };
+  }
+  const candidate = settleCandidate;
+  if (candidate.nextXid === undefined) {
+    const graceLeft = unspentNodeIds.graceMs - (Date.now() - candidate.readAt);
+    if (graceLeft > 0) {
+      await sleep(graceLeft);
+    }
+    candidate.nextXid = (
+      await client.query<{ nextXid: string }>(nextTransactionIdSql)
+    ).rows[0]!.nextXid;
+  }
+  const poll = async (): Promise<boolean> => {
+    const settled =
+      (
+        await client.query<{ settled: boolean }>(snapshotSettledSql, [
+          candidate.nextXid,
+        ])
+      ).rows[0]?.settled === true;
+    if (settled || Date.now() - start >= waitMs) {
+      return settled;
+    }
+    await sleep(settlePollMs);
+    return poll();
+  };
+  if (await poll()) {
+    settledLimits = {
+      blockLimit: candidate.blockLimit,
+      transactionLimit: candidate.transactionLimit,
+    };
+    settleCandidate = undefined;
+    return true;
+  }
+  return false;
+};
+
+const serializationFailure = '40001';
+const isSerializationFailure = (err: unknown) =>
+  (err as { code?: string } | undefined)?.code === serializationFailure;
+
+/**
+ * One batch of one partition in its own REPEATABLE READ transaction (one
+ * snapshot for every step; the stored values and the partition's watermarks
+ * commit together). A serialization failure (a concurrent event or watch
+ * recompute of the same row by another agent's job) is retried next loop.
+ */
+const runPartitionBatch = async (
+  client: pg.PoolClient,
+  partition: number,
+  partitionCount: number,
+  limits: { blockLimit: number; transactionLimit: number },
+  checkWatch: boolean
+) => {
+  const maxBlocks = 200;
+  const maxEvents = 20_000;
+  const skipThrough = nextSkipThrough(
+    partitionSkipThrough.get(partition) ?? 0,
+    partitionStalls.get(partition),
+    Date.now(),
+    unspentNodeIds.stallMaxMs,
+    limits.transactionLimit
+  );
+  partitionSkipThrough.set(partition, skipThrough);
+  await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ;');
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const raw = (
+      await client.query<{ result: { [key: string]: unknown } }>(runBatchSql, [
+        partition,
+        partitionCount,
+        limits.transactionLimit,
+        limits.blockLimit,
+        Math.max(unspentNodeIds.batchInputs * partitionCount, 1),
+        maxBlocks,
+        maxEvents,
+        skipThrough,
+        checkWatch,
+      ])
+    ).rows[0]!.result;
+    await client.query('COMMIT;');
+    const result = parseBatchResult(raw);
+    partitionStalls.set(
+      partition,
+      nextStallState(
+        partitionStalls.get(partition),
+        result.stalledAt,
+        Date.now()
+      )
+    );
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    if (isSerializationFailure(err)) {
+      return undefined;
+    }
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
+  }
+};
+
+const runBackfillBatch = async (
+  client: pg.PoolClient,
+  partition: number,
+  partitionCount: number
+) => {
+  await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ;');
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const raw = (
+      await client.query<{ result: { [key: string]: unknown } }>(
+        backfillBatchSql,
+        [partition, partitionCount, unspentNodeIds.backfillTransactions]
+      )
+    ).rows[0]!.result;
+    await client.query('COMMIT;');
+    return raw;
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    if (isSerializationFailure(err)) {
+      return undefined;
+    }
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
+  }
+};
+
+/**
+ * Start tracking if it has not started (at the settled limits, or at genesis),
+ * and re-partition if the configured connection count changed.
+ */
+const ensureInitialized = async (
+  client: pg.PoolClient,
+  partitionCount: number,
+  limits: { blockLimit: number; transactionLimit: number }
+) => {
+  const initialized =
+    (
+      await client.query<{ initialized: boolean }>(initializeSql, [
+        partitionCount,
+        unspentNodeIds.startAtGenesis ? 0 : limits.transactionLimit,
+        unspentNodeIds.startAtGenesis ? 0 : limits.blockLimit,
+      ])
+    ).rows[0]?.initialized === true;
+  if (initialized) {
+    unspentTrackingLog.info(
+      `Unspent tracking job: tracking started at ${
+        unspentNodeIds.startAtGenesis
+          ? 'genesis'
+          : `transaction ${limits.transactionLimit} / block ${limits.blockLimit}; earlier outputs stay unprocessed (NULL) until backfilled`
+      } (${partitionCount} partitions).`
+    );
+    return;
+  }
+  const repartitioned =
+    (
+      await client.query<{ repartitioned: boolean }>(repartitionSql, [
+        partitionCount,
+      ])
+    ).rows[0]?.repartitioned === true;
+  if (repartitioned) {
+    partitionStalls.clear();
+    partitionSkipThrough.clear();
+    unspentTrackingLog.info(
+      `Unspent tracking job: re-partitioned into ${partitionCount} partitions (every partition restarts from the lowest watermark).`
+    );
+  }
+};
+
+/**
+ * One pass of the tracking job: settle new limits, then run every partition
+ * on its own connection, in parallel, until it reaches the settled limits
+ * (and nothing else is pending) or `maxMs` elapsed; then delete the events
+ * every partition has consumed and, if enabled and caught up, backfill.
+ * Concurrent callers share the pass in flight.
+ */
+export const runUnspentNodeIdsJobPass = async (
+  options: { backfill?: boolean; maxMs?: number; settleWaitMs?: number } = {}
+): Promise<UnspentNodeIdsPassSummary> => {
+  if (passInFlight !== undefined) {
+    return passInFlight;
+  }
+  const partitionCount = unspentNodeIds.connections;
+  const start = Date.now();
+  const maxMs = options.maxMs ?? unspentNodeIds.passMaxMs;
+  const pass = async (): Promise<UnspentNodeIdsPassSummary> => {
+    const summary: UnspentNodeIdsPassSummary = {
+      backfillBatches: 0,
+      backfillChanged: 0,
+      batches: 0,
+      busy: false,
+      caughtUp: false,
+      changed: 0,
+      inputs: 0,
+      lastBatches: [],
+      ms: 0,
+      partitions: partitionCount,
+      stalled: false,
+    };
+    if (!unspentNodeIds.enabled) {
+      return summary;
+    }
+    const coordinator = await unspentNodeIdsJobPool.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await settleLimits(
+        coordinator,
+        options.settleWaitMs ?? Math.max(unspentNodeIds.graceMs * 5, 1_000)
+      );
+      const limits = settledLimits;
+      if (limits === undefined) {
+        return summary;
+      }
+      await ensureInitialized(coordinator, partitionCount, limits);
+      const partitionResults = await Promise.all(
+        Array.from({ length: partitionCount }, async (_, partition) => {
+          const client = await unspentNodeIdsJobPool.connect();
+          const state = {
+            batches: 0,
+            caughtUp: false,
+            changed: 0,
+            inputs: 0,
+            last: undefined as BatchResult | undefined,
+            stopped: false,
+          };
+          // eslint-disable-next-line functional/no-try-statement
+          try {
+            const loop = async (): Promise<void> => {
+              const batchStart = Date.now();
+              // the watch set is re-checked once per pass (first batch)
+              const result = await runPartitionBatch(
+                client,
+                partition,
+                partitionCount,
+                limits,
+                state.batches === 0
+              );
+              state.batches += 1;
+              if (result === undefined) {
+                // serialization failure: retried
+                return Date.now() - start >= maxMs ? undefined : loop();
+              }
+              state.last = result;
+              if (
+                result.busy === true ||
+                result.uninitialized === true ||
+                result.repartition === true
+              ) {
+                state.stopped = true;
+                return undefined;
+              }
+              state.inputs += result.inputs;
+              state.changed += result.changed;
+              const worked = batchDidWork(result);
+              if (worked || result.stalledAt !== null) {
+                unspentTrackingLog.info(
+                  formatBatchLog(
+                    partition,
+                    partitionCount,
+                    result,
+                    Date.now() - batchStart
+                  )
+                );
+              }
+              const reached = batchReachedLimits(result, limits);
+              if (!worked || (reached && result.events === 0)) {
+                state.caughtUp = reached;
+                return undefined;
+              }
+              if (Date.now() - start >= maxMs) {
+                return undefined;
+              }
+              return loop();
+            };
+            await loop();
+            return state;
+          } finally {
+            client.release();
+          }
+        })
+      );
+      summary.batches = partitionResults.reduce((sum, p) => sum + p.batches, 0);
+      summary.inputs = partitionResults.reduce((sum, p) => sum + p.inputs, 0);
+      summary.changed = partitionResults.reduce((sum, p) => sum + p.changed, 0);
+      summary.lastBatches = partitionResults.map((p) => p.last);
+      summary.busy = partitionResults.some((p) => p.last?.busy === true);
+      summary.caughtUp = partitionResults.every((p) => p.caughtUp);
+      summary.stalled = partitionResults.some(
+        (p) => p.last?.stalledAt !== null && p.last?.stalledAt !== undefined
+      );
+      await coordinator.query(deleteConsumedEventsSql);
+      if (
+        (options.backfill ?? unspentNodeIds.backfill) &&
+        summary.caughtUp &&
+        Date.now() - start < maxMs
+      ) {
+        const backfillResults = await Promise.all(
+          Array.from({ length: partitionCount }, async (_, partition) => {
+            const client = await unspentNodeIdsJobPool.connect();
+            const state = { batches: 0, changed: 0 };
+            // eslint-disable-next-line functional/no-try-statement
+            try {
+              const loop = async (): Promise<void> => {
+                const raw = await runBackfillBatch(
+                  client,
+                  partition,
+                  partitionCount
+                );
+                state.batches += 1;
+                if (raw !== undefined) {
+                  state.changed += Number(raw.changed ?? 0);
+                  if (
+                    raw.done === true ||
+                    raw.busy === true ||
+                    raw.uninitialized === true ||
+                    raw.repartition === true
+                  ) {
+                    return undefined;
+                  }
+                }
+                return Date.now() - start >= maxMs ? undefined : loop();
+              };
+              await loop();
+              return state;
+            } finally {
+              client.release();
+            }
+          })
+        );
+        summary.backfillBatches = backfillResults.reduce(
+          (sum, p) => sum + p.batches,
+          0
+        );
+        summary.backfillChanged = backfillResults.reduce(
+          (sum, p) => sum + p.changed,
+          0
+        );
+        await coordinator.query(deleteConsumedEventsSql);
+      }
+      return summary;
+    } finally {
+      summary.ms = Date.now() - start;
+      coordinator.release();
+    }
+  };
+  passInFlight = pass().finally(() => {
+    passInFlight = undefined;
+  });
+  return passInFlight;
+};
+
+/**
+ * Run passes until the job has processed everything committed before this
+ * call (tests, measurements): the settled limits reach the sequence values
+ * read now and every partition's last batch found nothing left (a stalled
+ * partition counts as done once its stall persists).
+ */
+export const drainUnspentNodeIdsJob = async (timeoutMs = 120_000) => {
+  const client = await unspentNodeIdsJobPool.connect();
+  const target = await client
+    .query<{ blockLimit: string; transactionLimit: string }>(readSequencesSql)
+    .then((result) => result.rows[0]!)
+    .finally(() => {
+      client.release();
+    });
+  const start = Date.now();
+  const attempt = async (): Promise<UnspentNodeIdsPassSummary> => {
+    const summary = await runUnspentNodeIdsJobPass({
+      maxMs: timeoutMs,
+      settleWaitMs: 2_000,
+    });
+    const limits = settledLimits;
+    const done =
+      !unspentNodeIds.enabled ||
+      (limits !== undefined &&
+        limits.transactionLimit >= Number(target.transactionLimit) &&
+        limits.blockLimit >= Number(target.blockLimit) &&
+        summary.lastBatches.length === summary.partitions &&
+        summary.lastBatches.every(
+          (last) =>
+            last !== undefined &&
+            !batchDidWork(last) &&
+            (last.inputWatermark >= limits.transactionLimit ||
+              last.stalledAt !== null)
+        ));
+    if (done) {
+      return summary;
+    }
+    if (Date.now() - start > timeoutMs) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        `Unspent tracking job did not drain within ${timeoutMs} ms (last batches: ${JSON.stringify(
+          summary.lastBatches
+        )}).`
+      );
+    }
+    return attempt();
+  };
+  return attempt();
+};
+
+/**
+ * The job's watermarks and backlog (logs, metrics, tests).
+ */
+export const getUnspentNodeIdsStatus = async () => {
+  if (!unspentNodeIds.enabled) {
+    return undefined;
+  }
+  const client = await unspentNodeIdsJobPool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const [progress] = (
+      await client.query<{ [key: string]: boolean | string | null }>(
+        progressSql
+      )
+    ).rows;
+    return progress;
+  } finally {
+    client.release();
+  }
+};
+/* eslint-enable complexity, max-params, @typescript-eslint/no-magic-numbers, require-atomic-updates, @typescript-eslint/init-declarations */
