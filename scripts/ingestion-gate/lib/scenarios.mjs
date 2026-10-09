@@ -8,6 +8,8 @@
  * Throughput is always `block_transaction rows for the measured blocks / wall
  * clock`, never the agent's own "active seconds" statistics.
  */
+import { readFileSync } from 'node:fs';
+
 import { AgentProcess } from './agent.mjs';
 import { assembleBlock, doubleSha256, generateTransactionPayload, loadOrGenerateBlockSequence } from './fixtures.mjs';
 import { genesisBlockRaw, genesisFromRaw, makeBlock, MockNode, testnetGenesisBlockRaw } from './mock-node.mjs';
@@ -151,6 +153,128 @@ const measureIngestion = async ({ environment, node, blocks, announce, timeoutMs
   };
 };
 
+
+/**
+ * `CHAINGRAPH_UNSPENT_TRACKING` (experiment): compare the stored read model
+ * with the F1g predicate on every output created after `watermark` (a
+ * transaction internal_id taken once the agent reached steady state, so the
+ * unaudited base chain is excluded). marker/settable track spends across all
+ * nodes; bitmask is compared per node, creator acceptance included. Returns
+ * mismatch counts in both directions (all 0 when correct; `null` in `off`).
+ */
+const unspentTrackingMode = process.env.CHAINGRAPH_UNSPENT_TRACKING ?? 'off';
+const unspentReadModelCheck = async (client, watermark) => {
+  if (unspentTrackingMode === 'off') return null;
+  await client.query('ANALYZE output; ANALYZE input; ANALYZE transaction; ANALYZE block_transaction;');
+  const acceptedAnyNode = `(SELECT bt.transaction_internal_id AS id FROM block_transaction bt JOIN node_block nb ON nb.block_internal_id = bt.block_internal_id
+                            UNION SELECT transaction_internal_id FROM node_transaction)`;
+  if (unspentTrackingMode === 'bitmask') {
+    const nodes = (await client.query('SELECT internal_id::int AS id FROM node ORDER BY internal_id')).rows.map((row) => row.id);
+    const perNode = {};
+    for (const node of nodes) {
+      const acceptedByNode = `(SELECT bt.transaction_internal_id AS id FROM block_transaction bt JOIN node_block nb ON nb.block_internal_id = bt.block_internal_id AND nb.node_internal_id = ${node}
+                               UNION SELECT transaction_internal_id FROM node_transaction WHERE node_internal_id = ${node})`;
+      const row = (
+        await client.query(`
+          WITH acc AS MATERIALIZED ${acceptedByNode},
+          spent AS (SELECT DISTINCT i.outpoint_transaction_hash AS h, i.outpoint_index AS i FROM input i JOIN acc ON acc.id = i.transaction_internal_id),
+          d AS (SELECT o.transaction_hash AS h, o.output_index AS i, (o.unspent_node_bits & (1::bigint << ${node})) <> 0 AS stored,
+                       (t.internal_id IN (SELECT id FROM acc)) AS created
+                  FROM output o JOIN transaction t ON t.hash = o.transaction_hash
+                  WHERE t.internal_id > $1 AND o.unspent_node_bits IS NOT NULL)
+          SELECT count(*)::int AS outputs,
+                 count(*) FILTER (WHERE d.stored AND NOT (d.created AND s.h IS NULL))::int AS stored_unspent_wrong,
+                 count(*) FILTER (WHERE NOT d.stored AND d.created AND s.h IS NULL)::int AS stored_spent_wrong
+            FROM d LEFT JOIN spent s ON s.h = d.h AND s.i = d.i`,
+          [watermark]
+        )
+      ).rows[0];
+      perNode[node] = row;
+    }
+    const values = Object.values(perNode);
+    return {
+      mode: unspentTrackingMode,
+      outputs: Math.max(0, ...values.map((value) => value.outputs)),
+      perNode,
+      storedSpentButUnspent: values.reduce((total, value) => total + value.stored_spent_wrong, 0),
+      storedUnspentButSpent: values.reduce((total, value) => total + value.stored_unspent_wrong, 0),
+    };
+  }
+  const stored =
+    unspentTrackingMode === 'marker'
+      ? { domain: 'o.spent_by_transaction_internal_id IS NOT NULL', unspent: 'o.spent_by_transaction_internal_id = 0' }
+      : { domain: 'true', unspent: 'EXISTS (SELECT 1 FROM unspent_output_set u WHERE u.transaction_hash = o.transaction_hash AND u.output_index = o.output_index)' };
+  const row = (
+    await client.query(
+      `WITH acc AS MATERIALIZED ${acceptedAnyNode},
+       spent AS (SELECT DISTINCT i.outpoint_transaction_hash AS h, i.outpoint_index AS i FROM input i JOIN acc ON acc.id = i.transaction_internal_id),
+       d AS (SELECT o.transaction_hash AS h, o.output_index AS i, ${stored.unspent} AS stored_unspent
+               FROM output o JOIN transaction t ON t.hash = o.transaction_hash
+               WHERE t.internal_id > $1 AND ${stored.domain})
+       SELECT count(*)::int AS outputs,
+              count(*) FILTER (WHERE d.stored_unspent AND s.h IS NOT NULL)::int AS stored_unspent_but_spent,
+              count(*) FILTER (WHERE NOT d.stored_unspent AND s.h IS NULL)::int AS stored_spent_but_unspent
+         FROM d LEFT JOIN spent s ON s.h = d.h AND s.i = d.i`,
+      [watermark]
+    )
+  ).rows[0];
+  return {
+    mode: unspentTrackingMode,
+    outputs: row.outputs,
+    storedSpentButUnspent: row.stored_spent_but_unspent,
+    storedUnspentButSpent: row.stored_unspent_but_spent,
+  };
+};
+const transactionWatermark = async (client) =>
+  Number((await client.query('SELECT COALESCE(max(internal_id), 0)::bigint AS id FROM transaction')).rows[0].id);
+const readModelCorrect = (check) => check === null || (check.storedSpentButUnspent === 0 && check.storedUnspentButSpent === 0);
+
+/**
+ * Per-block tracking timings from the agent's log ("Inserting block … |
+ * unspent tracking (…): mark X ms, resolve Y ms, post-commit Z ms (fixed A
+ * new-output, B spent-output rows …)"), summed over the blocks logged after
+ * `sinceMs`.
+ */
+/** The agent's log is buffered: stop the agent first, then read it. */
+const trackingTimingsAfterStop = async (agent, sinceMs, minHeight = 0) => {
+  await agent.stop();
+  return trackingTimingsFromLog(agent, sinceMs, minHeight);
+};
+const trackingTimingsFromLog = (agent, sinceMs, minHeight = 0) => {
+  const pattern = /mark (\d+) ms, resolve (\d+) ms(?:, post-commit (\d+) ms \(fixed (\d+) new-output, (\d+) spent-output rows(?:; (\d+) failed)?)?/u;
+  const totals = { blocks: 0, failedAttempts: 0, markMs: 0, maxPostCommitMs: 0, postCommitMs: 0, postCommitNewOutputsFixed: 0, postCommitSpentOutputsFixed: 0, resolveMs: 0 };
+  let text = '';
+  try {
+    text = readFileSync(agent.logPath, 'utf8');
+  } catch {
+    return totals;
+  }
+  text.split('\n').forEach((line) => {
+    if (!line.includes('Inserting block')) return;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (entry.time < sinceMs) return;
+    if (Number(/Inserting block (\d+)/u.exec(entry.msg ?? '')?.[1] ?? 0) < minHeight) return;
+    const match = pattern.exec(entry.msg ?? '');
+    if (!match) return;
+    totals.blocks += 1;
+    totals.markMs += Number(match[1]);
+    totals.resolveMs += Number(match[2]);
+    if (match[3] !== undefined) {
+      totals.postCommitMs += Number(match[3]);
+      totals.maxPostCommitMs = Math.max(totals.maxPostCommitMs, Number(match[3]));
+      totals.postCommitNewOutputsFixed += Number(match[4]);
+      totals.postCommitSpentOutputsFixed += Number(match[5]);
+      totals.failedAttempts += Number(match[6] ?? 0);
+    }
+  });
+  return totals;
+};
+
 export const maxBlockScenario = async (context) => {
   const [payload] = loadOrGenerateBlockSequence({
     blockCount: 1,
@@ -164,10 +288,15 @@ export const maxBlockScenario = async (context) => {
   const environment = await startEnvironment(context, 'max-block', [spec]);
   try {
     const [node] = environment.nodes;
+    const watermark = await transactionWatermark(environment.client);
     const blocks = linkBlocks([payload], node.tip().hash);
     context.log(`max-block: announcing ${(blocks[0].raw.length / 1e6).toFixed(2)} MB block with ${blocks[0].stats.transactions} txs`);
+    const sinceMs = Date.now();
     const result = await measureIngestion({ announce: () => node.announceViaHeaders(blocks), blocks, environment, node, timeoutMs: 600_000 });
-    return { ...result, peakHeapBytes: result.heap.peakHeapUsed };
+    // stop first: the post-commit pass runs after the node_block rows are visible
+    await environment.agent.stop();
+    const unspentReadModel = await unspentReadModelCheck(environment.client, watermark);
+    return { ...result, correct: result.correct && readModelCorrect(unspentReadModel), peakHeapBytes: result.heap.peakHeapUsed, tracking: await trackingTimingsAfterStop(environment.agent, sinceMs), unspentReadModel };
   } finally {
     await environment.cleanup();
   }
@@ -185,10 +314,53 @@ export const burstScenario = async (context) => {
   const environment = await startEnvironment(context, 'burst', [mainnetLikeSpec(context.seed)]);
   try {
     const [node] = environment.nodes;
+    const watermark = await transactionWatermark(environment.client);
     const blocks = linkBlocks(payloads, node.tip().hash);
     context.log(`burst: announcing 3 blocks (${(sumBytes(blocks) / 1e6).toFixed(2)} MB) back-to-back`);
+    const sinceMs = Date.now();
     const result = await measureIngestion({ announce: () => node.announceViaHeaders(blocks), blocks, environment, node, timeoutMs: 1_200_000 });
-    return { ...result, drainSeconds: result.wallSeconds, peakHeapBytes: result.heap.peakHeapUsed };
+    // block n+1 spends block n and all three are saved concurrently: the parent/child race
+    // stop first: the post-commit pass runs after the node_block rows are visible
+    await environment.agent.stop();
+    const unspentReadModel = await unspentReadModelCheck(environment.client, watermark);
+    return { ...result, correct: result.correct && readModelCorrect(unspentReadModel), drainSeconds: result.wallSeconds, peakHeapBytes: result.heap.peakHeapUsed, tracking: await trackingTimingsAfterStop(environment.agent, sinceMs), unspentReadModel };
+  } finally {
+    await environment.cleanup();
+  }
+};
+
+/**
+ * The max-block shape with real spends: a 100,000-tx parent block is saved
+ * first (not measured), then the measured 100,000-tx child spends output 0 of
+ * every parent transaction (the burst fixture's blocks 1 and 2), so the
+ * tracking statements update 100,000 committed outputs.
+ */
+export const maxBlockSpendScenario = async (context) => {
+  const payloads = loadOrGenerateBlockSequence({
+    blockCount: 3,
+    cacheDirectory: context.cacheDirectory,
+    log: context.log,
+    name: 'burst',
+    seed: context.seed,
+    transactionsPerBlock: context.settings.denseTransactionsPerBlock,
+  });
+  const environment = await startEnvironment(context, 'max-block-spend', [mainnetLikeSpec(context.seed)]);
+  try {
+    const [node] = environment.nodes;
+    const watermark = await transactionWatermark(environment.client);
+    const parentHeight = node.chain.length;
+    const [parent, child] = linkBlocks(payloads.slice(0, 2), node.tip().hash);
+    context.log('max-block-spend: saving the parent block (not measured)');
+    node.announceViaHeaders([parent]);
+    await waitFor(async () => (await acceptedBlockCount(environment.client, node.name, [parent.hash])) === 1, { description: 'parent block accepted', intervalMs: 50, timeoutMs: 600_000 });
+    await environment.client.query('CHECKPOINT');
+    context.log(`max-block-spend: announcing ${(child.raw.length / 1e6).toFixed(2)} MB child block with ${child.stats.transactions} txs`);
+    const sinceMs = Date.now();
+    const result = await measureIngestion({ announce: () => node.announceViaHeaders([child]), blocks: [child], environment, node, timeoutMs: 600_000 });
+    // stop first: the post-commit pass runs after the node_block rows are visible
+    await environment.agent.stop();
+    const unspentReadModel = await unspentReadModelCheck(environment.client, watermark);
+    return { ...result, correct: result.correct && readModelCorrect(unspentReadModel), peakHeapBytes: result.heap.peakHeapUsed, tracking: await trackingTimingsAfterStop(environment.agent, sinceMs, parentHeight + 1), unspentReadModel };
   } finally {
     await environment.cleanup();
   }
@@ -261,6 +433,7 @@ export const reorgScenario = async (context) => {
   const environment = await startEnvironment(context, 'reorg', [specA, specB]);
   try {
     const { client, nodes } = environment;
+    const watermark = await transactionWatermark(client);
     const forkHeight = nodes[0].chain.length - 1;
     const forkHash = nodes[0].tip().hash;
     const chainA = linkBlocks(branchA, forkHash);
@@ -317,6 +490,9 @@ export const reorgScenario = async (context) => {
     const expectedTransactions = sumTransactions(chainB);
     checks[`block_transaction rows for B match (${expectedTransactions})`] = blockTransactionRows === expectedTransactions;
     checks['no node_transaction row is confirmed in a block accepted by the same node'] = (await confirmedButInMempoolCount(client)) === 0;
+    await environment.agent.stop();
+    const unspentReadModel = await unspentReadModelCheck(client, watermark);
+    if (unspentReadModel !== null) checks['unspent read model equals the F1g reference'] = readModelCorrect(unspentReadModel);
     const failedChecks = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
     const wallMs = finished - started;
     return {
@@ -328,6 +504,7 @@ export const reorgScenario = async (context) => {
       expectedTransactions,
       failedChecks,
       transactionsPerSecond: blockTransactionRows / seconds(wallMs),
+      unspentReadModel,
       walBytes,
       wallSeconds: seconds(wallMs),
     };
@@ -453,6 +630,7 @@ export const catchUpScenario = async (context) => {
 
 export const scenarios = {
   'max-block': maxBlockScenario,
+  'max-block-spend': maxBlockSpendScenario,
   burst: burstScenario,
   reorg: reorgScenario,
   concurrent: concurrentScenario,

@@ -92,6 +92,7 @@ const dbUpMigrationPaths = [
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
   migration('default/1791400000000_unspent_tracking/up.sql'),
+  migration('default/1791400001000_unspent_post_commit/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -3151,6 +3152,225 @@ test.serial(
     t.true(cases.reacceptedStaleBlock > 0, 'fixture has a re-org');
   }
 );
+/**
+ * `CHAINGRAPH_UNSPENT_TRACKING`: concurrent parent/child saves. The agent saves
+ * up to 16 blocks at once; under READ COMMITTED a child's spend statement
+ * cannot see its parent's uncommitted outputs, and the parent's resolve cannot
+ * see the child's uncommitted inputs. The post-commit pass must close that
+ * race. A chain of blocks (each spending the previous one) and mempool
+ * parent/child pairs (child save issued first) are all saved at once, with at
+ * least 16 saves in flight; the read model must then equal the F1g reference
+ * for every output they created.
+ */
+const concurrencyHash = (kind: number, group: number, index: number) =>
+  `e8${kind.toString(16).padStart(2, '0')}${group
+    .toString(16)
+    .padStart(4, '0')}${index.toString(16).padStart(4, '0')}${'00'.repeat(26)}`;
+const concurrencyTransaction = (
+  hash: string,
+  spends: [string, number][]
+): ChaingraphTransaction => ({
+  hash,
+  inputs: spends.map(([outpointTransactionHash, outpointIndex]) => ({
+    outpointIndex,
+    outpointTransactionHash,
+    sequenceNumber: 0,
+    unlockingBytecode: '51',
+  })),
+  isCoinbase: false,
+  locktime: 0,
+  outputs: [
+    { lockingBytecode: '51', valueSatoshis: 1000n },
+    { lockingBytecode: '52', valueSatoshis: 1000n },
+  ],
+  sizeBytes: 60,
+  version: 2,
+});
+
+test.serial(
+  `[e2e] unspent tracking (${unspentTrackingMode}): concurrent parent/child saves match the F1g reference`,
+  async (t) => {
+    if (unspentTrackingMode === 'off') {
+      t.pass();
+      return;
+    }
+    const blockCount = 24;
+    const transactionsPerBlock = 40;
+    const mempoolPairs = 24;
+    const minimumInFlight = 16;
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+      postgresE2eConnectionStringTestDb;
+    const scenarioDbModule = '../db.js?unspent-tracking-concurrency';
+    const db = (await import(scenarioDbModule)) as typeof DbModule;
+    /*
+     * The pool size comes from CHAINGRAPH_POSTGRES_MAX_CONNECTIONS (default:
+     * CPU count); make sure at least 16 saves can be in flight at once.
+     */
+    (db.pool as unknown as { options: { max: number } }).options.max = Math.max(
+      (db.pool as unknown as { options: { max: number } }).options.max,
+      minimumInFlight + 8
+    );
+    const nodeA = Number(
+      (
+        await client.query<{ id: string }>(
+          /* sql */ `SELECT internal_id AS id FROM node WHERE name = 'node1';`
+        )
+      ).rows[0]!.id
+    );
+    // block k's transaction j spends output 0 of block k-1's transaction j
+    const blocks = Array.from({ length: blockCount }, (_, blockIndex) => ({
+      bits: 0,
+      hash: concurrencyHash(1, blockIndex, 0xffff),
+      height: 999_100 + blockIndex,
+      merkleRoot: '00'.repeat(32),
+      nonce: 0,
+      previousBlockHash: '00'.repeat(32),
+      sizeBytes: 0,
+      timestamp: 0,
+      transactions: Array.from(
+        { length: transactionsPerBlock },
+        (__, transactionIndex) =>
+          concurrencyTransaction(
+            concurrencyHash(2, blockIndex, transactionIndex),
+            blockIndex === 0
+              ? [[concurrencyHash(9, 0, transactionIndex), 0]]
+              : [[concurrencyHash(2, blockIndex - 1, transactionIndex), 0]]
+          )
+      ),
+      version: 1,
+    }));
+    const pairs = Array.from({ length: mempoolPairs }, (_, pairIndex) => {
+      const parent = concurrencyTransaction(concurrencyHash(3, pairIndex, 0), [
+        [concurrencyHash(9, 1, pairIndex), 0],
+      ]);
+      const child = concurrencyTransaction(concurrencyHash(3, pairIndex, 1), [
+        [parent.hash, 0],
+      ]);
+      return { child, parent };
+    });
+    // eslint-disable-next-line functional/no-let
+    let inFlight = 0;
+    // eslint-disable-next-line functional/no-let
+    let maxInFlight = 0;
+    const track = async <T>(work: () => Promise<T>) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        return await work();
+      } finally {
+        inFlight -= 1;
+      }
+    };
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      const results = await Promise.all([
+        ...blocks.map(async (block) =>
+          track(async () =>
+            db.saveBlock({
+              block,
+              nodeAcceptances: [
+                {
+                  acceptedAt: new Date(),
+                  nodeInternalId: nodeA,
+                  nodeName: 'concurrency',
+                },
+              ],
+              transactionCache: new Map() as unknown as Parameters<
+                typeof db.saveBlock
+              >[0]['transactionCache'],
+            })
+          )
+        ),
+        ...pairs.flatMap(({ child, parent }) => [
+          track(async () =>
+            db.saveTransactionForNodes(child, [
+              { nodeInternalId: nodeA, validatedAt: new Date() },
+            ])
+          ),
+          track(async () =>
+            db.saveTransactionForNodes(parent, [
+              { nodeInternalId: nodeA, validatedAt: new Date() },
+            ])
+          ),
+        ]),
+      ]);
+      const fixed = results.reduce(
+        (totals, result) => {
+          const postCommit =
+            result !== undefined && 'unspentTrackingTimings' in result
+              ? result.unspentTrackingTimings.postCommit
+              : result;
+          return {
+            newOutputs: totals.newOutputs + (postCommit?.newOutputsFixed ?? 0),
+            spentOutputs:
+              totals.spentOutputs + (postCommit?.spentOutputsFixed ?? 0),
+          };
+        },
+        { newOutputs: 0, spentOutputs: 0 }
+      );
+      t.log({ fixedByPostCommit: fixed, maxInFlight });
+      t.true(maxInFlight >= minimumInFlight, `in flight: ${maxInFlight}`);
+    } finally {
+      await db.pool.end();
+      if (originalPostgresConnectionString === undefined) {
+        delete process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+      } else {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+    await client.query('ANALYZE;');
+    const createdTransactions = new Set([
+      ...blocks.flatMap((block) =>
+        block.transactions.map((transaction) => transaction.hash)
+      ),
+      ...pairs.flatMap(({ child, parent }) => [child.hash, parent.hash]),
+    ]);
+    const rows = async (sql: string) =>
+      (await client.query<{ outpoint: string }>(sql)).rows
+        .map((row) => row.outpoint)
+        .filter((outpoint) =>
+          createdTransactions.has(outpoint.split(':')[0] ?? '')
+        )
+        .sort((a, b) => a.localeCompare(b));
+    const createdHere = /* sql */ `o.transaction_hash >= '\\xe8'::bytea AND o.transaction_hash < '\\xe9'::bytea`;
+    /*
+     * unspent: output 1 of every block transaction, output 0 of the last
+     * block's, and per mempool pair the parent's output 1 and both child outputs
+     */
+    const expectedUnspent =
+      blockCount * transactionsPerBlock +
+      transactionsPerBlock +
+      3 * mempoolPairs;
+    if (unspentTrackingMode === 'bitmask') {
+      const reference = await rows(nodeUnspentReferenceSql(nodeA));
+      t.is(reference.length, expectedUnspent);
+      t.deepEqual(
+        await rows(/* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
+          WHERE ${createdHere} AND (o.unspent_node_bits & (1::bigint << ${nodeA})) <> 0`),
+        reference
+      );
+      return;
+    }
+    const reference = await rows(unspentReferenceSql);
+    t.is(reference.length, expectedUnspent);
+    t.deepEqual(
+      await rows(
+        unspentTrackingMode === 'marker'
+          ? /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
+            WHERE ${createdHere} AND o.spent_by_transaction_internal_id = 0 AND ${createdByAcceptedSql}`
+          : /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint
+            FROM unspent_output_set u JOIN output o ON o.transaction_hash = u.transaction_hash AND o.output_index = u.output_index
+            WHERE ${createdHere} AND ${createdByAcceptedSql}`
+      ),
+      reference
+    );
+  }
+);
+
 /* eslint-enable @typescript-eslint/no-magic-numbers */
 
 /**
@@ -3753,8 +3973,13 @@ test.serial(
         // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
         rollback().then(async () => Promise.reject(error))
     );
+    /*
+     * test_output_search_index duplicates output_search_index, so either may
+     * win the cost tie depending on the data the earlier tests left behind;
+     * both are the 25-byte prefix index.
+     */
     plans.forEach((plan) => {
-      t.true(plan.includes('test_output_search_index'), plan);
+      t.true(plan.includes('output_search_index'), plan);
       t.false(plan.includes('Seq Scan'), plan);
     });
   }

@@ -19,9 +19,11 @@ import { copyFromBuffers } from './components/pg-binary-copy.js';
 import {
   bitmaskAcceptBlocksSql,
   bitmaskAcceptSql,
+  bitmaskClearSpentSql,
   bitmaskMaxNodeInternalId,
   bitmaskNodeIndexDefinitions,
   bitmaskResolveBlocksSql,
+  bitmaskResolveOutputsSql,
   bitmaskResolveSql,
   buildDeleteSpentFromSetSql,
   buildMarkSpentOutputsSql,
@@ -32,6 +34,10 @@ import {
   firstAcceptedBlockTransactionsSql,
   markStagedSpentOutputsSql,
   outputMarkerInsertParts,
+  postCommitBlocksSql,
+  postCommitReleaseBlocksSql,
+  postCommitReleaseTransactionsSql,
+  postCommitTransactionsSql,
   reacceptSpendsSql,
   resolveMempoolOutputsSql,
   resolveStagedNewOutputsSql,
@@ -43,6 +49,7 @@ import {
   postgresConnectionString,
   postgresMaxConnections,
   postgresSynchronousCommit,
+  unspentPostCommit,
   unspentResolveNewOutputs,
   unspentTracking,
 } from './config.js';
@@ -71,24 +78,42 @@ type NewOutputPolicy = 'none' | 'resolve' | 'trust' | 'unaudited';
 let resolveIndexesPresent = false;
 // eslint-disable-next-line functional/no-let
 let resolveIndexesCheckedAt = 0;
+/**
+ * The check in flight, shared by concurrent callers: a save must not be
+ * written "unaudited" just because another save's check has not returned yet.
+ */
+// eslint-disable-next-line functional/no-let, @typescript-eslint/init-declarations
+let resolveIndexesCheck: Promise<void> | undefined;
 const resolveIndexesRecheckMs = 5_000;
 const refreshResolveIndexesPresent = async (client: pg.PoolClient) => {
+  if (resolveIndexesPresent) {
+    return;
+  }
+  if (resolveIndexesCheck !== undefined) {
+    await resolveIndexesCheck;
+    return;
+  }
   const now = Date.now();
-  if (
-    resolveIndexesPresent ||
-    now - resolveIndexesCheckedAt <= resolveIndexesRecheckMs
-  ) {
+  if (now - resolveIndexesCheckedAt <= resolveIndexesRecheckMs) {
     return;
   }
   resolveIndexesCheckedAt = now;
-  const present =
-    (
-      await client.query<{ present: boolean }>(
-        /* sql */ `SELECT to_regclass('public.spent_by_index') IS NOT NULL AND to_regclass('public.block_inclusions_index') IS NOT NULL AS present;`
-      )
-    ).rows[0]?.present === true;
-  // eslint-disable-next-line require-atomic-updates -- a cache flag; once true it stays true
-  resolveIndexesPresent = present;
+  resolveIndexesCheck = (async () => {
+    const present =
+      (
+        await client.query<{ present: boolean }>(
+          /* sql */ `SELECT to_regclass('public.spent_by_index') IS NOT NULL AND to_regclass('public.block_inclusions_index') IS NOT NULL AS present;`
+        )
+      ).rows[0]?.present === true;
+    resolveIndexesPresent = present;
+  })();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    await resolveIndexesCheck;
+  } finally {
+    // eslint-disable-next-line require-atomic-updates -- only the creator of the check clears it
+    resolveIndexesCheck = undefined;
+  }
 };
 const newOutputPolicy = async (
   client: pg.PoolClient
@@ -146,8 +171,282 @@ const setInsertCteFor = (
 export interface UnspentTrackingTimings {
   markMs: number;
   policy: NewOutputPolicy;
+  postCommit?: PostCommitResult;
   resolveMs: number;
 }
+
+/**
+ * Result of the post-commit pass of one save: rows fixed by (a) (new outputs
+ * resolved against now-committed spenders) and (b) (spends re-applied to
+ * now-committed outputs), elapsed ms, and failed attempts that were retried.
+ */
+export interface PostCommitResult {
+  failedAttempts: number;
+  ms: number;
+  newOutputsFixed: number;
+  spentOutputsFixed: number;
+}
+
+/**
+ * Warnings from the post-commit pass (retries); the agent sets its logger.
+ */
+// eslint-disable-next-line functional/no-let
+let unspentTrackingWarn: (message: string) => void = () => undefined;
+// eslint-disable-next-line functional/no-let
+let unspentTrackingInfo: (message: string) => void = () => undefined;
+export const setUnspentTrackingLoggers = (loggers: {
+  info: (message: string) => void;
+  warn: (message: string) => void;
+}) => {
+  unspentTrackingWarn = loggers.warn;
+  unspentTrackingInfo = loggers.info;
+};
+/**
+ * Mempool and headers saves have no per-save log line: report the rows their
+ * post-commit pass fixed (if any).
+ */
+const reportPostCommit = (
+  label: string,
+  result: PostCommitResult | undefined
+) => {
+  if (
+    result !== undefined &&
+    (result.newOutputsFixed > 0 || result.spentOutputsFixed > 0)
+  ) {
+    unspentTrackingInfo(
+      `Unspent tracking post-commit (${label}): fixed ${result.newOutputsFixed} new-output and ${result.spentOutputsFixed} spent-output rows in ${result.ms} ms`
+    );
+  }
+  return result;
+};
+const postCommitBackoffInitialMs = 100;
+const postCommitBackoffMaxMs = 10_000;
+const sleep = async (ms: number) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+/**
+ * The post-commit pass (`CHAINGRAPH_UNSPENT_POST_COMMIT`, POLICY A only): run
+ * after the save's COMMIT, in its own short transaction, so a parent and a
+ * child saved concurrently see each other whichever commits second. The
+ * statements are idempotent, so a failed attempt (deadlock, serialization or
+ * connection error) is retried with exponential backoff until it succeeds;
+ * it is never skipped.
+ */
+const postCommitBackoffMs = (failedAttempts: number) =>
+  Math.min(
+    postCommitBackoffMaxMs,
+    // eslint-disable-next-line @typescript-eslint/no-magic-numbers
+    postCommitBackoffInitialMs * 2 ** Math.min(failedAttempts - 1, 10)
+  );
+
+interface PostCommitAttempt {
+  client: pg.PoolClient;
+  description: string;
+  failedAttempts: number;
+  parameters: unknown[];
+  sql: string;
+  start: number;
+}
+
+/**
+ * One attempt of the post-commit statement; on failure, wait (exponential
+ * backoff, capped) and try again. Never gives up: the statement is idempotent
+ * and the save is already committed.
+ */
+const attemptPostCommit = async (
+  attempt: PostCommitAttempt
+): Promise<PostCommitResult> => {
+  const result = await attempt.client
+    .query<{ newOutputsFixed: string; spentOutputsFixed: string }>(
+      attempt.sql,
+      attempt.parameters
+    )
+    .catch((err: unknown) => err as Error);
+  if (result instanceof Error) {
+    const failedAttempts = attempt.failedAttempts + 1;
+    const backoffMs = postCommitBackoffMs(failedAttempts);
+    unspentTrackingWarn(
+      `Unspent tracking post-commit pass failed (attempt ${failedAttempts}, ${
+        attempt.description
+      }); retrying in ${backoffMs} ms: ${String(result)}`
+    );
+    await sleep(backoffMs);
+    return attemptPostCommit({ ...attempt, failedAttempts });
+  }
+  return {
+    failedAttempts: attempt.failedAttempts,
+    ms: Date.now() - attempt.start,
+    newOutputsFixed: Number(result.rows[0]?.newOutputsFixed ?? 0),
+    spentOutputsFixed: Number(result.rows[0]?.spentOutputsFixed ?? 0),
+  };
+};
+
+const postCommitApplies = (policy: NewOutputPolicy, hashes: string[]) =>
+  unspentTracking !== 'off' &&
+  unspentPostCommit &&
+  policy === 'resolve' &&
+  hashes.length > 0;
+
+/**
+ * The post-commit pass (`CHAINGRAPH_UNSPENT_POST_COMMIT`, POLICY A only): run
+ * after the save's COMMIT, in its own short transaction, so a parent and a
+ * child saved concurrently see each other whichever commits second. The
+ * statements are idempotent, so a failed attempt (deadlock, serialization or
+ * connection error) is retried with exponential backoff until it succeeds;
+ * it is never skipped. `kind`: `blocks` for block hashes (block saves and
+ * headers acceptance), `transactions` for mempool transaction hashes.
+ */
+const runPostCommit = async (
+  client: pg.PoolClient,
+  policy: NewOutputPolicy,
+  target: { hashes: string[]; kind: 'blocks' | 'transactions' }
+): Promise<PostCommitResult | undefined> =>
+  postCommitApplies(policy, target.hashes)
+    ? attemptPostCommit({
+        client,
+        description: `${target.kind} ${target.hashes[0]!}${
+          target.hashes.length > 1 ? ` +${target.hashes.length - 1}` : ''
+        }`,
+        failedAttempts: 0,
+        parameters: [
+          unspentTracking,
+          target.hashes.map((hash) => Buffer.from(hash, 'hex')),
+        ],
+        sql:
+          target.kind === 'blocks'
+            ? postCommitBlocksSql
+            : postCommitTransactionsSql,
+        start: Date.now(),
+      })
+    : undefined;
+
+/**
+ * Post-commit pass after a delete of acceptance rows (`marker`/`settable`;
+ * see `postCommitReleaseBlocksSql`). Retried like `runPostCommit`.
+ */
+const releasePostCommitApplies = () =>
+  (unspentTracking === 'marker' || unspentTracking === 'settable') &&
+  unspentPostCommit;
+type PostCommitReleaseTarget =
+  | { blockHashes: string[]; kind: 'blocks' }
+  | { kind: 'transactions'; transactionInternalIds: number[] };
+const runPostCommitRelease = async (
+  client: pg.PoolClient,
+  target: PostCommitReleaseTarget
+) => {
+  if (!releasePostCommitApplies()) {
+    return undefined;
+  }
+  return attemptPostCommit({
+    client,
+    description: `release ${target.kind}`,
+    failedAttempts: 0,
+    parameters: [
+      unspentTracking,
+      target.kind === 'blocks'
+        ? target.blockHashes.map((hash) => Buffer.from(hash, 'hex'))
+        : target.transactionInternalIds,
+    ],
+    sql:
+      target.kind === 'blocks'
+        ? postCommitReleaseBlocksSql
+        : postCommitReleaseTransactionsSql,
+    start: Date.now(),
+  });
+};
+
+/**
+ * Release passes run detached from the delete that triggered them, on their
+ * own pooled connection: the agent's re-org bookkeeping (stale removal, then
+ * headers acceptance) must not wait for them. Shutdown drains them.
+ */
+const pendingPostCommitReleases = new Set<Promise<unknown>>();
+const detachPostCommitRelease = (target: PostCommitReleaseTarget) => {
+  if (!releasePostCommitApplies()) {
+    return;
+  }
+  const pending = pool
+    .connect()
+    .then(async (client) =>
+      runPostCommitRelease(client, target).finally(() => {
+        client.release();
+      })
+    )
+    .catch((err: unknown) => {
+      unspentTrackingWarn(
+        `Unspent tracking post-commit release failed: ${String(err)}`
+      );
+    })
+    .finally(() => {
+      pendingPostCommitReleases.delete(pending);
+    });
+  pendingPostCommitReleases.add(pending);
+};
+/**
+ * Wait for detached post-commit release passes (call before ending the pool).
+ */
+export const drainUnspentTrackingPostCommits = async () =>
+  Promise.all([...pendingPostCommitReleases]);
+
+/**
+ * `bitmask` mode: transactions of a block save that existed before the save
+ * (their outputs were not inserted with the accepting nodes' bits). If any
+ * "unknown" transaction turned out to exist already (cache miss), every
+ * transaction is treated as known.
+ */
+const knownTransactionHashes = (
+  block: ChaingraphBlock,
+  attemptedTransactions: ChaingraphTransaction[],
+  transactionCacheMisses: number
+) => {
+  if (unspentTracking !== 'bitmask') {
+    return [];
+  }
+  if (transactionCacheMisses !== 0) {
+    return block.transactions.map((transaction) => transaction.hash);
+  }
+  const attempted = new Set(
+    attemptedTransactions.map((transaction) => transaction.hash)
+  );
+  return block.transactions
+    .filter((transaction) => !attempted.has(transaction.hash))
+    .map((transaction) => transaction.hash);
+};
+
+/**
+ * `bitmask` mode, block save (after recording the acceptance): clear the
+ * accepting nodes' bits on the block's spends, then POLICY A for the new
+ * outputs; one statement each for all nodes. Returns elapsed ms per step.
+ */
+const bitmaskBlockSteps = async (
+  client: pg.PoolClient,
+  policy: NewOutputPolicy,
+  save: {
+    acceptingNodeIds: number[];
+    block: ChaingraphBlock;
+    newTransactionHashes: string[];
+  }
+) => {
+  if (unspentTracking !== 'bitmask' || !tracksNewOutputs(policy)) {
+    return { clearMs: 0, resolveMs: 0 };
+  }
+  const clearStart = Date.now();
+  await client.query(
+    bitmaskClearSpentSql(save.acceptingNodeIds, save.block.hash)
+  );
+  const resolveStart = Date.now();
+  if (policy === 'resolve' && save.newTransactionHashes.length > 0) {
+    await client.query(bitmaskResolveOutputsSql, [
+      save.newTransactionHashes.map((hash) => Buffer.from(hash, 'hex')),
+    ]);
+  }
+  return {
+    clearMs: resolveStart - clearStart,
+    resolveMs: Date.now() - resolveStart,
+  };
+};
 const timed = async (
   sql: string | undefined,
   run: (query: string) => Promise<unknown>
@@ -751,6 +1050,12 @@ SELECT COUNT(*)::integer AS "archivedCount" FROM inserted_history;
 `,
       [nodeInternalId, transactionInternalId]
     );
+    if (result.rows[0]!.archivedCount > 0) {
+      detachPostCommitRelease({
+        kind: 'transactions',
+        transactionInternalIds: [transactionInternalId],
+      });
+    }
     return result.rows[0]!.archivedCount;
   } finally {
     client.release();
@@ -947,6 +1252,16 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
     await client.query('ROLLBACK;');
     // eslint-disable-next-line functional/no-throw-statement
     throw err;
+  }
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    return reportPostCommit(
+      `mempool ${transaction.hash}`,
+      await runPostCommit(client, policy, {
+        hashes: [transaction.hash],
+        kind: 'transactions',
+      })
+    );
   } finally {
     client.release();
   }
@@ -1011,6 +1326,13 @@ export const recordNodeValidation = async (
       [transactionHash]
     );
     await client.query('COMMIT;');
+    return reportPostCommit(
+      `validation ${transactionHash}`,
+      await runPostCommit(client, policy, {
+        hashes: [transactionHash],
+        kind: 'transactions',
+      })
+    );
   } catch (err) {
     await client.query('ROLLBACK;');
     // eslint-disable-next-line functional/no-throw-statement
@@ -1282,11 +1604,15 @@ const saveBlockViaCopy = async ({
     const acceptingNodeIds = nodeAcceptances.map(
       (acceptance) => acceptance.nodeInternalId
     );
+    /*
+     * bitmask: only transactions that existed before this save need the
+     * per-node acceptance path; new outputs were inserted with the bits.
+     */
     const bitmaskAcceptMs = await bitmaskAccept(
       client,
       policy,
       acceptingNodeIds,
-      block.transactions.map((transaction) => transaction.hash)
+      knownTransactionHashes(block, unknownTransactions, transactionCacheMisses)
     );
     const addBlockResult = await client.query<{
       insertedBlockTransactionCount: string;
@@ -1299,26 +1625,33 @@ const saveBlockViaCopy = async ({
       Number(addBlockResult.rows[0]!.joinedTransactionCount)
     );
     const query = async (sql: string) => client.query(sql);
+    const bitmaskSteps = await bitmaskBlockSteps(client, policy, {
+      acceptingNodeIds,
+      block,
+      newTransactionHashes: unknownTransactions.map(
+        (transaction) => transaction.hash
+      ),
+    });
     const markMs =
-      bitmaskAcceptMs + (await timed(stagedSpendTrackingSql, query));
+      bitmaskAcceptMs +
+      bitmaskSteps.clearMs +
+      (await timed(stagedSpendTrackingSql, query));
     const resolveMs =
       (await timed(
         policy === 'resolve'
           ? resolveStagedNewOutputsSql(unspentTracking)
           : undefined,
         query
-      )) +
-      (await bitmaskResolve(
-        client,
-        policy,
-        acceptingNodeIds,
-        unknownTransactions.map((transaction) => transaction.hash)
-      ));
+      )) + bitmaskSteps.resolveMs;
     await client.query('COMMIT;');
+    const postCommit = await runPostCommit(client, policy, {
+      hashes: [block.hash],
+      kind: 'blocks',
+    });
     return {
       attemptedSavedTransactions: unknownTransactions,
       transactionCacheMisses,
-      unspentTrackingTimings: { markMs, policy, resolveMs },
+      unspentTrackingTimings: { markMs, policy, postCommit, resolveMs },
     };
   } catch (err) {
     await client.query('ROLLBACK;');
@@ -1586,7 +1919,11 @@ SELECT
       client,
       policy,
       acceptingNodeIds,
-      block.transactions.map((transaction) => transaction.hash)
+      knownTransactionHashes(
+        block,
+        attemptedSavedTransactions,
+        transactionCacheMisses
+      )
     );
     const addBlockResult = await client.query<{
       insertedBlockTransactionCount: string;
@@ -1602,20 +1939,31 @@ SELECT
     const newHashes = attemptedSavedTransactions.map(
       (transaction) => transaction.hash
     );
+    const bitmaskSteps = await bitmaskBlockSteps(client, policy, {
+      acceptingNodeIds,
+      block,
+      newTransactionHashes: newHashes,
+    });
     const markMs =
-      bitmaskAcceptMs + (await timed(blockSpendTrackingSql(block), query));
+      bitmaskAcceptMs +
+      bitmaskSteps.clearMs +
+      (await timed(blockSpendTrackingSql(block), query));
     const resolveMs =
       (await timed(
         policy === 'resolve'
           ? buildResolveNewOutputsSql(unspentTracking, newHashes)
           : undefined,
         query
-      )) + (await bitmaskResolve(client, policy, acceptingNodeIds, newHashes));
+      )) + bitmaskSteps.resolveMs;
     await client.query('COMMIT;');
+    const postCommit = await runPostCommit(client, policy, {
+      hashes: [block.hash],
+      kind: 'blocks',
+    });
     return {
       attemptedSavedTransactions,
       transactionCacheMisses,
-      unspentTrackingTimings: { markMs, policy, resolveMs },
+      unspentTrackingTimings: { markMs, policy, postCommit, resolveMs },
     };
   } catch (err) {
     await client.query('ROLLBACK;');
@@ -1711,6 +2059,15 @@ export const acceptBlocksViaHeaders = async (
     );
     await reacceptSpends(client, reaccepted.rows[0]?.ids ?? [], true);
     await client.query('COMMIT;');
+    if (insertedBlockIds.length > 0) {
+      reportPostCommit(
+        `headers, ${insertedBlockIds.length} block(s)`,
+        await runPostCommit(client, policy, {
+          hashes: acceptedBlocks.map((acceptedBlock) => acceptedBlock.hash),
+          kind: 'blocks',
+        })
+      );
+    }
     return nodeBlockInsertResult.rowCount;
   } catch (err) {
     if (unspentTracking !== 'off') {
@@ -1750,6 +2107,7 @@ DELETE FROM node_block WHERE
     .join(',')}))
 `);
   client.release();
+  detachPostCommitRelease({ blockHashes: staleChain, kind: 'blocks' });
 };
 
 /**

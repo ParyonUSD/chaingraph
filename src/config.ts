@@ -48,6 +48,7 @@ const expectedOptions = [
   'CHAINGRAPH_POSTGRES_MAX_CONNECTIONS',
   'CHAINGRAPH_POSTGRES_SYNCHRONOUS_COMMIT',
   'CHAINGRAPH_TRUSTED_NODES',
+  'CHAINGRAPH_UNSPENT_POST_COMMIT',
   'CHAINGRAPH_UNSPENT_RESOLVE_NEW_OUTPUTS',
   'CHAINGRAPH_UNSPENT_TRACKING',
   'CHAINGRAPH_USER_AGENT',
@@ -458,6 +459,14 @@ const unspentTracking = configuration.CHAINGRAPH_UNSPENT_TRACKING;
  */
 const unspentResolveNewOutputs =
   configuration.CHAINGRAPH_UNSPENT_RESOLVE_NEW_OUTPUTS !== 'false';
+/**
+ * Set via `CHAINGRAPH_UNSPENT_POST_COMMIT` (experiment, default `true`): after
+ * each save commits, re-run its resolve and spend statements in a short
+ * follow-up transaction, so concurrent parent/child saves see each other.
+ * `false` only to measure the race and the pass's cost.
+ */
+const unspentPostCommit =
+  configuration.CHAINGRAPH_UNSPENT_POST_COMMIT !== 'false';
 
 export {
   blockBufferTargetSizeMb,
@@ -477,6 +486,7 @@ export {
   postgresSynchronousCommit,
   isProduction,
   trustedNodes,
+  unspentPostCommit,
   unspentResolveNewOutputs,
   unspentTracking,
 };

@@ -210,15 +210,19 @@ test('resolve (policy A): one batched statement over the new transactions', (t) 
   t.true(
     marker.includes('WHERE input.outpoint_transaction_hash = n.hash OFFSET 0')
   );
+  // acceptance probes are inline (the SQL functions are never inlined)
+  t.false(marker.includes('unspent_tracking_transaction_is_accepted('));
   t.true(
     marker.includes(
-      'unspent_tracking_transaction_is_accepted(i.transaction_internal_id)'
-    )
+      'OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = i.transaction_internal_id)'
+    ),
+    marker
   );
   t.true(
     marker.includes(
-      'unspent_tracking_transaction_is_block_accepted(i.transaction_internal_id) DESC'
-    )
+      'WHERE bt.transaction_internal_id = i.transaction_internal_id) DESC'
+    ),
+    marker
   );
   t.true(marker.includes('AND o.spent_by_transaction_internal_id = 0;'));
   t.regex(

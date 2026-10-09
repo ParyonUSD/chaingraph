@@ -124,6 +124,21 @@ const markReplaces = (newSpender: string) => /* sql */ `CASE
  * still in the set) change. Needs `spent_by_index` (production mode); the
  * acceptance probe uses `block_inclusions_index`.
  */
+const anyNodeBlockAccepts = (
+  transactionInternalId: string
+) => /* sql */ `EXISTS (
+        SELECT 1 FROM block_transaction bt CROSS JOIN node n
+          JOIN node_block nb ON nb.node_internal_id = n.internal_id AND nb.block_internal_id = bt.block_internal_id
+          WHERE bt.transaction_internal_id = ${transactionInternalId})`;
+/**
+ * `unspent_tracking_transaction_is_accepted()`, written inline: a SQL function
+ * with sub-queries is never inlined by Postgres, so calling it per spender
+ * pays an executor start-up each time (~70 us; 100,000 spenders = 7 s).
+ */
+const anyNodeAccepts = (
+  transactionInternalId: string
+) => /* sql */ `(${anyNodeBlockAccepts(transactionInternalId)}
+        OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = ${transactionInternalId}))`;
 const acceptedSpendersOf = (newTransactions: string) => /* sql */ `
     SELECT DISTINCT ON (i.outpoint_transaction_hash, i.outpoint_index)
            i.outpoint_transaction_hash, i.outpoint_index, i.transaction_internal_id AS spender_internal_id
@@ -132,9 +147,9 @@ const acceptedSpendersOf = (newTransactions: string) => /* sql */ `
         SELECT outpoint_transaction_hash, outpoint_index, transaction_internal_id FROM input
           WHERE input.outpoint_transaction_hash = n.hash OFFSET 0
       ) i
-      WHERE unspent_tracking_transaction_is_accepted(i.transaction_internal_id)
+      WHERE ${anyNodeAccepts('i.transaction_internal_id')}
       ORDER BY i.outpoint_transaction_hash, i.outpoint_index,
-        unspent_tracking_transaction_is_block_accepted(i.transaction_internal_id) DESC`;
+        ${anyNodeBlockAccepts('i.transaction_internal_id')} DESC`;
 
 export const resolveNewOutputsSql = (
   mode: UnspentTrackingMode,
@@ -263,7 +278,9 @@ DELETE FROM unspent_output_set u
  * may have been released): mark/delete from the saved inputs of the given
  * transactions. In `marker` mode a mempool acceptance only fills unset markers
  * (NULL or 0); a block acceptance also replaces a mempool-only spender. `$1` is a `bigint[]` of transaction
- * internal IDs.
+ * internal IDs. The `input` lookup is a per-transaction probe: production
+ * statistics estimate ~1,800 inputs per transaction, which would otherwise
+ * plan a large array as a hash join over a sequential scan of `input`.
  */
 export const reacceptSpendsSql = (
   mode: UnspentTrackingMode,
@@ -273,7 +290,10 @@ export const reacceptSpendsSql = (
     ? /* sql */ `
 UPDATE output o SET spent_by_transaction_internal_id = i.transaction_internal_id
   FROM (SELECT DISTINCT unnest($1::bigint[]) AS id) s
-  JOIN input i ON i.transaction_internal_id = s.id
+  CROSS JOIN LATERAL (
+    SELECT transaction_internal_id, outpoint_transaction_hash, outpoint_index FROM input
+      WHERE input.transaction_internal_id = s.id OFFSET 0
+  ) i
   WHERE o.transaction_hash = i.outpoint_transaction_hash
     AND o.output_index = i.outpoint_index
     AND ${
@@ -285,7 +305,10 @@ UPDATE output o SET spent_by_transaction_internal_id = i.transaction_internal_id
     ? /* sql */ `
 DELETE FROM unspent_output_set u
   USING (SELECT DISTINCT unnest($1::bigint[]) AS id) s
-  JOIN input i ON i.transaction_internal_id = s.id
+  CROSS JOIN LATERAL (
+    SELECT transaction_internal_id, outpoint_transaction_hash, outpoint_index FROM input
+      WHERE input.transaction_internal_id = s.id OFFSET 0
+  ) i
   WHERE u.transaction_hash = i.outpoint_transaction_hash
     AND u.output_index = i.outpoint_index;`
     : undefined;
@@ -386,3 +409,61 @@ export const bitmaskNodeIndexDefinitions = (nodeInternalId: number) => {
     [`output_unspent_node_${nodeInternalId}_token_category_index`]: `CREATE INDEX output_unspent_node_${nodeInternalId}_token_category_index ON output USING btree (token_category) WHERE ${predicate};`,
   };
 };
+
+/**
+ * Bits of the given node internal IDs (`bitmask` mode), as a decimal string.
+ */
+export const nodeBitmask = (nodeInternalIds: number[]) =>
+  nodeInternalIds
+    .reduce(
+      // eslint-disable-next-line no-bitwise
+      (bits, id) => bits | (1n << BigInt(id)),
+      0n
+    )
+    .toString();
+
+/**
+ * `bitmask` mode, block save: clear the accepting nodes' bits on every
+ * outpoint spent by the block's transactions, one statement for all nodes
+ * (after the block's transactions and `block_transaction` rows are inserted).
+ * Keyed like the marker's spend statement; see migration
+ * `1791400001000_unspent_post_commit`.
+ */
+export const bitmaskClearSpentSql = (
+  acceptingNodeIds: number[],
+  blockHash: string
+) => /* sql */ `
+SELECT unspent_bits_clear_spent(${nodeBitmask(acceptingNodeIds)}::bigint, ARRAY(
+  SELECT bt.transaction_internal_id
+    FROM (SELECT internal_id FROM block WHERE hash = ${bytea(blockHash)}) b
+    CROSS JOIN LATERAL (
+      SELECT transaction_internal_id FROM block_transaction
+        WHERE block_transaction.block_internal_id = b.internal_id OFFSET 0
+    ) bt
+)) AS changed;`;
+
+/**
+ * `bitmask` mode, POLICY A for every node in one statement: `$1` is a
+ * `bytea[]` of the new transactions' hashes (call after recording the
+ * acceptance).
+ */
+export const bitmaskResolveOutputsSql = /* sql */ `SELECT unspent_bits_resolve_outputs($1::bytea[]) AS changed;`;
+
+/**
+ * The post-commit pass (all tracking modes; migration
+ * `1791400001000_unspent_post_commit`): after a save commits, (a) resolve its
+ * new outputs against committed accepted spenders, (b) re-apply the spends of
+ * its inputs. `$1` is the mode, `$2` a `bytea[]` of block hashes (block saves
+ * and headers acceptance) or transaction hashes (mempool saves).
+ */
+export const postCommitBlocksSql = /* sql */ `SELECT new_outputs_fixed::text AS "newOutputsFixed", spent_outputs_fixed::text AS "spentOutputsFixed" FROM unspent_tracking_post_commit_blocks($1::text, $2::bytea[]);`;
+export const postCommitTransactionsSql = /* sql */ `SELECT new_outputs_fixed::text AS "newOutputsFixed", spent_outputs_fixed::text AS "spentOutputsFixed" FROM unspent_tracking_post_commit_transactions($1::text, $2::bytea[]);`;
+
+/**
+ * Post-commit pass after losing acceptance (`marker`/`settable`): re-run the
+ * release for the transactions of removed blocks (`$2`, block hashes) or of an
+ * archived mempool transaction (`$2`, transaction internal IDs), so two nodes
+ * dropping the same rows concurrently cannot both skip it.
+ */
+export const postCommitReleaseBlocksSql = /* sql */ `SELECT unspent_tracking_post_commit_release_blocks($1::text, $2::bytea[]);`;
+export const postCommitReleaseTransactionsSql = /* sql */ `SELECT unspent_tracking_post_commit_release($1::text, $2::bigint[]);`;

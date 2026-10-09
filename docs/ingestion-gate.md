@@ -25,7 +25,7 @@ Options (`node scripts/ingestion-gate/run.mjs --help`):
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--agent-dir <dir>` | this checkout | Built chaingraph checkout to test (needs `build/` and `node_modules/`). Migrations are taken from the same dir. |
-| `--scenarios a,b` | all | Subset of `max-block,burst,reorg,concurrent,catch-up`. |
+| `--scenarios a,b` | all | Subset of `max-block,max-block-spend,burst,reorg,concurrent,catch-up`. |
 | `--quick` | off | Catch-up with 1,000 instead of 10,000 blocks. |
 | `--thresholds <file>` | `scripts/ingestion-gate/thresholds.json` | Threshold file (see below). |
 | `--out <file>` | `ingestion-gate.json` | Machine-readable report (gitignored). |
@@ -87,10 +87,19 @@ indexes built, triggers enabled – the production write path), then measure.
 | Scenario | What it does | Detects |
 | --- | --- | --- |
 | `max-block` | One 31.80 MB block (100,001 txs, 200,001 outputs) announced via `headers`. Fails on wall time, WAL bytes, peak heap; correctness = `block_transaction` row count. | Per-block write amplification (extra UPDATEs, maintenance triggers, new indexes or triggers on hot tables), WAL growth, agent memory blow-ups. |
+| `max-block-spend` | The max-block shape with real spends: a 100,000-tx parent block is saved first (not measured), then the measured 100,000-tx child spends output 0 of every parent transaction. Report-only (no thresholds yet). | Write cost of statements that update spent outputs (stored unspent read models), invisible in `max-block`, whose spends point at outpoints that do not exist. |
 | `burst` | Three such blocks (block n+1 spends block n) in one `headers` message; total drain time. | Contention between concurrent block saves (locks, advisory locks, hot rows), memory pressure under backlog. |
 | `reorg` | Two nodes follow a 100-block branch A (1,000 txs/block), receive 40 mempool txs, then both switch to a 101-block branch B (B[0] confirms 30 of the 40). Times convergence; checks each node's accepted chain (B accepted, A not, blocks ≤ fork still accepted), `block_transaction` for B, confirmed txs removed from `node_transaction` and archived in `node_transaction_history`, unconfirmed txs still in mempool, and no mempool row confirmed in a block of the same node. | Slow or incorrect stale-block removal/re-acceptance, mempool cleanup trigger regressions. |
 | `concurrent` | A mainnet-like node (8 × 12,500-tx blocks) and a chipnet-like node (different magic/genesis, 50 × 2,000-tx blocks), each a *sequential* writer (announce a block, wait until saved, next). Run alone, alone, then together on one agent/DB. Ratio = together tx/s ÷ (sum of alone tx/s). | Cross-network serialisation (e.g. a global advisory lock: ratio → ~0.5). Perfect parallelism → 1.0; the agent's single JS thread keeps it below that. |
 | `catch-up` | 10,000 small blocks (20 txs each, chained) announced via `inv` after initial sync, so they go through the live path with triggers enabled. blocks/s. | Per-block fixed costs: trigger/confirmation-path regressions, per-block round trips. |
+
+**Unspent read model check** (`CHAINGRAPH_UNSPENT_TRACKING` experiment): in
+`max-block`, `max-block-spend`, `burst` and `reorg` the gate stops the agent
+(so its post-commit passes have finished) and compares the stored read model
+with the F1g predicate for every output created after steady state, in both
+directions (marker/settable across all nodes, bitmask per node). Any mismatch
+fails the scenario's correctness check. `burst` saves three dependent blocks
+concurrently, so it exercises the parent/child race.
 
 ## Thresholds
 

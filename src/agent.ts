@@ -43,6 +43,7 @@ import {
   archiveMempoolTransactionsAcceptedByBlocks,
   configureUnspentTracking,
   createIndexes,
+  drainUnspentTrackingPostCommits,
   getAllKnownBlockHashes,
   getIncompleteBlocks,
   getIndexCreationProgress,
@@ -57,6 +58,7 @@ import {
   removeStaleBlocksForNode,
   saveBlock,
   saveTransactionForNodes,
+  setUnspentTrackingLoggers,
 } from './db.js';
 import type {
   ExpiringMempoolTransaction,
@@ -257,7 +259,21 @@ interface Node {
 const formatUnspentTrackingTimings = (timings: UnspentTrackingTimings) =>
   timings.policy === 'none'
     ? ''
-    : ` | unspent tracking (${timings.policy}): mark ${timings.markMs} ms, resolve ${timings.resolveMs} ms`;
+    : ` | unspent tracking (${timings.policy}): mark ${
+        timings.markMs
+      } ms, resolve ${timings.resolveMs} ms${
+        timings.postCommit === undefined
+          ? ''
+          : `, post-commit ${timings.postCommit.ms} ms (fixed ${
+              timings.postCommit.newOutputsFixed
+            } new-output, ${
+              timings.postCommit.spentOutputsFixed
+            } spent-output rows${
+              timings.postCommit.failedAttempts > 0
+                ? `; ${timings.postCommit.failedAttempts} failed attempt(s) retried`
+                : ''
+            })`
+      }`;
 
 export class Agent {
   logger: pino.BaseLogger;
@@ -857,7 +873,17 @@ export class Agent {
             this.logger.debug('Disabled synchronous_commit for initial sync.');
           }
         })
-        .then(async () => configureUnspentTracking())
+        .then(async () => {
+          setUnspentTrackingLoggers({
+            info: (message) => {
+              this.logger.info(message);
+            },
+            warn: (message) => {
+              this.logger.warn(message);
+            },
+          });
+          return configureUnspentTracking();
+        })
         .then((statements) => {
           if (statements.length > 0) {
             this.logger.info(
@@ -2263,6 +2289,7 @@ export class Agent {
     });
     this.shutdownPromise = this.blockBuffer
       .drain()
+      .then(async () => drainUnspentTrackingPostCommits())
       .then(async () => {
         this.logger.debug('Block buffer drained, stopping PG pool...');
         return pool.end();

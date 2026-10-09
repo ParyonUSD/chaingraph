@@ -3,7 +3,7 @@
  * Chaingraph ingestion gate – see docs/ingestion-gate.md.
  *
  *   yarn ingestion-gate [--agent-dir <built chaingraph checkout>]
- *                       [--scenarios max-block,burst,reorg,concurrent,catch-up]
+ *                       [--scenarios max-block,max-block-spend,burst,reorg,concurrent,catch-up]
  *                       [--quick] [--thresholds <file.json>] [--out <file.json>] [--keep-pg]
  *                       [--pg auto|docker|host] [--pg-image postgres:18] [--pg-bin <dir>]
  *                       [--pg-port 55432] [--pg-url <postgres://user:pass@host:port>]
@@ -121,6 +121,10 @@ const thresholdRules = {
     ['walBytes', 'maxWalBytes', 'max'],
     ['peakHeapBytes', 'maxPeakHeapBytes', 'max'],
   ],
+  'max-block-spend': [
+    ['wallSeconds', 'maxWallSeconds', 'max'],
+    ['walBytes', 'maxWalBytes', 'max'],
+  ],
   burst: [
     ['drainSeconds', 'maxDrainSeconds', 'max'],
     ['walBytes', 'maxWalBytes', 'max'],
@@ -164,6 +168,7 @@ const summaryColumns = (name, result) => {
   if (result === undefined) return {};
   const primary = {
     'max-block': `wall ${formatValue('wallSeconds', result.wallSeconds)}`,
+    'max-block-spend': `wall ${formatValue('wallSeconds', result.wallSeconds)}`,
     burst: `drain ${formatValue('drainSeconds', result.drainSeconds)}`,
     reorg: `converge ${formatValue('convergeSeconds', result.convergeSeconds)}`,
     concurrent: `ratio ${formatValue('concurrencyRatio', result.concurrencyRatio)} (${Math.round(result.together?.transactionsPerSecond ?? 0)} vs ${Math.round(result.mainnetAlone?.transactionsPerSecond ?? 0)}+${Math.round(result.chipnetAlone?.transactionsPerSecond ?? 0)} tx/s)`,
@@ -242,6 +247,15 @@ const main = async () => {
   const line = (cells) => cells.map((cell, index) => String(cell).padEnd(widths[index])).join(' | ');
   console.log(`\n${line(header)}\n${widths.map((width) => '-'.repeat(width)).join('-|-')}\n${rows.map(line).join('\n')}\n`);
   selectedScenarios.forEach((name) => (report.scenarios[name].result?.knownFailures ?? []).forEach((check) => log(`PASS* ${name}: known failing check (allow-listed in thresholds): ${check}`)));
+  selectedScenarios.forEach((name) => {
+    const { tracking, unspentReadModel } = report.scenarios[name].result ?? {};
+    if (unspentReadModel) {
+      log(`${name}: unspent read model (${unspentReadModel.mode}) vs F1g over ${unspentReadModel.outputs} outputs: ${unspentReadModel.storedUnspentButSpent} stored unspent but spent, ${unspentReadModel.storedSpentButUnspent} stored spent but unspent`);
+    }
+    if (tracking && tracking.blocks > 0) {
+      log(`${name}: tracking over ${tracking.blocks} block(s): mark ${tracking.markMs} ms, resolve ${tracking.resolveMs} ms, post-commit ${tracking.postCommitMs} ms (max ${tracking.maxPostCommitMs} ms; fixed ${tracking.postCommitNewOutputsFixed} new-output + ${tracking.postCommitSpentOutputsFixed} spent-output rows; ${tracking.failedAttempts} retried)`);
+    }
+  });
   log(`total ${report.totalSeconds.toFixed(0)} s – report written to ${resolve(options.out)} – ${report.passed ? 'GATE PASSED' : 'GATE FAILED'}`);
   return report.passed ? 0 : 1;
 };
