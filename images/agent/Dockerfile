@@ -16,6 +16,9 @@ COPY --from=build-stage /chaingraph/production-dependencies ./
 COPY --from=build-stage /chaingraph/defaults.env ./
 COPY --from=build-stage /chaingraph/bin bin
 COPY --from=build-stage /chaingraph/build build
+# ClickHouse DDL next to the compiled applier (ddl-apply.js resolves ./ddl);
+# applied by `node bin/chaingraph-clickhouse-ddl.js` (init container / Job).
+COPY --from=build-stage /chaingraph/src/store/clickhouse/ddl build/store/clickhouse/ddl
 ENV NODE_ENV production
 EXPOSE 3200
 CMD ["node", "bin/chaingraph.js"]
