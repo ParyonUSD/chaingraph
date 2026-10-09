@@ -6,9 +6,13 @@ import bitcoreP2pCash from '@chaingraph/bitcore-p2p-cash';
 import { Agent, cancelableDelay } from './agent.js';
 import { chaingraphInternalApiPort } from './config.js';
 import { instantiateLogger } from './logging.js';
+import { createStore } from './store/index.js';
 
 const logger = instantiateLogger();
 logger.info(`Starting Chaingraph...`);
+
+const store = createStore();
+await store.init();
 
 const shutdownTasks = [] as (() => void)[];
 const agent = new Agent({
@@ -19,6 +23,7 @@ const agent = new Agent({
       task();
     });
   },
+  store,
 });
 
 const enum StatusCode {

@@ -19,7 +19,6 @@ import {
 } from './bitcore.js';
 import { BlockBuffer } from './components/block-buffer.js';
 import { BlockTree } from './components/block-tree.js';
-import type { indexDefinitions } from './components/db-utils.js';
 import { SyncState } from './components/sync-state.js';
 import {
   formatBytes,
@@ -34,30 +33,13 @@ import {
   incompleteBlockRepairBatchSize,
   mempoolTransactionExpirationMs,
   mempoolTransactionExpirationScanIntervalMs,
-  postgresMaxConnections,
   trustedNodes,
 } from './config.js';
-import {
-  acceptBlocksViaHeaders,
-  archiveMempoolTransaction,
-  archiveMempoolTransactionsAcceptedByBlocks,
-  createIndexes,
-  getAllKnownBlockHashes,
-  getIncompleteBlocks,
-  getIndexCreationProgress,
-  getMempoolTransactionsExpiringBefore,
-  listExistingIndexes,
-  optionallyDisableSynchronousCommit,
-  optionallyEnableSynchronousCommit,
-  pool,
-  recordNodeValidation,
-  reenableMempoolCleaning,
-  registerTrustedNodeWithDb,
-  removeStaleBlocksForNode,
-  saveBlock,
-  saveTransactionForNodes,
-} from './db.js';
-import type { ExpiringMempoolTransaction, IncompleteBlock } from './db.js';
+import type {
+  ChaingraphStore,
+  ExpiringMempoolTransaction,
+  IncompleteBlock,
+} from './store/types.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -373,18 +355,6 @@ export class Agent {
   saveInboundTransactions = false;
 
   /**
-   * A list of indexes which are managed by Chaingraph. If these don't exist in
-   * the database, they will be created after initial sync is complete.
-   */
-  managedIndexes: (keyof typeof indexDefinitions)[] = [
-    'block_height_index',
-    'block_inclusions_index',
-    'output_search_index',
-    'spent_by_index',
-    'token_category_index',
-  ];
-
-  /**
    * Set to `true` if `shutdown` has been called.
    */
   willShutdown = false;
@@ -393,7 +363,17 @@ export class Agent {
 
   onShutdown: () => void;
 
-  constructor(config: { logger: pino.BaseLogger; onShutdown: () => void }) {
+  /**
+   * The storage backend (see `src/store/`).
+   */
+  store: ChaingraphStore;
+
+  constructor(config: {
+    logger: pino.BaseLogger;
+    onShutdown: () => void;
+    store: ChaingraphStore;
+  }) {
+    this.store = config.store;
     this.logger = config.logger;
     this.onShutdown = config.onShutdown;
     this.heartbeatInterval = setInterval(() => {
@@ -428,7 +408,7 @@ export class Agent {
 
     const blockDbRestoreStart = Date.now();
     // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    getAllKnownBlockHashes().then((hashes) => {
+    this.store.getAllKnownBlockHashes().then((hashes) => {
       this.blockDb = new Set(hashes);
       this.blockDbRestored = true;
       const millisecondsPerSecond = 1000;
@@ -548,62 +528,64 @@ export class Agent {
 
         const nodeRegistrationStart = Date.now();
         // eslint-disable-next-line @typescript-eslint/no-floating-promises
-        registerTrustedNodeWithDb({
-          latestConnectionBeganAt: new Date(),
-          nodeName: node.name,
-          protocolVersion: peer.version,
-          userAgent: peer.subversion,
-        }).then(({ internalId, syncedHeaderHashChain }) => {
-          this.logger.trace(`Trusted node registered: ${node.name}`);
-          const expectedGenesisBlock = genesisBlocks[node.networkMagicHex]!;
-          this.nodes[node.name]!.internalId = internalId;
-          this.nodesByInternalId[internalId] = [
-            node.name,
-            this.nodes[node.name]!,
-          ];
-          const needsGenesisBlock = syncedHeaderHashChain.length === 0;
-          const initialSyncState = this.blockTree.restoreChainForNode(
-            node.name,
-            needsGenesisBlock
-              ? [expectedGenesisBlock.hash]
-              : syncedHeaderHashChain
-          );
-          this.nodes[node.name]!.syncState = new SyncState(initialSyncState);
-          const millisecondsPerSecond = 1000;
-          const chainRestoreSeconds = (
-            (Date.now() - nodeRegistrationStart) /
-            millisecondsPerSecond
-          ).toFixed(1);
-          this.logger.info(
-            `${node.name}: chain state registered and restored from the database in ${chainRestoreSeconds} seconds.`
-          );
-          const genesisBlockHeaderFromDb = this.blockTree.getBlockHeaderHash(
-            node.name,
-            0
-          )!;
-          if (needsGenesisBlock) {
-            this.logger.trace(
-              `Genesis block unsaved for: ${node.name}, saving block with hash: ${expectedGenesisBlock.hash}`
-            );
-            /**
-             * Buffer the genesis block for this node (as if it were received over
-             * the P2P interface).
-             */
-            this.bufferParsedBlock(expectedGenesisBlock, new Date(), [
+        this.store
+          .registerNode({
+            latestConnectionBeganAt: new Date(),
+            nodeName: node.name,
+            protocolVersion: peer.version,
+            userAgent: peer.subversion,
+          })
+          .then(({ internalId, syncedHeaderHashChain }) => {
+            this.logger.trace(`Trusted node registered: ${node.name}`);
+            const expectedGenesisBlock = genesisBlocks[node.networkMagicHex]!;
+            this.nodes[node.name]!.internalId = internalId;
+            this.nodesByInternalId[internalId] = [
               node.name,
-            ]);
-          } else if (genesisBlockHeaderFromDb !== expectedGenesisBlock.hash) {
-            this.logger.fatal(
-              `Fatal error: attempted to restore chain for node ${node.name}, but the genesis block hash in the database differs from the one provided by the agent. This is likely a configuration error – shutting down to avoid corrupting the database. Block 0 hash expected: ${expectedGenesisBlock.hash} – from database: ${genesisBlockHeaderFromDb}`
+              this.nodes[node.name]!,
+            ];
+            const needsGenesisBlock = syncedHeaderHashChain.length === 0;
+            const initialSyncState = this.blockTree.restoreChainForNode(
+              node.name,
+              needsGenesisBlock
+                ? [expectedGenesisBlock.hash]
+                : syncedHeaderHashChain
             );
-            this.shutdown().catch((err) => {
-              this.logger.error(err);
-            });
-            return;
-          }
-          nodeRegisteredResolver();
-          this.requestHeaders(node.name);
-        });
+            this.nodes[node.name]!.syncState = new SyncState(initialSyncState);
+            const millisecondsPerSecond = 1000;
+            const chainRestoreSeconds = (
+              (Date.now() - nodeRegistrationStart) /
+              millisecondsPerSecond
+            ).toFixed(1);
+            this.logger.info(
+              `${node.name}: chain state registered and restored from the database in ${chainRestoreSeconds} seconds.`
+            );
+            const genesisBlockHeaderFromDb = this.blockTree.getBlockHeaderHash(
+              node.name,
+              0
+            )!;
+            if (needsGenesisBlock) {
+              this.logger.trace(
+                `Genesis block unsaved for: ${node.name}, saving block with hash: ${expectedGenesisBlock.hash}`
+              );
+              /**
+               * Buffer the genesis block for this node (as if it were received over
+               * the P2P interface).
+               */
+              this.bufferParsedBlock(expectedGenesisBlock, new Date(), [
+                node.name,
+              ]);
+            } else if (genesisBlockHeaderFromDb !== expectedGenesisBlock.hash) {
+              this.logger.fatal(
+                `Fatal error: attempted to restore chain for node ${node.name}, but the genesis block hash in the database differs from the one provided by the agent. This is likely a configuration error – shutting down to avoid corrupting the database. Block 0 hash expected: ${expectedGenesisBlock.hash} – from database: ${genesisBlockHeaderFromDb}`
+              );
+              this.shutdown().catch((err) => {
+                this.logger.error(err);
+              });
+              return;
+            }
+            nodeRegisteredResolver();
+            this.requestHeaders(node.name);
+          });
       });
 
       peer.on('disconnect', () => {
@@ -837,7 +819,8 @@ export class Agent {
         this.scheduleBlockBufferFill();
       }, second);
     } else {
-      optionallyDisableSynchronousCommit()
+      this.store
+        .prepareForInitialSync()
         .then((disabled) => {
           if (disabled) {
             this.logger.debug('Disabled synchronous_commit for initial sync.');
@@ -910,38 +893,40 @@ export class Agent {
           ) {
             this.completedInitialSync = true;
             this.logger.info(`Agent: initial sync is complete.`);
-            optionallyEnableSynchronousCommit()
-              .then((disabled) => {
-                if (disabled) {
+            this.store
+              .finishInitialSync({
+                onIndexProgress: (progress) => {
+                  this.logIndexCreationProgress(progress);
+                },
+                onNonFatalError: (err) => {
+                  this.logger.error(err);
+                },
+                onSyncSettingsRestored: () => {
                   this.logger.debug('Re-enabled synchronous_commit.');
-                }
+                },
+              })
+              .then(async () => {
+                this.logger.info(
+                  `Agent: all managed indexes have been created.`
+                );
+                return this.store
+                  .enableMempoolTracking()
+                  .then(({ schemaIsCurrent }) => {
+                    if (!schemaIsCurrent) {
+                      this.logger.warn(
+                        'Agent: WARNING! Database schema is old and missing multiple bug fixes. Update the Hasura image to apply migrations and then restart this agent.'
+                      );
+                    }
+                    this.logger.info('Agent: enabled mempool tracking.');
+                    this.saveInboundTransactions = true;
+                    this.scheduleIncompleteBlockRepair();
+                    this.scheduleMempoolTransactionExpirationScan();
+                  });
               })
               .catch((err) => {
-                this.logger.error(err);
-              })
-              .finally(() => {
-                this.buildIndexes()
-                  .then(async () => {
-                    this.logger.info(
-                      `Agent: all managed indexes have been created.`
-                    );
-                    return reenableMempoolCleaning().then((schemaIsCurrent) => {
-                      if (!schemaIsCurrent) {
-                        this.logger.warn(
-                          'Agent: WARNING! Database schema is old and missing multiple bug fixes. Update the Hasura image to apply migrations and then restart this agent.'
-                        );
-                      }
-                      this.logger.info('Agent: enabled mempool tracking.');
-                      this.saveInboundTransactions = true;
-                      this.scheduleIncompleteBlockRepair();
-                      this.scheduleMempoolTransactionExpirationScan();
-                    });
-                  })
-                  .catch((err) => {
-                    this.logger.fatal(err);
-                    // eslint-disable-next-line @typescript-eslint/no-floating-promises
-                    this.shutdown();
-                  });
+                this.logger.fatal(err);
+                // eslint-disable-next-line @typescript-eslint/no-floating-promises
+                this.shutdown();
               });
           }
         } else {
@@ -964,53 +949,26 @@ export class Agent {
   }
 
   /**
-   * Build any Chaingraph-managed indexes which don't already exist.
-   *
-   * With Postgres, it's more efficient to complete the initial sync with as few
-   * indexes as possible, then build the remaining indexes.
-   *
-   * This method is called any time Chaingraph is restarted – if the Chaingraph
-   * database has previously finished the initial sync and index creation, this
-   * method will simply confirm that all Chaingraph-managed indexes still exist.
+   * Log the progress of index (or projection) builds reported by
+   * `store.finishInitialSync`.
    */
-  async buildIndexes() {
-    const existingIndexes = await listExistingIndexes();
-    const missingIndexes = this.managedIndexes.filter(
-      (requiredIndex) => !existingIndexes.includes(requiredIndex)
-    );
-    const indexCreationCompletion = createIndexes(missingIndexes);
-    const indexLogDelayMs = 5000;
+  logIndexCreationProgress(
+    progress: [indexName: string, percentage: string][]
+  ) {
     const progressPercentageMinLength = 2;
-    const logIndexCreationProgress = () => {
-      getIndexCreationProgress()
-        .then((progress) => {
-          if (progress.length > 0) {
-            this.logger.info(
-              `Building indexes: ${progress
-                .map(
-                  ([name, percentage]) =>
-                    `${name}: ${percentage.padStart(
-                      progressPercentageMinLength,
-                      ' '
-                    )}%`
-                )
-                .join(', ')}`
-            );
-          }
-        })
-        .catch((err) => {
-          this.logger.error(err);
-        });
-    };
-    logIndexCreationProgress();
-    const progressLogInterval = setInterval(
-      logIndexCreationProgress,
-      indexLogDelayMs
-    );
-    indexCreationCompletion.finally(() => {
-      clearInterval(progressLogInterval);
-    });
-    return indexCreationCompletion;
+    if (progress.length > 0) {
+      this.logger.info(
+        `Building indexes: ${progress
+          .map(
+            ([name, percentage]) =>
+              `${name}: ${percentage.padStart(
+                progressPercentageMinLength,
+                ' '
+              )}%`
+          )
+          .join(', ')}`
+      );
+    }
   }
 
   canScanForMempoolTransactionExpirations() {
@@ -1083,10 +1041,11 @@ export class Agent {
     const expiresBefore = new Date(
       Date.now() + mempoolTransactionExpirationScanIntervalMs
     );
-    const expiringTransactions = await getMempoolTransactionsExpiringBefore({
-      expirationMs: mempoolTransactionExpirationMs,
-      expiresBefore,
-    });
+    const expiringTransactions =
+      await this.store.getMempoolTransactionsExpiringBefore({
+        expirationMs: mempoolTransactionExpirationMs,
+        expiresBefore,
+      });
     if (expiringTransactions.length === 0) {
       this.logger.debug(
         `Agent: no mempool transactions expiring before ${expiresBefore.toISOString()}; next scan in ${mempoolTransactionExpirationScanIntervalMs.toLocaleString()}ms.`
@@ -1104,7 +1063,7 @@ export class Agent {
   }
 
   async expireMempoolTransaction(transaction: ExpiringMempoolTransaction) {
-    const archivedCount = await archiveMempoolTransaction({
+    const archivedCount = await this.store.archiveMempoolTransaction({
       nodeInternalId: transaction.nodeInternalId,
       replacedAt: transaction.expiresAt,
       transactionInternalId: transaction.transactionInternalId,
@@ -1124,7 +1083,7 @@ export class Agent {
 
   async archiveAcceptedMempoolTransactions() {
     const archivedTransactions =
-      await archiveMempoolTransactionsAcceptedByBlocks();
+      await this.store.archiveMempoolTransactionsAcceptedByBlocks();
     if (archivedTransactions.length === 0) {
       return;
     }
@@ -1278,13 +1237,14 @@ export class Agent {
     const { finalHeight, heightLowerBound, heightUpperBound } =
       this.getIncompleteBlockRepairRange();
     const scanStartTime = Date.now();
-    const { incompleteBlocks, scannedBlockCount } = await getIncompleteBlocks({
-      excludedBlockHashes: [],
-      heightLowerBound,
-      heightUpperBound,
-      limit: incompleteBlockRepairBatchSize,
-      nodeInternalIds: this.getRegisteredNodeInternalIds(),
-    });
+    const { incompleteBlocks, scannedBlockCount } =
+      await this.store.getIncompleteBlocks({
+        excludedBlockHashes: [],
+        heightLowerBound,
+        heightUpperBound,
+        limit: incompleteBlockRepairBatchSize,
+        nodeInternalIds: this.getRegisteredNodeInternalIds(),
+      });
     const scanDurationMs = Date.now() - scanStartTime;
     const scanRate =
       scanDurationMs === 0
@@ -1446,11 +1406,12 @@ export class Agent {
         return;
       }
       const acceptedAt = new Date();
-      acceptBlocksViaHeaders(
-        this.nodes[nodeName]!.internalId!,
-        acceptedBlocks,
-        acceptedAt
-      )
+      this.store
+        .acceptBlocksViaHeaders(
+          this.nodes[nodeName]!.internalId!,
+          acceptedBlocks,
+          acceptedAt
+        )
         .then(() => {
           const lastAcceptedBlock = acceptedBlocks[acceptedBlocks.length - 1]!;
           this.logger.debug(
@@ -1792,7 +1753,7 @@ export class Agent {
 
     const startTime = Date.now();
     const { attemptedSavedTransactions, transactionCacheMisses } =
-      await saveBlock({
+      await this.store.saveBlock({
         block,
         isSavedTransaction: (hash) =>
           this.transactionCache.get(hash)?.db === true,
@@ -1889,7 +1850,8 @@ export class Agent {
   ) {
     const node = this.nodes[nodeName]!;
     node.syncState?.blockReorganizationAtHeight(firstHeight);
-    removeStaleBlocksForNode(node.internalId!, staleChain)
+    this.store
+      .removeStaleBlocksForNode(node.internalId!, staleChain)
       .then(() => {
         this.logger.info(
           staleChain,
@@ -1929,12 +1891,14 @@ export class Agent {
         this.logger.trace(
           `${nodeName}: validated known tx – hash: ${transactionHash}`
         );
-        recordNodeValidation(transactionHash, {
-          nodeInternalId: node.internalId!,
-          validatedAt: new Date(),
-        }).catch((err) => {
-          this.logger.error(err);
-        });
+        this.store
+          .recordNodeValidation(transactionHash, {
+            nodeInternalId: node.internalId!,
+            validatedAt: new Date(),
+          })
+          .catch((err) => {
+            this.logger.error(err);
+          });
         this.markTransactionSavedToDb(transactionHash);
       }
     }
@@ -2003,7 +1967,7 @@ export class Agent {
       );
       // TODO: collect statistics on save speed
       const startTime = Date.now();
-      await saveTransactionForNodes(tx, validations);
+      await this.store.saveMempoolTransaction(tx, validations);
       const durationMs = Date.now() - startTime;
       this.logger.debug(
         `Inserting mempool tx ${
@@ -2124,14 +2088,7 @@ export class Agent {
         },
       };
 
-      const pgPool = {
-        clients: {
-          active: pool.totalCount - pool.idleCount,
-          max: postgresMaxConnections,
-          total: pool.totalCount,
-        },
-        waitingRequests: pool.waitingCount,
-      };
+      const pgPool = this.store.poolStats();
 
       const now = Date.now();
       const txThroughput = this.databaseThroughput.aggregateStatistics(now);
@@ -2238,7 +2195,7 @@ export class Agent {
       .drain()
       .then(async () => {
         this.logger.debug('Block buffer drained, stopping PG pool...');
-        return pool.end();
+        return this.store.close();
       })
       .then(() => {
         this.logger.debug('PG pool cleared.');
