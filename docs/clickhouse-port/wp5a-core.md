@@ -7,7 +7,7 @@ Code (`src/store/clickhouse/`):
 
 | File | Contents |
 |---|---|
-| `clickhouse-store.ts` | `ClickHouseStore implements ChaingraphStore`: lifecycle, `registerNode`, `getAllKnownBlockHashes`, `acceptBlocksViaHeaders`, `removeStaleBlocksForNode`, `getIncompleteBlocks`, the bulk horizon; mempool methods throw `MempoolNotImplementedError` |
+| `clickhouse-store.ts` | `ClickHouseStore implements ChaingraphStore`: lifecycle, `registerNode`, `getAllKnownBlockHashes`, `acceptBlocksViaHeaders`, `removeStaleBlocksForNode`, `getIncompleteBlocks`, the bulk horizon; mempool methods: see `wp5a-mempool.md` (they threw `MempoolNotImplementedError` in WP5a-core) |
 | `block-commit.ts` | `saveBlock` as one commit: ids, spend resolution, pending spends, per-node rows; `TransactionRegistry` |
 | `utxo.ts` | transition rules, `AcceptanceCounter` (reference model), UTXO row encoders, server-side delta SQL, `OutputRegistry` |
 | `node-state.ts` | node registry, operation registry (order, rows-written, commit dependencies), acceptance-table encoders |
