@@ -28,6 +28,9 @@ import got from 'got';
 import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
+import type { StoreChecker } from '../store/checker.js';
+import { eventually } from '../store/eventually.js';
+import { createPostgresChecker } from '../store/postgres/checker.js';
 import type { ChaingraphTransaction } from '../types/chaingraph.js';
 
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
@@ -202,6 +205,12 @@ test.afterEach((t) => {
 // eslint-disable-next-line functional/no-let, @typescript-eslint/init-declarations
 let client: pg.Client;
 /**
+ * Backend-neutral reads. Built on `client`, so (on Postgres) it also sees rows
+ * of a fixture transaction the test has open.
+ */
+// eslint-disable-next-line functional/no-let, @typescript-eslint/init-declarations
+let checker: StoreChecker;
+/**
  * Before connecting to the e2e test database, drop and recreate it:
  */
 test.before(async () => {
@@ -222,6 +231,7 @@ test.before(async () => {
     connectionString: postgresE2eConnectionStringTestDb,
   });
   await client.connect();
+  checker = createPostgresChecker(client);
   if (recreateDbOnStartup) {
     await dbUpMigrationPaths.reduce<Promise<pg.QueryResult | undefined>>(
       async (chain, path) => {
@@ -618,151 +628,84 @@ const waitForTransactionSaveConflict = async (
   await waitForTransactionSaveConflict(transactionHash, remainingAttempts - 1);
 };
 
-const blockRepairPollingAttempts = 40;
-const blockRepairPollingIntervalMs = 250;
+const blockRepairTimeoutMs = 10_000;
 const getBlockTransactionCount = async (blockHash: string) =>
-  Number(
-    (
-      await client.query<{ count: string }>(
-        /* sql */ `
-        SELECT COUNT(*) FROM block_transaction
-          INNER JOIN block ON block.internal_id = block_transaction.block_internal_id
-          WHERE block.hash = $1;
-      `,
-        [hexToBin(blockHash)]
-      )
-    ).rows[0]!.count
-  );
+  checker.blockTransactionCount(blockHash);
 const waitForBlockTransactionCount = async (
   blockHash: string,
-  expectedCount: number,
-  remainingAttempts = blockRepairPollingAttempts
-): Promise<number> => {
-  const count = await getBlockTransactionCount(blockHash);
-  if (count === expectedCount || remainingAttempts === 0) {
-    return count;
-  }
-  await sleep(blockRepairPollingIntervalMs);
-  return waitForBlockTransactionCount(
-    blockHash,
-    expectedCount,
-    remainingAttempts - 1
+  expectedCount: number
+): Promise<number> =>
+  eventually(async () => getBlockTransactionCount(blockHash), {
+    isDone: (count) => count === expectedCount,
+    timeoutMs: blockRepairTimeoutMs,
+  });
+
+const mempoolArchiveTimeoutMs = 5_000;
+/**
+ * For each named transaction: is it in the node's mempool, how many history
+ * rows does the node have for it, and the earliest `replaced_at` (ISO string).
+ * Sorted by name.
+ */
+const getMempoolArchiveState = async (
+  node: string,
+  namedHashes: { [transactionName: string]: string }
+) => {
+  const hashes = Object.values(namedHashes);
+  const membership = await checker.mempoolMembership(node, hashes);
+  const history = await checker.transactionHistory(node, hashes);
+  return Object.entries(namedHashes)
+    .sort(([a], [b]) => (a < b ? -1 : Number(a > b)))
+    .map(([transactionName, hash]) => {
+      const rows = history.filter((row) => row.hash === hash);
+      const [replacedAt] = rows
+        .map((row) => row.replacedAt)
+        .filter((date): date is Date => date !== null)
+        .sort((a, b) => a.getTime() - b.getTime());
+      return {
+        historyRowCount: rows.length,
+        inMempool: membership.has(hash),
+        replacedAt: replacedAt === undefined ? null : replacedAt.toISOString(),
+        transactionName,
+      };
+    });
+};
+
+const expiryTransactions = {
+  /* eslint-disable @typescript-eslint/naming-convention, camelcase */
+  expiry_child_b: 'd2'.repeat(repeatedHashByteLength),
+  expiry_child_c: 'd3'.repeat(repeatedHashByteLength),
+  expiry_parent_a: 'd1'.repeat(repeatedHashByteLength),
+  /* eslint-enable @typescript-eslint/naming-convention, camelcase */
+};
+const expectedExpiryReplacedAt = '2026-01-15T00:00:00.000Z';
+const waitForExpiredMempoolArchive = async () =>
+  eventually(async () => getMempoolArchiveState('node1', expiryTransactions), {
+    isDone: (rows) =>
+      rows.every(
+        (row) =>
+          !row.inMempool &&
+          row.historyRowCount === 1 &&
+          row.replacedAt === expectedExpiryReplacedAt
+      ),
+    timeoutMs: mempoolArchiveTimeoutMs,
+  });
+
+const confirmedChildHash = 'd5'.repeat(repeatedHashByteLength);
+const waitForConfirmedMempoolArchive = async () =>
+  eventually(
+    async () => {
+      const [row] = await getMempoolArchiveState('node1', {
+        confirmedChild: confirmedChildHash,
+      });
+      const { historyRowCount, inMempool, replacedAt } = row!;
+      return { historyRowCount, inMempool, replacedAt };
+    },
+    {
+      isDone: (row) =>
+        !row.inMempool && row.historyRowCount === 1 && row.replacedAt === null,
+      timeoutMs: mempoolArchiveTimeoutMs,
+    }
   );
-};
-
-const mempoolExpirationPollingAttempts = 50;
-const mempoolExpirationPollingIntervalMs = 100;
-const getExpiredMempoolArchiveState = async () =>
-  (
-    await client.query<{
-      historyRowCount: number;
-      inMempool: boolean;
-      replacedAt: string | null;
-      transactionName: string;
-    }>(/* sql */ `
-WITH transaction_values (name, hash) AS (
-    VALUES
-      ('expiry_parent_a', decode(repeat('d1', 32), 'hex')),
-      ('expiry_child_b',  decode(repeat('d2', 32), 'hex')),
-      ('expiry_child_c',  decode(repeat('d3', 32), 'hex'))
-),
-selected_node AS (
-    SELECT internal_id
-      FROM node
-      WHERE name = 'node1'
-),
-named_transactions AS (
-    SELECT transaction_values.name, transaction.internal_id
-      FROM transaction
-      JOIN transaction_values
-        ON transaction_values.hash = transaction.hash
-)
-SELECT named_transactions.name AS "transactionName",
-       (node_transaction.transaction_internal_id IS NOT NULL) AS "inMempool",
-       COUNT(node_transaction_history.transaction_internal_id)::integer AS "historyRowCount",
-       MIN(node_transaction_history.replaced_at)::text AS "replacedAt"
-  FROM named_transactions
-  CROSS JOIN selected_node
-  LEFT JOIN node_transaction
-    ON node_transaction.node_internal_id = selected_node.internal_id
-   AND node_transaction.transaction_internal_id = named_transactions.internal_id
-  LEFT JOIN node_transaction_history
-    ON node_transaction_history.node_internal_id = selected_node.internal_id
-   AND node_transaction_history.transaction_internal_id = named_transactions.internal_id
-  GROUP BY named_transactions.name, node_transaction.transaction_internal_id
-  ORDER BY named_transactions.name;
-`)
-  ).rows;
-const waitForExpiredMempoolArchive = async (
-  remainingAttempts = mempoolExpirationPollingAttempts
-): Promise<Awaited<ReturnType<typeof getExpiredMempoolArchiveState>>> => {
-  const rows = await getExpiredMempoolArchiveState();
-  const expectedReplacedAt = '2026-01-15 00:00:00';
-  if (
-    rows.every(
-      (row) =>
-        !row.inMempool &&
-        row.historyRowCount === 1 &&
-        row.replacedAt === expectedReplacedAt
-    ) ||
-    remainingAttempts === 0
-  ) {
-    return rows;
-  }
-  await sleep(mempoolExpirationPollingIntervalMs);
-  return waitForExpiredMempoolArchive(remainingAttempts - 1);
-};
-
-const getConfirmedMempoolArchiveState = async () =>
-  (
-    await client.query<{
-      historyRowCount: number;
-      inMempool: boolean;
-      replacedAt: string | null;
-    }>(/* sql */ `
-WITH selected_node AS (
-    SELECT internal_id
-      FROM node
-      WHERE name = 'node1'
-),
-selected_transaction AS (
-    SELECT internal_id
-      FROM transaction
-      WHERE hash = decode(repeat('d5', 32), 'hex')
-)
-SELECT (node_transaction.transaction_internal_id IS NOT NULL) AS "inMempool",
-       COUNT(node_transaction_history.transaction_internal_id)::integer AS "historyRowCount",
-       MIN(node_transaction_history.replaced_at)::text AS "replacedAt"
-  FROM selected_transaction
-  CROSS JOIN selected_node
-  LEFT JOIN node_transaction
-    ON node_transaction.node_internal_id = selected_node.internal_id
-   AND node_transaction.transaction_internal_id = selected_transaction.internal_id
-  LEFT JOIN node_transaction_history
-    ON node_transaction_history.node_internal_id = selected_node.internal_id
-   AND node_transaction_history.transaction_internal_id = selected_transaction.internal_id
-  GROUP BY node_transaction.transaction_internal_id;
-`)
-  ).rows[0];
-
-const confirmedMempoolArchiveCompleted = (
-  row: Awaited<ReturnType<typeof getConfirmedMempoolArchiveState>>
-) =>
-  row !== undefined &&
-  !row.inMempool &&
-  row.historyRowCount === 1 &&
-  row.replacedAt === null;
-
-const waitForConfirmedMempoolArchive = async (
-  remainingAttempts = mempoolExpirationPollingAttempts
-): Promise<Awaited<ReturnType<typeof getConfirmedMempoolArchiveState>>> => {
-  const row = await getConfirmedMempoolArchiveState();
-  if (confirmedMempoolArchiveCompleted(row) || remainingAttempts === 0) {
-    return row;
-  }
-  await sleep(mempoolExpirationPollingIntervalMs);
-  return waitForConfirmedMempoolArchive(remainingAttempts - 1);
-};
 
 test.serial(
   '[e2e] ignores inbound transactions before initial sync is complete',
@@ -772,11 +715,7 @@ test.serial(
     );
     const delay = 1000;
     await sleep(delay);
-    const result = await client.query<{ encode: string }>(
-      /* sql */ `SELECT encode(hash, 'hex') FROM transaction WHERE hash = $1;`,
-      [hexToBin(halTxHash)]
-    );
-    t.deepEqual(result.rowCount, 0);
+    t.false(await checker.transactionExists(halTxHash));
     t.pass();
   }
 );
@@ -864,11 +803,7 @@ test.serial(
        * Convert client-side (the previous implementation) to verify the
        * SQL-side `encode(...)` used by `getAllKnownBlockHashes` matches it.
        */
-      const expected = (
-        await client.query<{ hash: Buffer }>(/* sql */ `
-  SELECT hash FROM block ORDER BY hash;
-  `)
-      ).rows.map((row) => row.hash.toString('hex'));
+      const expected = await checker.allBlockHashes();
       t.true(expected.length > 0);
       t.deepEqual(
         [...hashes].sort((a, b) => (a < b ? -1 : Number(a > b))),
@@ -913,13 +848,7 @@ test.serial(
       sizeBytes: 100,
       version: 1,
     };
-    const nodeInternalId = Number(
-      (
-        await client.query<{ internalId: number }>(
-          /* sql */ `SELECT internal_id AS "internalId" FROM node WHERE name = 'node1';`
-        )
-      ).rows[0]!.internalId
-    );
+    const nodeInternalId = (await checker.nodeInternalId('node1'))!;
     await client.query(
       /* sql */ `
       DELETE FROM node_transaction
@@ -974,22 +903,11 @@ test.serial(
       await competingClient.query(/* sql */ `COMMIT;`);
       competingTransactionOpen = false;
       await t.notThrowsAsync(savePromise);
-      const savedValidationCount = Number(
-        (
-          await client.query<{ count: string }>(
-            /* sql */ `
-            SELECT COUNT(*)::bigint AS count
-              FROM node_transaction
-              JOIN transaction
-                ON transaction.internal_id = node_transaction.transaction_internal_id
-              WHERE transaction.hash = $1
-                AND node_transaction.node_internal_id = $2
-                AND node_transaction.validated_at = $3;
-          `,
-            [Buffer.from(transactionHash, 'hex'), nodeInternalId, validatedAt]
-          )
-        ).rows[0]!.count
-      );
+      const savedValidationCount = (await checker.mempool('node1')).filter(
+        (entry) =>
+          entry.hash === transactionHash &&
+          entry.validatedAt?.getTime() === validatedAt.getTime()
+      ).length;
       t.deepEqual(savedValidationCount, 1);
     } finally {
       if (competingTransactionOpen) {
@@ -1133,57 +1051,40 @@ INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id,
     FROM selected_nodes
     CROSS JOIN named_transactions;
 `);
-      const remainingMempool = (
-        await client.query<{
-          nodeName: string;
-          transactionName: string;
-        }>(/* sql */ `
-WITH transaction_values (name, hash) AS (
-    VALUES
-      ('child_b', decode(repeat('f3', 32), 'hex')),
-      ('child_c', decode(repeat('f4', 32), 'hex'))
-)
-SELECT node.name AS "nodeName", transaction_values.name AS "transactionName"
-  FROM node_transaction
-  JOIN node
-    ON node.internal_id = node_transaction.node_internal_id
-  JOIN transaction
-    ON transaction.internal_id = node_transaction.transaction_internal_id
-  JOIN transaction_values
-    ON transaction_values.hash = transaction.hash
-  ORDER BY "nodeName", "transactionName";
-`)
-      ).rows;
-      t.deepEqual(remainingMempool, [
-        { nodeName: 'node2', transactionName: 'child_b' },
-        { nodeName: 'node2', transactionName: 'child_c' },
+      const cascadeChildren = {
+        /* eslint-disable @typescript-eslint/naming-convention, camelcase */
+        child_b: 'f3'.repeat(repeatedHashByteLength),
+        child_c: 'f4'.repeat(repeatedHashByteLength),
+        /* eslint-enable @typescript-eslint/naming-convention, camelcase */
+      };
+      const cascadeReplacedAt = '2026-01-01T00:10:00.000Z';
+      t.deepEqual(await getMempoolArchiveState('node1', cascadeChildren), [
+        {
+          historyRowCount: 1,
+          inMempool: false,
+          replacedAt: cascadeReplacedAt,
+          transactionName: 'child_b',
+        },
+        {
+          historyRowCount: 1,
+          inMempool: false,
+          replacedAt: cascadeReplacedAt,
+          transactionName: 'child_c',
+        },
       ]);
-      const archivedDescendants = (
-        await client.query<{
-          replacedAt: string;
-          transactionName: string;
-        }>(/* sql */ `
-WITH transaction_values (name, hash) AS (
-    VALUES
-      ('child_b', decode(repeat('f3', 32), 'hex')),
-      ('child_c', decode(repeat('f4', 32), 'hex'))
-)
-SELECT transaction_values.name AS "transactionName",
-       node_transaction_history.replaced_at::text AS "replacedAt"
-  FROM node_transaction_history
-  JOIN node
-    ON node.internal_id = node_transaction_history.node_internal_id
-  JOIN transaction
-    ON transaction.internal_id = node_transaction_history.transaction_internal_id
-  JOIN transaction_values
-    ON transaction_values.hash = transaction.hash
-  WHERE node.name = 'node1'
-  ORDER BY "transactionName";
-`)
-      ).rows;
-      t.deepEqual(archivedDescendants, [
-        { replacedAt: '2026-01-01 00:10:00', transactionName: 'child_b' },
-        { replacedAt: '2026-01-01 00:10:00', transactionName: 'child_c' },
+      t.deepEqual(await getMempoolArchiveState('node2', cascadeChildren), [
+        {
+          historyRowCount: 0,
+          inMempool: true,
+          replacedAt: null,
+          transactionName: 'child_b',
+        },
+        {
+          historyRowCount: 0,
+          inMempool: true,
+          replacedAt: null,
+          transactionName: 'child_c',
+        },
       ]);
     } finally {
       await client.query(/* sql */ `ROLLBACK;`);
@@ -1277,19 +1178,19 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
         {
           historyRowCount: 1,
           inMempool: false,
-          replacedAt: '2026-01-15 00:00:00',
+          replacedAt: expectedExpiryReplacedAt,
           transactionName: 'expiry_child_b',
         },
         {
           historyRowCount: 1,
           inMempool: false,
-          replacedAt: '2026-01-15 00:00:00',
+          replacedAt: expectedExpiryReplacedAt,
           transactionName: 'expiry_child_c',
         },
         {
           historyRowCount: 1,
           inMempool: false,
-          replacedAt: '2026-01-15 00:00:00',
+          replacedAt: expectedExpiryReplacedAt,
           transactionName: 'expiry_parent_a',
         },
       ]);
@@ -1664,73 +1565,36 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
       await client.query(backfillMigration);
       await client.query(backfillMigration);
 
-      const remainingMempool = (
-        await client.query<{
-          transactionName: string;
-        }>(/* sql */ `
-WITH transaction_values (name, hash) AS (
-    VALUES
-      ('backfill_child_b', decode(repeat('e2', 32), 'hex')),
-      ('backfill_child_c', decode(repeat('e3', 32), 'hex'))
-)
-SELECT transaction_values.name AS "transactionName"
-  FROM node_transaction
-  JOIN node
-    ON node.internal_id = node_transaction.node_internal_id
-  JOIN transaction
-    ON transaction.internal_id = node_transaction.transaction_internal_id
-  JOIN transaction_values
-    ON transaction_values.hash = transaction.hash
-  WHERE node.name = 'node1'
-  ORDER BY "transactionName";
-`)
-      ).rows;
-      t.deepEqual(remainingMempool, []);
-
-      const archivedTransactions = (
-        await client.query<{
-          historyRowCount: number;
-          replacedAt: string;
-          transactionName: string;
-        }>(/* sql */ `
-WITH transaction_values (name, hash) AS (
-    VALUES
-      ('backfill_parent_a', decode(repeat('e1', 32), 'hex')),
-      ('backfill_child_b',  decode(repeat('e2', 32), 'hex')),
-      ('backfill_child_c',  decode(repeat('e3', 32), 'hex'))
-)
-SELECT transaction_values.name AS "transactionName",
-       COUNT(*)::integer AS "historyRowCount",
-       MIN(node_transaction_history.replaced_at)::text AS "replacedAt"
-  FROM node_transaction_history
-  JOIN node
-    ON node.internal_id = node_transaction_history.node_internal_id
-  JOIN transaction
-    ON transaction.internal_id = node_transaction_history.transaction_internal_id
-  JOIN transaction_values
-    ON transaction_values.hash = transaction.hash
-  WHERE node.name = 'node1'
-  GROUP BY transaction_values.name
-  ORDER BY "transactionName";
-`)
-      ).rows;
-      t.deepEqual(archivedTransactions, [
-        {
-          historyRowCount: 1,
-          replacedAt: '2026-01-01 00:10:00',
-          transactionName: 'backfill_child_b',
-        },
-        {
-          historyRowCount: 1,
-          replacedAt: '2026-01-01 00:10:00',
-          transactionName: 'backfill_child_c',
-        },
-        {
-          historyRowCount: 1,
-          replacedAt: '2026-01-01 00:10:00',
-          transactionName: 'backfill_parent_a',
-        },
-      ]);
+      const backfillReplacedAt = '2026-01-01T00:10:00.000Z';
+      t.deepEqual(
+        await getMempoolArchiveState('node1', {
+          /* eslint-disable @typescript-eslint/naming-convention, camelcase */
+          backfill_child_b: 'e2'.repeat(repeatedHashByteLength),
+          backfill_child_c: 'e3'.repeat(repeatedHashByteLength),
+          backfill_parent_a: 'e1'.repeat(repeatedHashByteLength),
+          /* eslint-enable @typescript-eslint/naming-convention, camelcase */
+        }),
+        [
+          {
+            historyRowCount: 1,
+            inMempool: false,
+            replacedAt: backfillReplacedAt,
+            transactionName: 'backfill_child_b',
+          },
+          {
+            historyRowCount: 1,
+            inMempool: false,
+            replacedAt: backfillReplacedAt,
+            transactionName: 'backfill_child_c',
+          },
+          {
+            historyRowCount: 1,
+            inMempool: false,
+            replacedAt: backfillReplacedAt,
+            transactionName: 'backfill_parent_a',
+          },
+        ]
+      );
     } finally {
       await client.query(/* sql */ `ROLLBACK;`);
     }
@@ -1760,13 +1624,11 @@ test.serial(
     peers.node1.sendMessage(
       new peers.node1.messages.Transaction(new Transaction(halTxRaw))
     );
-    const delay = 1000;
-    await sleep(delay);
-    const result = await client.query<{ encode: string }>(
-      /* sql */ `SELECT encode(encode_transaction(transaction), 'hex') FROM transaction WHERE hash = $1;`,
-      [hexToBin(halTxHash)]
+    t.deepEqual(
+      await eventually(async () => checker.encodedTransactionHex(halTxHash)),
+      halTxRaw
     );
-    t.deepEqual(result.rows[0]!.encode, halTxRaw);
+    t.deepEqual(await checker.validatingNodes(halTxHash), ['node1']);
     t.pass();
   }
 );
@@ -1777,36 +1639,16 @@ test.serial(
     peers.node2.sendMessage(
       new peers.node2.messages.Transaction(new Transaction(halTxRaw))
     );
-    const delay = 1000;
-    await sleep(delay);
-    const validations = await client.query<{ name: string }>(
-      /* sql */ `
-      SELECT node.name
-        FROM node_transaction
-        INNER JOIN node
-          ON node.internal_id = node_transaction.node_internal_id
-        INNER JOIN transaction
-          ON transaction.internal_id = node_transaction.transaction_internal_id
-        WHERE transaction.hash = $1
-        ORDER BY node.name ASC;
-      `,
-      [hexToBin(halTxHash)]
-    );
+    const expectedNodes = ['node1', 'node2'];
     t.deepEqual(
-      validations.rows.map(({ name }) => name),
-      ['node1', 'node2']
+      await eventually(async () => checker.validatingNodes(halTxHash), {
+        isDone: (nodes) => nodes.length === expectedNodes.length,
+      }),
+      expectedNodes
     );
-    await client.query(
-      /* sql */ `
-      DELETE FROM node_transaction
-        USING node, transaction
-        WHERE node_transaction.node_internal_id = node.internal_id
-          AND node_transaction.transaction_internal_id = transaction.internal_id
-          AND node.name = 'node2'
-          AND transaction.hash = $1;
-      `,
-      [hexToBin(halTxHash)]
-    );
+    t.deepEqual(await checker.transactionRowCount(halTxHash), 1);
+    await checker.forgetNodeValidation('node2', halTxHash);
+    t.deepEqual(await checker.validatingNodes(halTxHash), ['node1']);
   }
 );
 
@@ -1814,13 +1656,12 @@ test.serial('[e2e] handles first chipnet CashTokens transaction', async (t) => {
   peers.node1.sendMessage(
     new peers.node1.messages.Transaction(new Transaction(chipnetCashTokensTx))
   );
-  const delay = 1000;
-  await sleep(delay);
-  const result = await client.query<{ encode: string }>(
-    /* sql */ `SELECT encode(encode_transaction(transaction), 'hex') FROM transaction WHERE hash = $1;`,
-    [hexToBin(chipnetCashTokensTxHash)]
+  t.deepEqual(
+    await eventually(async () =>
+      checker.encodedTransactionHex(chipnetCashTokensTxHash)
+    ),
+    chipnetCashTokensTx
   );
-  t.deepEqual(result.rows[0]!.encode, chipnetCashTokensTx);
   t.pass();
 });
 
@@ -1832,45 +1673,26 @@ test.serial(
         Buffer.from(halTxSpent, 'hex')
       )
     );
-    const delay = 1000;
-    await sleep(delay);
-    const result = await client.query<{ encode: string }>(
-      /* sql */ `SELECT encode(encode_transaction(transaction), 'hex') FROM transaction WHERE hash = $1;`,
-      [hexToBin(halTxSpent)]
+    t.deepEqual(
+      await eventually(async () => checker.encodedTransactionHex(halTxSpent)),
+      halTxSpentRaw
     );
-    t.deepEqual(result.rows[0]!.encode, halTxSpentRaw);
     t.pass();
   }
 );
 
 test.serial('[e2e] get hex-encoded genesis block header', async (t) => {
-  /* eslint-disable @typescript-eslint/naming-convention */
-  const encodedHex = (
-    await client.query<{ block_header_encoded_hex: string }>(
-      /* sql */ `SELECT block_header_encoded_hex (block) FROM block WHERE height = 0;`
-    )
-  ).rows[0]!.block_header_encoded_hex;
-  /* eslint-enable @typescript-eslint/naming-convention */
   t.deepEqual(
-    encodedHex,
+    await checker.encodedBlockHeaderHex({ height: 0 }),
     '0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c'
   );
 });
 
 test.serial('[e2e] get hex-encoded genesis block transaction', async (t) => {
-  const genesisTxHash = hexToBin(
-    '4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b'
-  );
-  /* eslint-disable @typescript-eslint/naming-convention */
-  const encodedHex = (
-    await client.query<{ transaction_encoded_hex: string }>(
-      /* sql */ `SELECT transaction_encoded_hex (transaction) FROM transaction WHERE hash = $1::bytea;`,
-      [genesisTxHash]
-    )
-  ).rows[0]!.transaction_encoded_hex;
-  /* eslint-enable @typescript-eslint/naming-convention */
   t.deepEqual(
-    encodedHex,
+    await checker.encodedTransactionHex(
+      '4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b'
+    ),
     '01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000'
   );
 });
@@ -1878,58 +1700,30 @@ test.serial('[e2e] get hex-encoded genesis block transaction', async (t) => {
 test.serial(
   '[e2e] get hex-encoded genesis block (with transaction)',
   async (t) => {
-    /* eslint-disable @typescript-eslint/naming-convention */
-    const encodedHex = (
-      await client.query<{ block_encoded_hex: string }>(
-        /* sql */ `SELECT block_encoded_hex (block) FROM block WHERE height = 0;`
-      )
-    ).rows[0]!.block_encoded_hex;
-    /* eslint-enable @typescript-eslint/naming-convention */
-    t.deepEqual(encodedHex, genesisBlockRaw);
+    t.deepEqual(await checker.encodedBlockHex({ height: 0 }), genesisBlockRaw);
   }
 );
 
-test.serial(
-  '[e2e] [postgres] value aggregates handle coinbase-only blocks',
-  async (t) => {
-    const aggregates = (
-      await client.query<{
-        feeSatoshis: string;
-        generatedValueSatoshis: string;
-        inputValueSatoshis: string;
-        outputValueSatoshis: string;
-      }>(/* sql */ `
-        SELECT
-          block_fee_satoshis(block)::text AS "feeSatoshis",
-          block_generated_value_satoshis(block)::text AS "generatedValueSatoshis",
-          block_input_value_satoshis(block)::text AS "inputValueSatoshis",
-          block_output_value_satoshis(block)::text AS "outputValueSatoshis"
-          FROM block WHERE height = 0;
-      `)
-    ).rows[0]!;
-    t.deepEqual(aggregates, {
-      feeSatoshis: '0',
-      generatedValueSatoshis: '5000000000',
-      inputValueSatoshis: '0',
-      outputValueSatoshis: '5000000000',
-    });
-  }
-);
+test.serial('[e2e] value aggregates handle coinbase-only blocks', async (t) => {
+  t.deepEqual(await checker.blockValueAggregates({ height: 0 }), {
+    fee: 0n,
+    generated: 5000000000n,
+    input: 0n,
+    output: 5000000000n,
+  });
+});
 
 test.serial(
   '[e2e] get hex-encoded block with multiple transactions',
   async (t) => {
     const blockWithMultipleTransactions = mockchainBeforeFork[1]!;
     t.true(blockWithMultipleTransactions.transactions.length > 1);
-    /* eslint-disable @typescript-eslint/naming-convention */
-    const encodedHex = (
-      await client.query<{ block_encoded_hex: string }>(
-        /* sql */ `SELECT block_encoded_hex(block) FROM block WHERE hash = $1::bytea;`,
-        [hexToBin(blockWithMultipleTransactions.header.hash)]
-      )
-    ).rows[0]!.block_encoded_hex;
-    /* eslint-enable @typescript-eslint/naming-convention */
-    t.deepEqual(encodedHex, binToHex(blockWithMultipleTransactions.toBuffer()));
+    t.deepEqual(
+      await checker.encodedBlockHex({
+        hash: blockWithMultipleTransactions.header.hash,
+      }),
+      binToHex(blockWithMultipleTransactions.toBuffer())
+    );
   }
 );
 
@@ -2023,33 +1817,15 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   t.pass();
 });
 
-test.serial(
-  '[e2e] new block saved after reorg',
-  async (t) => {
-    const acceptedBlocks = (
-      await client.query<{
-        hash: string;
-        nodeName: string;
-      }>(
-        /* sql */ `
-      SELECT node.name AS "nodeName", encode(block.hash, 'hex') AS hash
-        FROM node_block
-        INNER JOIN node
-          ON node.internal_id = node_block.node_internal_id
-        INNER JOIN block
-          ON block.internal_id = node_block.block_internal_id
-        WHERE node.name = 'node3'
-          AND block.height = $1
-        ORDER BY block.hash;
-    `,
-        [splitHeight + 1]
-      )
-    ).rows;
-    t.deepEqual(acceptedBlocks, [
-      { hash: tipA[0]!.header.hash, nodeName: 'node3' },
-    ]);
-  }
-);
+test.serial('[e2e] new block saved after reorg', async (t) => {
+  const acceptedBlocks = await checker.acceptedBlocks('node3', {
+    height: splitHeight + 1,
+  });
+  t.deepEqual(
+    acceptedBlocks.map(({ hash, height }) => ({ hash, height })),
+    [{ hash: tipA[0]!.header.hash, height: splitHeight + 1 }]
+  );
+});
 
 test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
   const tipStartIndex = 2;
@@ -2208,32 +1984,34 @@ test.serial(
     await waitForStdout(
       /Saved new block – height:\s+3161[^\n]+nodes: node1, node3/u
     );
-    /* eslint-disable @typescript-eslint/naming-convention */
-    const res = await client.query<{
-      internal_id: number;
-      node_internal_id: number;
-      transaction_internal_id: number;
-      validated_at: string;
-      replaced_at: string;
-    }>(
-      /* sql */ `SELECT * FROM node_transaction_history WHERE transaction_internal_id IN (SELECT internal_id FROM transaction WHERE hash IN ($1::bytea, $2::bytea)) ORDER BY validated_at ASC;
-         `,
-      [hexToBin(tx1!.hash), hexToBin(mock1.hash)]
+    const doubleSpendHashes = [tx1!.hash, mock1.hash];
+    const history = await eventually(
+      async () => checker.transactionHistory('node1', doubleSpendHashes),
+      { isDone: (rows) => rows.length === doubleSpendHashes.length }
     );
-    /* eslint-enable @typescript-eslint/naming-convention */
-    // eslint-disable-next-line @typescript-eslint/no-magic-numbers
-    t.deepEqual(res.rows.length, 2);
-    t.deepEqual(res.rows[0]!.node_internal_id, res.rows[1]!.node_internal_id);
-    t.deepEqual(res.rows[0]!.replaced_at, res.rows[1]!.validated_at);
-    t.true(
-      new Date(res.rows[0]!.validated_at) <= new Date(res.rows[0]!.replaced_at)
+    t.deepEqual(
+      history.map((row) => row.hash),
+      doubleSpendHashes
     );
-    t.true(
-      new Date(res.rows[1]!.validated_at) <= new Date(res.rows[1]!.replaced_at)
+    const [replaced, doubleSpend] = history;
+    t.deepEqual(replaced!.replacedAt, doubleSpend!.validatedAt);
+    t.true(replaced!.validatedAt! <= replaced!.replacedAt!);
+    t.true(doubleSpend!.validatedAt! <= doubleSpend!.replacedAt!);
+    t.deepEqual(
+      await checker.transactionHistory('node2', doubleSpendHashes),
+      []
+    );
+    t.deepEqual(
+      await checker.transactionHistory('node3', doubleSpendHashes),
+      []
     );
     t.pass();
   }
 );
+
+const allNodesBeforeRestart = ['node1', 'node2', 'node3'];
+const mempoolHashes = async (node: string) =>
+  (await checker.mempool(node)).map((entry) => entry.hash);
 
 test.serial(
   '[e2e] removes node_transaction entries which are confirmed by a block',
@@ -2245,19 +2023,22 @@ test.serial(
     logger.debug(`node1: sent tx2: ${tx2!.hash}`);
     peers.node1.sendMessage(new peers.node1.messages.Transaction(tx3));
     logger.debug(`node1: sent tx3: ${tx2!.hash}`);
-    const delay = 100;
-    await sleep(delay);
-    const mempool1 = await client.query<{ encode: string }>(
-      /* sql */ `SELECT encode(hash, 'hex') FROM node_transaction JOIN transaction ON node_transaction.transaction_internal_id = transaction.internal_id ORDER BY hash ASC;`
+    const expectedMempool1 = [
+      tx1!.hash,
+      tx3!.hash,
+      tx2!.hash,
+      chipnetCashTokensTxHash,
+      halTxSpent,
+      halTxHash,
+    ];
+    t.deepEqual(
+      await eventually(async () => mempoolHashes('node1'), {
+        isDone: (hashes) => hashes.length === expectedMempool1.length,
+      }),
+      expectedMempool1
     );
-    t.deepEqual(mempool1.rows, [
-      { encode: tx1!.hash },
-      { encode: tx3!.hash },
-      { encode: tx2!.hash },
-      { encode: chipnetCashTokensTxHash },
-      { encode: halTxSpent },
-      { encode: halTxHash },
-    ]);
+    t.deepEqual(await mempoolHashes('node2'), []);
+    t.deepEqual(await mempoolHashes('node3'), []);
     newBlocks('node1', [tipA[161]!]);
     newBlocks('node2', [tipB[161]!]);
     newBlocks('node3', [tipA[161]!]);
@@ -2269,14 +2050,23 @@ test.serial(
     await waitForStdout(
       /Saved new block – height:\s+3162[^\n]+nodes: node1, node3/u
     );
-    const mempool2 = await client.query<{ encode: string }>(
-      /* sql */ `SELECT encode(hash, 'hex') FROM node_transaction JOIN transaction ON node_transaction.transaction_internal_id = transaction.internal_id ORDER BY hash ASC;`
+    const expectedMempool2 = [chipnetCashTokensTxHash, halTxSpent, halTxHash];
+    t.deepEqual(
+      await eventually(async () => mempoolHashes('node1'), {
+        isDone: (hashes) => hashes.length === expectedMempool2.length,
+      }),
+      expectedMempool2
     );
-    t.deepEqual(mempool2.rows, [
-      { encode: chipnetCashTokensTxHash },
-      { encode: halTxSpent },
-      { encode: halTxHash },
-    ]);
+    t.deepEqual(await mempoolHashes('node2'), []);
+    t.deepEqual(await mempoolHashes('node3'), []);
+    await allNodesBeforeRestart.reduce<Promise<unknown>>(
+      async (chain, node) =>
+        chain.then(async () => {
+          t.deepEqual(await checker.confirmedButInMempool(node), [], node);
+          t.deepEqual(await checker.orphanMempoolDescendants(node), [], node);
+        }),
+      Promise.resolve(undefined)
+    );
     t.pass();
   }
 );
@@ -2300,32 +2090,16 @@ test.serial(
     const transactionHash =
       historicalRepairBlock.transactions[historicalRepairTransactionIndex]!
         .hash;
-    const selectedTransaction = (
-      await client.query<{ hash: string }>(
-        /* sql */ `
-        SELECT encode(transaction.hash, 'hex') AS hash
-          FROM block_transaction
-          INNER JOIN block
-            ON block.internal_id = block_transaction.block_internal_id
-          INNER JOIN transaction
-            ON transaction.internal_id =
-              block_transaction.transaction_internal_id
-          WHERE block.hash = $1
-            AND block_transaction.transaction_index = $2;
-      `,
-        [hexToBin(historicalRepairBlockHash), historicalRepairTransactionIndex]
-      )
-    ).rows;
-    t.deepEqual(selectedTransaction, [{ hash: transactionHash }]);
-    await client.query(
-      /* sql */ `
-        DELETE FROM block_transaction
-          USING block
-          WHERE block.internal_id = block_transaction.block_internal_id
-            AND block.hash = $1
-            AND block_transaction.transaction_index = $2;
-      `,
-      [hexToBin(historicalRepairBlockHash), historicalRepairTransactionIndex]
+    t.deepEqual(
+      await checker.blockTransactionAt(
+        historicalRepairBlockHash,
+        historicalRepairTransactionIndex
+      ),
+      transactionHash
+    );
+    await checker.dropBlockTransactionLink(
+      historicalRepairBlockHash,
+      historicalRepairTransactionIndex
     );
     t.deepEqual(
       await getBlockTransactionCount(historicalRepairBlockHash),
@@ -2370,15 +2144,17 @@ test.serial('[e2e] catches up a new node via headers', async (t) => {
       chainStates.node3[3162]!.header.hash
     })`
   );
-  const node4Blocks = await client.query<{ encode: string; height: string }>(
-    /* sql */ `SELECT encode(hash, 'hex'), height from node_block JOIN node ON node.internal_id = node_block.node_internal_id JOIN block ON block.internal_id = node_block.block_internal_id WHERE node.name = 'node4' ORDER BY height DESC;`
-  );
   const expectedCount = 3163;
-  t.deepEqual(node4Blocks.rowCount, expectedCount);
-  t.deepEqual(node4Blocks.rows[0], {
-    encode: tipA[161]!.header.hash,
-    height: '3162',
-  });
+  const node4Blocks = await eventually(
+    async () => checker.acceptedBlocks('node4'),
+    { isDone: (blocks) => blocks.length === expectedCount }
+  );
+  t.deepEqual(node4Blocks.length, expectedCount);
+  const node4Tip = node4Blocks[node4Blocks.length - 1]!;
+  t.deepEqual(
+    { hash: node4Tip.hash, height: node4Tip.height },
+    { hash: tipA[161]!.header.hash, height: 3162 }
+  );
   await waitForStdout('Agent: enabled mempool tracking.');
   t.pass();
 });
@@ -2437,19 +2213,9 @@ test.serial(
     await waitForStdout(
       /Saved new block – height:\s+3163[^\n]+nodes: node1, node4/u
     );
-    const blockTransactionCount = (
-      await client.query<{ count: string }>(
-        /* sql */ `
-        SELECT COUNT(*) FROM block_transaction
-          INNER JOIN block ON block.internal_id = block_transaction.block_internal_id
-          WHERE block.hash = $1;
-      `,
-        [hexToBin(tipA[tipStartIndex]!.header.hash)]
-      )
-    ).rows[0]!.count;
     t.deepEqual(
-      blockTransactionCount,
-      tipA[tipStartIndex]!.transactions.length.toString()
+      await getBlockTransactionCount(tipA[tipStartIndex]!.header.hash),
+      tipA[tipStartIndex]!.transactions.length
     );
   }
 );
@@ -2640,11 +2406,7 @@ test.serial(
 // eslint-disable-next-line functional/no-let
 let node1InternalId = 0;
 test.serial('[e2e] [api] /send-transaction: invalid TX', async (t) => {
-  node1InternalId = (
-    await client.query<{ internal_id: number }>(
-      /* sql */ `SELECT internal_id FROM node ORDER BY name ASC`
-    )
-  ).rows[0]!.internal_id;
+  node1InternalId = (await checker.nodeInternalId('node1'))!;
   const res = await got.post(
     `http://localhost:${chaingraphInternalApiPort}/send-transaction`,
     {
