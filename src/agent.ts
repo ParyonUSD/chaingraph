@@ -60,6 +60,7 @@ import {
   registerTrustedNodeWithDb,
   removeStaleBlocksForNode,
   runUnspentDeferredJobPass,
+  unspentDeferredJobPool,
   saveBlock,
   saveTransactionForNodes,
   setUnspentTrackingLoggers,
@@ -2390,6 +2391,7 @@ export class Agent {
       .drain()
       .then(async () => drainUnspentTrackingPostCommits())
       .then(async () => this.unspentDeferredJobRunning)
+      .then(async () => unspentDeferredJobPool.end())
       .then(async () => {
         this.logger.debug('Block buffer drained, stopping PG pool...');
         return pool.end();

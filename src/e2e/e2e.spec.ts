@@ -2981,6 +2981,7 @@ const runUnspentTrackingScenario = async (
     await check('re-org replaced the spender (stale removed first)', db);
   } finally {
     await db.pool.end();
+    await db.unspentDeferredJobPool.end();
     if (originalPostgresConnectionString === undefined) {
       delete process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
     } else {
@@ -3694,6 +3695,7 @@ test.serial(
       await compareDeferredQueryRoot(t, 'e2e chain state');
     } finally {
       await setup.pool.end();
+      await setup.unspentDeferredJobPool.end();
     }
     const stalls: string[] = [];
     // eslint-disable-next-line functional/no-let
@@ -3922,6 +3924,7 @@ test.serial(
     } finally {
       saving = false;
       await db.pool.end();
+      await db.unspentDeferredJobPool.end();
       if (originalPostgresConnectionString !== undefined) {
         process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
           originalPostgresConnectionString;
@@ -4089,6 +4092,7 @@ test.serial(
       );
     } finally {
       await db.pool.end();
+      await db.unspentDeferredJobPool.end();
       if (originalPostgresConnectionString !== undefined) {
         process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
           originalPostgresConnectionString;

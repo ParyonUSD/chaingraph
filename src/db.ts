@@ -93,6 +93,15 @@ export const pool = new pg.Pool({
 });
 
 /**
+ * E17 deferred tracking job: its own connection, outside the agent's pool
+ * (block saves can hold every pooled connection for minutes during a sync).
+ */
+export const unspentDeferredJobPool = new pg.Pool({
+  connectionString: postgresConnectionString,
+  max: 1,
+});
+
+/**
  * `CHAINGRAPH_UNSPENT_TRACKING` (experiment): how new outputs are written.
  * - `none`: mode `off`;
  * - `unaudited`: `spent_by_index` or `block_inclusions_index` is missing
@@ -2622,7 +2631,7 @@ export const runUnspentDeferredJobPass = async (
     if (kind === undefined) {
       return summary;
     }
-    const client = await pool.connect();
+    const client = await unspentDeferredJobPool.connect();
     // eslint-disable-next-line functional/no-try-statement
     try {
       await settleDeferredLimits(
@@ -2689,7 +2698,7 @@ export const runUnspentDeferredJobPass = async (
  * once its stall persists).
  */
 export const drainUnspentDeferredJob = async (timeoutMs = 120_000) => {
-  const client = await pool.connect();
+  const client = await unspentDeferredJobPool.connect();
   const target = await client
     .query<{ blockLimit: string; transactionLimit: string }>(readSequencesSql)
     .then((result) => result.rows[0]!)
@@ -2736,7 +2745,7 @@ export const getUnspentDeferredStatus = async () => {
   if (kind === undefined) {
     return undefined;
   }
-  const client = await pool.connect();
+  const client = await unspentDeferredJobPool.connect();
   // eslint-disable-next-line functional/no-try-statement
   try {
     const progress = (
