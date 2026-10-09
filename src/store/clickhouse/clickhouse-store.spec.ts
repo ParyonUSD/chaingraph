@@ -25,6 +25,7 @@ import {
   sha,
   threeBlockChain,
   txHashes,
+  zeroHash,
 } from './spec-fixtures.js';
 import { e2eClickHouseUrl } from './test-support.js';
 
@@ -626,6 +627,108 @@ e2e(
       'SELECT sum(sign) AS s FROM pending_spend'
     );
     t.is(pending[0]?.s ?? '0', '0');
+    t.deepEqual(await badUtxoSums(client), []);
+  }
+);
+
+e2e(
+  '[e2e] ClickHouseStore: in-flight cap 1, a parked child outlives its pending timeout while its parent is queued for a slot: no stand-in',
+  async (t) => {
+    t.timeout(120_000);
+    const slow = { on: false };
+    let childParked: (() => void) | undefined;
+    const parked = new Promise<void>((resolve) => {
+      childParked = resolve;
+    });
+    const { client, openStore } = await scratch(t, 'rearm', {
+      maxInFlightSaves: 1,
+      pendingSpendTimeoutMs: 300,
+    });
+    const store = await openStore(async (step) => {
+      if (step === 'incomplete') childParked?.();
+      if (slow.on) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 150);
+        });
+      }
+    });
+    const { node1, node2 } = await registerNodes(store);
+    const node3 = (
+      await store.registerNode({
+        latestConnectionBeganAt: new Date('2026-10-09T00:00:00Z'),
+        nodeName: 'node-three',
+        protocolVersion: 70016,
+        userAgent: '/BCHN:28.0.0/',
+      })
+    ).internalId;
+    const chain = threeBlockChain();
+    const both = [acceptance(node1), acceptance(node2)];
+    await store.saveBlock({
+      block: chain.block0,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: both,
+    });
+    // the child parks (incomplete) and gives its slot up
+    const child = store.saveBlock({
+      block: chain.block2,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: both,
+    });
+    await parked;
+    // an unrelated slow save (node 3 only) holds the only slot for > 1 s
+    slow.on = true;
+    const other = makeBlock(
+      0,
+      zeroHash,
+      [
+        makeTx({
+          coinbase: true,
+          label: 'other-c0',
+          outputs: [
+            { lockingBytecode: p2pkh('other'), valueSatoshis: 5_000_000_000n },
+          ],
+        }),
+      ],
+      'other-0'
+    );
+    const holder = store.saveBlock({
+      block: other,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node3)],
+    });
+    // the parent is queued behind it for several pending timeouts
+    const parent = store.saveBlock({
+      block: chain.block1,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: both,
+    });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    t.is(store.poolStats().waitingRequests, 1, 'the parent waits for a slot');
+    await Promise.all([child, holder, parent]);
+    await store.operations.drain();
+    slow.on = false;
+    await store.publishWatermarks();
+    const blocks = [chain.block0, chain.block1, chain.block2];
+    for (const node of [node1, node2]) {
+      const view = await nodeView(client, node);
+      t.deepEqual(
+        view.blocks,
+        blocks.map((block) => block.hash)
+      );
+      t.deepEqual(view.utxo, expectedUnspent(blocks));
+      t.deepEqual(
+        view.inputs
+          .filter((row) => row.key.startsWith(chain.b.hash))
+          .map((row) => [row.amount, row.value]),
+        [
+          ['400', '800'],
+          ['1000', '1000'],
+        ],
+        'the spent output was resolved, not the stand-in'
+      );
+    }
     t.deepEqual(await badUtxoSums(client), []);
   }
 );

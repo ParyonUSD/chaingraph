@@ -203,6 +203,8 @@ export interface WriterContext {
   mempoolHooks?: () => MempoolCommitter | undefined;
   /** Shutdown: abandon waits and uncommitted work. */
   abandon?: AbandonSignal;
+  /** Saves queued for an in-flight slot (0 when unbounded). */
+  savesQueued?: () => number;
 }
 
 /** Postgres's saveBlock result semantics. */
@@ -1383,10 +1385,9 @@ export class BlockCommitter {
         }),
       };
     });
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, context.pendingSpendTimeoutMs);
-    });
+    const all = Promise.all(waits.map(async ({ promise }) => promise)).then(
+      () => true
+    );
     try {
       /*
        * After the timeout the outputs still missing are taken as unknown
@@ -1394,15 +1395,29 @@ export class BlockCommitter {
        * parent that never arrives): their inputs are written with a
        * coinbase-like stand-in (value 0, no token, empty bytecode) and no
        * UTXO row, as Postgres stores such inputs (no output to join).
+       * While saves are queued for an in-flight slot (one may be the
+       * parent: it registers its outputs only once it holds a slot), the
+       * timeout is re-armed, so the cap never turns a late parent into a
+       * stand-in. Unbounded stores never queue: one timeout, as before.
        */
-      await Promise.race([
-        Promise.all(waits.map(async ({ promise }) => promise)),
-        timeout,
-        ...(context.abandon === undefined ? [] : [context.abandon.promise]),
-      ]);
+      for (;;) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => {
+            resolve(false);
+          }, context.pendingSpendTimeoutMs);
+        });
+        const done = await Promise.race([
+          all,
+          timeout,
+          ...(context.abandon === undefined ? [] : [context.abandon.promise]),
+        ]).finally(() => {
+          clearTimeout(timer);
+        });
+        if (done || (context.savesQueued?.() ?? 0) === 0) break;
+      }
       return new Map(result);
     } finally {
-      clearTimeout(timer);
       waits.forEach(({ cancel }) => {
         cancel();
       });
