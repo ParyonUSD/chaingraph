@@ -1,0 +1,31 @@
+{
+  "max-block": {
+    "maxWallSeconds": 10,
+    "maxPeakHeapBytes": 1700000000,
+    "maxBytesWritten": null,
+    "maxPartsCreated": null,
+    "maxMergeSeconds": null,
+    "maxDelayedInserts": 0,
+    "maxRejectedInserts": 0
+  },
+  "burst": {
+    "maxDrainSeconds": 30,
+    "maxBytesWritten": null,
+    "maxPartsCreated": null,
+    "maxMergeSeconds": null,
+    "maxDelayedInserts": 0,
+    "maxRejectedInserts": 0
+  },
+  "reorg": {
+    "maxConvergeSeconds": 6,
+    "knownFailingChecks": [
+      "still accepts genesis+base blocks at or below the fork point"
+    ]
+  },
+  "concurrent": {
+    "minConcurrencyRatio": 0.6
+  },
+  "catch-up": {
+    "minBlocksPerSecond": 300
+  }
+}

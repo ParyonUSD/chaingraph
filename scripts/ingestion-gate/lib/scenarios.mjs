@@ -1,26 +1,22 @@
 /**
  * Ingestion gate scenarios. Each scenario gets a fresh database (all
- * migrations of the agent under test), fresh mock nodes and a fresh agent,
+ * migrations – or, with `--store clickhouse`, the ClickHouse DDL – of the
+ * agent under test), fresh mock nodes and a fresh agent,
  * waits until the agent reaches steady state (initial sync done, managed
  * indexes built, mempool tracking enabled – i.e. the production write path,
  * with triggers enabled), then measures.
  *
  * Throughput is always `block_transaction rows for the measured blocks / wall
  * clock`, never the agent's own "active seconds" statistics.
+ *
+ * Every database read goes through `context.backend` (lib/postgres.mjs or
+ * lib/clickhouse.mjs, same surface); a "client" below is that backend's
+ * session.
  */
 import { AgentProcess } from './agent.mjs';
 import { assembleBlock, doubleSha256, generateTransactionPayload, loadOrGenerateBlockSequence } from './fixtures.mjs';
 import { genesisBlockRaw, genesisFromRaw, makeBlock, MockNode, testnetGenesisBlockRaw } from './mock-node.mjs';
-import {
-  acceptedBlockCount,
-  blockTransactionCount,
-  connectClient,
-  countRows,
-  currentWalLsn,
-  recreateDatabase,
-  waitFor,
-  walBytesSince,
-} from './postgres.mjs';
+import { waitFor } from './postgres.mjs';
 
 /* eslint-disable no-bitwise */
 const magicFromLabel = (label) => Buffer.from(label, 'utf8').map((byte) => byte | 128).toString('hex');
@@ -75,7 +71,8 @@ const seconds = (ms) => ms / 1000;
  * agent; resolve once the agent is in steady state.
  */
 const startEnvironment = async (context, label, nodeSpecs) => {
-  const client = await recreateDatabase({ agentDirectory: context.agentDirectory, baseUrl: context.baseUrl, databaseName });
+  const { backend } = context;
+  const client = await backend.recreateDatabase({ agentDirectory: context.agentDirectory, baseUrl: context.baseUrl, databaseName });
   const nodes = nodeSpecs.map((spec) => {
     const node = new MockNode({ genesis: spec.genesis, magicHex: spec.magicHex, name: spec.name, port: nextPort++ });
     node.extend(spec.baseChain);
@@ -85,7 +82,7 @@ const startEnvironment = async (context, label, nodeSpecs) => {
   const genesisBlocks = [...new Map(nodeSpecs.map((spec) => [spec.magicHex, `${spec.magicHex}:${spec.genesisRaw}`])).values()].join(',');
   const agent = new AgentProcess({
     agentDirectory: context.agentDirectory,
-    connectionString: `${context.baseUrl}/${databaseName}`,
+    environment: backend.agentEnvironment({ baseUrl: context.baseUrl, databaseName }),
     genesisBlocks,
     label,
     runDirectory: context.runDirectory,
@@ -95,10 +92,15 @@ const startEnvironment = async (context, label, nodeSpecs) => {
   const cleanup = async () => {
     await agent.stop();
     nodes.forEach((node) => node.close());
-    await client.end();
+    await backend.closeSession(client);
   };
   try {
-    await Promise.all(nodes.map((node) => node.waitForPeer()));
+    // fail fast if the agent exits before connecting (e.g. an unsupported store)
+    const agentExited = agent.exitPromise.then((code) => {
+      throw new Error(`agent ${label} exited (code ${code}) before connecting to the mock nodes\n--- last output ---\n${agent.stdoutBuffer.slice(-3000)}`);
+    });
+    await Promise.race([Promise.all(nodes.map((node) => node.waitForPeer())), agentExited]);
+    agentExited.catch(() => {});
     await agent.waitForSteadyState();
     // let post-sync housekeeping (incomplete block repair, expiration scan) settle
     await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -119,10 +121,11 @@ const chipnetLikeSpec = (seed, name = 'chipnet_like') => {
 };
 
 /** Shared measurement: announce, wait until all accepted, collect metrics. */
-const measureIngestion = async ({ environment, node, blocks, announce, timeoutMs, pollMs = 25 }) => {
+const measureIngestion = async ({ backend, environment, node, blocks, announce, timeoutMs, pollMs = 25 }) => {
   const { client, agent } = environment;
+  const { acceptedBlockCount, blockTransactionCount, countRows } = backend;
   const hashes = blocks.map((block) => block.hash);
-  const startLsn = await currentWalLsn(client);
+  const metricsStart = await backend.writeMetricsStart(client);
   const transactionRowsBefore = await countRows(client, 'transaction');
   const started = Date.now();
   announce();
@@ -132,7 +135,7 @@ const measureIngestion = async ({ environment, node, blocks, announce, timeoutMs
     timeoutMs,
   });
   const wallMs = finished - started;
-  const walBytes = await walBytesSince(client, startLsn);
+  const writeMetrics = await backend.writeMetricsSince(client, metricsStart);
   const blockTransactionRows = await blockTransactionCount(client, hashes);
   const newTransactionRows = (await countRows(client, 'transaction')) - transactionRowsBefore;
   const expectedTransactions = sumTransactions(blocks);
@@ -146,7 +149,7 @@ const measureIngestion = async ({ environment, node, blocks, announce, timeoutMs
     heap,
     newTransactionRows,
     transactionsPerSecond: blockTransactionRows / seconds(wallMs),
-    walBytes,
+    ...writeMetrics,
     wallSeconds: seconds(wallMs),
   };
 };
@@ -166,7 +169,7 @@ export const maxBlockScenario = async (context) => {
     const [node] = environment.nodes;
     const blocks = linkBlocks([payload], node.tip().hash);
     context.log(`max-block: announcing ${(blocks[0].raw.length / 1e6).toFixed(2)} MB block with ${blocks[0].stats.transactions} txs`);
-    const result = await measureIngestion({ announce: () => node.announceViaHeaders(blocks), blocks, environment, node, timeoutMs: 600_000 });
+    const result = await measureIngestion({ announce: () => node.announceViaHeaders(blocks), backend: context.backend, blocks, environment, node, timeoutMs: 600_000 });
     return { ...result, peakHeapBytes: result.heap.peakHeapUsed };
   } finally {
     await environment.cleanup();
@@ -187,67 +190,12 @@ export const burstScenario = async (context) => {
     const [node] = environment.nodes;
     const blocks = linkBlocks(payloads, node.tip().hash);
     context.log(`burst: announcing 3 blocks (${(sumBytes(blocks) / 1e6).toFixed(2)} MB) back-to-back`);
-    const result = await measureIngestion({ announce: () => node.announceViaHeaders(blocks), blocks, environment, node, timeoutMs: 1_200_000 });
+    const result = await measureIngestion({ announce: () => node.announceViaHeaders(blocks), backend: context.backend, blocks, environment, node, timeoutMs: 1_200_000 });
     return { ...result, drainSeconds: result.wallSeconds, peakHeapBytes: result.heap.peakHeapUsed };
   } finally {
     await environment.cleanup();
   }
 };
-
-const acceptedChain = async (client, nodeName) =>
-  (
-    await client.query(
-      `SELECT block.height::int AS height, encode(block.hash, 'hex') AS hash
-         FROM node_block
-         JOIN node ON node.internal_id = node_block.node_internal_id
-         JOIN block ON block.internal_id = node_block.block_internal_id
-        WHERE node.name = $1
-        ORDER BY block.height`,
-      [nodeName]
-    )
-  ).rows;
-
-const mempoolRowCount = async (client, nodeName, transactionHashes) =>
-  Number(
-    (
-      await client.query(
-        `SELECT count(*)::bigint AS count
-           FROM node_transaction
-           JOIN node ON node.internal_id = node_transaction.node_internal_id
-           JOIN transaction ON transaction.internal_id = node_transaction.transaction_internal_id
-          WHERE node.name = $1 AND transaction.hash = ANY($2::bytea[])`,
-        [nodeName, transactionHashes.map((hash) => Buffer.from(hash, 'hex'))]
-      )
-    ).rows[0].count
-  );
-
-const historyNodeCount = async (client, nodeName, transactionHashes) =>
-  Number(
-    (
-      await client.query(
-        `SELECT count(DISTINCT node_transaction_history.transaction_internal_id)::bigint AS count
-           FROM node_transaction_history
-           JOIN node ON node.internal_id = node_transaction_history.node_internal_id
-           JOIN transaction ON transaction.internal_id = node_transaction_history.transaction_internal_id
-          WHERE node.name = $1 AND transaction.hash = ANY($2::bytea[])`,
-        [nodeName, transactionHashes.map((hash) => Buffer.from(hash, 'hex'))]
-      )
-    ).rows[0].count
-  );
-
-/** node_transaction rows whose transaction is in a block the same node accepted. */
-const confirmedButInMempoolCount = async (client) =>
-  Number(
-    (
-      await client.query(
-        `SELECT count(*)::bigint AS count
-           FROM node_transaction
-           JOIN block_transaction ON block_transaction.transaction_internal_id = node_transaction.transaction_internal_id
-           JOIN node_block ON node_block.block_internal_id = block_transaction.block_internal_id
-                          AND node_block.node_internal_id = node_transaction.node_internal_id`
-      )
-    ).rows[0].count
-  );
 
 export const reorgScenario = async (context) => {
   const { reorgTransactionsPerBlock } = context.settings;
@@ -259,6 +207,7 @@ export const reorgScenario = async (context) => {
   const specA = mainnetLikeSpec(context.seed, 'reorg_node_1');
   const specB = { ...specA, name: 'reorg_node_2' };
   const environment = await startEnvironment(context, 'reorg', [specA, specB]);
+  const { acceptedBlockCount, acceptedChain, blockTransactionCount, confirmedButInMempoolCount, historyNodeCount, mempoolRowCount } = context.backend;
   try {
     const { client, nodes } = environment;
     const forkHeight = nodes[0].chain.length - 1;
@@ -282,7 +231,7 @@ export const reorgScenario = async (context) => {
     await waitFor(async () => (await sequential(nodes, (node) => mempoolRowCount(client, node.name, allMempoolHashes))).every((count) => count === allMempoolHashes.length), { description: '40 mempool transactions recorded for both nodes', intervalMs: 50, timeoutMs: 60_000 });
 
     context.log('reorg: switching both nodes to 101-block branch B');
-    const startLsn = await currentWalLsn(client);
+    const metricsStart = await context.backend.writeMetricsStart(client);
     const started = Date.now();
     nodes.forEach((node) => node.reorgTo(forkHeight, chainB));
     const finished = await waitFor(
@@ -292,7 +241,7 @@ export const reorgScenario = async (context) => {
       },
       { description: 'both nodes converged on branch B', intervalMs: 50, timeoutMs: 600_000 }
     );
-    const walBytes = await walBytesSince(client, startLsn);
+    const writeMetrics = await context.backend.writeMetricsSince(client, metricsStart);
     // give mempool cleanup triggers/agent a moment, then check final state
     await new Promise((resolve) => setTimeout(resolve, 500));
 
@@ -312,11 +261,11 @@ export const reorgScenario = async (context) => {
       checks[`${node.name}: 30 confirmed txs left the mempool`] = (await mempoolRowCount(client, node.name, confirmedHashes)) === 0;
       checks[`${node.name}: 30 confirmed txs archived in node_transaction_history`] = (await historyNodeCount(client, node.name, confirmedHashes)) === 30;
       checks[`${node.name}: 10 unconfirmed txs still in mempool`] = (await mempoolRowCount(client, node.name, unconfirmedHashes)) === 10;
+      checks[`${node.name}: no mempool transaction is confirmed in a block the same node accepts`] = (await confirmedButInMempoolCount(client, node.name)) === 0;
     }
     const blockTransactionRows = await blockTransactionCount(client, chainBHashes);
     const expectedTransactions = sumTransactions(chainB);
     checks[`block_transaction rows for B match (${expectedTransactions})`] = blockTransactionRows === expectedTransactions;
-    checks['no node_transaction row is confirmed in a block accepted by the same node'] = (await confirmedButInMempoolCount(client)) === 0;
     const failedChecks = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
     const wallMs = finished - started;
     return {
@@ -328,7 +277,7 @@ export const reorgScenario = async (context) => {
       expectedTransactions,
       failedChecks,
       transactionsPerSecond: blockTransactionRows / seconds(wallMs),
-      walBytes,
+      ...writeMetrics,
       wallSeconds: seconds(wallMs),
     };
   } finally {
@@ -346,6 +295,7 @@ const runConcurrentCase = async (context, label, workloads) => {
   if (workloads.mainnet) specs.push(mainnetLikeSpec(context.seed));
   if (workloads.chipnet) specs.push(chipnetLikeSpec(context.seed));
   const environment = await startEnvironment(context, label, specs);
+  const { backend } = context;
   try {
     const { client, nodes } = environment;
     const plans = nodes.map((node) => {
@@ -353,20 +303,20 @@ const runConcurrentCase = async (context, label, workloads) => {
       return { blocks: linkBlocks(payloads, node.tip().hash), node };
     });
     const allHashes = plans.flatMap((plan) => plan.blocks.map((block) => block.hash));
-    const startLsn = await currentWalLsn(client);
+    const metricsStart = await backend.writeMetricsStart(client);
     const perNodeFinish = {};
     /*
      * Each network is a sequential writer, like a node following its tip:
      * announce one block, wait until it is saved, announce the next. Each
      * writer polls with its own connection so the two loops are independent.
      */
-    const pollers = await Promise.all(plans.map(() => connectClient(`${context.baseUrl}/${databaseName}`)));
+    const pollers = await Promise.all(plans.map(() => backend.openSession({ agentDirectory: context.agentDirectory, baseUrl: context.baseUrl, databaseName })));
     const started = Date.now();
     await Promise.all(
       plans.map(async (plan, index) => {
         for (const block of plan.blocks) {
           plan.node.announceViaHeaders([block]);
-          await waitFor(async () => (await acceptedBlockCount(pollers[index], plan.node.name, [block.hash])) === 1, {
+          await waitFor(async () => (await backend.acceptedBlockCount(pollers[index], plan.node.name, [block.hash])) === 1, {
             description: `${plan.node.name} block ${block.hash}`,
             intervalMs: 5,
             timeoutMs: 600_000,
@@ -376,9 +326,10 @@ const runConcurrentCase = async (context, label, workloads) => {
       })
     );
     const finished = Date.now();
-    await Promise.all(pollers.map((poller) => poller.end()));
+    await Promise.all(pollers.map((poller) => backend.closeSession(poller)));
     const wallMs = finished - started;
-    const blockTransactionRows = await blockTransactionCount(client, allHashes);
+    const writeMetrics = await backend.writeMetricsSince(client, metricsStart);
+    const blockTransactionRows = await backend.blockTransactionCount(client, allHashes);
     const expectedTransactions = plans.reduce((total, plan) => total + sumTransactions(plan.blocks), 0);
     return {
       blockTransactionRows,
@@ -386,7 +337,7 @@ const runConcurrentCase = async (context, label, workloads) => {
       expectedTransactions,
       perNodeFinishSeconds: perNodeFinish,
       transactionsPerSecond: blockTransactionRows / seconds(wallMs),
-      walBytes: await walBytesSince(client, startLsn),
+      ...writeMetrics,
       wallSeconds: seconds(wallMs),
     };
   } finally {
@@ -419,6 +370,7 @@ export const catchUpScenario = async (context) => {
   const blockCount = context.settings.catchUpBlocks;
   const payloads = loadOrGenerateBlockSequence({ blockCount, cacheDirectory: context.cacheDirectory, log: context.log, name: 'catchup', seed: context.seed, transactionsPerBlock: context.settings.catchUpTransactionsPerBlock });
   const environment = await startEnvironment(context, 'catch-up', [mainnetLikeSpec(context.seed)]);
+  const { acceptedBlockCount, blockTransactionCount, nodeBlockCount } = context.backend;
   try {
     const { client } = environment;
     const [node] = environment.nodes;
@@ -426,13 +378,12 @@ export const catchUpScenario = async (context) => {
     const hashes = blocks.map((block) => block.hash);
     const expectedNodeBlocks = node.chain.length + blocks.length;
     context.log(`catch-up: announcing ${blockCount} blocks`);
-    const startLsn = await currentWalLsn(client);
+    const metricsStart = await context.backend.writeMetricsStart(client);
     const started = Date.now();
     node.appendViaInventory(blocks);
-    const nodeBlockCount = async () =>
-      Number((await client.query(`SELECT count(*)::bigint AS count FROM node_block JOIN node ON node.internal_id = node_block.node_internal_id WHERE node.name = $1`, [node.name])).rows[0].count);
-    const finished = await waitFor(async () => (await nodeBlockCount()) === expectedNodeBlocks, { description: `${blockCount} catch-up blocks accepted`, intervalMs: 100, timeoutMs: 3_600_000 });
+    const finished = await waitFor(async () => (await nodeBlockCount(client, node.name)) === expectedNodeBlocks, { description: `${blockCount} catch-up blocks accepted`, intervalMs: 100, timeoutMs: 3_600_000 });
     const wallMs = finished - started;
+    const writeMetrics = await context.backend.writeMetricsSince(client, metricsStart);
     const blockTransactionRows = await blockTransactionCount(client, hashes);
     const expectedTransactions = sumTransactions(blocks);
     return {
@@ -443,7 +394,7 @@ export const catchUpScenario = async (context) => {
       expectedTransactions,
       peakHeapBytes: environment.agent.heapPeak(started, finished).peakHeapUsed,
       transactionsPerSecond: blockTransactionRows / seconds(wallMs),
-      walBytes: await walBytesSince(client, startLsn),
+      ...writeMetrics,
       wallSeconds: seconds(wallMs),
     };
   } finally {

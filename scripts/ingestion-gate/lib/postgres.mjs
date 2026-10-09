@@ -182,3 +182,84 @@ export const waitFor = async (predicate, { timeoutMs, intervalMs = 25, descripti
     await sleep(intervalMs);
   }
 };
+
+/*
+ * Backend surface shared with clickhouse.mjs (`--store`): sessions, agent
+ * environment, correctness reads and write metrics. A Postgres session is a
+ * pg.Client.
+ */
+
+export const openSession = async ({ baseUrl, databaseName }) => connectClient(`${baseUrl}/${databaseName}`);
+
+export const closeSession = async (client) => client.end();
+
+export const agentEnvironment = ({ baseUrl, databaseName }) => ({
+  CHAINGRAPH_POSTGRES_CONNECTION_STRING: `${baseUrl}/${databaseName}`,
+  CHAINGRAPH_STORE: 'postgres',
+});
+
+/** Write metrics of a measured window: WAL bytes (cluster-wide). */
+export const writeMetricsStart = async (client) => ({ lsn: await currentWalLsn(client) });
+
+export const writeMetricsSince = async (client, start) => ({ walBytes: await walBytesSince(client, start.lsn) });
+
+export const acceptedChain = async (client, nodeName) =>
+  (
+    await client.query(
+      `SELECT block.height::int AS height, encode(block.hash, 'hex') AS hash
+         FROM node_block
+         JOIN node ON node.internal_id = node_block.node_internal_id
+         JOIN block ON block.internal_id = node_block.block_internal_id
+        WHERE node.name = $1
+        ORDER BY block.height`,
+      [nodeName]
+    )
+  ).rows;
+
+export const nodeBlockCount = async (client, nodeName) =>
+  Number((await client.query(`SELECT count(*)::bigint AS count FROM node_block JOIN node ON node.internal_id = node_block.node_internal_id WHERE node.name = $1`, [nodeName])).rows[0].count);
+
+export const mempoolRowCount = async (client, nodeName, transactionHashes) =>
+  Number(
+    (
+      await client.query(
+        `SELECT count(*)::bigint AS count
+           FROM node_transaction
+           JOIN node ON node.internal_id = node_transaction.node_internal_id
+           JOIN transaction ON transaction.internal_id = node_transaction.transaction_internal_id
+          WHERE node.name = $1 AND transaction.hash = ANY($2::bytea[])`,
+        [nodeName, transactionHashes.map((hash) => Buffer.from(hash, 'hex'))]
+      )
+    ).rows[0].count
+  );
+
+export const historyNodeCount = async (client, nodeName, transactionHashes) =>
+  Number(
+    (
+      await client.query(
+        `SELECT count(DISTINCT node_transaction_history.transaction_internal_id)::bigint AS count
+           FROM node_transaction_history
+           JOIN node ON node.internal_id = node_transaction_history.node_internal_id
+           JOIN transaction ON transaction.internal_id = node_transaction_history.transaction_internal_id
+          WHERE node.name = $1 AND transaction.hash = ANY($2::bytea[])`,
+        [nodeName, transactionHashes.map((hash) => Buffer.from(hash, 'hex'))]
+      )
+    ).rows[0].count
+  );
+
+/** Per node: node_transaction rows whose transaction is in a block the same node accepted. */
+export const confirmedButInMempoolCount = async (client, nodeName) =>
+  Number(
+    (
+      await client.query(
+        `SELECT count(*)::bigint AS count
+           FROM node_transaction
+           JOIN node ON node.internal_id = node_transaction.node_internal_id
+           JOIN block_transaction ON block_transaction.transaction_internal_id = node_transaction.transaction_internal_id
+           JOIN node_block ON node_block.block_internal_id = block_transaction.block_internal_id
+                          AND node_block.node_internal_id = node_transaction.node_internal_id
+          WHERE node.name = $1`,
+        [nodeName]
+      )
+    ).rows[0].count
+  );

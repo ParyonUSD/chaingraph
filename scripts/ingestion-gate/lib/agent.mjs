@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const heapSamplerUrl = pathToFileURL(fileURLToPath(new URL('./heap-sampler.mjs', import.meta.url))).href;
 
 export class AgentProcess {
-  constructor({ agentDirectory, runDirectory, label, connectionString, trustedNodes, genesisBlocks, settings }) {
+  constructor({ agentDirectory, runDirectory, label, environment, trustedNodes, genesisBlocks, settings }) {
     this.label = label;
     this.stdoutBuffer = '';
     this.waiters = [];
@@ -34,13 +34,14 @@ export class AgentProcess {
         CHAINGRAPH_LOG_LEVEL_PATH: 'debug',
         CHAINGRAPH_LOG_LEVEL_STDOUT: 'info',
         CHAINGRAPH_LOG_PATH: this.logPath,
-        CHAINGRAPH_POSTGRES_CONNECTION_STRING: connectionString,
         CHAINGRAPH_POSTGRES_MAX_CONNECTIONS: String(settings.postgresMaxConnections),
         CHAINGRAPH_TRUSTED_NODES: trustedNodes,
         HOME: process.env.HOME,
         INGESTION_GATE_HEAP_SAMPLES: this.heapSamplePath,
         NODE_ENV: 'production',
         PATH: process.env.PATH,
+        // backend selection + connection (CHAINGRAPH_STORE, CHAINGRAPH_POSTGRES_* / CHAINGRAPH_CLICKHOUSE_*)
+        ...environment,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });

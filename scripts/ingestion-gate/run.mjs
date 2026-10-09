@@ -7,6 +7,14 @@
  *                       [--quick] [--thresholds <file.json>] [--out <file.json>] [--keep-pg]
  *                       [--pg auto|docker|host] [--pg-image postgres:18] [--pg-bin <dir>]
  *                       [--pg-port 55432] [--pg-url <postgres://user:pass@host:port>]
+ *                       [--store postgres|clickhouse] [--ch-url http://localhost:18123]
+ *
+ * `--store clickhouse` runs the agent with CHAINGRAPH_STORE=clickhouse against
+ * an already-running ClickHouse server (`--ch-url`, credentials may be in the
+ * URL; never Cloud for the gate), applies the agent's DDL per scenario, reads
+ * correctness through the compiled ClickHouse checker (pinned gated views) and
+ * reports part_log/events write metrics instead of WAL; thresholds default to
+ * thresholds.clickhouse.json.
  *
  * Exits non-zero if any scenario errors, fails a correctness check or exceeds
  * a threshold.
@@ -18,7 +26,9 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { dockerMemoryBytes, dropDatabase, startDockerPostgres, startHostPostgres } from './lib/postgres.mjs';
+import * as clickhouseBackend from './lib/clickhouse.mjs';
+import * as postgresBackend from './lib/postgres.mjs';
+import { dockerMemoryBytes, startDockerPostgres, startHostPostgres } from './lib/postgres.mjs';
 import { scenarios } from './lib/scenarios.mjs';
 
 const harnessDirectory = dirname(fileURLToPath(import.meta.url));
@@ -28,6 +38,7 @@ const { values: options } = parseArgs({
   options: {
     'agent-dir': { default: repositoryRoot, type: 'string' },
     'cache-dir': { default: join(repositoryRoot, 'data/ingestion-gate/fixtures'), type: 'string' },
+    'ch-url': { default: process.env.INGESTION_GATE_CH_URL ?? 'http://localhost:18123', type: 'string' },
     quick: { default: false, type: 'boolean' },
     help: { default: false, type: 'boolean' },
     'keep-pg': { default: false, type: 'boolean' },
@@ -40,7 +51,8 @@ const { values: options } = parseArgs({
     'pg-url': { type: 'string' },
     scenarios: { default: Object.keys(scenarios).join(','), type: 'string' },
     seed: { default: '1', type: 'string' },
-    thresholds: { default: join(harnessDirectory, 'thresholds.json'), type: 'string' },
+    store: { default: process.env.INGESTION_GATE_STORE ?? 'postgres', type: 'string' },
+    thresholds: { type: 'string' },
   },
 });
 
@@ -51,7 +63,11 @@ if (options.help) {
 
 const log = (message) => console.log(`[ingestion-gate ${new Date().toISOString().slice(11, 19)}] ${message}`);
 const agentDirectory = resolve(options['agent-dir']);
-const thresholds = JSON.parse(readFileSync(options.thresholds, 'utf8'));
+if (!['postgres', 'clickhouse'].includes(options.store)) throw new Error(`--store must be postgres or clickhouse, got ${options.store}`);
+const isClickHouse = options.store === 'clickhouse';
+const backend = isClickHouse ? clickhouseBackend : postgresBackend;
+const thresholdsPath = options.thresholds ?? join(harnessDirectory, isClickHouse ? 'thresholds.clickhouse.json' : 'thresholds.json');
+const thresholds = JSON.parse(readFileSync(thresholdsPath, 'utf8'));
 const selectedScenarios = options.scenarios.split(',').map((name) => name.trim()).filter(Boolean);
 selectedScenarios.forEach((name) => {
   if (scenarios[name] === undefined) throw new Error(`unknown scenario: ${name}`);
@@ -97,6 +113,7 @@ const cleanupAndExit = (code) => {
  */
 const minimumDockerMemoryBytes = 14e9;
 const startPostgres = async () => {
+  if (isClickHouse) return { baseUrl: options['ch-url'], description: 'clickhouse (external)', stop: () => {} };
   if (options['pg-url'] !== undefined) return { baseUrl: options['pg-url'], description: 'external', stop: () => {} };
   let mode = options.pg;
   if (mode === 'auto') {
@@ -114,16 +131,27 @@ const startPostgres = async () => {
 process.on('SIGINT', () => cleanupAndExit(130));
 process.on('SIGTERM', () => cleanupAndExit(143));
 
+/** ClickHouse write limits (null in thresholds.clickhouse.json until calibrated). */
+const clickhouseWriteRules = [
+  ['bytesWritten', 'maxBytesWritten', 'max'],
+  ['partsCreated', 'maxPartsCreated', 'max'],
+  ['mergeSeconds', 'maxMergeSeconds', 'max'],
+  ['delayedInserts', 'maxDelayedInserts', 'max'],
+  ['rejectedInserts', 'maxRejectedInserts', 'max'],
+];
+
 /** [metric path, threshold key, comparison] per scenario. */
 const thresholdRules = {
   'max-block': [
     ['wallSeconds', 'maxWallSeconds', 'max'],
     ['walBytes', 'maxWalBytes', 'max'],
     ['peakHeapBytes', 'maxPeakHeapBytes', 'max'],
+    ...clickhouseWriteRules,
   ],
   burst: [
     ['drainSeconds', 'maxDrainSeconds', 'max'],
     ['walBytes', 'maxWalBytes', 'max'],
+    ...clickhouseWriteRules,
   ],
   reorg: [['convergeSeconds', 'maxConvergeSeconds', 'max']],
   concurrent: [['concurrencyRatio', 'minConcurrencyRatio', 'min']],
@@ -173,7 +201,12 @@ const summaryColumns = (name, result) => {
     heap: result.peakHeapBytes ? formatValue('peakHeapBytes', result.peakHeapBytes) : '',
     primary,
     txPerSecond: result.transactionsPerSecond ? Math.round(result.transactionsPerSecond).toString() : '',
-    wal: result.walBytes !== undefined ? formatValue('walBytes', result.walBytes) : '',
+    wal:
+      result.walBytes !== undefined
+        ? formatValue('walBytes', result.walBytes)
+        : result.bytesWritten !== undefined
+          ? `${formatValue('walBytes', result.bytesWritten)} (+${formatValue('walBytes', result.mergeBytesWritten)} merges, ${result.partsCreated} parts)`
+          : '',
   };
 };
 
@@ -189,6 +222,7 @@ const main = async () => {
       node: process.version,
       platform: `${process.platform}-${process.arch}`,
       postgres: postgresServer.description,
+      store: options.store,
       totalMemoryBytes: totalmem(),
     },
     harnessRevision: gitRevision(repositoryRoot),
@@ -206,6 +240,7 @@ const main = async () => {
     const started = Date.now();
     const context = {
       agentDirectory,
+      backend,
       baseUrl,
       cacheDirectory: options['cache-dir'],
       log,
@@ -227,7 +262,7 @@ const main = async () => {
     writeFileSync(options.out, `${JSON.stringify(report, null, 2)}\n`);
   }
   if (options['keep-pg']) log(`--keep-pg: leaving Postgres running at ${baseUrl}/chaingraph_ingestion_gate (stop it yourself)`);
-  else await dropDatabase({ baseUrl, databaseName: 'chaingraph_ingestion_gate' }).catch(() => {});
+  else await backend.dropDatabase({ agentDirectory, baseUrl, databaseName: 'chaingraph_ingestion_gate' }).catch(() => {});
   report.totalSeconds = (Date.now() - gateStarted) / 1000;
   writeFileSync(options.out, `${JSON.stringify(report, null, 2)}\n`);
 
@@ -237,7 +272,7 @@ const main = async () => {
     const status = entry.passed ? (entry.result?.knownFailures ? 'PASS*' : 'PASS') : 'FAIL';
     return [name, status, columns.primary ?? '-', columns.txPerSecond ?? '', columns.wal ?? '', columns.heap ?? '', entry.failures.join('; ')];
   });
-  const header = ['scenario', 'status', 'headline', 'tx/s', 'WAL', 'peak heap', 'failures'];
+  const header = ['scenario', 'status', 'headline', 'tx/s', isClickHouse ? 'written' : 'WAL', 'peak heap', 'failures'];
   const widths = header.map((title, index) => Math.max(title.length, ...rows.map((row) => String(row[index]).length)));
   const line = (cells) => cells.map((cell, index) => String(cell).padEnd(widths[index])).join(' | ');
   console.log(`\n${line(header)}\n${widths.map((width) => '-'.repeat(width)).join('-|-')}\n${rows.map(line).join('\n')}\n`);

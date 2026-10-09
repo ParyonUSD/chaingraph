@@ -1,0 +1,244 @@
+/**
+ * ClickHouse backend of the ingestion gate (`--store clickhouse`): the same
+ * surface as `postgres.mjs` (see `storeBackend` there).
+ *
+ * - The schema is the DDL of the agent under test (`<agent>/src/store/clickhouse/ddl`),
+ *   applied by the agent's compiled `build/store/clickhouse/ddl-apply.js`.
+ * - Every correctness read goes through the agent's compiled ClickHouse
+ *   checker or the pinned gated views (`*_at`, one `readSnapshot` per read),
+ *   so the clock stops only when a save is committed AND published.
+ * - WAL bytes are replaced by server-side write metrics from
+ *   `system.part_log`, `system.events`, `system.parts`, `system.merges` and
+ *   `system.query_log` (see `writeMetricsStart` / `writeMetricsSince`).
+ *
+ * Point it at a private server (local docker `clickhouse/clickhouse-server:26.8`):
+ * the `system.events` deltas are server-wide.
+ */
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Agent-compiled modules (checker, views, DDL) of the agent under test. */
+const loadModules = async (agentDirectory) => {
+  const load = (path) => import(pathToFileURL(join(agentDirectory, 'build/store/clickhouse', path)).href);
+  try {
+    const [client, checker, ddl, visibility] = await Promise.all([
+      load('client.js'),
+      load('checker.js'),
+      load('ddl-apply.js'),
+      load('visibility.js'),
+    ]);
+    return { checker, client, ddl, visibility };
+  } catch (error) {
+    throw new Error(`${agentDirectory} has no compiled ClickHouse store (build/store/clickhouse/{client,checker,ddl-apply,visibility}.js) – build an agent with WP5: ${error.message}`);
+  }
+};
+
+/** `system.events` counters read before/after a measured window (names checked on 26.8). */
+export const eventCounters = [
+  'InsertedBytes',
+  'InsertedRows',
+  'InsertQuery',
+  'DelayedInserts',
+  'DelayedInsertsMilliseconds',
+  'RejectedInserts',
+  'DuplicatedInsertedBlocks',
+  'MergedRows',
+  'MergedUncompressedBytes',
+  'MergeTotalMilliseconds',
+];
+
+export const metricQueries = {
+  eventSnapshot: `SELECT name, toString(value) AS value FROM system.events
+    WHERE has({names:Array(String)}, name)
+    SETTINGS system_events_show_zero_values = 1`,
+  /** Compressed bytes written by inserts (NewPart) and by merges (MergeParts), parts created, merge time. */
+  partLog: `SELECT
+      toString(sumIf(size_in_bytes, event_type = 'NewPart')) AS new_part_bytes,
+      toString(countIf(event_type = 'NewPart')) AS new_parts,
+      toString(sumIf(size_in_bytes, event_type = 'MergeParts')) AS merge_bytes,
+      toString(countIf(event_type = 'MergeParts')) AS merges,
+      toString(sumIf(duration_ms, event_type = 'MergeParts')) AS merge_ms
+    FROM system.part_log
+    WHERE database = {database:String} AND event_time_microseconds >= {since:DateTime64(6)}`,
+  partLogByTable: `SELECT table,
+      toString(countIf(event_type = 'NewPart')) AS new_parts,
+      toString(sumIf(size_in_bytes, event_type = 'NewPart')) AS new_part_bytes,
+      toString(sumIf(size_in_bytes, event_type = 'MergeParts')) AS merge_bytes
+    FROM system.part_log
+    WHERE database = {database:String} AND event_time_microseconds >= {since:DateTime64(6)}
+    GROUP BY table ORDER BY table`,
+  /** Active parts of the busiest (table, partition), against parts_to_delay_insert. */
+  maxActiveParts: `SELECT toString(max(parts)) AS parts FROM (
+      SELECT count() AS parts FROM system.parts
+      WHERE database = {database:String} AND active
+      GROUP BY table, partition_id)`,
+  /** Peak server memory of one INSERT (the Postgres "~3 GB per block" note). */
+  maxInsertMemory: `SELECT toString(max(memory_usage)) AS bytes, toString(count()) AS inserts
+    FROM system.query_log
+    WHERE type = 'QueryFinish' AND query_kind = 'Insert'
+      AND current_database = {database:String}
+      AND event_time_microseconds >= {since:DateTime64(6)}`,
+  runningMerges: `SELECT toString(count()) AS merges FROM system.merges WHERE database = {database:String}`,
+  serverNow: `SELECT toString(now64(6)) AS now`,
+};
+
+const adminServer = (baseUrl) => ({ url: baseUrl });
+
+/** A session on `databaseName`: client, compiled checker and the pinned-view helpers. */
+export const openSession = async ({ agentDirectory, baseUrl, databaseName }) => {
+  const modules = await loadModules(agentDirectory);
+  const client = new modules.client.ClickHouseClient({ database: databaseName, password: '', requestTimeoutMs: 600_000, url: baseUrl, username: '' });
+  const checker = modules.checker.createClickHouseChecker(client, databaseName);
+  return { baseUrl, checker, client, databaseName, kind: 'clickhouse', modules };
+};
+
+export const closeSession = async (session) => session.client.close();
+
+/** Drop, create and apply the agent's DDL; returns a session. */
+export const recreateDatabase = async ({ agentDirectory, baseUrl, databaseName }) => {
+  const modules = await loadModules(agentDirectory);
+  await modules.ddl.applyClickHouseDdl(adminServer(baseUrl), databaseName, { recreate: true });
+  return openSession({ agentDirectory, baseUrl, databaseName });
+};
+
+export const dropDatabase = async ({ agentDirectory, baseUrl, databaseName }) => {
+  const modules = await loadModules(agentDirectory);
+  await modules.ddl.dropClickHouseDatabase(adminServer(baseUrl), databaseName);
+};
+
+/** Agent environment for this backend (the agent's config still requires a Postgres string). */
+export const agentEnvironment = ({ baseUrl, databaseName }) => ({
+  CHAINGRAPH_CLICKHOUSE_DATABASE: databaseName,
+  CHAINGRAPH_CLICKHOUSE_URL: baseUrl,
+  CHAINGRAPH_POSTGRES_CONNECTION_STRING: 'postgres://unused:unused@127.0.0.1:1/unused',
+  CHAINGRAPH_STORE: 'clickhouse',
+});
+
+/** Pinned parameters for node-agnostic views (`*_at(visible0, tail)`). */
+const agnosticParams = async (session) => {
+  const { visibility } = session.modules;
+  const snapshot = await visibility.readSnapshot(session.client, visibility.nodeAgnosticId);
+  return visibility.agnosticViewParams(snapshot);
+};
+
+const agnosticView = (name) => `${name}_at(visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)})`;
+
+/** Rows of a node-agnostic table visible through its gated view. */
+export const countRows = async (session, table) => {
+  const params = await agnosticParams(session);
+  const [row] = await session.client.query(`SELECT toString(count()) AS c FROM ${agnosticView(table)}`, params);
+  return Number(row.c);
+};
+
+/** Blocks among `blockHashes` accepted by `nodeName` (pinned `node_block_at`, via the checker). */
+export const acceptedBlockCount = async (session, nodeName, blockHashes) => session.checker.acceptedBlockCount(nodeName, blockHashes);
+
+/** Linked transactions of the given blocks, one pinned snapshot for the whole set. */
+export const blockTransactionCount = async (session, blockHashes) => {
+  const params = await agnosticParams(session);
+  const [row] = await session.client.query(
+    `SELECT toString(count()) AS c FROM ${agnosticView('block_transaction')}
+     WHERE block_internal_id IN (SELECT internal_id FROM ${agnosticView('block')}
+                                 WHERE has(arrayMap(h -> toFixedString(unhex(h), 32), {hashes:Array(String)}), hash))`,
+    { ...params, hashes: blockHashes }
+  );
+  return Number(row.c);
+};
+
+/** Accepted blocks of a node: `{ height, hash }`, by height. */
+export const acceptedChain = async (session, nodeName) =>
+  (await session.checker.acceptedBlocks(nodeName)).map(({ hash, height }) => ({ hash, height }));
+
+/** Number of accepted blocks of a node (pinned `node_block_at` count). */
+export const nodeBlockCount = async (session, nodeName) => {
+  const nodeId = await session.checker.nodeInternalId(nodeName);
+  if (nodeId === undefined) return 0;
+  const { visibility } = session.modules;
+  const snapshot = await visibility.readSnapshot(session.client, nodeId);
+  const [row] = await session.client.query(
+    'SELECT toString(count()) AS c FROM node_block_at(node = {node:UInt32}, visible = {visible:UInt64})',
+    visibility.nodeViewParams(snapshot)
+  );
+  return Number(row.c);
+};
+
+export const mempoolRowCount = async (session, nodeName, transactionHashes) => (await session.checker.mempoolMembership(nodeName, transactionHashes)).size;
+
+export const historyNodeCount = async (session, nodeName, transactionHashes) =>
+  new Set((await session.checker.transactionHistory(nodeName, transactionHashes)).map((row) => row.hash)).size;
+
+/** Per node: mempool transactions confirmed in a block the same node accepts. */
+export const confirmedButInMempoolCount = async (session, nodeName) => (await session.checker.confirmedButInMempool(nodeName)).length;
+
+const eventValues = async (client) =>
+  Object.fromEntries((await client.query(metricQueries.eventSnapshot, { names: eventCounters })).map((row) => [row.name, Number(row.value)]));
+
+/**
+ * Start a measured window: server time, event counters, and a 1 s sampler of
+ * the busiest (table, partition)'s active part count.
+ */
+export const writeMetricsStart = async (session) => {
+  const { client, databaseName } = session;
+  const [{ now: since }] = await client.query(metricQueries.serverNow);
+  const events = await eventValues(client);
+  const sampler = { maxActiveParts: 0, running: true };
+  const sample = async () => {
+    while (sampler.running) {
+      try {
+        const [row] = await client.query(metricQueries.maxActiveParts, { database: databaseName });
+        sampler.maxActiveParts = Math.max(sampler.maxActiveParts, Number(row.parts));
+      } catch {
+        // sampling is best-effort
+      }
+      await sleep(1000);
+    }
+  };
+  sampler.done = sample();
+  return { events, sampler, since };
+};
+
+/**
+ * End a window: `SYSTEM FLUSH LOGS`, then part_log / query_log totals since
+ * the start, event deltas, the sampled part peak, and the time until no merge
+ * of this database is running (`quiesceSeconds`, capped at 120 s).
+ */
+export const writeMetricsSince = async (session, start) => {
+  const { client, databaseName } = session;
+  start.sampler.running = false;
+  await start.sampler.done;
+  const params = { database: databaseName, since: start.since };
+  const [finalSample] = await client.query(metricQueries.maxActiveParts, { database: databaseName });
+  const maxActiveParts = Math.max(start.sampler.maxActiveParts, Number(finalSample.parts));
+  const quiesceStarted = Date.now();
+  for (;;) {
+    const [{ merges }] = await client.query(metricQueries.runningMerges, { database: databaseName });
+    if (Number(merges) === 0 || Date.now() - quiesceStarted > 120_000) break;
+    await sleep(100);
+  }
+  const quiesceSeconds = (Date.now() - quiesceStarted) / 1000;
+  await client.command('SYSTEM FLUSH LOGS');
+  const events = await eventValues(client);
+  const [partLog] = await client.query(metricQueries.partLog, params);
+  const byTable = await client.query(metricQueries.partLogByTable, params);
+  const [insertMemory] = await client.query(metricQueries.maxInsertMemory, params);
+  const delta = Object.fromEntries(eventCounters.map((name) => [name, (events[name] ?? 0) - (start.events[name] ?? 0)]));
+  return {
+    bytesWritten: Number(partLog.new_part_bytes),
+    clickhouse: {
+      eventDeltas: delta,
+      insertQueries: Number(insertMemory.inserts),
+      partLogByTable: byTable.map((row) => ({ mergeBytes: Number(row.merge_bytes), newPartBytes: Number(row.new_part_bytes), newParts: Number(row.new_parts), table: row.table })),
+    },
+    delayedInserts: delta.DelayedInserts,
+    maxActiveParts,
+    maxInsertMemoryBytes: Number(insertMemory.bytes),
+    mergeBytesWritten: Number(partLog.merge_bytes),
+    merges: Number(partLog.merges),
+    mergeSeconds: Number(partLog.merge_ms) / 1000,
+    partsCreated: Number(partLog.new_parts),
+    quiesceSeconds,
+    rejectedInserts: delta.RejectedInserts,
+  };
+};

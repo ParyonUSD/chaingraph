@@ -35,6 +35,8 @@ Options (`node scripts/ingestion-gate/run.mjs --help`):
 | `--pg-port` | `55432` | Port for the throwaway server. |
 | `--pg-url` | – | Use an existing server instead (`postgres://user:pass@host:port`; the gate creates/drops `chaingraph_ingestion_gate`). |
 | `--keep-pg` | off | Leave the server and last scenario DB running for inspection. |
+| `--store postgres\|clickhouse` | `postgres` | Store backend of the agent under test (`INGESTION_GATE_STORE`); see [ClickHouse backend](#clickhouse-backend---store-clickhouse). |
+| `--ch-url` | `http://localhost:18123` | ClickHouse HTTP endpoint for `--store clickhouse` (`INGESTION_GATE_CH_URL`; credentials may be in the URL). |
 | `--seed` | `1` | Fixture seed. |
 | `--label` | – | Free text stored in the report. |
 
@@ -167,6 +169,66 @@ five scenarios.
 3. Add `[metric, thresholdKey, 'max'|'min']` rules to `thresholdRules` in
    `run.mjs`, a headline in `summaryColumns`, and defaults in
    `thresholds.json`. Calibrate as above and document it here.
+
+## ClickHouse backend (`--store clickhouse`)
+
+```sh
+docker run -d --name ch1-local -p 18123:8123 clickhouse/clickhouse-server:26.8   # once; any private 26.8 server
+yarn build && node scripts/ingestion-gate/run.mjs --store clickhouse --ch-url http://localhost:18123
+```
+
+Same scenarios, mock nodes and fixtures; what changes (`lib/clickhouse.mjs`, same
+surface as `lib/postgres.mjs`, selected in `run.mjs`):
+
+- **Database.** Per scenario `chaingraph_ingestion_gate` is dropped and recreated with
+  the agent's own DDL (`<agent-dir>/src/store/clickhouse/ddl/NNN_*.sql`, applied by the
+  agent's compiled `build/store/clickhouse/ddl-apply.js`). The agent runs with
+  `CHAINGRAPH_STORE=clickhouse`, `CHAINGRAPH_CLICKHOUSE_URL/_DATABASE` (and a dummy
+  `CHAINGRAPH_POSTGRES_CONNECTION_STRING`, which the config still requires). The server
+  is not started by the gate: point `--ch-url` at a private local server, never Cloud
+  (the event counters below are server-wide).
+- **Correctness reads and the clock** go through the agent's compiled ClickHouse checker
+  (`build/store/clickhouse/checker.js`) or the pinned gated views with one
+  `readSnapshot` per read: `acceptedBlockCount` (the clock), `acceptedChain`,
+  `mempoolRowCount`, `historyNodeCount` and `confirmedButInMempoolCount` call the
+  checker; `blockTransactionCount`, `countRows` and the catch-up `nodeBlockCount` are
+  single pinned-view counts (`block_transaction_at`, `transaction_at`,
+  `node_block_at`). A block therefore counts as saved only when its commit is
+  `committed` **and** the node's watermark is published. Every per-node check is per
+  node (the Postgres `confirmedButInMempoolCount` is per node too now).
+- **Write metrics replace WAL** (taken around the same window; `SYSTEM FLUSH LOGS`
+  before the log tables are read; all filtered to the gate database and
+  `event_time_microseconds >=` the server time at the window start):
+
+  | Report field | Source |
+  | --- | --- |
+  | `bytesWritten` | `sum(size_in_bytes)` of `system.part_log` `NewPart` (compressed bytes inserted) |
+  | `mergeBytesWritten`, `merges` | the same for `MergeParts` (write amplification), and their count |
+  | `partsCreated` | `count()` of `NewPart`; per table in `clickhouse.partLogByTable` |
+  | `mergeSeconds` | `sum(duration_ms)` of `MergeParts` |
+  | `maxActiveParts` | max active parts of one (table, partition) in `system.parts`, sampled every 1 s and at the end (compare with `parts_to_delay_insert`) |
+  | `quiesceSeconds` | time after the window until `system.merges` has no merge of the database (capped at 120 s) |
+  | `delayedInserts`, `rejectedInserts` | `system.events` deltas `DelayedInserts`, `RejectedInserts` (must be 0) |
+  | `maxInsertMemoryBytes` | `max(memory_usage)` in `system.query_log`, `type = 'QueryFinish' AND query_kind = 'Insert'` |
+  | `clickhouse.eventDeltas` | deltas of `InsertedBytes`, `InsertedRows`, `InsertQuery`, `DelayedInserts`, `DelayedInsertsMilliseconds`, `RejectedInserts`, `DuplicatedInsertedBlocks`, `MergedRows`, `MergedUncompressedBytes`, `MergeTotalMilliseconds` (server-wide) |
+
+  Counter names were checked on 26.8.22.13 (`system_events_show_zero_values = 1`):
+  there is no `MergesTimeMilliseconds`; `MergeTotalMilliseconds` is the merge-time
+  counter. The agent inserts with `async_insert = 0`, so `asynchronous_insert_log`
+  is not read.
+- **Thresholds** default to `scripts/ingestion-gate/thresholds.clickhouse.json`: wall,
+  drain, converge, ratio, catch-up and heap limits are copied from `thresholds.json`
+  (G1: no worse than Postgres on the same host); `maxDelayedInserts` and
+  `maxRejectedInserts` are 0; `maxBytesWritten`, `maxPartsCreated` and
+  `maxMergeSeconds` are `null` ("calibrate": not enforced) until three reference runs
+  exist, then set to about 1.5–2× their values.
+- **Status (WP5b, 2026-10-09).** The metric queries and the pinned correctness reads
+  were verified on local 26.8 against a throwaway database (three 100k-row inserts plus
+  an `OPTIMIZE`: 3 parts, 7.5 MB `NewPart`, 5.6 MB `MergeParts`, 0 delayed/rejected).
+  No scenario can run yet: until the WP5 store lands the agent exits with
+  `CHAINGRAPH_STORE=clickhouse is not implemented yet (WP5)`, which the gate now
+  reports at once (an agent that exits before connecting no longer hangs
+  `waitForPeer`).
 
 ## Known findings / TODOs
 
