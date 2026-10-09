@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-magic-numbers, functional/no-loop-statement, functional/no-let, no-await-in-loop, complexity, functional/no-throw-statement, @typescript-eslint/require-array-sort-compare, @typescript-eslint/init-declarations, @typescript-eslint/no-loop-func */
+/* eslint-disable max-lines, @typescript-eslint/no-magic-numbers, functional/no-loop-statement, functional/no-let, no-await-in-loop, complexity, functional/no-throw-statement, @typescript-eslint/require-array-sort-compare, @typescript-eslint/init-declarations, @typescript-eslint/no-loop-func */
 // cspell:ignore clickhouse unhex aabb varint seqs
 
 import test from 'ava';
@@ -484,6 +484,148 @@ e2e(
       'SELECT sum(sign) AS s FROM pending_spend'
     );
     t.is(pending[0]?.s, '0', 'pending spends were filled under the child seq');
+    t.deepEqual(await badUtxoSums(client), []);
+  }
+);
+
+e2e(
+  '[e2e] ClickHouseStore: in-flight cap 2, blocks N+2, N+1, N saved concurrently in that order complete; final state exact',
+  async (t) => {
+    t.timeout(120_000);
+    const cap = 2;
+    let peakActive = 0;
+    let peakWaiting = 0;
+    let overCap = 0;
+    const holder: { store?: ClickHouseStore } = {};
+    const { client, openStore } = await scratch(
+      t,
+      'cap',
+      /*
+       * a child that waited out the timeout would be stored with stand-in
+       * inputs: keep it far above the completion bound below
+       */
+      { maxInFlightSaves: cap, pendingSpendTimeoutMs: 90_000 }
+    );
+    const sample = () => {
+      const stats = holder.store?.poolStats();
+      if (stats !== undefined) {
+        peakActive = Math.max(peakActive, stats.clients.active);
+        peakWaiting = Math.max(peakWaiting, stats.waitingRequests);
+        if (stats.clients.active > cap) overCap += 1;
+      }
+    };
+    const store = await openStore(async () => {
+      sample();
+      // slow every step so the three saves overlap
+      await new Promise((resolve) => {
+        setTimeout(resolve, 10);
+      });
+    });
+    holder.store = store;
+    t.is(store.poolStats().clients.max, cap);
+    const { node1, node2 } = await registerNodes(store);
+    const chain = threeBlockChain();
+    const d = makeTx({
+      label: 'd',
+      outputs: [
+        {
+          fungibleTokenAmount: 400n,
+          lockingBytecode: p2pkh('dave'),
+          tokenCategory: category,
+          valueSatoshis: 1_300n,
+        },
+      ],
+      spends: [[chain.b.hash, 0]],
+    });
+    const c3 = makeTx({
+      coinbase: true,
+      label: 'c3',
+      outputs: [
+        { lockingBytecode: p2pkh('miner'), valueSatoshis: 5_000_000_000n },
+      ],
+    });
+    const block3 = makeBlock(3, chain.block2.hash, [c3, d]);
+    const both = [acceptance(node1), acceptance(node2)];
+    await store.saveBlock({
+      block: chain.block0,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: both,
+    });
+
+    // N+2, N+1, N: each child is called (and queued) before its parent
+    const saves = [block3, chain.block2, chain.block1].map(async (block) =>
+      store.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: both,
+      })
+    );
+    const sampler = setInterval(sample, 1);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      (async () => {
+        await Promise.all(saves);
+        // a parked child reports early; wait for every commit
+        await store.operations.drain();
+        return 'completed';
+      })(),
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => {
+          resolve('stuck');
+        }, 30_000);
+      }),
+    ]);
+    clearTimeout(timer);
+    clearInterval(sampler);
+    t.is(outcome, 'completed', 'no deadlock under the cap');
+    t.is(overCap, 0, 'never more than the cap working at once');
+    t.is(peakActive, cap, `peak active ${peakActive}`);
+    t.true(peakWaiting >= 1, `a call queued for a slot (peak ${peakWaiting})`);
+    t.deepEqual(store.poolStats(), {
+      clients: { active: 0, max: cap, total: 0 },
+      waitingRequests: 0,
+    });
+
+    await store.publishWatermarks();
+    const blocks = [chain.block0, chain.block1, chain.block2, block3];
+    for (const node of [node1, node2]) {
+      const view = await nodeView(client, node);
+      t.deepEqual(
+        view.blocks,
+        blocks.map((block) => block.hash)
+      );
+      t.deepEqual(view.txs, txHashes(blocks));
+      t.deepEqual(view.utxo, expectedUnspent(blocks));
+      t.deepEqual(view.utxoByScript, view.utxo);
+      // resolved spent outputs, never the timeout's stand-in (value 0)
+      t.deepEqual(
+        view.inputs
+          .filter(
+            (row) =>
+              row.key.startsWith(chain.b.hash) || row.key.startsWith(d.hash)
+          )
+          .map((row) => [row.key.slice(0, 4), row.amount, row.value])
+          .sort(),
+        [
+          [chain.b.hash.slice(0, 4), '1000', '1000'],
+          [chain.b.hash.slice(0, 4), '400', '800'],
+          [d.hash.slice(0, 4), '400', '1300'],
+        ].sort()
+      );
+    }
+    const states = await client.query<{ state: string; c: string }>(
+      `SELECT state, count() AS c FROM (SELECT argMax(state, state_rank) AS state FROM commit_log
+         WHERE kind = 'block' GROUP BY commit_seq) GROUP BY state ORDER BY state`
+    );
+    t.deepEqual(
+      states.map((row) => [row.state, row.c]),
+      [['committed', '4']],
+      'four block commits, none aborted'
+    );
+    const pending = await client.query<{ s: string }>(
+      'SELECT sum(sign) AS s FROM pending_spend'
+    );
+    t.is(pending[0]?.s ?? '0', '0');
     t.deepEqual(await badUtxoSums(client), []);
   }
 );

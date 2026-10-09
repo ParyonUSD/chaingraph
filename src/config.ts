@@ -45,17 +45,16 @@ const expectedOptions = [
   'CHAINGRAPH_LOG_PATH',
   'CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_MS',
   'CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS',
-  'CHAINGRAPH_POSTGRES_CONNECTION_STRING',
   'CHAINGRAPH_POSTGRES_MAX_CONNECTIONS',
   'CHAINGRAPH_POSTGRES_SYNCHRONOUS_COMMIT',
   'CHAINGRAPH_TRUSTED_NODES',
   'CHAINGRAPH_USER_AGENT',
   'NODE_ENV',
 ] as const;
-const requireStringValues = (
+const requireStringValues = <Key extends string>(
   conf: { [x: string]: string | undefined },
-  keys: typeof expectedOptions
-): conf is { [key in (typeof expectedOptions)[number]]: string } => {
+  keys: readonly Key[]
+): conf is { [key in Key]: string } => {
   const missing = keys.find((key) => typeof conf[key] !== 'string');
   if (missing !== undefined) {
     // eslint-disable-next-line no-console
@@ -68,12 +67,6 @@ if (!requireStringValues(configuration, expectedOptions)) {
   // eslint-disable-next-line functional/no-throw-statement
   throw new Error('Missing expected environment variable.');
 }
-
-/**
- * Set via the `CHAINGRAPH_POSTGRES_CONNECTION_STRING` environment variable.
- */
-const postgresConnectionString =
-  configuration.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
 
 const maxConnectionsValue = Number(
   configuration.CHAINGRAPH_POSTGRES_MAX_CONNECTIONS
@@ -432,6 +425,30 @@ if (!isValidStore(chaingraphStoreValue)) {
  */
 const chaingraphStore = chaingraphStoreValue;
 
+/**
+ * Options required only by the Postgres store. With `CHAINGRAPH_STORE=clickhouse`
+ * they are not required and are ignored (the image's `defaults.env` still
+ * supplies a localhost connection string; nothing connects to it).
+ */
+const postgresOnlyOptions = ['CHAINGRAPH_POSTGRES_CONNECTION_STRING'] as const;
+if (
+  chaingraphStore === 'postgres' &&
+  !requireStringValues(configuration, postgresOnlyOptions)
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error('Missing expected environment variable.');
+}
+
+/**
+ * Set via the `CHAINGRAPH_POSTGRES_CONNECTION_STRING` environment variable.
+ * Required if `CHAINGRAPH_STORE` is `postgres` (the default); `undefined` when
+ * it is `clickhouse` (the variable is ignored).
+ */
+const postgresConnectionString =
+  chaingraphStore === 'postgres'
+    ? optionalOptions.CHAINGRAPH_POSTGRES_CONNECTION_STRING
+    : undefined;
+
 const optionalString = (value: string | undefined, fallback: string) =>
   value === undefined || value === '' ? fallback : value;
 
@@ -496,6 +513,24 @@ const clickhousePassword = optionalString(
   ''
 );
 
+const maxInFlightSavesValue = Number(
+  optionalString(optionalOptions.CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES, '0')
+);
+if (!Number.isInteger(maxInFlightSavesValue) || maxInFlightSavesValue < 0) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    'The CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES environment variable must be an integer greater than or equal to 0.'
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES` environment variable
+ * (default: `0`, unbounded). The ClickHouse store's in-flight cap: at most this
+ * many block saves / header acceptances work at once; a call waiting on
+ * another call does not hold a slot. Ignored by the Postgres store (its bound
+ * is `CHAINGRAPH_POSTGRES_MAX_CONNECTIONS`).
+ */
+const clickhouseMaxInFlightSaves = maxInFlightSavesValue;
+
 /**
  * `true` if the `NODE_ENV` environment variable is `production`.
  */
@@ -511,6 +546,7 @@ export {
   chaingraphStore,
   chaingraphUserAgent,
   clickhouseDatabase,
+  clickhouseMaxInFlightSaves,
   clickhousePassword,
   clickhouseUrl,
   clickhouseUser,

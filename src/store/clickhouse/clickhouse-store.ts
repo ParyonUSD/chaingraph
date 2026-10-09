@@ -32,6 +32,7 @@ import type { FaultInjector, SaveBlockResult } from './block-commit.js';
 import {
   BlockCommitter,
   chunked,
+  freshen,
   SimulatedCrash,
   TransactionRegistry,
 } from './block-commit.js';
@@ -51,14 +52,17 @@ import type {
   StoreOperation,
 } from './node-state.js';
 import {
+  AbandonedError,
   AbandonSignal,
   acceptanceColumns,
   awaitDependencies,
   deferred,
   encodeNodeBlockHistoryRows,
   encodeNodeBlockRows,
+  InFlightLimiter,
   NodeRegistry,
   OperationRegistry,
+  SaveSlot,
   waitForPredecessorRows,
 } from './node-state.js';
 import { RowBinaryWriter } from './row-binary.js';
@@ -91,6 +95,13 @@ export interface ClickHouseStoreOptions {
   orphanGraceMs?: number;
   /** Orphan pool bound (the oldest is released early when full). */
   maxOrphans?: number;
+  /**
+   * In-flight cap: at most this many `saveBlock` / `acceptBlocksViaHeaders`
+   * calls work at once (`CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES`). 0 or
+   * undefined: unbounded (no slots, the WP5a behavior). A call gives its
+   * slot up while it waits on another call (wp5c-hardening.md §1).
+   */
+  maxInFlightSaves?: number;
   /** Test hook: called between the steps of every commit. */
   fault?: FaultInjector;
   /** Background errors (watermark publishing, lease loss). */
@@ -209,8 +220,18 @@ export class ClickHouseStore implements ChaingraphStore {
 
   private readonly lookupChunkSize: number;
 
+  /** The in-flight cap; `undefined` = unbounded. */
+  private readonly slots: InFlightLimiter | undefined;
+
   constructor(private readonly options: ClickHouseStoreOptions) {
     this.lookupChunkSize = options.lookupChunkSize ?? defaultLookupChunkSize;
+    const cap = options.maxInFlightSaves ?? 0;
+    if (!Number.isInteger(cap) || cap < 0) {
+      throw new RangeError(
+        `maxInFlightSaves must be an integer >= 0 (got ${cap}).`
+      );
+    }
+    this.slots = cap === 0 ? undefined : new InFlightLimiter(cap);
     this.outputs = new OutputRegistry<StoreOperation>(
       options.recentOutputCapacity
     );
@@ -395,11 +416,24 @@ export class ClickHouseStore implements ChaingraphStore {
     return this.requirePublisher().publishWatermark();
   }
 
+  /**
+   * Heartbeat stats. With the in-flight cap: `active` = saves / header
+   * acceptances holding a slot, `max` = the cap, `waitingRequests` = calls
+   * queued for a slot, `total` = every live store operation (including
+   * parked children and calls waiting on other calls). Unbounded (cap 0):
+   * live operations, `max` 0, as in WP5a.
+   */
   poolStats(): StorePoolStats {
-    const active = this.operations.activeCount;
+    const live = this.operations.activeCount;
+    if (this.slots === undefined) {
+      return {
+        clients: { active: live, max: 0, total: live },
+        waitingRequests: 0,
+      };
+    }
     return {
-      clients: { active, max: 0, total: active },
-      waitingRequests: 0,
+      clients: { active: this.slots.active, max: this.slots.max, total: live },
+      waitingRequests: this.slots.waiting,
     };
   }
 
@@ -514,6 +548,19 @@ export class ClickHouseStore implements ChaingraphStore {
     let reportedEarly = false;
     const full = (async () => {
       try {
+        try {
+          await this.takeSlot(operation);
+        } catch (error) {
+          operation.markFailed(error);
+          if (error instanceof AbandonedError) {
+            // shutdown while queued: nothing written (as an abandoned save)
+            return {
+              attemptedSavedTransactions: [],
+              transactionCacheMisses: 0,
+            };
+          }
+          throw error;
+        }
         if (this.committerInstance === undefined) {
           throw new StoreClosedError('ClickHouseStore.init() has not run.');
         }
@@ -522,6 +569,7 @@ export class ClickHouseStore implements ChaingraphStore {
           parked.resolve(result);
         });
       } finally {
+        operation.slot?.release();
         this.mempool.removeModifier(operation);
         this.operations.end(operation);
       }
@@ -557,6 +605,7 @@ export class ClickHouseStore implements ChaingraphStore {
     ]);
     let commit: OpenCommit | undefined;
     try {
+      await this.takeSlot(operation);
       await waitForPredecessorRows(operation);
       const dependencies = new Set<StoreOperation>(operation.predecessors);
       const client = this.requireClient();
@@ -621,7 +670,7 @@ export class ClickHouseStore implements ChaingraphStore {
       );
       /* the node's mempool cleanup for the accepted blocks, in this commit */
       const hooks = this.requireMempoolCommitter();
-      await hooks.ensureFresh(operation, [nodeInternalId]);
+      await freshen(hooks, this.mempool, operation, [nodeInternalId]);
       const mempoolChanges: NodeMempoolChange[] = [];
       if (!this.mempool.isEmpty(nodeInternalId)) {
         const blocksAccepted = new Map<string, Date | null>(
@@ -742,7 +791,8 @@ export class ClickHouseStore implements ChaingraphStore {
         );
       }
       operation.markRowsWritten();
-      await this.abandonSignal.race(awaitDependencies(dependencies));
+      const settled = this.abandonSignal.race(awaitDependencies(dependencies));
+      await (dependencies.size > 0 ? operation.whileWaiting(settled) : settled);
       await this.requireCommitLog().markCommitted(commit.seq, rowCounts);
       operation.markCommitted();
       await this.fault('committed', { kind: 'header_accept', seq: commit.seq });
@@ -759,6 +809,7 @@ export class ClickHouseStore implements ChaingraphStore {
       );
       throw error;
     } finally {
+      operation.slot?.release();
       this.mempool.removeModifier(operation);
       this.operations.end(operation);
     }
@@ -1295,6 +1346,18 @@ export class ClickHouseStore implements ChaingraphStore {
     }
     this.assertOpen();
     return this.operations.begin(kind, nodes);
+  }
+
+  /**
+   * Take an in-flight slot for `operation` (no-op when unbounded). Called
+   * after registration, so the operation is already a predecessor of later
+   * calls and its ticket (id) is its call order.
+   */
+  private async takeSlot(operation: StoreOperation) {
+    if (this.slots === undefined) return;
+    const slot = new SaveSlot(this.slots, operation.id, this.abandonSignal);
+    operation.slot = slot;
+    await slot.acquire();
   }
 
   /** Run `work` with no other operation live (mode switches). */

@@ -1,16 +1,30 @@
+// cspell:ignore clickhouse
 import { createServer } from 'http';
 
 import { decodeTransaction, hashTransaction, hexToBin } from '@bitauth/libauth';
 import bitcoreP2pCash from '@chaingraph/bitcore-p2p-cash';
 
 import { Agent, cancelableDelay } from './agent.js';
-import { chaingraphInternalApiPort } from './config.js';
+import {
+  chaingraphInternalApiPort,
+  chaingraphStore,
+  clickhouseMaxInFlightSaves,
+} from './config.js';
 import { instantiateLogger } from './logging.js';
 import { createStore } from './store/index.js';
 
 const logger = instantiateLogger();
 logger.info(`Starting Chaingraph...`);
 
+logger.info(
+  chaingraphStore === 'clickhouse'
+    ? `Store: clickhouse (in-flight cap: ${
+        clickhouseMaxInFlightSaves === 0
+          ? 'unbounded'
+          : clickhouseMaxInFlightSaves
+      }).`
+    : 'Store: postgres.'
+);
 const store = createStore();
 await store.init();
 

@@ -167,6 +167,20 @@ export class TransactionRegistry {
   }
 }
 
+/**
+ * `ensureFresh` (rebuild a stale node mempool after its earlier operations
+ * settle) without holding an in-flight slot when it has to wait.
+ */
+export const freshen = async (
+  hooks: Pick<MempoolCommitter, 'ensureFresh'>,
+  mempool: Pick<MempoolState, 'stale'>,
+  operation: StoreOperation,
+  nodes: readonly number[]
+) =>
+  nodes.some((node) => mempool.stale.has(node))
+    ? operation.whileWaiting(hooks.ensureFresh(operation, nodes))
+    : hooks.ensureFresh(operation, nodes);
+
 /** What the block committer needs from the store. */
 export interface WriterContext {
   client: ClickHouseClient;
@@ -472,7 +486,7 @@ export class BlockCommitter {
     for (;;) {
       const other = this.inFlight.get(block.hash);
       if (other === undefined || other === operation || other.finished) break;
-      await other.committed.catch(() => undefined);
+      await operation.whileWaiting(other.committed.catch(() => undefined));
     }
     this.inFlight.set(block.hash, operation);
     try {
@@ -676,7 +690,9 @@ export class BlockCommitter {
       requestedNodes.some((node) => context.mempool.mayHaveMempool(node))
     ) {
       await waitForPredecessorRows(operation);
-      await hooks?.ensureFresh(operation, requestedNodes);
+      if (hooks !== undefined) {
+        await freshen(hooks, context.mempool, operation, requestedNodes);
+      }
     }
     const blockInternalId = blockExists
       ? BigInt(storedBlock.internal_id)
@@ -1046,7 +1062,9 @@ export class BlockCommitter {
        * aborts it and the next start downloads the block again.
        */
       onParked?.({ attemptedSavedTransactions, transactionCacheMisses });
-      const filled = await this.waitForPending(unresolved);
+      const filled = await operation.whileWaiting(
+        this.waitForPending(unresolved)
+      );
       filled.forEach((spend, key) => {
         resolved.set(key, spend);
         if (spend.owner !== undefined && spend.owner !== operation) {
@@ -1130,8 +1148,10 @@ export class BlockCommitter {
     await context.fault('rows-written', { kind: 'block', seq: commit.seq });
 
     /* 6. Commit once every commit this one read from is committed. */
-    await (context.abandon?.race(awaitDependencies(dependencies)) ??
-      awaitDependencies(dependencies));
+    const settled =
+      context.abandon?.race(awaitDependencies(dependencies)) ??
+      awaitDependencies(dependencies);
+    await (dependencies.size > 0 ? operation.whileWaiting(settled) : settled);
     await context.commitLog.markCommitted(commit.seq, rowCounts);
     operation.markCommitted();
     context.onCommitted(operation);

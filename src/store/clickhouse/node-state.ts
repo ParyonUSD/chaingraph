@@ -72,6 +72,12 @@ export class StoreOperation {
 
   seq: bigint | undefined;
 
+  /**
+   * The operation's in-flight slot (`InFlightLimiter`), set for block saves
+   * and header acceptances when the cap is on; `undefined` when unbounded.
+   */
+  slot: SaveSlot | undefined;
+
   private readonly rows = deferred<void>();
 
   private readonly commit = deferred<void>();
@@ -130,6 +136,17 @@ export class StoreOperation {
     this.state = 'failed';
     this.commit.reject(error);
   }
+
+  /**
+   * Await `work`, a wait on other operations (their rows, commits or
+   * registrations), without holding an in-flight slot: the slot is released
+   * for the wait and taken again (by this operation's ticket) afterwards.
+   * This is the cap's deadlock rule: a slot holder never waits on another
+   * operation (docs/clickhouse-port/wp5c-hardening.md §1).
+   */
+  async whileWaiting<T>(work: Promise<T>): Promise<T> {
+    return this.slot === undefined ? work : this.slot.idle(work);
+  }
 }
 
 export class DependencyFailedError extends Error {}
@@ -173,6 +190,131 @@ export class AbandonSignal {
   async race<T>(work: Promise<T>): Promise<T> {
     this.assertNotAbandoned();
     return Promise.race([work, this.promise]);
+  }
+}
+
+/**
+ * The in-flight cap (`CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES`): at most
+ * `max` block saves / header acceptances hold a slot at once. Waiters are
+ * granted in ticket order (ticket = operation id = store call order), so new
+ * operations are served FIFO and an operation that gave its slot up for a
+ * wait (`StoreOperation.whileWaiting`) is served before every newer one.
+ * Invariant: the queue is empty whenever fewer than `max` slots are held (a
+ * release hands the slot straight to the head of the queue).
+ */
+export class InFlightLimiter {
+  private holders = 0;
+
+  private readonly queue: { ticket: number; grant: () => void }[] = [];
+
+  constructor(readonly max: number) {
+    if (!Number.isInteger(max) || max < 1) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new RangeError(
+        `In-flight cap must be an integer >= 1 (got ${max}).`
+      );
+    }
+  }
+
+  /** Slots held now. */
+  get active() {
+    return this.holders;
+  }
+
+  /** Operations queued for a slot. */
+  get waiting() {
+    return this.queue.length;
+  }
+
+  /** Resolves once a slot is held; rejects (and leaves the queue) on abandon. */
+  async acquire(ticket: number, abandon?: AbandonSignal): Promise<void> {
+    abandon?.assertNotAbandoned();
+    if (this.holders < this.max) {
+      this.holders += 1;
+      return;
+    }
+    const { granted, waiter } = this.enqueue(ticket);
+    if (abandon === undefined) {
+      await granted;
+      return;
+    }
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await Promise.race([granted, abandon.promise]);
+    } catch (error) {
+      const index = this.queue.indexOf(waiter);
+      if (index === -1) {
+        // granted in the same turn: hand the slot on
+        this.release();
+      } else {
+        this.queue.splice(index, 1);
+      }
+      // eslint-disable-next-line functional/no-throw-statement
+      throw error;
+    }
+  }
+
+  /** Queue a waiter in ticket order (new tickets are the largest: FIFO). */
+  private enqueue(ticket: number) {
+    const waiter = { grant: () => undefined as void, ticket };
+    const granted = new Promise<void>((resolve) => {
+      waiter.grant = resolve;
+    });
+    const position = this.queue.findIndex((other) => other.ticket > ticket);
+    this.queue.splice(
+      position === -1 ? this.queue.length : position,
+      0,
+      waiter
+    );
+    return { granted, waiter };
+  }
+
+  release() {
+    const next = this.queue.shift();
+    if (next === undefined) {
+      this.holders -= 1;
+      return;
+    }
+    next.grant();
+  }
+}
+
+/** One operation's hold on the in-flight cap (idempotent acquire/release). */
+export class SaveSlot {
+  private held = false;
+
+  constructor(
+    private readonly limiter: InFlightLimiter,
+    private readonly ticket: number,
+    private readonly abandon?: AbandonSignal
+  ) {}
+
+  get isHeld() {
+    return this.held;
+  }
+
+  async acquire() {
+    if (this.held) return;
+    await this.limiter.acquire(this.ticket, this.abandon);
+    this.held = true;
+  }
+
+  release() {
+    if (!this.held) return;
+    this.held = false;
+    this.limiter.release();
+  }
+
+  /** Release the slot while `work` is pending, then take it again. */
+  async idle<T>(work: Promise<T>): Promise<T> {
+    if (!this.held) return work;
+    this.release();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      return await work;
+    } finally {
+      await this.acquire();
+    }
   }
 }
 
@@ -232,11 +374,17 @@ export class OperationRegistry {
   }
 }
 
-/** Wait until every predecessor of `operation` has written all its rows. */
+/**
+ * Wait until every predecessor of `operation` has written all its rows
+ * (without holding an in-flight slot while waiting).
+ */
 export const waitForPredecessorRows = async (operation: StoreOperation) => {
-  await Promise.all(
+  const rows = Promise.all(
     operation.predecessors.map(async (predecessor) => predecessor.rowsWritten)
   );
+  await (operation.predecessors.length > 0
+    ? operation.whileWaiting(rows)
+    : rows);
 };
 
 /**

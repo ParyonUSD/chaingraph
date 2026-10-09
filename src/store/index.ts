@@ -2,6 +2,7 @@
 import {
   chaingraphStore,
   clickhouseDatabase,
+  clickhouseMaxInFlightSaves,
   clickhousePassword,
   clickhouseUrl,
   clickhouseUser,
@@ -41,6 +42,8 @@ export interface StoreConfig {
     password: string;
     url: string;
     user: string;
+    /** In-flight cap (0 or undefined: unbounded). */
+    maxInFlightSaves?: number;
   };
 }
 
@@ -53,6 +56,7 @@ export const storeConfigFromEnvironment = (): StoreConfig => ({
   backend: chaingraphStore,
   clickhouse: {
     database: clickhouseDatabase,
+    maxInFlightSaves: clickhouseMaxInFlightSaves,
     password: clickhousePassword,
     url: clickhouseUrl,
     user: clickhouseUser,
@@ -75,6 +79,7 @@ export const createStore = (
         url: config.clickhouse.url,
         username: config.clickhouse.user,
       },
+      maxInFlightSaves: config.clickhouse.maxInFlightSaves,
       onError: (error) => {
         instances.logger?.error(
           error,
