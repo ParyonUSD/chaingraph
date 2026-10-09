@@ -21,7 +21,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
         with:
-          submodules: 'true'
       - name: Get tag
         run: |
           echo "::set-output name=commit::$(git rev-parse --short HEAD)"
