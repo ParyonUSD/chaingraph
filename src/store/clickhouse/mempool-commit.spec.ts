@@ -548,6 +548,70 @@ e2e(
 );
 
 e2e(
+  '[e2e] mempool: an orphan whose parent arrives conflicting with an accepted block ends archived as its descendant (Postgres arrival order)',
+  async (t) => {
+    const { checker, client, fx, nodes, store } = await setup(
+      t,
+      'orphan_conflict',
+      {
+        orphanGraceMs: 30_000,
+      }
+    );
+    const name = short(fx);
+    await store.saveBlock({
+      block: fx.blockP,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(nodes.node1, at(40))],
+    });
+    const s = makeTx({
+      label: 's',
+      outputs: [{ lockingBytecode: p2pkh('s'), valueSatoshis: 900n }],
+      spends: [[fx.r.hash, 0]],
+    });
+    const sSaved = store.saveMempoolTransaction(s, [
+      { nodeInternalId: nodes.node1, validatedAt: at(50) },
+      { nodeInternalId: nodes.node2, validatedAt: at(50) },
+    ]);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 200);
+    });
+    t.true(store.mempool.orphans.has(s.hash));
+    // r conflicts with p (in block P, accepted by node 1 only)
+    await store.saveMempoolTransaction(fx.r, [
+      { nodeInternalId: nodes.node1, validatedAt: at(60) },
+      { nodeInternalId: nodes.node2, validatedAt: at(60) },
+    ]);
+    await sSaved;
+    await settle(store);
+    const node1 = await mempoolView(checker, nodeOne);
+    t.deepEqual(node1.mempool, []);
+    t.deepEqual(
+      node1.history.map((row) => [
+        name(row.hash) === row.hash.slice(0, 8) ? 's' : name(row.hash),
+        row.validatedAt,
+        row.replacedAt,
+      ]),
+      [
+        ['s', at(50).toISOString(), at(40).toISOString()],
+        ['r', at(60).toISOString(), at(40).toISOString()],
+      ]
+    );
+    const node2 = await mempoolView(checker, nodeTwo);
+    t.deepEqual(
+      node2.mempool,
+      [
+        `${fx.r.hash}@${at(60).toISOString()}`,
+        `${s.hash}@${at(50).toISOString()}`,
+      ].sort()
+    );
+    t.deepEqual(node2.history, []);
+    t.deepEqual(await checker.orphanMempoolDescendants(nodeOne), []);
+    t.deepEqual(await badUtxoSums(client), []);
+    await assertMemoryMatchesStore(t, store, checker, 'after orphan conflict');
+  }
+);
+
+e2e(
   '[e2e] mempool: an orphan whose parent never arrives is saved after the grace period; a later block resolves its spend',
   async (t) => {
     const { checker, client, fx, nodes, store } = await setup(t, 'grace', {

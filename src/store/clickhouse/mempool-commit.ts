@@ -1394,7 +1394,8 @@ export class MempoolCommitter {
     transaction: ChaingraphTransaction,
     byNode: Map<number, Date>,
     force: boolean,
-    parkedDone: Deferred<void> | undefined
+    parkedDone: Deferred<void> | undefined,
+    orphanParents: readonly TxKey[] = []
   ): Promise<void> {
     const nodes = [...byNode.keys()];
     const operation = await this.begin(nodes);
@@ -1469,7 +1470,7 @@ export class MempoolCommitter {
         await context.transactions.release(operation, false);
         const done = parkedDone ?? deferred<void>();
         done.promise.catch(() => undefined);
-        this.registerOrphan(transaction, byNode, missing, done);
+        this.registerOrphan(transaction, byNode, missing, done, orphanParents);
         operation.markDone();
         waitFor = done.promise;
         return;
@@ -1495,7 +1496,8 @@ export class MempoolCommitter {
         dependencies,
         (opened) => {
           commit = opened;
-        }
+        },
+        orphanParents
       );
       context.outputs.release(operation, true);
       await context.transactions.release(operation, true);
@@ -1530,9 +1532,16 @@ export class MempoolCommitter {
     transaction: ChaingraphTransaction,
     byNode: Map<number, Date>,
     missing: readonly string[],
-    done: Deferred<void>
+    done: Deferred<void>,
+    earlierParents: readonly TxKey[]
   ) {
     const { orphans } = this.mempool;
+    const parents = [
+      ...new Set([
+        ...earlierParents,
+        ...missing.map((key) => outpointParts(key).hash),
+      ]),
+    ];
     const waits = missing.map((key) => this.context.outputs.waitFor(key));
     let timer: ReturnType<typeof setTimeout> | undefined;
     let settled = false;
@@ -1553,7 +1562,7 @@ export class MempoolCommitter {
       const entry = orphans.get(transaction.hash);
       orphans.delete(transaction.hash);
       const validations = entry?.validations ?? byNode;
-      this.saveOrPark(transaction, validations, force, done)
+      this.saveOrPark(transaction, validations, force, done, parents)
         .catch(() => undefined)
         .finally(() => {
           if (!orphans.has(transaction.hash)) {
@@ -1617,7 +1626,8 @@ export class MempoolCommitter {
       | undefined,
     byNode: ReadonlyMap<number, Date>,
     dependencies: Set<StoreOperation>,
-    onCommit: (commit: OpenCommit) => void
+    onCommit: (commit: OpenCommit) => void,
+    orphanParents: readonly TxKey[] = []
   ): Promise<OpenCommit | undefined> {
     await waitForPredecessorRows(operation);
     operation.predecessors.forEach((predecessor) => {
@@ -1647,6 +1657,10 @@ export class MempoolCommitter {
         {
           confirmedFor: state?.confirmedFor ?? false,
           conflictReplacedAt: state?.conflict,
+          inheritedReplacedAt: this.mempool.inheritedReplacedAt(
+            node,
+            orphanParents
+          ),
         }
       );
       if (change !== undefined && !isEmptyChange(change)) {

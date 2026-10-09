@@ -120,6 +120,8 @@ export interface OrphanEntry {
   release: () => void;
 }
 
+const defaultRecentlyArchivedCapacity = 100_000;
+
 const pushUnique = <K, V>(map: Map<K, V[]>, key: K, value: V) => {
   const list = map.get(key);
   if (list === undefined) {
@@ -218,6 +220,20 @@ export class MempoolState {
 
   /** Nodes whose in-memory mempool may be ahead of the store (a modifier failed). */
   readonly stale = new Set<number>();
+
+  /**
+   * tx → node → `replaced_at` of its latest archive with a non-NULL
+   * `replaced_at` (replacement, conflict, descendant, expiry, or a
+   * validation archived on arrival). Bounded (insertion order). Read only for
+   * released orphans: an orphan waited for these parents, so in Postgres
+   * (which saves an orphan at once) it would have been in the node's
+   * mempool when the parent was archived, and the cascade would have taken
+   * it (`inheritedReplacedAt`).
+   */
+  private readonly recentlyArchived = new Map<TxKey, Map<number, Date>>();
+
+  /** Capacity of `recentlyArchived`. */
+  recentlyArchivedCapacity = defaultRecentlyArchivedCapacity;
 
   node(nodeInternalId: number): NodeMempoolState {
     const existing = this.mempools.get(nodeInternalId);
@@ -388,6 +404,8 @@ export class MempoolState {
     confirmed: {
       confirmedFor: boolean;
       conflictReplacedAt: Date | null | undefined;
+      /** a released orphan's parent was archived for the node (descendant) */
+      inheritedReplacedAt?: Date;
     }
   ): NodeMempoolChange | undefined {
     const mempool = this.node(nodeInternalId);
@@ -399,10 +417,21 @@ export class MempoolState {
       node: nodeInternalId,
       resolutions: [],
     };
-    if (confirmed.confirmedFor || confirmed.conflictReplacedAt !== undefined) {
+    if (
+      confirmed.confirmedFor ||
+      confirmed.conflictReplacedAt !== undefined ||
+      confirmed.inheritedReplacedAt !== undefined
+    ) {
+      /*
+       * Precedence as in Postgres: confirmation (NULL), then a direct
+       * conflict (its own MIN(accepted_at)), then the cascade from a parent
+       * archived while this transaction waited as an orphan.
+       */
       const replacedAt = confirmed.confirmedFor
         ? null
-        : confirmed.conflictReplacedAt ?? null;
+        : confirmed.conflictReplacedAt === undefined
+        ? confirmed.inheritedReplacedAt ?? null
+        : confirmed.conflictReplacedAt;
       change.immediate = { facts, replacedAt, validatedAt };
       change.archives = this.withEntries(
         mempool,
@@ -483,9 +512,48 @@ export class MempoolState {
 
   /* ------------------------------------------------------- applying */
 
+  /**
+   * The earliest `replaced_at` with which one of `parents` (the parents a
+   * released orphan waited for) was archived for `node`, if any.
+   */
+  inheritedReplacedAt(
+    nodeInternalId: number,
+    parents: readonly TxKey[]
+  ): Date | undefined {
+    return parents.reduce<Date | undefined>((earliest, parent) => {
+      const at = this.recentlyArchived.get(parent)?.get(nodeInternalId);
+      return at !== undefined &&
+        (earliest === undefined || at.getTime() < earliest.getTime())
+        ? at
+        : earliest;
+    }, undefined);
+  }
+
+  private noteArchived(tx: TxKey, nodeInternalId: number, at: Date | null) {
+    if (at === null) return;
+    const byNode = this.recentlyArchived.get(tx) ?? new Map<number, Date>();
+    this.recentlyArchived.delete(tx);
+    byNode.set(nodeInternalId, at);
+    this.recentlyArchived.set(tx, byNode);
+    if (this.recentlyArchived.size > this.recentlyArchivedCapacity) {
+      const [oldest] = this.recentlyArchived.keys();
+      if (oldest !== undefined) this.recentlyArchived.delete(oldest);
+    }
+  }
+
   /** Apply a planned change to the node's in-memory mempool. */
   apply(change: NodeMempoolChange) {
     const mempool = this.node(change.node);
+    change.archives.forEach((archive) => {
+      this.noteArchived(archive.tx, change.node, archive.replacedAt);
+    });
+    if (change.immediate !== undefined) {
+      this.noteArchived(
+        change.immediate.facts.hash,
+        change.node,
+        change.immediate.replacedAt
+      );
+    }
     change.resolutions.forEach((resolution) => {
       mempool.resolve(resolution.spender, resolution.outpoint);
     });
