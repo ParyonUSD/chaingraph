@@ -811,6 +811,15 @@ test.serial('[e2e] completes initial sync', async (t) => {
     oneMinute
   );
   await waitForStdout('Agent: initial sync is complete.');
+  if (isClickHouseE2e) {
+    /*
+     * On Postgres the `[postgres]` index test below waits for this; on
+     * ClickHouse (where it is skipped) the bulk-horizon UTXO build runs
+     * before mempool tracking starts, and the next tests announce
+     * transactions that are ignored until it has.
+     */
+    await waitForStdout('Agent: enabled mempool tracking.', oneMinute);
+  }
   t.pass();
 });
 

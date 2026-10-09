@@ -98,6 +98,14 @@ export const e2eStoreEnvironment = (): { [key: string]: string } =>
         /* eslint-disable @typescript-eslint/naming-convention */
         CHAINGRAPH_CLICKHOUSE_DATABASE: e2eClickHouseDatabase,
         CHAINGRAPH_CLICKHOUSE_PASSWORD: e2eClickHouseServer.password ?? '',
+        /*
+         * The mockchain's non-coinbase inputs spend random outpoints that
+         * never exist ("inputs do not spend prior outputs"); a ClickHouse
+         * block save waits this long for a spent output before taking it as
+         * unknown (Postgres stores such inputs at once). 1 ms keeps tip-mode
+         * blocks, which wait for their predecessors' rows, from queueing.
+         */
+        CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS: '1',
         CHAINGRAPH_CLICKHOUSE_URL: e2eClickHouseServer.url,
         CHAINGRAPH_CLICKHOUSE_USER: e2eClickHouseServer.username ?? '',
         CHAINGRAPH_STORE: 'clickhouse',
