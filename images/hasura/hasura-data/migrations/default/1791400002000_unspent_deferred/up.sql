@@ -69,6 +69,14 @@ CREATE TABLE unspent_tracking_watch (
 );
 COMMENT ON TABLE unspent_tracking_watch IS 'Experiment (E17): transactions released recently (watch set), with their acceptance when last checked; re-checked by every job pass until 100 blocks after the release, so a re-acceptance through a path that writes no event is still applied. Not tracked by Hasura.';
 
+CREATE TABLE unspent_tracking_skipped (
+  outpoint_transaction_hash bytea NOT NULL,
+  outpoint_index bigint NOT NULL,
+  transaction_internal_id bigint NOT NULL,
+  CONSTRAINT unspent_tracking_skipped_pkey PRIMARY KEY (outpoint_transaction_hash, outpoint_index, transaction_internal_id)
+);
+COMMENT ON TABLE unspent_tracking_skipped IS 'Experiment (E17): inputs the tracking job passed while their output row did not exist (a stall over the limit, or child-before-parent across the start of tracking). Outputs the job sees for the first time are otherwise set without probing spent_by_index (no processed input can spend them: the job stops before such an input). Not tracked by Hasura.';
+
 -- Release events: statement-level, one INSERT ... SELECT per DELETE, whichever
 -- code path deletes the rows (re-org, mempool drop, replacement, cascade,
 -- mempool cleaning on block acceptance). Created disabled; the agent enables
@@ -209,6 +217,17 @@ BEGIN
     VALUES (kind, 0, input_watermark, input_watermark, block_watermark, 0)
     ON CONFLICT ON CONSTRAINT unspent_tracking_progress_pkey DO NOTHING;
   GET DIAGNOSTICS inserted = ROW_COUNT;
+  IF inserted > 0 THEN
+    -- child-before-parent across the start of tracking: recent inputs whose
+    -- output is not saved yet (bounded: the last 100,000 transactions)
+    INSERT INTO unspent_tracking_skipped (outpoint_transaction_hash, outpoint_index, transaction_internal_id)
+      SELECT i.outpoint_transaction_hash, i.outpoint_index, i.transaction_internal_id
+        FROM input i
+        WHERE i.transaction_internal_id > input_watermark - 100000 AND i.transaction_internal_id <= input_watermark
+          AND i.outpoint_transaction_hash <> '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
+          AND NOT EXISTS (SELECT 1 FROM output o WHERE o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index)
+      ON CONFLICT ON CONSTRAINT unspent_tracking_skipped_pkey DO NOTHING;
+  END IF;
   INSERT INTO unspent_tracking_progress (tracking_kind, node_internal_id, input_transaction_internal_id,
       node_transaction_transaction_internal_id, node_block_block_internal_id, consumed_event_id)
     SELECT kind, n.internal_id, p.input_transaction_internal_id, p.node_transaction_transaction_internal_id,
@@ -251,6 +270,7 @@ DECLARE
   n_event_txs bigint := 0;
   n_affected bigint := 0;
   n_changed bigint := 0;
+  n_fresh bigint := 0;
   max_event bigint;
   tip bigint;
 BEGIN
@@ -269,6 +289,8 @@ BEGIN
     RETURN jsonb_build_object('uninitialized', true);
   END IF;
   CREATE TEMP TABLE IF NOT EXISTS unspent_deferred_affected (h bytea NOT NULL, i bigint NOT NULL) ON COMMIT DELETE ROWS;
+  CREATE INDEX IF NOT EXISTS unspent_deferred_affected_key ON pg_temp.unspent_deferred_affected (h, i);
+  CREATE TEMP TABLE IF NOT EXISTS unspent_deferred_fresh (h bytea NOT NULL, i bigint NOT NULL, creator bigint NOT NULL) ON COMMIT DELETE ROWS;
   CREATE TEMP TABLE IF NOT EXISTS unspent_deferred_txs (id bigint NOT NULL) ON COMMIT DELETE ROWS;
   CREATE TEMP TABLE IF NOT EXISTS unspent_deferred_inputs (tx bigint NOT NULL, h bytea NOT NULL, i bigint NOT NULL) ON COMMIT DELETE ROWS;
   CREATE TEMP TABLE IF NOT EXISTS unspent_deferred_consumed (id bigint NOT NULL, event_kind text NOT NULL, node bigint NOT NULL,
@@ -400,20 +422,55 @@ BEGIN
       DELETE FROM unspent_deferred_inputs WHERE tx > upper_tx;
     END IF;
     IF skip_stall_through > w THEN
-      SELECT count(*) INTO skipped_inputs
-        FROM unspent_deferred_inputs c
-        WHERE c.tx <= skip_stall_through
-          AND NOT EXISTS (SELECT 1 FROM output o WHERE o.transaction_hash = c.h AND o.output_index = c.i);
+      INSERT INTO unspent_tracking_skipped (outpoint_transaction_hash, outpoint_index, transaction_internal_id)
+        SELECT c.h, c.i, c.tx
+          FROM unspent_deferred_inputs c
+          WHERE c.tx <= skip_stall_through
+            AND NOT EXISTS (SELECT 1 FROM output o WHERE o.transaction_hash = c.h AND o.output_index = c.i)
+        ON CONFLICT ON CONSTRAINT unspent_tracking_skipped_pkey DO NOTHING;
+      GET DIAGNOSTICS skipped_inputs = ROW_COUNT;
     END IF;
     SELECT count(*) INTO n_inputs FROM unspent_deferred_inputs;
     INSERT INTO unspent_deferred_affected (h, i) SELECT h, i FROM unspent_deferred_inputs;
     IF upper_tx > w THEN
+      -- outputs created by the range; those the job has not seen (NULL) take
+      -- the fast path in step 7 unless something else touches them
+      IF kind = 'marker' THEN
+        INSERT INTO unspent_deferred_fresh (h, i, creator)
+          SELECT o.transaction_hash, o.output_index, t.internal_id
+            FROM transaction t
+            CROSS JOIN LATERAL (SELECT transaction_hash, output_index FROM output
+                                  WHERE output.transaction_hash = t.hash
+                                    AND output.spent_by_transaction_internal_id IS NULL OFFSET 0) o
+            WHERE t.internal_id > w AND t.internal_id <= upper_tx;
+        INSERT INTO unspent_deferred_affected (h, i)
+          SELECT o.transaction_hash, o.output_index
+            FROM transaction t
+            CROSS JOIN LATERAL (SELECT transaction_hash, output_index FROM output
+                                  WHERE output.transaction_hash = t.hash
+                                    AND output.spent_by_transaction_internal_id IS NOT NULL OFFSET 0) o
+            WHERE t.internal_id > w AND t.internal_id <= upper_tx;
+      ELSE
+        INSERT INTO unspent_deferred_fresh (h, i, creator)
+          SELECT o.transaction_hash, o.output_index, t.internal_id
+            FROM transaction t
+            CROSS JOIN LATERAL (SELECT transaction_hash, output_index FROM output
+                                  WHERE output.transaction_hash = t.hash
+                                    AND output.unspent_node_bits IS NULL OFFSET 0) o
+            WHERE t.internal_id > w AND t.internal_id <= upper_tx;
+        INSERT INTO unspent_deferred_affected (h, i)
+          SELECT o.transaction_hash, o.output_index
+            FROM transaction t
+            CROSS JOIN LATERAL (SELECT transaction_hash, output_index FROM output
+                                  WHERE output.transaction_hash = t.hash
+                                    AND output.unspent_node_bits IS NOT NULL OFFSET 0) o
+            WHERE t.internal_id > w AND t.internal_id <= upper_tx;
+      END IF;
+      -- fresh outputs a passed (skipped) input spends: full recompute
       INSERT INTO unspent_deferred_affected (h, i)
-        SELECT o.transaction_hash, o.output_index
-          FROM transaction t
-          CROSS JOIN LATERAL (SELECT transaction_hash, output_index FROM output
-                                WHERE output.transaction_hash = t.hash OFFSET 0) o
-          WHERE t.internal_id > w AND t.internal_id <= upper_tx;
+        SELECT f.h, f.i FROM unspent_deferred_fresh f
+          WHERE EXISTS (SELECT 1 FROM unspent_tracking_skipped s
+                          WHERE s.outpoint_transaction_hash = f.h AND s.outpoint_index = f.i);
     END IF;
   END IF;
 
@@ -477,7 +534,12 @@ BEGIN
     GET DIAGNOSTICS n_sweep = ROW_COUNT;
   END IF;
 
-  -- 7. recompute
+  -- 7. recompute: every collected output from scratch; then the fast path
+  -- for outputs the job sees for the first time and nothing else touched (no
+  -- processed input can spend them: the job stops before an input whose
+  -- output is missing, and records the ones it passes in
+  -- unspent_tracking_skipped): marker 0 / the creator's acceptance bits,
+  -- without probing spent_by_index
   SELECT count(*) INTO n_affected FROM unspent_deferred_affected;
   IF n_affected > 0 THEN
     IF kind = 'marker' THEN
@@ -486,6 +548,36 @@ BEGIN
       n_changed := unspent_deferred_recompute_bits();
     END IF;
   END IF;
+  IF kind = 'marker' THEN
+    UPDATE output o SET spent_by_transaction_internal_id = 0
+      FROM (SELECT f.h, f.i FROM unspent_deferred_fresh f
+              WHERE NOT EXISTS (SELECT 1 FROM pg_temp.unspent_deferred_affected a WHERE a.h = f.h AND a.i = f.i)
+              ORDER BY f.h, f.i OFFSET 0) v
+      WHERE o.transaction_hash = v.h AND o.output_index = v.i
+        AND o.spent_by_transaction_internal_id IS NULL;
+  ELSE
+    UPDATE output o SET unspent_node_bits = v.bits
+      FROM (SELECT f.h, f.i,
+                   (SELECT COALESCE(bit_or(1::bigint << n.internal_id::integer), 0)
+                      FROM block_transaction bt
+                      CROSS JOIN node n
+                      JOIN node_block nb ON nb.node_internal_id = n.internal_id AND nb.block_internal_id = bt.block_internal_id
+                      WHERE bt.transaction_internal_id = f.creator AND n.internal_id < 64)
+                 | (SELECT COALESCE(bit_or(1::bigint << nt.node_internal_id::integer), 0)
+                      FROM node_transaction nt
+                      WHERE nt.transaction_internal_id = f.creator AND nt.node_internal_id < 64) AS bits
+              FROM unspent_deferred_fresh f
+              WHERE NOT EXISTS (SELECT 1 FROM pg_temp.unspent_deferred_affected a WHERE a.h = f.h AND a.i = f.i)
+              ORDER BY f.h, f.i OFFSET 0) v
+      WHERE o.transaction_hash = v.h AND o.output_index = v.i
+        AND o.unspent_node_bits IS NULL;
+  END IF;
+  GET DIAGNOSTICS n_fresh = ROW_COUNT;
+  n_affected := n_affected + n_fresh;
+  n_changed := n_changed + n_fresh;
+  -- passed inputs whose output has now been processed are no longer needed
+  DELETE FROM unspent_tracking_skipped s USING unspent_deferred_fresh f
+    WHERE s.outpoint_transaction_hash = f.h AND s.outpoint_index = f.i;
 
   -- 8. watermarks (same transaction as the updates)
   UPDATE unspent_tracking_progress p
@@ -507,7 +599,7 @@ BEGIN
     'events', n_events, 'eventTransactions', n_event_txs,
     'blocks', n_blocks, 'blockTransactions', n_block_txs,
     'watchAdded', n_watch_added, 'watchChanged', n_watch_changed, 'watchExpired', n_watch_expired,
-    'sweep', n_sweep, 'affected', n_affected, 'changed', n_changed);
+    'sweep', n_sweep, 'affected', n_affected, 'changed', n_changed, 'fresh', n_fresh);
 END;
 $$;
 

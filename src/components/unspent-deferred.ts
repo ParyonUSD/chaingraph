@@ -181,6 +181,7 @@ export interface DeferredBatchResult {
   changed: number;
   events: number;
   eventTransactions: number;
+  fresh: number;
   inputs: number;
   inputWatermark: number;
   previousBlockWatermark: number;
@@ -207,6 +208,7 @@ export const parseBatchResult = (raw: {
     changed: num('changed'),
     events: num('events'),
     eventTransactions: num('eventTransactions'),
+    fresh: num('fresh'),
     inputs: num('inputs'),
     inputWatermark: num('inputWatermark'),
     previousBlockWatermark: num('previousBlockWatermark'),
@@ -298,7 +300,7 @@ export const formatBatchLog = (
     result.watchAdded
   }/~${result.watchChanged}/-${result.watchExpired}, sweep ${
     result.sweep
-  }; ${result.affected.toLocaleString()} outputs checked, ${result.changed.toLocaleString()} changed${
+  }; ${result.affected.toLocaleString()} outputs checked (${result.fresh.toLocaleString()} first seen, no probe), ${result.changed.toLocaleString()} changed${
     result.stalledAt === null
       ? ''
       : `; stalled before tx ${result.stalledAt} (output not saved yet)`

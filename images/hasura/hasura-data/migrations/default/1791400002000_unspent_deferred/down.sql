@@ -18,6 +18,7 @@ DROP TRIGGER IF EXISTS trigger_unspent_deferred_node_transaction_delete ON node_
 DROP FUNCTION IF EXISTS trigger_unspent_deferred_node_block_delete();
 DROP FUNCTION IF EXISTS trigger_unspent_deferred_node_transaction_delete();
 DROP TABLE IF EXISTS unspent_tracking_watch;
+DROP TABLE IF EXISTS unspent_tracking_skipped;
 DROP TABLE IF EXISTS unspent_tracking_progress;
 DROP TABLE IF EXISTS unspent_tracking_events;
 -- Partial indexes created by the agent for the deferred modes:
