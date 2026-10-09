@@ -329,6 +329,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@clickhouse/client@npm:1.24":
+  version: 1.24.1
+  resolution: "@clickhouse/client@npm:1.24.1"
+  checksum: 210d01a9fae6e040b0aa7cd2779dc518c864bbc99efa152da97a6a148853291f5b91f48caea0ce8d55ae3b3d230d9ac3582db2c7e9288184eedb6e1ad6e9ddb7
+  languageName: node
+  linkType: hard
+
 "@clinic/bubbleprof@npm:^9.0.0":
   version: 9.0.0
   resolution: "@clinic/bubbleprof@npm:9.0.0"
@@ -2882,6 +2889,7 @@ __metadata:
     "@ava/typescript": ^3.0.1
     "@bitauth/libauth": ^2.0.0-alpha.8
     "@chaingraph/bitcore-p2p-cash": ^9.0.5
+    "@clickhouse/client": 1.24
     "@istanbuljs/nyc-config-typescript": ^1.0.2
     "@types/dotenv": ^8.2.0
     "@types/lru-cache": ^7.10.10

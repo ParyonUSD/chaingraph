@@ -16,8 +16,8 @@ Files run in order; every statement is `IF NOT EXISTS`, so re-running is safe.
 | `010_core.sql` | block, transaction, block_transaction, output, input, node |
 | `020_acceptance.sql` | node_block, node_transaction, tx_acceptance, node_block_history, node_transaction_history |
 | `030_utxo.sql` | utxo, utxo_by_script |
-| `040_bookkeeping.sql` | commit_log, visibility, id_reservation, writer_lease, pending_spend |
-| `050_views.sql` | visibility gate views (node-scoped ones parameterised by `{node:UInt32}`) |
+| `040_bookkeeping.sql` | commit_log, commit_void, epoch_fence, visibility, id_reservation, writer_lease, pending_spend |
+| `050_views.sql` | visibility gate views: `*_v` (live watermark) and `*_at` (pinned watermark, WP4); `CREATE OR REPLACE` |
 | `060_projections.sql` | the §2.1/§2.4 projections as `ALTER TABLE … ADD PROJECTION IF NOT EXISTS` |
 
 Server-fact checks are in `../checks/` (`run.sh <url> <file>`); results below.
@@ -47,7 +47,9 @@ engine as written. VersionedCollapsingMergeTree appends `version` to the sorting
 | commit_log | ReplacingMergeTree(state_rank) / SharedReplacingMergeTree | `commit_seq` | none | 8192 | 4 (crash), 5 |
 | visibility | ReplacingMergeTree(visible_seq) / SharedReplacingMergeTree | `node_internal_id` | none | 8192 | 1, 5 |
 | id_reservation | MergeTree / SharedMergeTree | `id_kind, range_start` | none | 8192 | 4 (crash never reuses ids) |
-| writer_lease | ReplacingMergeTree(heartbeat_at) / SharedReplacingMergeTree | `lease_name` | none | 8192 | single writer (precondition of 4) |
+| commit_void (WP4) | MergeTree / SharedMergeTree | `commit_seq` | none | 8192 | 4 (aborted seqs; read by the gate) |
+| epoch_fence (WP4) | MergeTree / SharedMergeTree | `epoch` | none | 8192 | 4 (stale-writer fencing) |
+| writer_lease | ReplacingMergeTree(heartbeat_at) / SharedReplacingMergeTree | `lease_name, epoch, agent_id` (WP4) | none | 8192 | single writer (precondition of 4) |
 | pending_spend | VCMT / SharedVCMT | `outpoint_transaction_hash, outpoint_index, node_internal_id, spender_transaction_hash, spender_input_index, version` | none | 8192 | 1, 2, 4 (child-before-parent) |
 
 Projections (060): `block.p_height (height)`, `transaction.p_id (internal_id)`,
@@ -63,14 +65,16 @@ Projections (060): `block.p_height (height)`, `transaction.p_id (internal_id)`,
 
 | View | Parameter | Gate | Collapse | Checklist |
 |---|---|---|---|---|
-| `node_block_v` | `node` | `commit_seq <= visible(n)`, not aborted | `HAVING sum(sign) > 0` per (n, block) | 1, 2, 4, 5, 7 |
+| `node_block_v` | `node` | `commit_seq <= visible(n)`, not void, not fenced | `HAVING sum(sign) > 0` per (n, block) | 1, 2, 4, 5, 7 |
 | `node_transaction_v` | `node` | same | per (n, tx) | 1, 2, 4, 5, 7 |
 | `tx_acceptance_v` | `node` | same | per (tx, n, block/0) | 1, 2, 4, 5, 7 |
 | `utxo_v` | `node` | same | per utxo key | 1, 2, 3, 4, 5, 7 |
 | `utxo_by_script_v` | `node` | same | per utxo key | 1, 2, 3, 4, 5, 7 |
 | `node_block_history_v` | `node` | same | none | 5, 6, 7 |
 | `node_transaction_history_v` | `node` | same | none | 5, 6, 7 |
-| `block_v`, `transaction_v`, `block_transaction_v`, `output_v`, `input_v` | none | `seq <= visible(0)` and not aborted, or in the committed tail above `visible(0)` | none | 7 (node-agnostic; no acceptance fields) |
+| `block_v`, `transaction_v`, `block_transaction_v`, `output_v`, `input_v` | none | (`seq <= visible(0)` or in the committed tail above `visible(0)`), not void, not fenced | none | 7 (node-agnostic; no acceptance fields) |
+| every node-scoped `*_at` (WP4) | `node`, `visible` | as `*_v`, with `least(visible, live visible(n))` | as `*_v` | pins one watermark across views (no torn reads) |
+| `block_at`, `transaction_at`, `block_transaction_at`, `output_at`, `input_at` (WP4) | `visible0`, `tail` | (`seq <= least(visible0, live visible(0))` or `seq` in `tail` and committed), not void, not fenced | none | pinned node-agnostic snapshot |
 | `node_v` | none | `FINAL` | Replacing | 7 (name → id) |
 
 Querying a node-scoped view without `node` is an error, so no acceptance answer can be had without naming
@@ -78,6 +82,10 @@ a node. Verified on both servers: every view executes; the outer `WHERE` on a ke
 view's `PREWHERE` and uses the primary key (check d: `Granules: 2/392`); the scalar `visible(n)` subquery is
 folded to a constant (`commit_seq <= 5`); `output_v` filtered on `locking_bytecode_prefix` reads projection
 `p_script` (`EXPLAIN projections = 1`: `ReadFromMergeTree (p_script)`, `Granules: 1/20`).
+
+WP4 re-verified this for the `*_at` views (`visibility.spec.ts`, `[e2e] pinned views keep primary-key and
+projection use`): `utxo_at` reads 1/13 granules on `(node_internal_id, token_category)`, `output_at` reads
+projection `p_script`; the fence array and watermark fold to constants in `PREWHERE`.
 
 Note for WP4: `force_optimize_projection = 1` gives a false "No projection is used" through the gated views,
 because it also applies to the `visibility`/`commit_log` subqueries. Use `EXPLAIN projections = 1` instead.
@@ -159,6 +167,19 @@ Both servers default `async_insert = 1`, `insert_deduplicate = 1`, `deduplicate_
     `commit_seq`.
 17. History tables carry ids only (plan columns).
 
+WP4 amendments (design: `docs/clickhouse-port/wp4-commit-and-visibility.md`):
+
+18. `commit_seq = (writer_epoch << 40) | counter`, counter ≥ 1: each lease epoch owns a disjoint seq range.
+19. `commit_void` (aborted seqs) replaces the gate's `commit_log FINAL WHERE state = 'aborted'` scan, which
+    would grow with every commit; `commit_log` gains `abort_reason` (`ALTER … ADD COLUMN IF NOT EXISTS`).
+20. `epoch_fence(epoch, max_valid_seq)`: rows of an older epoch above its fence are invisible (stale writer).
+    Written densely for every epoch below the new lease epoch at takeover; the gate builds a dense array once
+    per query (`fence_max_seq`) and checks `commit_seq <= fence_max_seq[commit_seq >> 40]`.
+21. `writer_lease` is keyed `(lease_name, epoch, agent_id)` with a server-stamped `claimed_at`, so every claim
+    survives merges and the tie-break is deterministic. **Databases created before WP4: `DROP TABLE
+    writer_lease` before re-applying** (the `CREATE … IF NOT EXISTS` keeps the old key otherwise).
+22. Views are `CREATE OR REPLACE`; every node-scoped and node-agnostic view has a pinned `*_at` twin.
+
 ## Differences: Cloud 26.6 vs local 26.8
 
 - Every statement in 001–060 was accepted unchanged by both. No statement was rejected by 26.6.
@@ -189,10 +210,11 @@ Both servers default `async_insert = 1`, `insert_deduplicate = 1`, `deduplicate_
 - **4: exactly-once UTXO rows.** With a constant `version`, a duplicated +1 (an agent bug, not a retry: retries
   are covered by tokens, verified in check a) leaves an outpoint unspent forever. The verifier (§2.3) is the
   only guard.
-- **4/5: incomplete commits block the watermark.** A child whose parent never arrives (an orphan mempool tx)
+- **4/5: incomplete commits block the watermark.** *WP4: by design (mempool commits are never incomplete;
+  block commits have a bounded lifetime, `staleIncomplete`), see the WP4 doc.* A child whose parent never arrives (an orphan mempool tx)
   keeps its commit `incomplete`, which holds `visible(n)` back indefinitely. WP5 should keep such txs in the
   agent and out of commits, or time them out to `aborted`.
-- **5: torn reads across views in one query.** Each view evaluates `max(visible_seq)` on its own, so a query
+- **5: torn reads across views in one query.** *WP4: resolved by the `*_at` views and `readSnapshot`.* Each view evaluates `max(visible_seq)` on its own, so a query
   joining two node-scoped views (e.g. `utxo_v` and `tx_acceptance_v`) can see two different watermarks if one
   advances mid-query. Option for WP4: give the views a second parameter `{visible:UInt64}` read once per
   request by the API (also the key for §2.4 watermark caching). Verified locally that a watermark parameter
@@ -200,7 +222,8 @@ Both servers default `async_insert = 1`, `insert_deduplicate = 1`, `deduplicate_
 - **7: base tables reachable.** The API must be granted `SELECT` on the `*_v` views only, and the views need
   `SQL SECURITY DEFINER` (WP4) so the API user needs no rights on base tables. Otherwise `tx_acceptance`
   (sorted by `transaction_hash` first) answers "accepted by some node" for a hash.
-- **writer_lease is advisory.** ClickHouse has no compare-and-set, so two agents can both believe they hold
+- **writer_lease is advisory.** *WP4: epoch fencing (`epoch_fence`) makes a stale writer's later commits
+  invisible; residual window in the WP4 doc.* ClickHouse has no compare-and-set, so two agents can both believe they hold
   it. Single-writer is enforced operationally (one deployment) plus the verifier's duplicate-hash count.
 
 **Elements that could answer "accepted by any node" without a node in the key.**

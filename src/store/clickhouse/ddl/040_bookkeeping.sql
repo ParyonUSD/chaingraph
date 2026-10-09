@@ -11,6 +11,16 @@
 --   * pending_spend key is (outpoint_transaction_hash, outpoint_index, node_internal_id, spender...):
 --     it is probed by outpoint when a parent's outputs arrive. version = commit_seq of the +1 row.
 --   * id_reservation ranges are half-open [range_start, range_end).
+--
+-- WP4 amendments (docs/clickhouse-port/wp4-commit-and-visibility.md):
+--   * commit_seq layout: (writer_epoch << 40) | counter, counter >= 1. Every lease epoch owns a disjoint
+--     seq range, so dedup tokens of two writers never collide and a stale writer's seqs are fenceable.
+--   * commit_log.abort_reason (markAborted(seq, reason)).
+--   * commit_void: the aborted seqs, read by the gate (tiny; the gate must not scan commit_log FINAL).
+--   * epoch_fence: per older epoch, the highest seq that may ever be visible; rows of that epoch above it
+--     (a fenced, stale writer's) are invisible. Written densely (every epoch < current) at lease takeover.
+--   * writer_lease is keyed (lease_name, epoch, agent_id) so every claim survives merges (epoch fencing,
+--     tie-break on server-assigned claimed_at). Databases created before WP4: DROP TABLE writer_lease first.
 
 CREATE TABLE IF NOT EXISTS cg.commit_log
 (
@@ -24,10 +34,38 @@ CREATE TABLE IF NOT EXISTS cg.commit_log
     row_counts    Map(LowCardinality(String), UInt64),
     writer_epoch  UInt64,
     started_at    DateTime64(3, 'UTC'),
-    finished_at   Nullable(DateTime64(3, 'UTC'))
+    finished_at   Nullable(DateTime64(3, 'UTC')),
+    abort_reason  String DEFAULT ''
 )
 ENGINE = ReplacingMergeTree(state_rank)
 ORDER BY commit_seq
+SETTINGS non_replicated_deduplication_window = 10000;
+
+ALTER TABLE cg.commit_log ADD COLUMN IF NOT EXISTS abort_reason String DEFAULT '';
+
+-- Aborted commits (WP4). Written before commit_log's 'aborted' row; the gate hides these seqs.
+CREATE TABLE IF NOT EXISTS cg.commit_void
+(
+    commit_seq    UInt64,
+    reason        String,
+    writer_epoch  UInt64,
+    voided_at     DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+ORDER BY commit_seq
+SETTINGS non_replicated_deduplication_window = 10000;
+
+-- Epoch fences (WP4): rows of epoch `epoch` with commit_seq > max_valid_seq are invisible.
+-- One row per epoch below the current lease epoch (dense from 1); readers take min() per epoch.
+CREATE TABLE IF NOT EXISTS cg.epoch_fence
+(
+    epoch            UInt64,
+    max_valid_seq    UInt64,
+    fenced_by_epoch  UInt64,
+    fenced_at        DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+ORDER BY epoch
 SETTINGS non_replicated_deduplication_window = 10000;
 
 -- Per-node watermark. node_internal_id 0 = the node-agnostic data watermark.
@@ -54,16 +92,19 @@ ENGINE = MergeTree
 ORDER BY (id_kind, range_start)
 SETTINGS non_replicated_deduplication_window = 10000;
 
+-- One row per (claim, heartbeat); Replacing keeps the latest heartbeat of each claim. Times are the
+-- server's (now64), so claim order does not depend on agent clocks.
 CREATE TABLE IF NOT EXISTS cg.writer_lease
 (
     lease_name    LowCardinality(String),
-    agent_id      String,
     epoch         UInt64,
+    agent_id      String,
+    claimed_at    DateTime64(3, 'UTC'),
     heartbeat_at  DateTime64(3, 'UTC'),
     expires_at    DateTime64(3, 'UTC')
 )
 ENGINE = ReplacingMergeTree(heartbeat_at)
-ORDER BY lease_name
+ORDER BY (lease_name, epoch, agent_id)
 SETTINGS non_replicated_deduplication_window = 10000;
 
 -- Inputs whose spent output is not yet stored (child-before-parent, §3.5), per node.
