@@ -18,10 +18,3 @@ client/generated
 
 # ingestion gate report (fixtures/runs live under data/)
 ingestion-gate.json
-
-# Yarn (Corepack + global cache; only .yarn/plugins is tracked)
-.yarn/cache
-.yarn/install-state.gz
-.yarn/unplugged
-.yarn/build-state.yml
-.pnp.*
