@@ -3069,7 +3069,12 @@ test.serial(
         rollback().then(async () => Promise.reject(error))
     );
     plans.forEach((plan) => {
-      t.true(plan.includes('test_output_search_index'), plan);
+      /*
+       * Either the agent-created index or the identical test copy satisfies
+       * the check; which one the planner picks depends on whether auto-vacuum
+       * has analyzed `output` yet.
+       */
+      t.true(/\b(?:test_)?output_search_index\b/u.test(plan), plan);
       t.false(plan.includes('Seq Scan'), plan);
     });
   }
