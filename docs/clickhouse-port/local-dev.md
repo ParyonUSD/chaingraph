@@ -3,6 +3,19 @@
 Everything runs on the laptop; no cloud. Container/volume names are prefixed
 `ch1-` so they can be stopped/removed without generic patterns.
 
+## Checkout
+
+```sh
+git clone --recursive -b experiment/clickhouse-store https://github.com/ParyonUSD/chaingraph.git
+# existing clone / worktree:
+git submodule update --init --depth 1 -- .yarn
+YARN_ENABLE_NETWORK=0 yarn install --immutable --immutable-cache   # offline, links node_modules
+```
+
+`.yarn` is a submodule: ParyonUSD/chaingraph-dependencies branch `clickhouse-store` (Yarn 3.3.1,
+plugins, offline cache incl. `@clickhouse/client`). The offline install above is the only
+`yarn install` needed.
+
 ## Containers
 
 Postgres for the e2e suite and the ingestion gate (same image/env as CI,

@@ -9,7 +9,7 @@ Please also join us on the [`Chaingraph Dev` Telegram chat group](https://t.me/c
 Chaingraph uses the [Yarn package manager's zero-installs](https://yarnpkg.com/features/zero-installs) philosophy. First, ensure you have [Node.js](https://nodejs.org/en/) and [Yarn](https://yarnpkg.com/) installed, then recursively clone the repo:
 
 ```sh
-git clone --recursive https://github.com/bitauth/chaingraph.git
+git clone --recursive https://github.com/ParyonUSD/chaingraph.git
 cd chaingraph
 
 # later, to pull dependency updates:
@@ -18,7 +18,7 @@ git pull --recurse-submodules
 git submodule update --recursive
 ```
 
-Note that it is not necessary to run `yarn install` – all of [Chaingraph's dependencies are tracked in an independent git repository](https://github.com/bitauth/chaingraph-dependencies), and the dependency repo is automatically shallow-cloned into the `.yarn` directory.
+Note that it is not necessary to run `yarn install` – all of [Chaingraph's dependencies are tracked in an independent git repository](https://github.com/ParyonUSD/chaingraph-dependencies) (this fork uses its `clickhouse-store` branch, upstream [bitauth/chaingraph-dependencies](https://github.com/bitauth/chaingraph-dependencies) plus `@clickhouse/client`), and the dependency repo is automatically shallow-cloned into the `.yarn` directory.
 
 Finally, [install Hasura CLI](https://hasura.io/docs/latest/hasura-cli/install-hasura-cli/). On Linux and macOS:
 

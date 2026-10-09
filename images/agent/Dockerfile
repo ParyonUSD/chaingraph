@@ -1,4 +1,8 @@
-FROM node:24-alpine AS build-stage
+# node:24-alpine pinned by index digest (multi-arch), resolved 2026-10-10 via
+# `docker buildx imagetools inspect node:24-alpine`. Bump deliberately.
+ARG NODE_IMAGE=node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
+
+FROM $NODE_IMAGE AS build-stage
 WORKDIR /chaingraph
 COPY package.json yarn.lock .yarnrc.yml ./
 COPY .yarn .yarn
@@ -10,7 +14,7 @@ RUN yarn build
 # Use Yarn plugin-production-install to copy only production dependencies (https://gitlab.com/Larry1123/yarn-contrib/-/tree/master/packages/plugin-production-install)
 RUN yarn prod-install ./production-dependencies
 
-FROM node:24-alpine AS production
+FROM $NODE_IMAGE AS production
 WORKDIR /chaingraph
 COPY --from=build-stage /chaingraph/production-dependencies ./
 COPY --from=build-stage /chaingraph/defaults.env ./

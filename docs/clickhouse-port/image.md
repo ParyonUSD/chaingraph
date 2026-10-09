@@ -17,23 +17,25 @@ since WP5c, ships the ClickHouse DDL and a standalone DDL step:
 
 ## Build (linux/amd64)
 
-`.yarn` is a git submodule, so `git archive` does not include it: copy the working `.yarn` in.
+`.yarn` is a git submodule (Yarn 3.3.1 release, plugins and offline cache) from
+[ParyonUSD/chaingraph-dependencies](https://github.com/ParyonUSD/chaingraph-dependencies) branch
+`clickhouse-store` (upstream `bitauth/chaingraph-dependencies` plus the `@clickhouse/client`
+1.24.1 cache zip). Check out with `git clone --recursive`, or `git submodule update --init --depth 1`
+in an existing clone. `git archive` does not include submodules, so export `.yarn` separately.
 Build from an export of a commit so uncommitted edits never reach the image:
 
 ```sh
 bash -c 'set -eu; SHA=$(git rev-parse --short HEAD); B=$(mktemp -d)
 git archive HEAD | tar -x -C $B
-rsync -a --exclude .git .yarn/ $B/.yarn/
+git -C .yarn archive HEAD | tar -x -C $B/.yarn
 cd $B && docker buildx build --platform linux/amd64 -f images/agent/Dockerfile \
   -t <registry>/chaingraph-agent:clickhouse-$SHA .'
 # add --push to publish, or --load to keep it in the local daemon
 ```
 
-The working `.yarn` matters: `@clickhouse/client-npm-1.24.1-*.zip` is in the local
-`.yarn/cache` but not committed to the `.yarn` submodule (`bitauth/chaingraph-dependencies`),
-and the Dockerfile installs with `--immutable --immutable-cache`. A build from a clean clone
-(`git submodule update`) fails with `YN0056 Cache entry required but missing for
-@clickhouse/client@npm:1.24.1`.
+The Dockerfile installs offline with `yarn install --immutable --immutable-cache`; every
+package, `@clickhouse/client` included, comes from the submodule's `.yarn/cache`. No network
+`yarn install` is needed. The base image is `node:24-alpine` pinned by digest (`NODE_IMAGE` arg).
 
 ## DDL step (init container or Job)
 
@@ -72,7 +74,8 @@ Output: one line naming endpoint, database, user, DDL directory and files; then
 ## Verification (WP5c, 2026-10-09, image built from `f7b4481`, before the WP5a-mempool commits)
 
 MacBook (Apple M-series), Docker Desktop, buildx v0.37.0, cross-building linux/amd64 under emulation;
-build from `git archive HEAD` + working `.yarn`, only the base image cached.
+build from `git archive HEAD` + working `.yarn`, only the base image cached (before the
+submodule moved to ParyonUSD/chaingraph-dependencies; see the submodule build row).
 
 | Item | Result |
 | --- | --- |
@@ -81,4 +84,4 @@ build from `git archive HEAD` + working `.yarn`, only the base image cached.
 | DDL CLI in the container → `http://host.docker.internal:18123`, db `ch1_wp5c_image` | exit 0, 57 statements, 45 tables/views (10 MergeTree, 4 Replacing, 6 VersionedCollapsing, 25 views); re-run exit 0 (idempotent); database dropped afterwards |
 | `CHAINGRAPH_CLICKHOUSE_DDL_DIR=/nope` | exit 1, clear message |
 | `build/config.js` in the image with `CHAINGRAPH_STORE=clickhouse` and no Postgres var | loads (defaults.env value) |
-| Clean `.yarn` submodule (no ClickHouse zip), `--target build-stage` | fails at `yarn install` (YN0056), see above |
+| Clean `.yarn` submodule (bitauth upstream, no ClickHouse zip), `--target build-stage` | fails at `yarn install` (YN0056); fixed by the ParyonUSD `clickhouse-store` submodule |
