@@ -1,4 +1,4 @@
-/* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, @typescript-eslint/member-ordering, @typescript-eslint/no-invalid-void-type, class-methods-use-this, functional/no-let, functional/no-loop-statement, no-bitwise, complexity, functional/no-throw-statement, @typescript-eslint/no-use-before-define */
+/* eslint-disable max-lines, no-continue, no-await-in-loop, max-classes-per-file, camelcase, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, @typescript-eslint/member-ordering, @typescript-eslint/no-invalid-void-type, class-methods-use-this, functional/no-let, functional/no-loop-statement, no-bitwise, complexity, functional/no-throw-statement, @typescript-eslint/no-use-before-define */
 // cspell:ignore clickhouse seqs retryable
 /**
  * Per-node in-memory state of the ClickHouse writer (WP5a-core):
@@ -100,6 +100,28 @@ export class StoreOperation {
   private readonly commit = deferred<void>();
 
   private rowsDone = false;
+
+  /**
+   * Operations whose commit this one waits for (its data dependencies, as
+   * they are found): the edges the commit-order barrier's cycle check
+   * follows (`awaitCommitOrder`). Add with `noteWaitsOn`.
+   */
+  readonly waitsOn = new Set<StoreOperation>();
+
+  /** The earlier operations this one's commit-order barrier waits for now. */
+  barrierWaits: readonly StoreOperation[] = [];
+
+  /** Record that this operation waits for the commit of `operations`. */
+  noteWaitsOn(operations: Iterable<StoreOperation>) {
+    let added = false;
+    for (const other of operations) {
+      if (other !== this && !this.waitsOn.has(other)) {
+        this.waitsOn.add(other);
+        added = true;
+      }
+    }
+    if (added) this.registry?.notifyGraphChanged();
+  }
 
   constructor(
     readonly id: number,
@@ -213,9 +235,9 @@ export class DependencyFailedError extends Error {}
  * `done`, so it never contributes a `dependsOn` seq: what it waits for is
  * ordering, and each of those commits is terminal before `owner` commits.
  */
-class PredecessorBarrier extends StoreOperation {
+export class PredecessorBarrier extends StoreOperation {
   constructor(
-    owner: StoreOperation,
+    readonly owner: StoreOperation,
     private readonly settledAll: Promise<void>
   ) {
     super(-owner.id, 'predecessors', owner.nodes);
@@ -491,6 +513,17 @@ class OrderedQueue {
     return this.head < this.items.length ? this.items[this.head]!.id : Infinity;
   }
 
+  /** The open operations with an id below `id`, oldest first. */
+  openBefore(id: number): StoreOperation[] {
+    const found: StoreOperation[] = [];
+    for (let index = this.head; index < this.items.length; index += 1) {
+      const item = this.items[index]!;
+      if (item.id >= id) break;
+      if (this.isOpen(item)) found.push(item);
+    }
+    return found;
+  }
+
   /** Re-check after an operation closed: wake waiters it was holding. */
   advance() {
     if (this.waiters.size === 0) {
@@ -551,6 +584,38 @@ export class OperationRegistry {
   private nextId = 1;
 
   private readonly idle: (() => void)[] = [];
+
+  /** Resolved (and replaced) whenever the wait-for graph changes. */
+  private graphChange = deferred<void>();
+
+  /**
+   * Resolves at the next change of the wait-for graph: an operation settled,
+   * found a new data dependency, or changed its commit-order barrier.
+   */
+  get nextGraphChange(): Promise<void> {
+    return this.graphChange.promise;
+  }
+
+  notifyGraphChanged() {
+    const current = this.graphChange;
+    this.graphChange = deferred<void>();
+    current.resolve();
+  }
+
+  /**
+   * The unsettled operations registered before `operation` that share a node
+   * with it (each once, oldest first).
+   */
+  unsettledEarlier(operation: StoreOperation): StoreOperation[] {
+    const found = new Set<StoreOperation>();
+    operation.nodes.forEach((node) => {
+      this.lanes
+        .get(node)
+        ?.unsettled.openBefore(operation.id)
+        .forEach((other) => found.add(other));
+    });
+    return [...found].sort((a, b) => a.id - b.id);
+  }
 
   get activeCount() {
     return this.live.size;
@@ -634,6 +699,7 @@ export class OperationRegistry {
       }
       lane.unsettled.advance();
     });
+    this.notifyGraphChanged();
   }
 
   /** Whether no operation was registered on `operation`'s nodes after it. */
@@ -735,9 +801,11 @@ export const waitForPredecessorRows = async (operation: StoreOperation) => {
  * `dependsOn`.
  */
 export const awaitDependencies = async (
-  dependencies: Iterable<StoreOperation>
+  dependencies: Iterable<StoreOperation>,
+  waiter?: StoreOperation
 ): Promise<bigint[]> => {
   const list = [...new Set(dependencies)];
+  waiter?.noteWaitsOn(list);
   await Promise.all(
     list.map(async (dependency) =>
       dependency.committed.catch((error: unknown) => {
@@ -753,6 +821,89 @@ export const awaitDependencies = async (
     .filter((dependency) => dependency.state === 'committed')
     .map((dependency) => dependency.seq)
     .filter((seq): seq is bigint => seq !== undefined);
+};
+
+/** What `operation` waits for now (wait-for graph edges of the barrier's cycle check). */
+const waitEdges = (operation: StoreOperation): StoreOperation[] => {
+  if (operation instanceof PredecessorBarrier) {
+    return operation.owner.registry?.unsettledEarlier(operation.owner) ?? [];
+  }
+  return [...operation.waitsOn, ...operation.barrierWaits];
+};
+
+/** Whether `from` waits (transitively) for `target` in the current wait-for graph. */
+export const waitsTransitively = (
+  from: StoreOperation,
+  target: StoreOperation
+): boolean => {
+  const seen = new Set<StoreOperation>();
+  const stack = [from];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (current === target) return true;
+    if (seen.has(current) || current.finished) continue;
+    seen.add(current);
+    waitEdges(current).forEach((next) => {
+      stack.push(next);
+    });
+  }
+  return false;
+};
+
+const sameOperations = (
+  a: readonly StoreOperation[],
+  b: readonly StoreOperation[]
+) => a.length === b.length && a.every((item, index) => item === b[index]);
+
+/**
+ * Commit order per node (docs/clickhouse-port/g1-fix-pass.md, bug 1): a
+ * block commit is marked committed only after every earlier operation on
+ * its nodes has settled, and never if one of them failed
+ * (`DependencyFailedError`, so the commit aborts while it is still open and
+ * above every watermark). Otherwise a later batch could commit on top of an
+ * earlier one that then fails: the node's watermark passes the aborted (or
+ * never begun) commit and the node sees later blocks without the earlier
+ * ones (the c1 hole). An earlier operation that itself waits (transitively)
+ * for this one's commit (child-before-parent: it spends this batch's
+ * outputs) is not waited for, so the wait-for graph stays acyclic; the
+ * check is re-run whenever the graph changes. Waits without holding an
+ * in-flight slot.
+ */
+export const awaitCommitOrder = async (
+  operation: StoreOperation,
+  abandon?: { race: <T>(work: Promise<T>) => Promise<T> }
+): Promise<void> => {
+  const { registry } = operation;
+  if (registry === undefined) return;
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    while (registry.hasUnsettledEarlier(operation)) {
+      const blockers = registry
+        .unsettledEarlier(operation)
+        .filter((earlier) => !waitsTransitively(earlier, operation));
+      if (!sameOperations(blockers, operation.barrierWaits)) {
+        operation.barrierWaits = blockers;
+        registry.notifyGraphChanged();
+      }
+      if (blockers.length === 0) break;
+      const change = registry.nextGraphChange;
+      await operation.whileWaiting(
+        abandon === undefined ? change : abandon.race(change)
+      );
+    }
+  } finally {
+    if (operation.barrierWaits.length > 0) {
+      operation.barrierWaits = [];
+      registry.notifyGraphChanged();
+    }
+  }
+  if (operation.poisoned !== undefined) {
+    throw new DependencyFailedError(
+      `An earlier operation on nodes ${operation.nodes.join(
+        ', '
+      )} failed: ${String(operation.poisoned)}`
+    );
+  }
 };
 
 /** Column lists (DDL order, ddl/020_acceptance.sql and 040_bookkeeping.sql). */

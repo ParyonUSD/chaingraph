@@ -4,7 +4,11 @@ import { readFileSync } from 'node:fs';
 
 import test from 'ava';
 
-import type { CommitLease, CommitLogClient } from './commit-log.js';
+import type {
+  CommitLease,
+  CommitLogClient,
+  CommitLogDiagnostic,
+} from './commit-log.js';
 import {
   CommitDependencyError,
   commitKinds,
@@ -15,6 +19,7 @@ import {
   epochOfSeq,
   lastSeqOfEpoch,
   seqForEpoch,
+  VisibilityInvariantError,
 } from './commit-log.js';
 import { createScratchDatabase, e2eClickHouseUrl } from './test-support.js';
 
@@ -151,6 +156,75 @@ test('CommitLog: begin, commit and abort track state in memory', async (t) => {
   await t.throwsAsync(log.markCommitted(first.seq, {}), {
     instanceOf: CommitStateError,
   });
+});
+
+test('CommitLog: a committed (or possibly committed) seq, or one at or below a published watermark, is never voided (G1 bug 1 guard)', async (t) => {
+  const { client, inserts } = stubClient();
+  const marks = new Map<number, bigint>();
+  const diagnostics: CommitLogDiagnostic[] = [];
+  const log = new CommitLog(client, fixedLease(2n), () => 1_000, {
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    publishedWatermarks: () => marks,
+  });
+  await log.init();
+  const committed = await log.beginCommit({ kind: 'block', nodeScope: [1] });
+  await log.markCommitted(committed.seq, {});
+  await t.throwsAsync(log.markAborted(committed.seq, 'late failure'), {
+    instanceOf: VisibilityInvariantError,
+    message: /it is committed/u,
+  });
+  // an open commit at or below a published watermark of its scope or node 0
+  const open = await log.beginCommit({ kind: 'block', nodeScope: [1] });
+  marks.set(1, open.seq);
+  await t.throwsAsync(log.markAborted(open.seq, 'x'), {
+    instanceOf: VisibilityInvariantError,
+    message: /visible\(1\)/u,
+  });
+  marks.set(1, open.seq - 1n);
+  marks.set(0, open.seq);
+  await t.throwsAsync(log.markAborted(open.seq, 'x'), {
+    instanceOf: VisibilityInvariantError,
+    message: /visible\(0\)/u,
+  });
+  // another node's watermark does not matter
+  marks.set(0, open.seq - 1n);
+  marks.set(2, open.seq + 5n);
+  await log.markAborted(open.seq, 'allowed');
+  t.is(log.stateOf(open.seq), 'aborted');
+  // a commit whose committed row was sent but failed: may be committed
+  const failing = await log.beginCommit({ kind: 'block', nodeScope: [1] });
+  client.insertSelect = async (sql, params, options) => {
+    if (options.deduplicationToken.endsWith(':committed')) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error('socket hang up');
+    }
+    inserts.push({ params, sql, token: options.deduplicationToken });
+  };
+  await t.throwsAsync(log.markCommitted(failing.seq, {}));
+  await t.throwsAsync(log.markAborted(failing.seq, 'x'), {
+    instanceOf: VisibilityInvariantError,
+    message: /may be committed/u,
+  });
+  t.is(log.stateOf(failing.seq), 'intent', 'it stays open: watermarks held');
+  t.false(
+    inserts.some(
+      (insert) =>
+        insert.token === `${committed.seq}:commit_void:0` ||
+        insert.token === `${failing.seq}:commit_void:0`
+    ),
+    'no void row was written for a refused abort'
+  );
+  t.deepEqual(
+    diagnostics.map((item) => [item.event, item.seq]),
+    [
+      ['void_refused', committed.seq.toString()],
+      ['void_refused', open.seq.toString()],
+      ['void_refused', open.seq.toString()],
+      ['commit_void', open.seq.toString()],
+      ['void_refused', failing.seq.toString()],
+    ]
+  );
+  t.is(diagnostics[3]!.watermarks, `0:${open.seq - 1n},1:${open.seq - 1n}`);
 });
 
 test('CommitLog: markCommitted refuses until dependencies are committed', async (t) => {

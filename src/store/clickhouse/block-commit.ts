@@ -36,6 +36,7 @@ import type {
 import {
   AbandonedError,
   acceptanceColumns,
+  awaitCommitOrder,
   awaitDependencies,
   deferred,
   encodeNodeBlockRows,
@@ -76,8 +77,9 @@ export class PendingSpendTimeoutError extends Error {}
 
 /**
  * Called between the steps of a commit (tests inject crashes here). Step
- * names: `intent`, then the table just written (`output`, `input`, …), then
- * `incomplete`, `fill`, `rows-written`, `committed`.
+ * names: `begin` (block commits: before the seq is allocated), `intent`,
+ * then the table just written (`output`, `input`, …), then `incomplete`,
+ * `fill`, `rows-written`, `committed`.
  */
 export type FaultInjector = (
   step: string,
@@ -233,7 +235,39 @@ export interface WriterContext {
    * `utxo_by_script` rows. Default `true`.
    */
   utxo?: boolean;
+  /**
+   * A block batch failed (not abandoned, not a simulated crash): its blocks
+   * will not be committed, so nothing later of its nodes may be either
+   * (the store abandons its in-flight work; docs/clickhouse-port/g1-fix-pass.md).
+   */
+  onBatchFailure?: (failure: BatchFailure) => void;
+  /** Structured diagnostics (pending-spend timeouts, failed aborts). */
+  diagnostic?: (diagnostic: WriterDiagnostic) => void;
 }
+
+/** A failed block batch, as reported to `onBatchFailure`. */
+export interface BatchFailure {
+  error: unknown;
+  seq: bigint | undefined;
+  nodes: readonly number[];
+  heights: readonly number[];
+}
+
+/** Writer-side structured diagnostics. */
+export type WriterDiagnostic =
+  | {
+      event: 'abort_failed';
+      seq: string;
+      reason: string;
+      error: string;
+    }
+  | {
+      event: 'pending_spend_timeout';
+      seq: string;
+      unresolved: number;
+      sample: string[];
+      waitedMs: number;
+    };
 
 /** The stored UTXO tables (skipped entirely when the context's `utxo` is false). */
 export const utxoTables: ReadonlySet<string> = new Set([
@@ -602,6 +636,9 @@ export class BlockBatch {
   /** Owned hashes waiting for an id phase. */
   unresolved: string[] = [];
 
+  /** Every call of the batch was answered early as parked (`onParked`). */
+  parked = false;
+
   private phases: Promise<void>[] = [];
 
   private phaseScheduled = false;
@@ -810,7 +847,14 @@ export class BlockCommitter {
         if (commit !== undefined) {
           await context.commitLog
             .markAborted(commit.seq, String(error))
-            .catch(() => undefined);
+            .catch((abortError: unknown) => {
+              context.diagnostic?.({
+                error: String(abortError),
+                event: 'abort_failed',
+                reason: String(error),
+                seq: commit!.seq.toString(),
+              });
+            });
         }
         operation.markFailed(error);
         batch.pendingIds.forEach((id) => {
@@ -818,13 +862,34 @@ export class BlockCommitter {
         });
         context.outputs.release(operation, false);
         await context.transactions.release(operation, false);
+        /*
+         * A parked batch's calls were answered already: their `committed`
+         * must reject (the blocks were not saved), not resolve as saved.
+         */
+        if (batch.parked) throw error;
         return empty();
       }
       context.mempool.markStale(operation);
+      // first (synchronously): nothing later of these nodes may commit now
+      context.onBatchFailure?.({
+        error,
+        heights: batch.items.map((item) => item.request.block.height),
+        nodes: operation.nodes,
+        seq: commit?.seq,
+      });
       if (commit !== undefined) {
+        const reason = `saveBlock failed: ${String(error)}`;
         await context.commitLog
-          .markAborted(commit.seq, `saveBlock failed: ${String(error)}`)
-          .catch(() => undefined);
+          .markAborted(commit.seq, reason)
+          .catch((abortError: unknown) => {
+            // the commit stays open (its watermarks held) until recovery
+            context.diagnostic?.({
+              error: String(abortError),
+              event: 'abort_failed',
+              reason,
+              seq: commit!.seq.toString(),
+            });
+          });
       }
       operation.markFailed(error);
       batch.pendingIds.forEach((id) => {
@@ -1084,7 +1149,10 @@ export class BlockCommitter {
      * sequential lookups per extra round).
      */
     const attempted = new Set<string>();
+    /** Commits committed before the last store lookup of spent outputs. */
+    let committedAtLookup = context.commitLog.committedCount;
     const resolveWanted = async () => {
+      committedAtLookup = context.commitLog.committedCount;
       const missing = new Map(
         [...wanted].filter(([key]) => !attempted.has(key))
       );
@@ -1104,6 +1172,7 @@ export class BlockCommitter {
     );
 
     /* 4. The commit. */
+    await context.fault('begin', { kind: 'block', seq: undefined });
     const nodeScope = acceptingNodes;
     const dependsOn = [...dependencies]
       .filter((dependency) => dependency.state === 'committed')
@@ -1471,11 +1540,17 @@ export class BlockCommitter {
        * and the next start downloads the blocks again.
        */
       operation.yieldLane();
+      batch.parked = true;
       batch.items.forEach((item, index) => {
         item.onParked(results[index]!);
       });
       const filled = await operation.whileWaiting(
-        this.waitForPending(unresolved)
+        this.waitForPending(
+          unresolved,
+          wanted,
+          commit.seq,
+          context.commitLog.committedCount !== committedAtLookup
+        )
       );
       filled.forEach((spend, key) => {
         resolved.set(key, spend);
@@ -1483,6 +1558,8 @@ export class BlockCommitter {
           dependencies.add(spend.owner);
         }
       });
+      // a parent found now is waited for: the commit-order barrier must know
+      operation.noteWaitsOn(dependencies);
       const fillInputs: ResolvedInput[] = pendingInputs.map(
         ({ input, inputIndex, transaction }) => {
           const spent = resolveSpent(
@@ -1559,9 +1636,14 @@ export class BlockCommitter {
 
     /* 6. Commit once every commit this one read from is committed. */
     const settled =
-      context.abandon?.race(awaitDependencies(dependencies)) ??
-      awaitDependencies(dependencies);
+      context.abandon?.race(awaitDependencies(dependencies, operation)) ??
+      awaitDependencies(dependencies, operation);
     await (dependencies.size > 0 ? operation.whileWaiting(settled) : settled);
+    /*
+     * ... and every earlier operation of its nodes has settled, none failed
+     * (commit order: no later batch becomes visible on top of a failed one).
+     */
+    await awaitCommitOrder(operation, context.abandon);
     await context.commitLog.markCommitted(commit.seq, rowCounts);
     operation.markCommitted();
     context.onCommitted(operation);
@@ -1799,35 +1881,78 @@ export class BlockCommitter {
     };
   }
 
-  /** Wait (bounded) until every pending outpoint is registered by a save. */
+  /**
+   * Wait (bounded) until every pending outpoint is known: registered by a
+   * save, or stored by a valid commit. The registry only remembers recent
+   * outputs (`recentOutputCapacity`), so a parent that registered, committed
+   * and was evicted between this commit's lookup and this wait (e.g. saved
+   * by another node's lane) is found by one store lookup after subscribing
+   * (G1 bug 2, docs/clickhouse-port/g1-fix-pass.md); later registrations
+   * wake the wait.
+   */
   private async waitForPending(
-    keys: readonly string[]
+    keys: readonly string[],
+    wanted: ReadonlyMap<string, { hash: string; index: number }>,
+    seq: bigint,
+    /** Some commit was committed since the last lookup: look up again. */
+    recheckStore: boolean
   ): Promise<Map<string, ResolvedSpend>> {
     const { context } = this;
+    const started = Date.now();
     /*
      * check and subscribe in one synchronous pass: a save that registered
      * the outpoint since `resolveSpends` is found here, a later one wakes us
      */
     const result = new Map<string, ResolvedSpend>();
+    const fromStore = new Map<
+      string,
+      Deferred<RegisteredOutput<StoreOperation>>
+    >();
     const waits = keys.map((key) => {
       const known = context.outputs.lookup(key);
+      const stored = deferred<RegisteredOutput<StoreOperation>>();
+      if (known === undefined) fromStore.set(key, stored);
       const wait =
         known === undefined
           ? { key, ...context.outputs.waitFor(key) }
           : { cancel: () => undefined, key, promise: Promise.resolve(known) };
       return {
         ...wait,
-        promise: wait.promise.then(async (entry) => {
-          result.set(key, {
-            output: {
-              ...entry.output,
-              transactionInternalId: await entry.internalId,
-            },
-            owner: entry.owner?.finished === true ? undefined : entry.owner,
-          });
-        }),
+        promise: Promise.race([wait.promise, stored.promise]).then(
+          async (entry) => {
+            result.set(key, {
+              output: {
+                ...entry.output,
+                transactionInternalId: await entry.internalId,
+              },
+              owner: entry.owner?.finished === true ? undefined : entry.owner,
+            });
+          }
+        ),
       };
     });
+    if (recheckStore && fromStore.size > 0) {
+      lookupStoredOutputs(
+        context,
+        [...fromStore.keys()].map((key) => wanted.get(key)!)
+      ).then(
+        (rows) => {
+          rows.forEach(({ output, seq: outputSeq }) => {
+            const key = outpointKey(output.transactionHash, output.outputIndex);
+            const owner = context.operationOfSeq(outputSeq);
+            const entry: RegisteredOutput<StoreOperation> = {
+              internalId: Promise.resolve(output.transactionInternalId),
+              output,
+              owner,
+            };
+            if (owner === undefined) context.outputs.remember(key, entry);
+            fromStore.get(key)?.resolve(entry);
+          });
+        },
+        // the registration wait (or the timeout) decides
+        () => undefined
+      );
+    }
     const all = Promise.all(waits.map(async ({ promise }) => promise)).then(
       () => true
     );
@@ -1854,13 +1979,23 @@ export class BlockCommitter {
           resolve(false);
         }, context.pendingSpendTimeoutMs);
       });
-      await Promise.race([
+      const complete = await Promise.race([
         all,
         timeout,
         ...(context.abandon === undefined ? [] : [context.abandon.promise]),
       ]).finally(() => {
         clearTimeout(timer);
       });
+      if (!complete) {
+        const missing = keys.filter((key) => !result.has(key));
+        context.diagnostic?.({
+          event: 'pending_spend_timeout',
+          sample: missing.slice(0, 5),
+          seq: seq.toString(),
+          unresolved: missing.length,
+          waitedMs: Date.now() - started,
+        });
+      }
       return new Map(result);
     } finally {
       waits.forEach(({ cancel }) => {

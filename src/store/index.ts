@@ -84,6 +84,26 @@ export const createStore = (
         username: config.clickhouse.user,
       },
       maxInFlightSaves: config.clickhouse.maxInFlightSaves,
+      onDiagnostic: (diagnostic) => {
+        /*
+         * One structured line per void, refused void, failed abort, failed
+         * block batch and pending-spend timeout (g1-fix-pass.md): the lab
+         * greps `clickhouseDiagnostic.event`.
+         */
+        const { logger } = instances;
+        if (logger === undefined) return;
+        const message = `ClickHouse store: ${diagnostic.event}.`;
+        if (diagnostic.event === 'void_refused') {
+          logger.fatal({ clickhouseDiagnostic: diagnostic }, message);
+        } else if (
+          diagnostic.event === 'block_batch_failed' ||
+          diagnostic.event === 'abort_failed'
+        ) {
+          logger.error({ clickhouseDiagnostic: diagnostic }, message);
+        } else {
+          logger.warn({ clickhouseDiagnostic: diagnostic }, message);
+        }
+      },
       onError: (error) => {
         instances.logger?.error(
           error,

@@ -17,6 +17,7 @@ import {
 } from './test-support.js';
 import {
   agnosticViewParams,
+  assertWatermarksBelowOpen,
   computeWatermarks,
   counterMaskSeq,
   nodeViewParams,
@@ -27,6 +28,7 @@ import {
   VisibilityPublisher,
   voidInlineLimit,
   voidOverflowSentinel,
+  WatermarkInvariantError,
 } from './visibility.js';
 
 const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
@@ -104,6 +106,38 @@ test('computeWatermarks: watermarks never pass an open commit (randomised)', (t)
       t.true(visible <= last);
     });
   });
+});
+
+test('assertWatermarksBelowOpen: a watermark at or past an open commit of its scope (or node 0) throws', (t) => {
+  const open = [{ nodeScope: [1], seq: 10n }];
+  t.notThrows(() => {
+    assertWatermarksBelowOpen(
+      new Map([
+        [0, 9n],
+        [1, 9n],
+        [2, 50n],
+      ]),
+      open
+    );
+  });
+  t.throws(
+    () => {
+      assertWatermarksBelowOpen(
+        new Map([
+          [0, 9n],
+          [1, 10n],
+        ]),
+        open
+      );
+    },
+    { instanceOf: WatermarkInvariantError }
+  );
+  t.throws(
+    () => {
+      assertWatermarksBelowOpen(new Map([[0, 11n]]), open);
+    },
+    { instanceOf: WatermarkInvariantError }
+  );
 });
 
 test('VisibilityPublisher: writes only advanced watermarks', async (t) => {

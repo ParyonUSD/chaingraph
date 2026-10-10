@@ -134,6 +134,14 @@ export interface RecoveryResult {
 interface TrackedCommit {
   seq: bigint;
   state: CommitState;
+  /**
+   * `markCommitted` sent the `committed` row: if it failed, the row may
+   * still have landed (and readers may see the seq in their committed
+   * tail), so the commit must never be voided by this process; it stays
+   * open (holding its watermarks) until the next start's recovery reads
+   * its final state.
+   */
+  commitSent?: boolean;
   kind: CommitKind;
   nodeScope: number[];
   blockHashHex: string;
@@ -142,6 +150,36 @@ interface TrackedCommit {
 }
 
 export class CommitDependencyError extends Error {}
+
+/**
+ * Refused: voiding a commit that is (or may be) visible. Once `visible(n)`
+ * passed a seq, or the seq is committed (its node-agnostic rows are in every
+ * reader's committed tail), it must never be voided: readers would see rows
+ * disappear (G1 checklist items 4-5; docs/clickhouse-port/g1-fix-pass.md).
+ */
+export class VisibilityInvariantError extends Error {}
+
+/** A structured diagnostic of the commit log (logged by the store's owner). */
+export interface CommitLogDiagnostic {
+  event: 'commit_void' | 'void_refused';
+  seq: string;
+  reason: string;
+  /** The commit's state before the abort, as known here. */
+  state: string;
+  nodeScope: number[];
+  /** Published watermarks of the scope's nodes and node 0 (`node:seq`). */
+  watermarks: string;
+}
+
+export interface CommitLogOptions {
+  /**
+   * The published watermarks (node → visible seq) this process knows; a
+   * void at or below one of them (its node scope or node 0) is refused.
+   */
+  publishedWatermarks?: () => ReadonlyMap<number, bigint>;
+  /** Called for every void and every refused void. */
+  onDiagnostic?: (diagnostic: CommitLogDiagnostic) => void;
+}
 
 /** The commit log of a lost lease epoch: it never writes again. */
 export class CommitLogRetiredError extends Error {}
@@ -211,6 +249,8 @@ export class CommitLog {
 
   private nextCounter = 1n;
 
+  private committed = 0;
+
   private lastAllocated = 0n;
 
   private initialized = false;
@@ -220,8 +260,14 @@ export class CommitLog {
   constructor(
     private readonly client: CommitLogClient,
     private readonly lease: CommitLease,
-    private readonly now: () => number = Date.now
+    private readonly now: () => number = Date.now,
+    private readonly options: CommitLogOptions = {}
   ) {}
+
+  /** How many commits this process has marked committed (a change counter). */
+  get committedCount() {
+    return this.committed;
+  }
 
   /** Whether `retire` was called. */
   get isRetired() {
@@ -352,7 +398,9 @@ export class CommitLog {
       }
     });
     this.lease.assertHeld();
+    tracked.commitSent = true;
     await this.writeState(tracked, 'committed', rowCounts);
+    this.committed += 1;
     this.open.delete(seq);
     this.emitTerminal(seq);
   }
@@ -364,9 +412,12 @@ export class CommitLog {
   async markAborted(
     seq: bigint,
     reason: string,
-    record?: CommitRecord
+    record?: CommitRecord,
+    recoveredWatermarks?: ReadonlyMap<number, bigint>
   ): Promise<void> {
-    const tracked: TrackedCommit = this.open.get(seq) ??
+    this.assertNotRetired();
+    const open = this.open.get(seq);
+    const tracked: TrackedCommit = open ??
       (record === undefined
         ? undefined
         : {
@@ -386,7 +437,13 @@ export class CommitLog {
         startedAtMs: this.now(),
         state: 'intent',
       };
-    this.assertNotRetired();
+    this.assertVoidable(
+      seq,
+      reason,
+      tracked,
+      open === undefined && record === undefined,
+      recoveredWatermarks ?? this.options.publishedWatermarks?.()
+    );
     await this.client.insertSelect(
       commitVoidInsert,
       { epoch: this.lease.epoch, reason, seq },
@@ -457,13 +514,24 @@ export class CommitLog {
       { high: epoch << epochShift }
     );
     const aborted = nonTerminal.map(toRecord);
+    const published =
+      aborted.length === 0
+        ? new Map<number, bigint>()
+        : new Map(
+            (
+              await this.client.query<{ node: number; visible: string }>(
+                'SELECT node_internal_id AS node, toString(max(visible_seq)) AS visible FROM visibility GROUP BY node'
+              )
+            ).map((row) => [Number(row.node), BigInt(row.visible)])
+          );
     // eslint-disable-next-line functional/no-loop-statement
     for (const record of aborted) {
       // eslint-disable-next-line no-await-in-loop
       await this.markAborted(
         record.seq,
         `recovered at startup by epoch ${epoch} (was ${record.state})`,
-        record
+        record,
+        published
       );
     }
 
@@ -571,5 +639,56 @@ export class CommitLog {
       },
       { deduplicationToken: dedupToken(tracked.seq, 'commit_log', state) }
     );
+  }
+
+  /**
+   * The void guard: a seq may be voided only while no reader can have seen
+   * any of its rows, i.e. it is not committed (in this process or in the
+   * recovered log) and it is above the published watermark of node 0 and of
+   * every node in its scope. Throws `VisibilityInvariantError` (and reports
+   * it) otherwise; reports every allowed void with the watermarks.
+   */
+  private assertVoidable(
+    seq: bigint,
+    reason: string,
+    tracked: TrackedCommit,
+    untracked: boolean,
+    watermarks: ReadonlyMap<number, bigint> | undefined
+  ) {
+    const nodes = [0, ...tracked.nodeScope];
+    const marks = nodes
+      .map((node) => `${node}:${String(watermarks?.get(node) ?? 'none')}`)
+      .join(',');
+    const committedHere =
+      untracked &&
+      !this.aborted.has(seq) &&
+      seq <= this.lastAllocated &&
+      epochOfSeq(seq) === epochOfSeq(this.lastAllocated);
+    const passed = nodes.filter(
+      (node) => (watermarks?.get(node) ?? -1n) >= seq
+    );
+    const problem =
+      tracked.state === 'committed' || committedHere
+        ? 'it is committed'
+        : tracked.commitSent === true
+        ? 'its committed row was sent (it may be committed)'
+        : passed.length > 0
+        ? `visible(${passed.join(',')}) already passed it`
+        : undefined;
+    const diagnostic: CommitLogDiagnostic = {
+      event: problem === undefined ? 'commit_void' : 'void_refused',
+      nodeScope: [...tracked.nodeScope],
+      reason,
+      seq: seq.toString(),
+      state: committedHere ? 'committed' : tracked.state,
+      watermarks: marks,
+    };
+    this.options.onDiagnostic?.(diagnostic);
+    if (problem !== undefined) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new VisibilityInvariantError(
+        `Refusing to void commit ${seq} (${reason}): ${problem} (watermarks ${marks}).`
+      );
+    }
   }
 }

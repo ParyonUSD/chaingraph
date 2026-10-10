@@ -8,6 +8,7 @@ import test from 'ava';
 import {
   AbandonedError,
   AbandonSignal,
+  awaitCommitOrder,
   awaitDependencies,
   DependencyFailedError,
   InFlightLimiter,
@@ -103,6 +104,71 @@ test('OperationRegistry: a failure fails the operations that had it as a predece
   b.markCommitted();
   t.deepEqual(await awaitDependencies(c.predecessors), []);
   t.is(c.poisoned, undefined);
+});
+
+test('awaitCommitOrder: a later operation commits only after the earlier ones of its nodes settle; never after one failed (G1 bug 1)', async (t) => {
+  const registry = new OperationRegistry();
+  const a = registry.begin('block', [1]);
+  const b = registry.begin('block', [1]);
+  const other = registry.begin('block', [2]);
+  const bOrder = awaitCommitOrder(b);
+  t.is(await settledState(bOrder), 'pending', 'b waits for a');
+  t.deepEqual(b.barrierWaits, [a]);
+  t.is(
+    await settledState(awaitCommitOrder(other)),
+    'resolved',
+    'another node is not ordered'
+  );
+  a.markCommitted();
+  t.is(await settledState(bOrder), 'resolved');
+  t.deepEqual(b.barrierWaits, []);
+  b.markCommitted();
+
+  const c = registry.begin('block', [1]);
+  const d = registry.begin('block', [1]);
+  const dOrder = awaitCommitOrder(d);
+  t.is(await settledState(dOrder), 'pending');
+  c.markFailed(new Error('injected'));
+  await t.throwsAsync(dOrder, { instanceOf: DependencyFailedError });
+});
+
+test('awaitCommitOrder: an earlier child waiting for a later parent is not waited for (no cycle), also when the edge appears late', async (t) => {
+  const registry = new OperationRegistry();
+  const child = registry.begin('block', [1]);
+  const parent = registry.begin('block', [1]);
+  // the child already waits for the parent's commit
+  child.noteWaitsOn([parent]);
+  t.is(await settledState(awaitCommitOrder(parent)), 'resolved');
+
+  const lateChild = registry.begin('block', [1]);
+  const lateParent = registry.begin('block', [1]);
+  child.markCommitted();
+  parent.markCommitted();
+  const order = awaitCommitOrder(lateParent);
+  t.is(await settledState(order), 'pending', 'no edge yet: waits');
+  // the child finds the parent's outputs later (its pending wait resolves)
+  lateChild.noteWaitsOn([lateParent]);
+  t.is(await settledState(order), 'resolved', 'the new edge releases it');
+
+  lateParent.markCommitted();
+  lateChild.markCommitted();
+
+  // transitive: first waits for last's commit, last's barrier waits for middle
+  const first = registry.begin('block', [1]);
+  const middle = registry.begin('block', [1]);
+  const last = registry.begin('block', [1]);
+  first.noteWaitsOn([last]);
+  const lastOrder = awaitCommitOrder(last);
+  t.is(await settledState(lastOrder), 'pending', 'last waits for middle');
+  t.deepEqual(last.barrierWaits, [middle]);
+  const middleOrder = awaitCommitOrder(middle);
+  t.is(
+    await settledState(middleOrder),
+    'resolved',
+    'middle: first waits (via last) for middle, so middle does not wait for first'
+  );
+  middle.markCommitted();
+  t.is(await settledState(lastOrder), 'resolved');
 });
 
 test('OperationRegistry: an operation ended without settling does not block later ones', async (t) => {

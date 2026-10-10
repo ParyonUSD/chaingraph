@@ -66,6 +66,32 @@ export const computeWatermarks = ({
   return result;
 };
 
+/** A watermark would pass an open (non-terminal) commit of its scope. */
+export class WatermarkInvariantError extends Error {}
+
+/**
+ * The publisher never passes an open or incomplete commit (WP4): for every
+ * open commit, `W(0)` and `W(n)` of every node n in its scope are below its
+ * seq. True by construction of `computeWatermarks`; checked before every
+ * publish so a regression throws instead of exposing a partial commit.
+ */
+export const assertWatermarksBelowOpen = (
+  watermarks: ReadonlyMap<number, bigint>,
+  openCommits: readonly OpenCommitScope[]
+) => {
+  openCommits.forEach(({ seq, nodeScope }) => {
+    [nodeAgnosticId, ...nodeScope].forEach((node) => {
+      const watermark = watermarks.get(node);
+      if (watermark !== undefined && watermark >= seq) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw new WatermarkInvariantError(
+          `Watermark ${watermark} of node ${node} would pass open commit ${seq}.`
+        );
+      }
+    });
+  });
+};
+
 export type VisibilityClient = Pick<ClickHouseClient, 'command' | 'query'>;
 
 /** What the publisher needs from the commit log. */
@@ -404,6 +430,11 @@ export class VisibilityPublisher {
     return this.published.get(nodeId) ?? 0n;
   }
 
+  /** Every published watermark (node → visible seq), a copy. */
+  publishedWatermarks(): ReadonlyMap<number, bigint> {
+    return new Map(this.published);
+  }
+
   private schedule() {
     if (this.timer !== undefined) {
       return;
@@ -424,11 +455,13 @@ export class VisibilityPublisher {
     this.source.openCommits().forEach(({ nodeScope }) => {
       nodeScope.forEach((node) => this.nodes.add(node));
     });
+    const openCommits = this.source.openCommits();
     const watermarks = computeWatermarks({
       lastAllocatedSeq: this.source.lastAllocatedSeq,
       nodes: this.nodes,
-      openCommits: this.source.openCommits(),
+      openCommits,
     });
+    assertWatermarksBelowOpen(watermarks, openCommits);
     const advanced = [...watermarks]
       .filter(([node, visible]) => visible > (this.published.get(node) ?? 0n))
       .sort(([a], [b]) => a - b);

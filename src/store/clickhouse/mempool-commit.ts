@@ -1855,8 +1855,8 @@ export class MempoolCommitter {
     await this.insertChangeRows(commit, kind, rows, '0', rowCounts);
     operation.markRowsWritten();
     await context.fault('rows-written', { kind, seq: commit.seq });
-    await (context.abandon?.race(awaitDependencies(dependencies)) ??
-      awaitDependencies(dependencies));
+    await (context.abandon?.race(awaitDependencies(dependencies, operation)) ??
+      awaitDependencies(dependencies, operation));
     await context.commitLog.markCommitted(commit.seq, rowCounts);
     operation.markCommitted();
     await context.fault('committed', { kind, seq: commit.seq });

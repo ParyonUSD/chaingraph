@@ -28,7 +28,11 @@ import type {
   StorePoolStats,
 } from '../types.js';
 
-import type { FaultInjector, SaveBlockResult } from './block-commit.js';
+import type {
+  FaultInjector,
+  SaveBlockResult,
+  WriterDiagnostic,
+} from './block-commit.js';
 import {
   appendAll,
   BlockBatch,
@@ -41,7 +45,7 @@ import {
 } from './block-commit.js';
 import type { ClickHouseConnectionConfig } from './client.js';
 import { ClickHouseClient } from './client.js';
-import type { OpenCommit } from './commit-log.js';
+import type { CommitLogDiagnostic, OpenCommit } from './commit-log.js';
 import { CommitLog } from './commit-log.js';
 import { ClickHouseReservationStore, IdAllocator } from './id-allocator.js';
 import { changeRows, MempoolCommitter } from './mempool-commit.js';
@@ -136,6 +140,12 @@ export interface ClickHouseStoreOptions {
   /** Background errors (watermark publishing, lease loss). */
   onError?: (error: unknown) => void;
   /**
+   * Structured diagnostics for the lab: every void (with the watermarks it
+   * was checked against), refused void, failed abort, failed block batch
+   * and pending-spend timeout (docs/clickhouse-port/g1-fix-pass.md).
+   */
+  onDiagnostic?: (diagnostic: StoreDiagnostic) => void;
+  /**
    * The store cannot continue (the writer lease was lost and not re-acquired
    * within about one ttl). Default: exit code 1 and SIGTERM to this process.
    */
@@ -182,6 +192,20 @@ const positiveIntegerFromEnvironment = (name: string, fallback: number) => {
 };
 
 export class StoreClosedError extends Error {}
+
+/** A structured diagnostic of the ClickHouse store (`onDiagnostic`). */
+export type StoreDiagnostic =
+  | CommitLogDiagnostic
+  | WriterDiagnostic
+  | {
+      event: 'block_batch_failed';
+      seq: string;
+      nodes: number[];
+      heights: string;
+      error: string;
+      /** This failure abandoned the epoch's in-flight work (the first one does). */
+      abandoned: boolean;
+    };
 
 /** The writer lease was lost and could not be re-acquired in time. */
 export class LeaseRecoveryFailedError extends Error {}
@@ -399,7 +423,15 @@ export class ClickHouseStore implements ChaingraphStore {
     lease.startHeartbeat((error) => {
       this.onLeaseLost(error);
     });
-    const commitLog = new CommitLog(client, lease);
+    const commitLog = new CommitLog(client, lease, Date.now, {
+      onDiagnostic: (diagnostic) => {
+        this.diagnostic(diagnostic);
+      },
+      publishedWatermarks: () =>
+        this.publisher?.publishedWatermarks() ?? new Map<number, bigint>(),
+    });
+    /* this epoch's signal: a failed batch abandons this epoch's work only */
+    const epochSignal = this.abandonSignal;
     await commitLog.init();
     this.commitLogInstance = commitLog;
     await this.loadFence();
@@ -442,6 +474,43 @@ export class ClickHouseStore implements ChaingraphStore {
         this.options.pendingSpendTimeoutMs ?? defaultPendingSpendTimeoutMs,
       transactions: this.transactions,
       utxo: this.utxoEnabled,
+      // eslint-disable-next-line sort-keys
+      diagnostic: (diagnostic) => {
+        this.diagnostic(diagnostic);
+      },
+      onBatchFailure: (failure) => {
+        this.diagnostic({
+          abandoned: !epochSignal.abandoned,
+          error: String(failure.error),
+          event: 'block_batch_failed',
+          heights:
+            failure.heights.length === 0
+              ? ''
+              : `${Math.min(...failure.heights)}-${Math.max(
+                  ...failure.heights
+                )}`,
+          nodes: [...failure.nodes],
+          seq: failure.seq?.toString() ?? 'none',
+        });
+        if (epochSignal.abandoned) return;
+        /*
+         * The batch's blocks will not be committed. Every later block of its
+         * nodes would be visible on top of the missing ones (the c1 hole),
+         * and children of its outputs would wait the pending-spend timeout
+         * and be stored with stand-in inputs. So, as on shutdown: abandon
+         * every in-flight operation (aborted; block saves resolve as
+         * handled) and refuse new work. The agent shuts down on the failed
+         * save and the next start re-downloads everything not committed.
+         */
+        epochSignal.abandon(
+          `a block batch failed (${String(
+            failure.error
+          )}); nothing later may commit on top of it`
+        );
+        this.mempoolCommitter?.dropOrphans(
+          new StoreClosedError('Orphan dropped: a block batch failed.')
+        );
+      },
     });
     this.mempoolCommitter = new MempoolCommitter({
       abandon: this.abandonSignal,
@@ -662,6 +731,14 @@ export class ClickHouseStore implements ChaingraphStore {
     );
   }
 
+  private diagnostic(diagnostic: StoreDiagnostic) {
+    try {
+      this.options.onDiagnostic?.(diagnostic);
+    } catch {
+      // diagnostics never break a commit
+    }
+  }
+
   /** Publish watermarks now (tests; the publisher also runs on its own). */
   async publishWatermarks(): Promise<Map<number, bigint>> {
     if (this.recovery !== undefined) await this.recovery;
@@ -870,7 +947,11 @@ export class ClickHouseStore implements ChaingraphStore {
       .get(batch)!
       .promise.then((results) => results[index]!);
     full.catch((error: unknown) => {
-      if (reportedEarly && !(error instanceof SimulatedCrash)) {
+      if (
+        reportedEarly &&
+        !(error instanceof SimulatedCrash) &&
+        !(error instanceof AbandonedError)
+      ) {
         this.options.onError?.(error);
       }
     });
@@ -915,7 +996,16 @@ export class ClickHouseStore implements ChaingraphStore {
       // no other operation was registered on these nodes since: order kept
       this.operations.isLatestOnItsNodes(batch.operation) &&
       !batch.blockHashes.has(block.hash) &&
-      this.committerInstance?.isInFlight(block.hash) !== true
+      this.committerInstance?.isInFlight(block.hash) !== true &&
+      /*
+       * a batch is one contiguous chain segment: the block extends the
+       * batch's last block. Otherwise blocks arriving out of order (e.g. the
+       * calls re-run after a lost lease, in whatever order they failed) mix
+       * into batches that spend each other's outputs both ways: a cycle of
+       * commit dependencies, i.e. a deadlock (g1-fix-pass.md).
+       */
+      batch.items[batch.items.length - 1]?.request.block.hash ===
+        block.previousBlockHash
     );
   }
 
@@ -1197,7 +1287,9 @@ export class ClickHouseStore implements ChaingraphStore {
         );
       }
       operation.markRowsWritten();
-      const settled = this.abandonSignal.race(awaitDependencies(dependencies));
+      const settled = this.abandonSignal.race(
+        awaitDependencies(dependencies, operation)
+      );
       await (dependencies.size > 0 ? operation.whileWaiting(settled) : settled);
       await this.requireCommitLog().markCommitted(commit.seq, rowCounts);
       operation.markCommitted();
@@ -1405,7 +1497,7 @@ export class ClickHouseStore implements ChaingraphStore {
       );
       await this.fault('tx_acceptance', { kind: 'reorg', seq: commit.seq });
       operation.markRowsWritten();
-      await this.abandonSignal.race(awaitDependencies(dependencies));
+      await this.abandonSignal.race(awaitDependencies(dependencies, operation));
       await this.requireCommitLog().markCommitted(commit.seq, rowCounts);
       operation.markCommitted();
       await this.fault('committed', { kind: 'reorg', seq: commit.seq });
