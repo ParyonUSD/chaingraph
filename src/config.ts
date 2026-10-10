@@ -53,6 +53,7 @@ const expectedOptions = [
   'CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL_TRANSACTIONS',
   'CHAINGRAPH_UNSPENT_NODE_IDS_BATCH_INPUTS',
   'CHAINGRAPH_UNSPENT_NODE_IDS_CONNECTIONS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_DURING_SYNC',
   'CHAINGRAPH_UNSPENT_NODE_IDS_FALLBACK_EVENTS',
   'CHAINGRAPH_UNSPENT_NODE_IDS_FALLBACK_TRANSACTIONS',
   'CHAINGRAPH_UNSPENT_NODE_IDS_GRACE_MS',
@@ -508,6 +509,14 @@ const unspentNodeIds = {
     'CHAINGRAPH_UNSPENT_NODE_IDS_PASS_MAX_MS',
     30_000
   ),
+  /**
+   * `pause` (default): no job pass while the agent has blocks downloading or
+   * waiting to be saved (a catch-up); the job then drains at full width.
+   * `run`: the job runs alongside the catch-up (competes with the block
+   * saves for I/O).
+   */
+  pauseDuringSync:
+    configuration.CHAINGRAPH_UNSPENT_NODE_IDS_DURING_SYNC !== 'run',
   stallMaxMs: nonNegativeIntegerSetting(
     'CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS',
     600_000
@@ -515,6 +524,16 @@ const unspentNodeIds = {
   startAtGenesis: configuration.CHAINGRAPH_UNSPENT_NODE_IDS_START === 'genesis',
 };
 /* eslint-enable @typescript-eslint/no-magic-numbers */
+if (
+  !['', 'pause', 'run'].includes(
+    configuration.CHAINGRAPH_UNSPENT_NODE_IDS_DURING_SYNC
+  )
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_UNSPENT_NODE_IDS_DURING_SYNC' environment variable: ${configuration.CHAINGRAPH_UNSPENT_NODE_IDS_DURING_SYNC}. Must be one of the following: pause, run`
+  );
+}
 if (
   !['', 'tip', 'genesis'].includes(
     configuration.CHAINGRAPH_UNSPENT_NODE_IDS_START

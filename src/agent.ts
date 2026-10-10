@@ -1243,6 +1243,14 @@ export class Agent {
     }
     this.unspentNodeIdsJobTimeout = setTimeout(() => {
       this.unspentNodeIdsJobTimeout = undefined;
+      if (
+        unspentNodeIds.pauseDuringSync &&
+        (this.blockBuffer.count() > 0 || this.blockBuffer.reservedBlocks > 0)
+      ) {
+        // a catch-up is in progress: retry once the block buffer is empty
+        this.requestUnspentNodeIdsJobPass(unspentNodeIds.intervalMs);
+        return;
+      }
       this.unspentNodeIdsJobRunning = runUnspentNodeIdsJobPass()
         .then((summary) => {
           if (summary.busy) {
