@@ -3,7 +3,7 @@
  * Chaingraph ingestion gate – see docs/ingestion-gate.md.
  *
  *   yarn ingestion-gate [--agent-dir <built chaingraph checkout>]
- *                       [--scenarios max-block,burst,reorg,concurrent,catch-up]
+ *                       [--scenarios max-block,burst,reorg,concurrent,catch-up] (opt-in: replay)
  *                       [--quick] [--thresholds <file.json>] [--out <file.json>] [--keep-pg]
  *                       [--pg auto|docker|host] [--pg-image postgres:18] [--pg-bin <dir>]
  *                       [--pg-port 55432] [--pg-url <postgres://user:pass@host:port>]
@@ -21,7 +21,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { cpus, totalmem } from 'node:os';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -29,7 +29,9 @@ import { parseArgs } from 'node:util';
 import * as clickhouseBackend from './lib/clickhouse.mjs';
 import * as postgresBackend from './lib/postgres.mjs';
 import { dockerMemoryBytes, startDockerPostgres, startHostPostgres } from './lib/postgres.mjs';
-import { scenarios } from './lib/scenarios.mjs';
+import { optInScenarios, scenarios as defaultScenarios } from './lib/scenarios.mjs';
+
+const scenarios = { ...defaultScenarios, ...optInScenarios };
 
 const harnessDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(harnessDirectory, '../..');
@@ -49,7 +51,7 @@ const { values: options } = parseArgs({
     'pg-image': { default: process.env.INGESTION_GATE_PG_IMAGE ?? 'postgres:18', type: 'string' },
     'pg-port': { default: process.env.INGESTION_GATE_PG_PORT ?? '55432', type: 'string' },
     'pg-url': { type: 'string' },
-    scenarios: { default: Object.keys(scenarios).join(','), type: 'string' },
+    scenarios: { default: Object.keys(defaultScenarios).join(','), type: 'string' },
     seed: { default: '1', type: 'string' },
     store: { default: process.env.INGESTION_GATE_STORE ?? 'postgres', type: 'string' },
     thresholds: { type: 'string' },
@@ -148,6 +150,7 @@ const thresholdRules = {
     ['peakHeapBytes', 'maxPeakHeapBytes', 'max'],
     ...clickhouseWriteRules,
   ],
+  replay: [['drainSeconds', 'maxDrainSeconds', 'max'], ...clickhouseWriteRules, ['eventLoopMaxMs', 'maxEventLoopMs', 'max']],
   burst: [
     ['drainSeconds', 'maxDrainSeconds', 'max'],
     ['walBytes', 'maxWalBytes', 'max'],
@@ -193,13 +196,14 @@ const summaryColumns = (name, result) => {
   const primary = {
     'max-block': `wall ${formatValue('wallSeconds', result.wallSeconds)}`,
     burst: `drain ${formatValue('drainSeconds', result.drainSeconds)}`,
+    replay: `drain ${formatValue('drainSeconds', result.drainSeconds)}`,
     reorg: `converge ${formatValue('convergeSeconds', result.convergeSeconds)}`,
     concurrent: `ratio ${formatValue('concurrencyRatio', result.concurrencyRatio)} (${Math.round(result.together?.transactionsPerSecond ?? 0)} vs ${Math.round(result.mainnetAlone?.transactionsPerSecond ?? 0)}+${Math.round(result.chipnetAlone?.transactionsPerSecond ?? 0)} tx/s)`,
     'catch-up': `${result.blocksPerSecond?.toFixed(1)} blocks/s`,
   }[name];
   return {
     heap: result.peakHeapBytes ? formatValue('peakHeapBytes', result.peakHeapBytes) : '',
-    primary,
+    primary: result.eventLoopMaxMs === undefined ? primary : `${primary}, loop max ${Math.round(result.eventLoopMaxMs)} ms`,
     txPerSecond: result.transactionsPerSecond ? Math.round(result.transactionsPerSecond).toString() : '',
     wal:
       result.walBytes !== undefined
@@ -208,6 +212,31 @@ const summaryColumns = (name, result) => {
           ? `${formatValue('walBytes', result.bytesWritten)} (+${formatValue('walBytes', result.mergeBytesWritten)} merges, ${result.partsCreated} parts)`
           : '',
   };
+};
+
+/**
+ * With CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS set (passed to the agent), the worst
+ * event-loop delay any agent of the scenario logged (whole agent lifetime).
+ */
+const eventLoopSummary = (scenarioDirectory) => {
+  if (!existsSync(scenarioDirectory)) return {};
+  let eventLoopMaxMs;
+  let eventLoopWorstP99Ms;
+  let eventLoopSamples = 0;
+  readdirSync(scenarioDirectory)
+    .filter((file) => file.endsWith('.agent.ndjson'))
+    .forEach((file) => {
+      readFileSync(join(scenarioDirectory, file), 'utf8')
+        .split('\n')
+        .filter((line) => line.includes('"eventLoopDelay"'))
+        .forEach((line) => {
+          const { eventLoopDelay } = JSON.parse(line);
+          eventLoopSamples += 1;
+          eventLoopMaxMs = Math.max(eventLoopMaxMs ?? 0, eventLoopDelay.maxMs);
+          eventLoopWorstP99Ms = Math.max(eventLoopWorstP99Ms ?? 0, eventLoopDelay.p99Ms);
+        });
+    });
+  return eventLoopSamples === 0 ? {} : { eventLoopMaxMs, eventLoopSamples, eventLoopWorstP99Ms };
 };
 
 const main = async () => {
@@ -251,6 +280,7 @@ const main = async () => {
     let entry;
     try {
       const result = await scenarios[name](context);
+      Object.assign(result, eventLoopSummary(context.runDirectory));
       const failures = evaluate(name, result);
       entry = { failures, passed: failures.length === 0, result, scenarioSeconds: (Date.now() - started) / 1000 };
     } catch (error) {

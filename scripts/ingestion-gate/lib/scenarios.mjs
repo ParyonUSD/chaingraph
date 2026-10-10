@@ -199,6 +199,36 @@ export const burstScenario = async (context) => {
   }
 };
 
+/**
+ * Opt-in (not in the default set): a mainnet-replay-like run of many large
+ * blocks announced back-to-back (G1 lab: Feb-2024 blocks, multi-block
+ * commits, a full recent-output cache). Each block spends output 0 of every
+ * transaction of the previous one. Sized by INGESTION_GATE_REPLAY_BLOCKS
+ * (default 64) and INGESTION_GATE_REPLAY_TX (default 20,000 per block).
+ */
+export const replayScenario = async (context) => {
+  const blockCount = Number(process.env.INGESTION_GATE_REPLAY_BLOCKS ?? 64);
+  const transactionsPerBlock = Number(process.env.INGESTION_GATE_REPLAY_TX ?? 20_000);
+  const payloads = loadOrGenerateBlockSequence({
+    blockCount,
+    cacheDirectory: context.cacheDirectory,
+    log: context.log,
+    name: 'replay',
+    seed: context.seed,
+    transactionsPerBlock,
+  });
+  const environment = await startEnvironment(context, 'replay', [mainnetLikeSpec(context.seed)]);
+  try {
+    const [node] = environment.nodes;
+    const blocks = linkBlocks(payloads, node.tip().hash);
+    context.log(`replay: announcing ${blocks.length} blocks (${(sumBytes(blocks) / 1e6).toFixed(2)} MB, ${sumTransactions(blocks)} txs) back-to-back`);
+    const result = await measureIngestion({ announce: () => node.announceViaHeaders(blocks), backend: context.backend, blocks, environment, node, pollMs: 250, timeoutMs: 3_600_000 });
+    return { ...result, drainSeconds: result.wallSeconds, peakHeapBytes: result.heap.peakHeapUsed };
+  } finally {
+    await environment.cleanup();
+  }
+};
+
 export const reorgScenario = async (context) => {
   const { reorgTransactionsPerBlock } = context.settings;
   const branchA = loadOrGenerateBlockSequence({ blockCount: 100, cacheDirectory: context.cacheDirectory, log: context.log, name: 'reorg-a', seed: context.seed, transactionsPerBlock: reorgTransactionsPerBlock });
@@ -411,4 +441,9 @@ export const scenarios = {
   reorg: reorgScenario,
   concurrent: concurrentScenario,
   'catch-up': catchUpScenario,
+};
+
+/** Scenarios run only when named in `--scenarios`. */
+export const optInScenarios = {
+  replay: replayScenario,
 };

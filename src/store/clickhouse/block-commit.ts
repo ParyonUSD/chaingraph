@@ -44,6 +44,7 @@ import {
   encodeTxAcceptanceRows,
   waitForPredecessorRows,
 } from './node-state.js';
+import { RecentCache } from './recent-cache.js';
 import { RowBinaryWriter } from './row-binary.js';
 import type { ResolvedInput, SpentOutput } from './row-encoders.js';
 import {
@@ -138,11 +139,13 @@ export class TransactionRegistry {
     { internalId: Promise<bigint>; owner: StoreOperation }
   >();
 
-  private readonly recent = new Map<string, bigint>();
+  private readonly recent: RecentCache<string, bigint>;
 
   private readonly hashesByOwner = new Map<StoreOperation, string[]>();
 
-  constructor(private readonly recentCapacity = 1_000_000) {}
+  constructor(recentCapacity = 1_000_000) {
+    this.recent = new RecentCache(recentCapacity);
+  }
 
   lookup(hash: string):
     | {
@@ -168,11 +171,7 @@ export class TransactionRegistry {
   }
 
   remember(hash: string, internalId: bigint) {
-    this.recent.delete(hash);
     this.recent.set(hash, internalId);
-    while (this.recent.size > this.recentCapacity) {
-      this.recent.delete(this.recent.keys().next().value as string);
-    }
   }
 
   /** Unpin; ids of a committed owner are remembered. */

@@ -551,6 +551,26 @@ if (clickhouseUtxoValue !== 'on' && clickhouseUtxoValue !== 'off') {
  */
 const clickhouseUtxo: 'off' | 'on' = clickhouseUtxoValue;
 
+const eventLoopDiagnosticValue = Number(
+  optionalString(optionalOptions.CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS, '0')
+);
+if (
+  !Number.isInteger(eventLoopDiagnosticValue) ||
+  eventLoopDiagnosticValue < 0
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    'The CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS environment variable must be an integer greater than or equal to 0.'
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS` environment variable
+ * (default: `0`, off). If set, the agent logs the event-loop delay of its JS
+ * thread (p50 / p99 / max over the window) every this many milliseconds, as
+ * one `eventLoopDelay` line (docs/clickhouse-port/g1-fix-pass-2.md).
+ */
+const eventLoopDiagnosticMs = eventLoopDiagnosticValue;
+
 /**
  * `true` if the `NODE_ENV` environment variable is `production`.
  */
@@ -571,6 +591,7 @@ export {
   clickhouseUrl,
   clickhouseUser,
   clickhouseUtxo,
+  eventLoopDiagnosticMs,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
   mempoolTransactionExpirationMs,

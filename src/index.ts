@@ -5,10 +5,12 @@ import { decodeTransaction, hashTransaction, hexToBin } from '@bitauth/libauth';
 import bitcoreP2pCash from '@chaingraph/bitcore-p2p-cash';
 
 import { Agent, cancelableDelay } from './agent.js';
+import { startEventLoopMonitor } from './components/event-loop-monitor.js';
 import {
   chaingraphInternalApiPort,
   chaingraphStore,
   clickhouseMaxInFlightSaves,
+  eventLoopDiagnosticMs,
 } from './config.js';
 import { instantiateLogger } from './logging.js';
 import { createStore } from './store/index.js';
@@ -25,6 +27,14 @@ logger.info(
       }).`
     : 'Store: postgres.'
 );
+if (eventLoopDiagnosticMs > 0) {
+  startEventLoopMonitor(eventLoopDiagnosticMs, (sample) => {
+    logger.info(
+      { eventLoopDelay: sample },
+      `Event loop delay: p50 ${sample.p50Ms} ms, p99 ${sample.p99Ms} ms, max ${sample.maxMs} ms over ${sample.windowMs} ms (heap ${sample.heapUsedMb} MB).`
+    );
+  });
+}
 const store = createStore();
 await store.init();
 

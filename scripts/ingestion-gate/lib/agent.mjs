@@ -8,6 +8,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const heapSamplerUrl = pathToFileURL(fileURLToPath(new URL('./heap-sampler.mjs', import.meta.url))).href;
 
+const passThroughPattern = /^(CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS|CHAINGRAPH_CLICKHOUSE_[A-Z_]+)$/;
+/** INGESTION_GATE_AGENT_NODE_OPTIONS becomes the agent's NODE_OPTIONS (e.g. `--cpu-prof --cpu-prof-dir=...`). */
+const passThroughEnvironment = () => ({
+  ...Object.fromEntries(Object.entries(process.env).filter(([name]) => passThroughPattern.test(name))),
+  ...(process.env.INGESTION_GATE_AGENT_NODE_OPTIONS === undefined ? {} : { NODE_OPTIONS: process.env.INGESTION_GATE_AGENT_NODE_OPTIONS }),
+});
+
 export class AgentProcess {
   constructor({ agentDirectory, runDirectory, label, environment, trustedNodes, genesisBlocks, settings }) {
     this.label = label;
@@ -40,6 +47,9 @@ export class AgentProcess {
         INGESTION_GATE_HEAP_SAMPLES: this.heapSamplePath,
         NODE_ENV: 'production',
         PATH: process.env.PATH,
+        // diagnostics and store tuning from the harness's own environment (e.g. CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS,
+        // CHAINGRAPH_CLICKHOUSE_MAX_BLOCKS_PER_COMMIT, INGESTION_GATE_AGENT_NODE_OPTIONS); the scenario's own settings win
+        ...passThroughEnvironment(),
         // backend selection + connection (CHAINGRAPH_STORE, CHAINGRAPH_POSTGRES_* / CHAINGRAPH_CLICKHOUSE_*)
         ...environment,
       },

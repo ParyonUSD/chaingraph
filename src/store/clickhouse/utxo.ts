@@ -1,4 +1,4 @@
-/* eslint-disable max-classes-per-file, @typescript-eslint/no-magic-numbers, max-params, @typescript-eslint/parameter-properties, @typescript-eslint/init-declarations, functional/no-let */
+/* eslint-disable max-classes-per-file, @typescript-eslint/no-magic-numbers, max-params, @typescript-eslint/init-declarations, functional/no-let */
 // cspell:ignore clickhouse dedup unhex
 /**
  * The per-node UTXO set (plan §2.3, WP5a-core): the transition rules, the
@@ -25,6 +25,7 @@
  */
 import type { ChaingraphOutput } from '../../types/chaingraph.js';
 
+import { RecentCache } from './recent-cache.js';
 import { RowBinaryWriter } from './row-binary.js';
 import { nonfungibleTokenCapabilityEnum8 } from './row-encoders.js';
 
@@ -414,13 +415,15 @@ interface Waiter<Owner> {
 export class OutputRegistry<Owner> {
   private readonly pinned = new Map<OutpointKey, RegisteredOutput<Owner>[]>();
 
-  private readonly recent = new Map<OutpointKey, RegisteredOutput<Owner>>();
+  private readonly recent: RecentCache<OutpointKey, RegisteredOutput<Owner>>;
 
   private readonly waiters = new Map<OutpointKey, Waiter<Owner>[]>();
 
   private readonly keysByOwner = new Map<Owner, OutpointKey[]>();
 
-  constructor(private readonly recentCapacity = 500_000) {}
+  constructor(recentCapacity = 500_000) {
+    this.recent = new RecentCache(recentCapacity);
+  }
 
   get pinnedCount() {
     return this.pinned.size;
@@ -504,13 +507,7 @@ export class OutputRegistry<Owner> {
 
   /** Cache durable outputs (e.g. read from the store). */
   remember(key: OutpointKey, entry: RegisteredOutput<Owner>) {
-    this.recent.delete(key);
     this.recent.set(key, entry);
-    // eslint-disable-next-line functional/no-loop-statement
-    while (this.recent.size > this.recentCapacity) {
-      const oldest = this.recent.keys().next().value as OutpointKey;
-      this.recent.delete(oldest);
-    }
   }
 
   lookup(key: OutpointKey): RegisteredOutput<Owner> | undefined {
