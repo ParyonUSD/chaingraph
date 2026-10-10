@@ -1,12 +1,14 @@
-/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention */
-// cspell:ignore clickhouse dedup urlsecret
+/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-let, functional/no-throw-statement */
+// cspell:ignore clickhouse dedup urlsecret retryable
 import { inspect } from 'node:util';
 
+import { ClickHouseError } from '@clickhouse/client';
 import test from 'ava';
 
 import {
   ClickHouseClient,
   clickHouseConfigFromEnv,
+  isRetryable,
   quoteIdentifier,
   splitCredentials,
 } from './client.js';
@@ -64,6 +66,32 @@ test('splitCredentials: moves URL credentials out of the URL', (t) => {
   t.is(
     splitCredentials({ ...explicit, url: 'http://h:1', username: '' }).username,
     'default'
+  );
+});
+
+test('isRetryable: transport errors and transient server codes (209 socket timeout, 210, 3, 32, 202, 252), not statement errors', (t) => {
+  t.true(
+    isRetryable(
+      Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })
+    )
+  );
+  t.true(
+    isRetryable(
+      new ClickHouseError({
+        code: '209',
+        message: 'Timeout exceeded while reading from socket (30000 ms).',
+        type: 'SOCKET_TIMEOUT',
+      })
+    )
+  );
+  ['3', '32', '202', '210', '252'].forEach((code) => {
+    t.true(isRetryable(new ClickHouseError({ code, message: code })), code);
+  });
+  t.false(
+    isRetryable(new ClickHouseError({ code: '62', message: 'Syntax error' }))
+  );
+  t.false(
+    isRetryable(new ClickHouseError({ code: '60', message: 'Unknown table' }))
   );
 });
 
@@ -189,5 +217,48 @@ e2e(
       }),
       { message: /Invalid ClickHouse identifier/u }
     );
+  }
+);
+
+e2e(
+  '[e2e] ClickHouseClient: a read is retried after a socket reset and a 209; a statement error is not',
+  async (t) => {
+    const url = e2eClickHouseUrl!;
+    const failures = ['reset', '209'];
+    let attempts = 0;
+    const client = new ClickHouseClient({
+      database: 'default',
+      faultBeforeRequest: (request) => {
+        if (request.kind !== 'query') return;
+        attempts += 1;
+        const failure = failures.shift();
+        if (failure === 'reset') {
+          throw Object.assign(new Error('socket hang up'), {
+            code: 'ECONNRESET',
+          });
+        }
+        if (failure === '209') {
+          throw new ClickHouseError({
+            code: '209',
+            message: 'Timeout exceeded while reading from socket (test).',
+            type: 'SOCKET_TIMEOUT',
+          });
+        }
+      },
+      password: process.env.CHAINGRAPH_E2E_CLICKHOUSE_PASSWORD ?? '',
+      requestTimeoutMs: 30_000,
+      url,
+      username: process.env.CHAINGRAPH_E2E_CLICKHOUSE_USER ?? '',
+    });
+    t.teardown(async () => client.close());
+    t.deepEqual(await client.query<{ one: number }>('SELECT 1 AS one'), [
+      { one: 1 },
+    ]);
+    t.is(attempts, 3);
+    attempts = 0;
+    await t.throwsAsync(client.query('SELECT * FROM no_such_table_g1'), {
+      instanceOf: ClickHouseError,
+    });
+    t.is(attempts, 1, 'a statement error is not retried');
   }
 );

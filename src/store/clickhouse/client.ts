@@ -49,6 +49,7 @@ declare global {
   }
 }
 
+// eslint-disable-next-line functional/no-mixed-type
 export interface ClickHouseConnectionConfig {
   /** The HTTP(S) endpoint, e.g. `http://localhost:18123`. Credentials in the URL are moved to `username`/`password`. */
   url: string;
@@ -63,6 +64,18 @@ export interface ClickHouseConnectionConfig {
    * turns queueing into commit latency. Default 64.
    */
   maxOpenConnections?: number;
+  /**
+   * Test hook: called before every attempt of a query or insert (inside the
+   * retry loop); throwing simulates a transport or server error of that
+   * attempt. Never set in production.
+   */
+  faultBeforeRequest?: (request: ClickHouseRequestInfo) => Promise<void> | void;
+}
+
+/** What `faultBeforeRequest` is told about a request. */
+export interface ClickHouseRequestInfo {
+  kind: 'insert' | 'query';
+  sql: string;
 }
 
 export interface QueryParams {
@@ -74,13 +87,15 @@ export interface IdempotentInsertOptions {
   deduplicationToken: string;
   /** Extra settings; cannot override `async_insert` or the token. */
   settings?: ClickHouseSettings;
-  /** Retries after a transport error (not after a server error). Default 3. */
+  /** Retries after a transport or transient server error (`isRetryable`). Default 3. */
   retries?: number;
 }
 
 const defaultDatabase = 'cg';
 const defaultRequestTimeoutMs = 300_000;
 const defaultInsertRetries = 3;
+/** Retries of a read (`query`) after a transport or transient server error. */
+const defaultQueryRetries = 3;
 const defaultMaxOpenConnections = 64;
 const retryBaseDelayMs = 100;
 const identifierPattern = /^[A-Za-z_][A-Za-z0-9_]*$/u;
@@ -141,8 +156,31 @@ const sleep = async (ms: number) =>
     setTimeout(resolve, ms);
   });
 
-/** Transport errors are retried; a server error (it answered) is not. */
-const isRetryable = (error: unknown) => !(error instanceof ClickHouseError);
+/**
+ * Server error codes that say nothing about the statement itself: the
+ * connection or the server's socket read gave out (the client stalled past
+ * `receive_timeout`, a reset mid-body), or the server is shedding load.
+ * Retrying them is safe for a read and for a deduplicated insert.
+ * 3 UNEXPECTED_END_OF_FILE, 32 ATTEMPT_TO_READ_AFTER_EOF, 202
+ * TOO_MANY_SIMULTANEOUS_QUERIES, 209 SOCKET_TIMEOUT, 210 NETWORK_ERROR,
+ * 252 TOO_MANY_PARTS. (G1 c1: a 209 "Timeout exceeded while reading from
+ * socket (30000 ms)" failed a whole 64-block batch; docs/clickhouse-port/g1-fix-pass.md.)
+ */
+export const transientServerCodes: ReadonlySet<string> = new Set([
+  '3',
+  '32',
+  '202',
+  '209',
+  '210',
+  '252',
+]);
+
+/**
+ * Transport errors (no answer: ECONNRESET "socket hang up", timeouts) and
+ * transient server errors are retried; any other server error is not.
+ */
+export const isRetryable = (error: unknown) =>
+  !(error instanceof ClickHouseError) || transientServerCodes.has(error.code);
 
 /** INSERT returns no rows: discard the response body. */
 const drain = async (stream: Readable) => {
@@ -166,17 +204,16 @@ const idempotentSettings = (
   };
 };
 
-const withRetries = async (
+const withRetries = async <T>(
   retries: number | undefined,
-  attempt: () => Promise<void>
-): Promise<void> => {
+  attempt: () => Promise<T>
+): Promise<T> => {
   const maxRetries = retries ?? defaultInsertRetries;
   // eslint-disable-next-line functional/no-loop-statement, functional/no-let
   for (let tryIndex = 0; ; tryIndex += 1) {
     try {
       // eslint-disable-next-line no-await-in-loop
-      await attempt();
-      return;
+      return await attempt();
     } catch (error) {
       if (tryIndex >= maxRetries || !isRetryable(error)) {
         // eslint-disable-next-line functional/no-throw-statement
@@ -196,8 +233,13 @@ export class ClickHouseClient {
 
   private readonly raw: RawClickHouseClient;
 
+  private readonly faultBeforeRequest:
+    | ((request: ClickHouseRequestInfo) => Promise<void> | void)
+    | undefined;
+
   constructor(config: ClickHouseConnectionConfig) {
     const clean = splitCredentials(config);
+    this.faultBeforeRequest = config.faultBeforeRequest;
     this.database = clean.database;
     this.endpoint = clean.url;
     this.raw = createClient({
@@ -233,19 +275,26 @@ export class ClickHouseClient {
     });
   }
 
-  /** Run a `SELECT`; rows are decoded from `JSONEachRow` (64-bit integers as strings). */
+  /**
+   * Run a `SELECT`; rows are decoded from `JSONEachRow` (64-bit integers as
+   * strings). Reads are idempotent: a transport or transient server error
+   * is retried (`defaultQueryRetries`, exponential backoff), as inserts are.
+   */
   async query<T = { [key: string]: unknown }>(
     sql: string,
     params: QueryParams = {},
     settings: ClickHouseSettings = {}
   ): Promise<T[]> {
-    const result = await this.raw.query({
-      clickhouse_settings: settings,
-      format: 'JSONEachRow',
-      query: sql,
-      query_params: params,
+    return withRetries(defaultQueryRetries, async () => {
+      await this.faultBeforeRequest?.({ kind: 'query', sql });
+      const result = await this.raw.query({
+        clickhouse_settings: settings,
+        format: 'JSONEachRow',
+        query: sql,
+        query_params: params,
+      });
+      return result.json<T>();
     });
-    return result.json<T>();
   }
 
   /**
@@ -271,6 +320,7 @@ export class ClickHouseClient {
       .map(quoteIdentifier)
       .join(', ')}) FORMAT RowBinary`;
     await withRetries(options.retries, async () => {
+      await this.faultBeforeRequest?.({ kind: 'insert', sql });
       const result = await this.raw.exec({
         clickhouse_settings: idempotentSettings(options),
         query: sql,
@@ -290,6 +340,7 @@ export class ClickHouseClient {
     options: IdempotentInsertOptions
   ): Promise<void> {
     await withRetries(options.retries, async () => {
+      await this.faultBeforeRequest?.({ kind: 'insert', sql });
       await this.raw.command({
         clickhouse_settings: idempotentSettings(options),
         query: sql,
