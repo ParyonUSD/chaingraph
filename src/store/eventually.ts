@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from 'util';
+
 const defaultTimeoutMs = 3000;
 const defaultIntervalMs = 50;
 
@@ -36,4 +38,33 @@ export const eventually = async <T>(
     return attempt();
   };
   return attempt();
+};
+
+/**
+ * `eventually` until the result deep-equals `expected` (`isDeepStrictEqual`,
+ * as AVA's `t.deepEqual`); returns the last result, so the caller still
+ * asserts `t.deepEqual(result, expected)` and a timeout reports the real value.
+ */
+export const eventuallyEqual = async <T>(
+  read: () => Promise<T>,
+  expected: T,
+  options: { intervalMs?: number; timeoutMs?: number } = {}
+): Promise<T> =>
+  eventually(read, {
+    ...options,
+    isDone: (value) => isDeepStrictEqual(value, expected),
+  });
+
+/**
+ * For negative ("stays absent") checks: read, wait `gapMs`, read again, and
+ * return both results. Asserting both against the expected value checks a
+ * stable state instead of a single read after a fixed sleep.
+ */
+export const readTwice = async <T>(
+  read: () => Promise<T>,
+  gapMs: number
+): Promise<[T, T]> => {
+  const first = await read();
+  await sleep(gapMs);
+  return [first, await read()];
 };
