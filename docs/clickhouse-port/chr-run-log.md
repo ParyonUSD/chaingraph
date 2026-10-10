@@ -1,0 +1,11 @@
+# CH1 Phase 1 mainnet replay RE-RUN (chr) run log
+
+Kit: paryon_kubernetes-consolidation/experiments/chaingraph/ch1-rerun/ (README order; plan docs/chaingraph/plans/clickhouse-phase1-rerun.md).
+Cluster paryon-c4d-noarray-test, pool ch1-c4d. Image agent:ch1-dc81e0b@sha256:9ba2f574... (port dc81e0b). Owner-approved: plan 40 USD, hard stop 60 USD GCP.
+Raw results: chaingraph-performance/2026-10-11-chr-<run>/ (local only, never committed). One line per step, UTC.
+
+- 2026-10-10T23:10:39Z preflight: gcloud auth ok (richard@quicker.io, chaingraph1); image tag ch1-dc81e0b digest sha256:9ba2f5745b36... = the sent one (AR); snapshots chaingraph-ref-834000-20261010, chaingraph-checkpoint-831862-indexed, bchn-checkpoint-831862, bchn-checkpoint-834000 READY; no ch1-* disks/pools/namespaces; pools present (not ours, untouched): default-pool, c4d-postgres, cg-candidate.
+- 2026-10-10T23:10:39Z rates refreshed from the Cloud Billing Catalog API (SKUs effective 2026-10-10T07:00Z): C4D spot London core 0.01479/h, RAM 0.001579/GB-h, LSSD 0.0723/GiB-mo -> c4d-highmem-96-lssd spot ~2.90 USD/h all-in (on-demand ~7.30), unchanged from the first run; 1000 GiB HdB 40k/2400 0.571 USD/h; BCHN disks 0.087 USD/h. budget.json written to every chr run dir (cap 60, plan 40, deadline = pool create + 7 h) BEFORE any provisioning.
+- 2026-10-10T23:12:58Z disks created 23:10:49Z (start of spend): ch1-chain-bchn-tip (bchn-checkpoint-831862) + ch1-chain-bchn-834 (bchn-checkpoint-834000) 350 GiB (GCP default provisioned 5100 IOPS / 665 MiB/s, ~+0.1 USD/h over baseline), ch1-ref-pg (chaingraph-checkpoint-831862-indexed, 1000 GiB 40k/2400), ch1-ref834-pg (snapshot chaingraph-ref-834000-20261010, restored from, not modified; 1000 GiB 40k/2400). Secrets local + DOCR (read-only, expires 11:10Z).
+- 2026-10-10T23:14:54Z pool ch1-c4d created SPOT on the first attempt (done 23:14:48Z); node gke-paryon-c4d-noarray-test-ch1-c4d-19f37828-hgjt Ready. deadlineUtc 2026-10-11T06:14:48Z (absolute), teardown by 05:44:48Z; written to every budget.json.
+- 2026-10-10T23:15:30Z namespaces applied (7, paryon-lab=ch1). Budget stop CronJob ch1-backfill/ch1-budget-stop armed (schedule '14 6 11 10 *' UTC, default-pool), smoke Job Complete 23:15:21Z: every step absent/deleted (4 StatefulSets, 7 pod namespaces). armed=true in every budget.json. No workload before this point.
