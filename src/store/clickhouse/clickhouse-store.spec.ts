@@ -28,6 +28,7 @@ import {
   zeroHash,
 } from './spec-fixtures.js';
 import { e2eClickHouseUrl } from './test-support.js';
+import { nodeViewParams, pinnedView, readSnapshot } from './visibility.js';
 
 const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
 
@@ -505,7 +506,13 @@ e2e(
        * a child that waited out the timeout would be stored with stand-in
        * inputs: keep it far above the completion bound below
        */
-      { maxInFlightSaves: cap, pendingSpendTimeoutMs: 90_000 }
+      {
+        maxBlocksPerCommit: 1,
+        maxInFlightSaves: cap,
+        pendingSpendTimeoutMs: 90_000,
+        // one commit per block, all three working at once (non-batched store)
+        runningBatchesPerNodeSet: 3,
+      }
     );
     const sample = () => {
       const stats = holder.store?.poolStats();
@@ -705,7 +712,14 @@ e2e(
     await new Promise((resolve) => {
       setTimeout(resolve, 50);
     });
-    t.is(store.poolStats().waitingRequests, 1, 'the parent waits for a slot');
+    /*
+     * the parent waits for a slot; it registered its outputs when it was
+     * called (WP6b), so the child already resumed and waits for one too
+     */
+    t.true(
+      store.poolStats().waitingRequests >= 1,
+      'the parent waits for a slot'
+    );
     await Promise.all([child, holder, parent]);
     await store.operations.drain();
     slow.on = false;
@@ -1223,14 +1237,11 @@ const utxoCountAt = async (
   client: Parameters<typeof nodeView>[0],
   node: number
 ) => {
-  const [{ visible }] = (await client.query<{ visible: string }>(
-    'SELECT max(visible_seq) AS visible FROM visibility WHERE node_internal_id = {node:UInt32}',
-    { node }
-  )) as [{ visible: string }];
+  const snapshot = await readSnapshot(client, node);
   const rows = await client.query<{ n: string; s: string }>(
     `SELECT toString(count()) AS n, toString(sum(value_satoshis)) AS s
-     FROM utxo_at(node = {node:UInt32}, visible = {visible:UInt64})`,
-    { node, visible }
+     FROM ${pinnedView('utxo_at')}`,
+    nodeViewParams(snapshot)
   );
   return rows[0]!;
 };
@@ -1301,6 +1312,226 @@ e2e(
       'SELECT toString(sum(sign)) AS s, toString(count()) AS n FROM pending_spend'
     );
     t.deepEqual(pending[0], { n: String(2 * 150_000), s: '0' });
+    t.deepEqual(await badUtxoSums(client), []);
+  }
+);
+
+/**
+ * A chain of `count` blocks after `block0` (from `threeBlockChain`'s style):
+ * block i has a coinbase and a tx spending the previous block's coinbase
+ * output 0 and (from block 2) the previous tx's output 0.
+ */
+const linearChain = (count: number, label: string) => {
+  const blocks: ChaingraphBlock[] = [];
+  let previousHash = zeroHash;
+  let previousCoinbase: string | undefined;
+  let previousTx: string | undefined;
+  for (let height = 0; height < count; height += 1) {
+    const coinbase = makeTx({
+      coinbase: true,
+      label: `${label}-c${height}`,
+      outputs: [
+        { lockingBytecode: p2pkh(`${label}-miner`), valueSatoshis: 1_000n },
+        { lockingBytecode: p2pkh(`${label}-keep`), valueSatoshis: 7n },
+      ],
+    });
+    const spends: [string, number][] = [];
+    if (previousCoinbase !== undefined) spends.push([previousCoinbase, 0]);
+    if (previousTx !== undefined) spends.push([previousTx, 0]);
+    const transactions = [coinbase];
+    if (spends.length > 0) {
+      const transaction = makeTx({
+        label: `${label}-t${height}`,
+        outputs: [
+          { lockingBytecode: p2pkh(`${label}-chain`), valueSatoshis: 900n },
+          { lockingBytecode: p2pkh(`${label}-side`), valueSatoshis: 1n },
+        ],
+        spends,
+      });
+      transactions.push(transaction);
+      previousTx = transaction.hash;
+    }
+    const block = makeBlock(
+      height,
+      previousHash,
+      transactions,
+      `${label}-block-${height}`
+    );
+    blocks.push(block);
+    previousHash = block.hash;
+    previousCoinbase = coinbase.hash;
+  }
+  return blocks;
+};
+
+const blockCommitCount = async (client: Parameters<typeof nodeView>[0]) =>
+  Number(
+    (
+      await client.query<{ n: string }>(
+        `SELECT toString(count()) AS n FROM commit_log FINAL WHERE kind = 'block' AND state = 'committed'`
+      )
+    )[0]!.n
+  );
+
+e2e(
+  '[e2e] ClickHouseStore: queued blocks are coalesced into multi-block commits, all-or-none per node (WP6b item 4)',
+  async (t) => {
+    t.timeout(300_000);
+    const { client, openStore } = await scratch(t, 'batch');
+    const blocks = linearChain(41, 'batch');
+    const both = () => [acceptance(1), acceptance(2)];
+    const control = { commits: 0, crash: false, holdFirst: false };
+    let release: (() => void) | undefined;
+    const crashing = await openStore(async (step, context) => {
+      if (context.kind !== 'block') return;
+      if (step === 'intent' && control.holdFirst) {
+        // the first commit waits, so the next blocks queue up behind it
+        control.holdFirst = false;
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      if (step === 'utxo' && control.crash && control.commits === 1) {
+        throw new SimulatedCrash('crash inside a multi-block commit');
+      }
+      if (step === 'committed') control.commits += 1;
+    });
+    const { node1, node2 } = await registerNodes(crashing);
+    t.deepEqual([node1, node2], [1, 2]);
+    await crashing.saveBlock({
+      block: blocks[0]!,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: both(),
+    });
+    control.commits = 0;
+    control.holdFirst = true;
+    control.crash = true;
+    // block 1 starts alone; blocks 2..20 queue behind it as one batch
+    const saves = blocks.slice(1, 21).map(async (block) =>
+      crashing.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: both(),
+      })
+    );
+    // eslint-disable-next-line no-unmodified-loop-condition
+    for (let tries = 0; tries < 500 && release === undefined; tries += 1) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 10);
+      });
+    }
+    release!();
+    const outcomes = await Promise.allSettled(saves);
+    t.is(outcomes[0]!.status, 'fulfilled', 'block 1 committed alone');
+    t.true(
+      outcomes
+        .slice(1)
+        .every(
+          (outcome) =>
+            outcome.status === 'rejected' &&
+            outcome.reason instanceof SimulatedCrash
+        ),
+      'blocks 2..20 were one commit, which crashed'
+    );
+    await crashing.simulateCrash();
+    // before recovery the crashed batch is invisible to both nodes (watermark)
+    for (const node of [node1, node2]) {
+      t.deepEqual(
+        (await nodeView(client, node)).blocks,
+        blocks.slice(0, 2).map((block) => block.hash)
+      );
+    }
+
+    // recovery aborts it; a reader still sees none of it
+    await new Promise((resolve) => {
+      setTimeout(resolve, leaseTtlMs + 200);
+    });
+    const store = await openStore();
+    await store.publishWatermarks();
+    for (const node of [node1, node2]) {
+      const view = await nodeView(client, node);
+      t.deepEqual(
+        view.blocks,
+        blocks.slice(0, 2).map((block) => block.hash)
+      );
+      t.deepEqual(view.utxo, expectedUnspent(blocks.slice(0, 2)));
+    }
+    const before = await blockCommitCount(client);
+    // the rest, called without waiting: coalesced, exact for both nodes
+    await Promise.all(
+      blocks.slice(2).map(async (block) =>
+        store.saveBlock({
+          block,
+          isSavedTransaction: notSaved,
+          nodeAcceptances: both(),
+        })
+      )
+    );
+    await store.operations.drain();
+    await store.publishWatermarks();
+    const commits = (await blockCommitCount(client)) - before;
+    t.log(`${blocks.length - 2} blocks in ${commits} commits`);
+    t.true(commits < (blocks.length - 2) / 2, `${commits} commits`);
+    for (const node of [node1, node2]) {
+      const view = await nodeView(client, node);
+      t.deepEqual(
+        view.blocks,
+        blocks.map((block) => block.hash)
+      );
+      t.deepEqual(view.txs, txHashes(blocks));
+      t.deepEqual(view.utxo, expectedUnspent(blocks));
+      t.deepEqual(view.utxoByScript, view.utxo);
+    }
+    t.deepEqual(await badUtxoSums(client), []);
+    const incomplete = await store.getIncompleteBlocks({
+      excludedBlockHashes: [],
+      heightLowerBound: 0,
+      heightUpperBound: 100,
+      limit: 100,
+      nodeInternalIds: [node1, node2],
+    });
+    t.deepEqual(incomplete.incompleteBlocks, []);
+  }
+);
+
+e2e(
+  '[e2e] ClickHouseStore: a batch with a child before its parent parks and completes; maxBlocksPerCommit 1 commits per block',
+  async (t) => {
+    t.timeout(300_000);
+    const { client, openStore } = await scratch(t, 'batch_child', {
+      maxBlocksPerCommit: 1,
+    });
+    const store = await openStore();
+    const { node1 } = await registerNodes(store);
+    const blocks = linearChain(12, 'single');
+    await store.saveBlock({
+      block: blocks[0]!,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    const before = await blockCommitCount(client);
+    // reverse order: every block is saved before its parent
+    await Promise.all(
+      blocks
+        .slice(1)
+        .reverse()
+        .map(async (block) =>
+          store.saveBlock({
+            block,
+            isSavedTransaction: notSaved,
+            nodeAcceptances: [acceptance(node1)],
+          })
+        )
+    );
+    await store.operations.drain();
+    await store.publishWatermarks();
+    t.is((await blockCommitCount(client)) - before, blocks.length - 1);
+    const view = await nodeView(client, node1);
+    t.deepEqual(
+      view.blocks,
+      blocks.map((block) => block.hash)
+    );
+    t.deepEqual(view.utxo, expectedUnspent(blocks));
     t.deepEqual(await badUtxoSums(client), []);
   }
 );

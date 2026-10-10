@@ -171,7 +171,7 @@ test('appendAll / minMax: 300k elements without a stack overflow (WP6b item 1)',
   });
 });
 
-test('pendingSpendRows: 100k unresolved spends for 2 nodes in well under 1 s of CPU (WP6b item 2)', (t) => {
+test('pendingSpendRows: 100k unresolved spends for 2 nodes in linear time (WP6b item 2)', (t) => {
   const count = 100_000;
   const pendingInputs = Array.from({ length: count }, (_, index) => ({
     input: { outpointIndex: index, outpointTransactionHash: 'parent' },
@@ -186,12 +186,25 @@ test('pendingSpendRows: 100k unresolved spends for 2 nodes in well under 1 s of 
       spender: item.transaction.hash,
     }))
   );
-  const started = process.cpuUsage();
+  /*
+   * CPU time of this thread only (AVA runs other files in parallel worker
+   * threads, which process.cpuUsage would count). The quadratic version took
+   * about a minute; linear takes ~0.1–0.3 s, so 3 s leaves room for a loaded host.
+   */
+  const threadCpu = () => {
+    // Node >= 23.9 (the typings here predate it); falls back to the process
+    const { threadCpuUsage } = process as unknown as {
+      threadCpuUsage?: () => NodeJS.CpuUsage;
+    };
+    const usage = threadCpuUsage?.() ?? process.cpuUsage();
+    return (usage.user + usage.system) / 1_000;
+  };
+  const started = threadCpu();
   const plus = pendingSpendRows(pendingInputs, pendingUtxo, 1);
   const minus = pendingSpendRows(pendingInputs, pendingUtxo, -1);
-  const used = process.cpuUsage(started);
-  const cpuMs = (used.user + used.system) / 1_000;
-  t.true(cpuMs < 1_000, `took ${cpuMs} ms of CPU`);
+  const cpuMs = threadCpu() - started;
+  t.log(`${cpuMs.toFixed(0)} ms of thread CPU`);
+  t.true(cpuMs < 3_000, `took ${cpuMs} ms of CPU`);
   t.is(plus.length, 1 + 2 * (count - 1));
   t.is(minus.length, plus.length);
   t.deepEqual(plus[0], {

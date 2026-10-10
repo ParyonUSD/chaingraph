@@ -31,6 +31,7 @@ import type {
 import type { FaultInjector, SaveBlockResult } from './block-commit.js';
 import {
   appendAll,
+  BlockBatch,
   BlockCommitter,
   chunked,
   freshen,
@@ -47,6 +48,7 @@ import { changeRows, MempoolCommitter } from './mempool-commit.js';
 import type { NodeMempoolChange } from './mempool-state.js';
 import { isEmptyChange, MempoolState } from './mempool-state.js';
 import type {
+  Deferred,
   NodeBlockHistoryRow,
   NodeBlockRow,
   OperationKind,
@@ -104,6 +106,24 @@ export interface ClickHouseStoreOptions {
    * slot up while it waits on another call (wp5c-hardening.md §1).
    */
   maxInFlightSaves?: number;
+  /**
+   * Multi-block commits: at most this many consecutive queued blocks of one
+   * node set per commit (`CHAINGRAPH_CLICKHOUSE_MAX_BLOCKS_PER_COMMIT`,
+   * default 64; 1 = one commit per block).
+   */
+  maxBlocksPerCommit?: number;
+  /**
+   * ... and at most this many block bytes (`sizeBytes`) per commit, unless
+   * a single block is larger (`CHAINGRAPH_CLICKHOUSE_MAX_BYTES_PER_COMMIT`,
+   * default 32 MiB).
+   */
+  maxBytesPerCommit?: number;
+  /**
+   * Batches of one node set running at once (default: 1 in tip mode, 4 in
+   * bulk mode). Tests raise it (with `maxBlocksPerCommit: 1`) to get the
+   * per-block concurrency of the non-batched store.
+   */
+  runningBatchesPerNodeSet?: number;
   /** Test hook: called between the steps of every commit. */
   fault?: FaultInjector;
   /** Background errors (watermark publishing, lease loss). */
@@ -125,6 +145,29 @@ const defaultMaxOrphans = 10_000;
 const twoHoursSeconds = 7_200;
 const msPerSecond = 1_000;
 const headerVarintThresholds = [252, 65_535, 4_294_967_295];
+
+const defaultMaxBlocksPerCommit = 64;
+const defaultMaxBytesPerCommit = 32 * 1024 * 1024;
+/** Running batches per node set: tip mode decides from stored state, so 1. */
+const tipRunningBatches = 1;
+/** Bulk-mode saves decide nothing from stored state: a few overlap. */
+const bulkRunningBatches = 4;
+
+interface BatchLane {
+  open: BlockBatch | undefined;
+  queue: BlockBatch[];
+  running: number;
+}
+
+const positiveIntegerFromEnvironment = (name: string, fallback: number) => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new RangeError(`${name} must be an integer >= 1 (got ${raw}).`);
+  }
+  return value;
+};
 
 export class StoreClosedError extends Error {}
 
@@ -225,6 +268,18 @@ export class ClickHouseStore implements ChaingraphStore {
   /** The in-flight cap; `undefined` = unbounded. */
   private readonly slots: InFlightLimiter | undefined;
 
+  /** Block batches per node set (`saveBlock`). */
+  private readonly batchLanes = new Map<string, BatchLane>();
+
+  private readonly batchResults = new Map<
+    BlockBatch,
+    Deferred<SaveBlockResult[]>
+  >();
+
+  private readonly maxBlocksPerCommit: number;
+
+  private readonly maxBytesPerCommit: number;
+
   constructor(private readonly options: ClickHouseStoreOptions) {
     this.lookupChunkSize = options.lookupChunkSize ?? defaultLookupChunkSize;
     const cap = options.maxInFlightSaves ?? 0;
@@ -234,6 +289,18 @@ export class ClickHouseStore implements ChaingraphStore {
       );
     }
     this.slots = cap === 0 ? undefined : new InFlightLimiter(cap);
+    this.maxBlocksPerCommit =
+      options.maxBlocksPerCommit ??
+      positiveIntegerFromEnvironment(
+        'CHAINGRAPH_CLICKHOUSE_MAX_BLOCKS_PER_COMMIT',
+        defaultMaxBlocksPerCommit
+      );
+    this.maxBytesPerCommit =
+      options.maxBytesPerCommit ??
+      positiveIntegerFromEnvironment(
+        'CHAINGRAPH_CLICKHOUSE_MAX_BYTES_PER_COMMIT',
+        defaultMaxBytesPerCommit
+      );
     this.outputs = new OutputRegistry<StoreOperation>(
       options.recentOutputCapacity
     );
@@ -542,52 +609,146 @@ export class ClickHouseStore implements ChaingraphStore {
     if (this.abandonSignal.abandoned) {
       return { attemptedSavedTransactions: [], transactionCacheMisses: 0 };
     }
+    const committer = this.committerInstance;
+    if (committer === undefined) {
+      throw new StoreClosedError('ClickHouseStore.init() has not run.');
+    }
+    while (this.exclusive !== undefined) {
+      await this.exclusive;
+    }
+    this.assertOpen();
+    /* from here to the append: synchronous (call order = batch order) */
     const nodes = [
       ...new Set(args.nodeAcceptances.map((item) => item.nodeInternalId)),
-    ];
-    const operation = await this.beginOperation('block', nodes);
+    ].sort((a, b) => a - b);
+    const lane = this.batchLane(nodes.join(','));
     const parked = deferred<SaveBlockResult>();
     parked.promise.catch(() => undefined);
     let reportedEarly = false;
-    const full = (async () => {
-      try {
-        try {
-          await this.takeSlot(operation);
-        } catch (error) {
-          operation.markFailed(error);
-          if (error instanceof AbandonedError) {
-            // shutdown while queued: nothing written (as an abandoned save)
-            return {
-              attemptedSavedTransactions: [],
-              transactionCacheMisses: 0,
-            };
-          }
-          throw error;
-        }
-        if (this.committerInstance === undefined) {
-          throw new StoreClosedError('ClickHouseStore.init() has not run.');
-        }
-        return await this.committerInstance.save(operation, args, (result) => {
-          reportedEarly = true;
-          parked.resolve(result);
-        });
-      } finally {
-        operation.slot?.release();
-        this.mempool.removeModifier(operation);
-        this.operations.end(operation);
-      }
-    })();
+    const item = {
+      onParked: (result: SaveBlockResult) => {
+        reportedEarly = true;
+        parked.resolve(result);
+      },
+      request: args,
+    };
+    let batch = lane.open;
+    if (batch !== undefined && this.canAppend(batch, args.block)) {
+      committer.append(batch, item);
+    } else {
+      // a block saved by another live operation: wait for it, alone
+      const deferPrepare = committer.isInFlight(args.block.hash);
+      batch = new BlockBatch(
+        this.operations.begin('block', nodes),
+        deferPrepare
+      );
+      committer.append(batch, item);
+      lane.queue.push(batch);
+      lane.open = deferPrepare ? undefined : batch;
+      this.batchResults.set(batch, deferred<SaveBlockResult[]>());
+      this.startBatches(lane);
+    }
+    const index = batch.items.length - 1;
+    const full = this.batchResults
+      .get(batch)!
+      .promise.then((results) => results[index]!);
     full.catch((error: unknown) => {
       if (reportedEarly && !(error instanceof SimulatedCrash)) {
         this.options.onError?.(error);
       }
     });
     /*
-     * A child block waiting for its parent's outputs resolves once its
+     * A block of a batch waiting for its parent's outputs resolves once the
      * commit is `incomplete` (block-commit.ts); everything else resolves on
      * commit.
      */
     return Promise.race([full, parked.promise]);
+  }
+
+  /**
+   * The batch lane of one node set: batches in creation order; at most
+   * `maxRunningBatches` of them run at once (until their rows are written,
+   * they park or they finish), and blocks arriving meanwhile join the open
+   * (last, not yet started) batch. A block arriving with nothing running
+   * starts at once, alone (the tip case).
+   */
+  private batchLane(key: string): BatchLane {
+    let lane = this.batchLanes.get(key);
+    if (lane === undefined) {
+      lane = { open: undefined, queue: [], running: 0 };
+      this.batchLanes.set(key, lane);
+    }
+    return lane;
+  }
+
+  /** Whether `block` may join the open `batch` (wp6b-write-path.md §2). */
+  private canAppend(batch: BlockBatch, block: ChaingraphBlock) {
+    return (
+      batch.state === 'open' &&
+      !batch.deferPrepare &&
+      batch.items.length < this.maxBlocksPerCommit &&
+      batch.bytes + block.sizeBytes <= this.maxBytesPerCommit &&
+      // no other operation was registered on these nodes since: order kept
+      this.operations.isLatestOnItsNodes(batch.operation) &&
+      !batch.blockHashes.has(block.hash) &&
+      this.committerInstance?.isInFlight(block.hash) !== true
+    );
+  }
+
+  private startBatches(lane: BatchLane) {
+    const limit =
+      this.options.runningBatchesPerNodeSet ??
+      (this.mode === 'tip' ? tipRunningBatches : bulkRunningBatches);
+    while (lane.running < limit && lane.queue.length > 0) {
+      const batch = lane.queue.shift()!;
+      batch.state = 'started';
+      if (lane.open === batch) lane.open = undefined;
+      lane.running += 1;
+      batch.operation.onYield = () => {
+        lane.running -= 1;
+        this.startBatches(lane);
+      };
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      this.runBatch(batch);
+    }
+  }
+
+  private async runBatch(batch: BlockBatch) {
+    const { operation } = batch;
+    const results = this.batchResults.get(batch)!;
+    const empty = () =>
+      batch.items.map(() => ({
+        attemptedSavedTransactions: [],
+        transactionCacheMisses: 0,
+      }));
+    try {
+      try {
+        this.abandonSignal.assertNotAbandoned();
+        await this.takeSlot(operation);
+      } catch (error) {
+        operation.markFailed(error);
+        if (error instanceof AbandonedError) {
+          // shutdown while queued: nothing written (as an abandoned save)
+          batch.pendingIds.forEach((id) => {
+            id.reject(error);
+          });
+          this.outputs.release(operation, false);
+          await this.transactions.release(operation, false);
+          results.resolve(empty());
+          return;
+        }
+        throw error;
+      }
+      results.resolve(await this.committerInstance!.save(batch));
+    } catch (error) {
+      results.reject(error);
+    } finally {
+      operation.yieldLane();
+      operation.slot?.release();
+      this.mempool.removeModifier(operation);
+      this.operations.end(operation);
+      this.batchResults.delete(batch);
+    }
   }
 
   /**

@@ -81,6 +81,12 @@ export class StoreOperation {
   /** Set by `OperationRegistry.end`: no longer orders later operations. */
   ended = false;
 
+  /**
+   * Called once when the operation stops needing its batch lane
+   * (`yieldLane`): its rows are written, it parked, or it finished.
+   */
+  onYield: (() => void) | undefined;
+
   private seqValue: bigint | undefined;
 
   /**
@@ -146,7 +152,15 @@ export class StoreOperation {
     return this.state !== 'running';
   }
 
+  /** Give up the block-batch lane (idempotent; see clickhouse-store.ts). */
+  yieldLane() {
+    const { onYield } = this;
+    this.onYield = undefined;
+    onYield?.();
+  }
+
   markRowsWritten() {
+    this.yieldLane();
     if (!this.rowsDone) {
       this.rowsDone = true;
       this.rows.resolve();
@@ -436,7 +450,7 @@ class WaiterHeap {
 /**
  * Operations of one node in registration (= id) order, with a lazily
  * advanced head: the oldest one for which `isOpen` still holds. Push and
- * amortised head advance are O(1).
+ * amortized head advance are O(1).
  */
 class OrderedQueue {
   private items: StoreOperation[] = [];
@@ -485,6 +499,9 @@ class OrderedQueue {
 
 /** Per-node ordering state. */
 class NodeLane {
+  /** The operation registered last on this node. */
+  last: StoreOperation | undefined;
+
   /** Registered and not yet ended (for failure propagation). */
   readonly live = new Set<StoreOperation>();
 
@@ -544,6 +561,7 @@ export class OperationRegistry {
     sorted.forEach((node) => {
       const lane = this.lane(node);
       lane.live.add(operation);
+      lane.last = operation;
       lane.rows.push(operation);
       lane.unsettled.push(operation);
     });
@@ -608,6 +626,13 @@ export class OperationRegistry {
       }
       lane.unsettled.advance();
     });
+  }
+
+  /** Whether no operation was registered on `operation`'s nodes after it. */
+  isLatestOnItsNodes(operation: StoreOperation): boolean {
+    return operation.nodes.every(
+      (node) => this.lanes.get(node)?.last === operation
+    );
   }
 
   /** Whether an earlier operation on a shared node is still unsettled. */

@@ -1,4 +1,4 @@
-/* eslint-disable max-classes-per-file, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, @typescript-eslint/parameter-properties, no-await-in-loop, functional/no-loop-statement, max-params, functional/no-let, @typescript-eslint/init-declarations, class-methods-use-this, @typescript-eslint/no-loop-func, prefer-destructuring, require-atomic-updates, functional/no-mixed-type, no-continue */
+/* eslint-disable max-classes-per-file, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, @typescript-eslint/parameter-properties, no-await-in-loop, functional/no-loop-statement, max-params, functional/no-let, @typescript-eslint/init-declarations, class-methods-use-this, @typescript-eslint/no-loop-func, prefer-destructuring, require-atomic-updates, functional/no-mixed-type, no-continue, @typescript-eslint/member-ordering, max-depth, camelcase */
 // cspell:ignore clickhouse dedup unhex seqs varint
 /**
  * `saveBlock` for the ClickHouse store (WP5a-core): one block = one commit
@@ -47,7 +47,6 @@ import { RowBinaryWriter } from './row-binary.js';
 import type { ResolvedInput, SpentOutput } from './row-encoders.js';
 import {
   encodeBlockRows,
-  encodeBlockTransactionRows,
   encodeInputRows,
   encodeOutputRows,
   encodeResolvedInputRows,
@@ -526,6 +525,102 @@ const inclusionsOf = (
     tx: transaction.hash,
   }));
 
+/** One `saveBlock` call. */
+export interface BlockSaveRequest {
+  block: ChaingraphBlock;
+  nodeAcceptances: readonly NodeAcceptance[];
+  isSavedTransaction: (hash: string) => boolean;
+}
+
+/** One request of a batch and how its call is answered. */
+interface BatchItem {
+  request: BlockSaveRequest;
+  /** Resolves the call early when the batch parks (`incomplete`). */
+  onParked: (result: SaveBlockResult) => void;
+}
+
+/**
+ * Consecutive `saveBlock` calls for the same node set, saved as ONE commit
+ * (docs/clickhouse-port/wp6b-write-path.md): one `commit_log` intent and
+ * committed row and one insert per table for all of its blocks. The batch
+ * has one store operation, registered when the batch was created; a block
+ * is appended only while no other operation has been registered on these
+ * nodes since (so the call order the agent sees is unchanged), and only
+ * until the batch starts.
+ *
+ * Transaction ids and outputs are pinned when a block is appended (as a
+ * single save pinned them when it started), and ids are resolved by an
+ * "id phase" scheduled at once (I/O only, no wait on any operation), so
+ * other operations never wait on a batch that has not started.
+ */
+export class BlockBatch {
+  readonly items: BatchItem[] = [];
+
+  /** Sum of the blocks' `sizeBytes`. */
+  bytes = 0;
+
+  /** `open` (accepts appends), then `started`. */
+  state: 'open' | 'started' = 'open';
+
+  /** Ids of every transaction of the batch (own promises or other owners'). */
+  readonly idOf = new Map<string, Promise<bigint> | bigint>();
+
+  /** Transactions this batch pinned, with their id deferreds. */
+  readonly pendingIds = new Map<string, Deferred<bigint>>();
+
+  /** Owned hashes found stored by an id phase, with the writing commit. */
+  readonly stored = new Map<string, { internalId: bigint; seq: bigint }>();
+
+  /** Operations whose rows this batch reads. */
+  readonly dependencies = new Set<StoreOperation>();
+
+  /** Block hashes in the batch. */
+  readonly blockHashes = new Set<string>();
+
+  /** Owned hashes waiting for an id phase. */
+  unresolved: string[] = [];
+
+  private phases: Promise<void>[] = [];
+
+  private phaseScheduled = false;
+
+  idError: unknown;
+
+  constructor(
+    readonly operation: StoreOperation,
+    /** Prepare (pin) only when the batch runs: its block is saved elsewhere now. */
+    readonly deferPrepare = false
+  ) {}
+
+  /** Schedule an id phase for the hashes pinned so far (one per event-loop turn). */
+  scheduleIdPhase(run: (hashes: string[]) => Promise<void>) {
+    if (this.phaseScheduled) return;
+    this.phaseScheduled = true;
+    const phase = new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    }).then(async () => {
+      this.phaseScheduled = false;
+      const hashes = this.unresolved;
+      this.unresolved = [];
+      if (hashes.length > 0) await run(hashes);
+    });
+    this.phases.push(
+      phase.catch((error: unknown) => {
+        this.idError ??= error;
+      })
+    );
+  }
+
+  /** Resolves once every id phase scheduled so far has finished. */
+  async idsSettled(): Promise<void> {
+    while (this.phases.length > 0) {
+      const phases = this.phases;
+      this.phases = [];
+      await Promise.all(phases);
+    }
+  }
+}
+
 export class BlockCommitter {
   /**
    * Block hash → the live operation saving it. A concurrent save of the same
@@ -536,58 +631,146 @@ export class BlockCommitter {
 
   constructor(private readonly context: WriterContext) {}
 
+  /** Whether another live operation is saving `hash` now. */
+  isInFlight(hash: string) {
+    const other = this.inFlight.get(hash);
+    return other !== undefined && !other.finished;
+  }
+
   /**
-   * Save `block` for `nodeAcceptances` under `operation` (registered by the
-   * caller at call time for the accepting nodes).
+   * Add a request to a batch: pin its transactions and register its outputs
+   * now (synchronously, in call order), and schedule an id phase.
    */
-  async save(
-    operation: StoreOperation,
-    {
-      block,
-      nodeAcceptances,
-      isSavedTransaction,
-    }: {
-      block: ChaingraphBlock;
-      nodeAcceptances: readonly NodeAcceptance[];
-      isSavedTransaction: (hash: string) => boolean;
-    },
-    onParked?: (result: SaveBlockResult) => void
-  ): Promise<SaveBlockResult> {
+  append(batch: BlockBatch, item: BatchItem) {
+    batch.items.push(item);
+    batch.bytes += item.request.block.sizeBytes;
+    batch.blockHashes.add(item.request.block.hash);
+    if (!batch.deferPrepare) this.prepare(batch, item.request.block);
+  }
+
+  /** Pin `block`'s transactions and outputs for the batch (wp5a-core §4). */
+  private prepare(batch: BlockBatch, block: ChaingraphBlock) {
     const { context } = this;
-    let commit: OpenCommit | undefined;
-    const pendingIds = new Map<string, Deferred<bigint>>();
-    for (;;) {
-      const other = this.inFlight.get(block.hash);
-      if (other === undefined || other === operation || other.finished) break;
-      await operation.whileWaiting(other.committed.catch(() => undefined));
-    }
+    const { operation } = batch;
     this.inFlight.set(block.hash, operation);
+    const owned: ChaingraphTransaction[] = [];
+    block.transactions.forEach((transaction) => {
+      if (batch.idOf.has(transaction.hash)) return;
+      const known = context.transactions.lookup(transaction.hash);
+      if (known !== undefined) {
+        batch.idOf.set(transaction.hash, known.internalId);
+        if (known.owner !== undefined && known.owner !== operation) {
+          batch.dependencies.add(known.owner);
+        }
+        return;
+      }
+      const id = deferred<bigint>();
+      id.promise.catch(() => undefined);
+      batch.pendingIds.set(transaction.hash, id);
+      batch.idOf.set(transaction.hash, id.promise);
+      context.transactions.pin(transaction.hash, operation, id.promise);
+      batch.unresolved.push(transaction.hash);
+      owned.push(transaction);
+    });
+    context.outputs.register(
+      operation,
+      owned.map((transaction) => ({
+        hash: transaction.hash,
+        internalId: batch.idOf.get(transaction.hash) as Promise<bigint>,
+        outputs: transaction.outputs,
+      }))
+    );
+    batch.scheduleIdPhase(async (hashes) => this.idPhase(batch, hashes));
+  }
+
+  /**
+   * Resolve the ids of `hashes` (pinned by the batch): stored ones keep
+   * their id (and the batch depends on their commit if it is open), new ones
+   * get fresh ids. I/O only: never waits on another operation.
+   */
+  private async idPhase(batch: BlockBatch, hashes: readonly string[]) {
+    const { context } = this;
     try {
-      const result = await this.run(
-        operation,
-        { block, isSavedTransaction, nodeAcceptances },
-        pendingIds,
-        (opened) => {
-          commit = opened;
-        },
-        onParked
-      );
+      const stored = await lookupStoredTransactions(context, hashes);
+      const newHashes = hashes.filter((hash) => !stored.has(hash));
+      const newIds: bigint[] = [];
+      if (newHashes.length > 0) {
+        for (const segment of await context.ids.allocate(
+          'transaction',
+          newHashes.length
+        )) {
+          for (let id = segment.start; id < segment.end; id += 1n) {
+            newIds.push(id);
+          }
+        }
+      }
+      stored.forEach((row, hash) => {
+        batch.stored.set(hash, row);
+        const owner = context.operationOfSeq(row.seq);
+        if (owner !== undefined && owner !== batch.operation) {
+          batch.dependencies.add(owner);
+        }
+        batch.pendingIds.get(hash)?.resolve(row.internalId);
+      });
+      newHashes.forEach((hash, index) => {
+        batch.pendingIds.get(hash)!.resolve(newIds[index]!);
+      });
+    } catch (error) {
+      hashes.forEach((hash) => {
+        batch.pendingIds.get(hash)?.reject(error);
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Save every request of `batch` as one commit; resolves the per-request
+   * results in request order. If the commit parks (child-before-parent),
+   * every request is answered early through its `onParked`.
+   */
+  async save(batch: BlockBatch): Promise<SaveBlockResult[]> {
+    const { context } = this;
+    const { operation } = batch;
+    let commit: OpenCommit | undefined;
+    const empty = () =>
+      batch.items.map(() => ({
+        attemptedSavedTransactions: [],
+        transactionCacheMisses: 0,
+      }));
+    try {
+      if (batch.deferPrepare) {
+        for (const item of batch.items) {
+          const { hash } = item.request.block;
+          for (;;) {
+            const other = this.inFlight.get(hash);
+            if (other === undefined || other === operation || other.finished)
+              break;
+            await operation.whileWaiting(
+              other.committed.catch(() => undefined)
+            );
+          }
+          this.prepare(batch, item.request.block);
+        }
+      }
+      const results = await this.run(batch, (opened) => {
+        commit = opened;
+      });
       context.outputs.release(operation, true);
       await context.transactions.release(operation, true);
-      return result;
+      return results;
     } catch (error) {
       if (error instanceof SimulatedCrash) {
         operation.markFailed(error);
-        pendingIds.forEach((id) => {
+        batch.pendingIds.forEach((id) => {
           id.reject(error);
         });
         throw error;
       }
       if (error instanceof AbandonedError) {
         /*
-         * Shutdown: abort, and report the block as handled so the agent's
-         * block buffer drains; nothing of it is committed, so the next start
-         * restores the chain without it and downloads it again.
+         * Shutdown: abort, and report the blocks as handled so the agent's
+         * block buffer drains; nothing of them is committed, so the next
+         * start restores the chain without them and downloads them again.
          */
         if (commit !== undefined) {
           await context.commitLog
@@ -595,12 +778,12 @@ export class BlockCommitter {
             .catch(() => undefined);
         }
         operation.markFailed(error);
-        pendingIds.forEach((id) => {
+        batch.pendingIds.forEach((id) => {
           id.reject(error);
         });
         context.outputs.release(operation, false);
         await context.transactions.release(operation, false);
-        return { attemptedSavedTransactions: [], transactionCacheMisses: 0 };
+        return empty();
       }
       context.mempool.markStale(operation);
       if (commit !== undefined) {
@@ -609,157 +792,107 @@ export class BlockCommitter {
           .catch(() => undefined);
       }
       operation.markFailed(error);
-      pendingIds.forEach((id) => {
+      batch.pendingIds.forEach((id) => {
         id.reject(error);
       });
       context.outputs.release(operation, false);
       await context.transactions.release(operation, false);
       throw error;
     } finally {
-      if (this.inFlight.get(block.hash) === operation) {
-        this.inFlight.delete(block.hash);
-      }
+      batch.blockHashes.forEach((hash) => {
+        if (this.inFlight.get(hash) === operation) this.inFlight.delete(hash);
+      });
     }
   }
 
   private async run(
-    operation: StoreOperation,
-    {
-      block,
-      nodeAcceptances,
-      isSavedTransaction,
-    }: {
-      block: ChaingraphBlock;
-      nodeAcceptances: readonly NodeAcceptance[];
-      isSavedTransaction: (hash: string) => boolean;
-    },
-    pendingIds: Map<string, Deferred<bigint>>,
-    onCommit: (commit: OpenCommit) => void,
-    onParked?: (result: SaveBlockResult) => void
-  ): Promise<SaveBlockResult> {
+    batch: BlockBatch,
+    onCommit: (commit: OpenCommit) => void
+  ): Promise<SaveBlockResult[]> {
     const { context } = this;
+    const { operation, dependencies } = batch;
     const tipMode = context.mode() === 'tip';
-    const dependencies = new Set<StoreOperation>();
-    const acceptanceByNode = new Map<number, NodeAcceptance>();
-    nodeAcceptances.forEach((acceptance) => {
-      acceptanceByNode.set(acceptance.nodeInternalId, acceptance);
-    });
+    const blocks = batch.items.map((item) => item.request.block);
 
-    /*
-     * 1. Transaction ids. Pin every transaction not known to this writer
-     * (synchronously, so a concurrent save of the same tx reuses the id),
-     * and pin their outputs so concurrent children can resolve spends.
-     */
-    const idOf = new Map<string, Promise<bigint> | bigint>();
-    const ownedHashes = new Set<string>();
-    block.transactions.forEach((transaction) => {
-      if (idOf.has(transaction.hash)) {
-        return;
-      }
-      const known = context.transactions.lookup(transaction.hash);
-      if (known !== undefined) {
-        idOf.set(transaction.hash, known.internalId);
-        if (known.owner !== undefined && known.owner !== operation) {
-          dependencies.add(known.owner);
-        }
-        return;
-      }
-      const id = deferred<bigint>();
-      id.promise.catch(() => undefined);
-      pendingIds.set(transaction.hash, id);
-      idOf.set(transaction.hash, id.promise);
-      context.transactions.pin(transaction.hash, operation, id.promise);
-      ownedHashes.add(transaction.hash);
-    });
-    context.outputs.register(
-      operation,
-      block.transactions
-        .filter((transaction) => ownedHashes.has(transaction.hash))
-        .map((transaction) => ({
-          hash: transaction.hash,
-          internalId: idOf.get(transaction.hash) as Promise<bigint>,
-          outputs: transaction.outputs,
-        }))
+    /* 1. Ids (pinned at append; id phases resolve them). */
+    batch.scheduleIdPhase(async (hashes) => this.idPhase(batch, hashes));
+    const storedBlocksQuery = this.lookupStoredBlocks(
+      blocks.map((block) => block.hash)
     );
-
-    const blockLookup = context.client.query<{
-      internal_id: string;
-      commit_seq: string;
-    }>(
-      `SELECT internal_id, commit_seq FROM block
-       WHERE hash = toFixedString(unhex({hash:String}), 32) AND ${validCommitSql()}
-       ORDER BY commit_seq LIMIT 1`,
-      { fence: context.fence(), hash: block.hash }
-    );
-    const stored = await lookupStoredTransactions(context, [
-      ...pendingIds.keys(),
-    ]);
-    const storedBlock = (await blockLookup)[0];
-    const newHashes = [...pendingIds.keys()].filter(
-      (hash) => !stored.has(hash)
-    );
-    const newIds =
-      newHashes.length === 0
-        ? []
-        : (await context.ids.allocate('transaction', newHashes.length)).flatMap(
-            (segment) => {
-              const ids: bigint[] = [];
-              for (let id = segment.start; id < segment.end; id += 1n) {
-                ids.push(id);
-              }
-              return ids;
-            }
-          );
-    const knownIds = new Map<string, bigint>();
-    stored.forEach((row, hash) => {
-      knownIds.set(hash, row.internalId);
-      const owner = context.operationOfSeq(row.seq);
-      if (owner !== undefined && owner !== operation) {
-        dependencies.add(owner);
-      }
-    });
-    const { inserted } = assignTransactionIds(newHashes, knownIds, newIds);
-    newHashes.forEach((hash, index) => {
-      pendingIds.get(hash)!.resolve(newIds[index]!);
-    });
-    stored.forEach((row, hash) => {
-      pendingIds.get(hash)?.resolve(row.internalId);
-    });
-    const internalIds = await Promise.all(
-      block.transactions.map(async (transaction) => idOf.get(transaction.hash)!)
+    storedBlocksQuery.catch(() => undefined);
+    await batch.idsSettled();
+    // eslint-disable-next-line @typescript-eslint/no-throw-literal
+    if (batch.idError !== undefined) throw batch.idError;
+    const storedBlocks = await storedBlocksQuery;
+    const uniqueHashes = [...batch.idOf.keys()];
+    const resolvedIds = await Promise.all(
+      uniqueHashes.map(async (hash) => batch.idOf.get(hash)!)
     );
     const idByHash = new Map(
-      block.transactions.map((transaction, index) => [
-        transaction.hash,
-        internalIds[index]!,
-      ])
+      uniqueHashes.map((hash, index) => [hash, resolvedIds[index]!])
     );
-    const newTransactions = block.transactions.filter((transaction) =>
-      inserted.has(transaction.hash)
-    );
-    const attemptedSavedTransactions = block.transactions.filter(
-      (transaction) => !isSavedTransaction(transaction.hash)
-    );
-    const transactionCacheMisses = attemptedSavedTransactions.filter(
-      (transaction) => !inserted.has(transaction.hash)
-    ).length;
-    const blockExists = storedBlock !== undefined;
-    if (storedBlock !== undefined) {
-      const owner = context.operationOfSeq(BigInt(storedBlock.commit_seq));
-      if (owner !== undefined && owner !== operation) {
-        dependencies.add(owner);
+    /** Hashes this batch inserts (owned and not stored), with the first item. */
+    const insertedBy = new Map<string, number>();
+    blocks.forEach((block, itemIndex) => {
+      block.transactions.forEach((transaction) => {
+        if (
+          batch.pendingIds.has(transaction.hash) &&
+          !batch.stored.has(transaction.hash) &&
+          !insertedBy.has(transaction.hash)
+        ) {
+          insertedBy.set(transaction.hash, itemIndex);
+        }
+      });
+    });
+    const results: SaveBlockResult[] = batch.items.map(
+      ({ request }, itemIndex) => {
+        const attemptedSavedTransactions = request.block.transactions.filter(
+          (transaction) => !request.isSavedTransaction(transaction.hash)
+        );
+        return {
+          attemptedSavedTransactions,
+          transactionCacheMisses: attemptedSavedTransactions.filter(
+            (transaction) => insertedBy.get(transaction.hash) !== itemIndex
+          ).length,
+        };
       }
+    );
+    const newTransactions: ChaingraphTransaction[] = [];
+    {
+      const added = new Set<string>();
+      blocks.forEach((block) => {
+        block.transactions.forEach((transaction) => {
+          if (
+            insertedBy.has(transaction.hash) &&
+            !added.has(transaction.hash)
+          ) {
+            added.add(transaction.hash);
+            newTransactions.push(transaction);
+          }
+        });
+      });
     }
+    storedBlocks.forEach((row) => {
+      const owner = context.operationOfSeq(BigInt(row.commit_seq));
+      if (owner !== undefined && owner !== operation) dependencies.add(owner);
+    });
 
     /*
      * 2. Per-node decisions need every earlier operation's rows for these
      * nodes (tip mode: UTXO transitions; any mode: re-accepting a stored block).
      */
-    const requestedNodes = [...acceptanceByNode.keys()].sort((a, b) => a - b);
+    const requestedNodes = [
+      ...new Set(
+        batch.items.flatMap(({ request }) =>
+          request.nodeAcceptances.map((item) => item.nodeInternalId)
+        )
+      ),
+    ].sort((a, b) => a - b);
+    const anyBlockExists = blocks.some((block) => storedBlocks.has(block.hash));
     const hooks = context.mempoolHooks?.();
     if (
       tipMode ||
-      blockExists ||
+      anyBlockExists ||
       requestedNodes.some((node) => context.mempool.mayHaveMempool(node))
     ) {
       await waitForPredecessorRows(operation);
@@ -767,45 +900,103 @@ export class BlockCommitter {
         await freshen(hooks, context.mempool, operation, requestedNodes);
       }
     }
-    const blockInternalId = blockExists
-      ? BigInt(storedBlock.internal_id)
-      : await context.ids.allocateOne('block');
-    const liveNodes = blockExists
-      ? await this.nodesAccepting(
-          blockInternalId,
-          requestedNodes,
-          dependencies,
-          operation
-        )
-      : new Set<number>();
-    const acceptingNodes = requestedNodes.filter(
-      (node) => !liveNodes.has(node)
-    );
-    /*
-     * Re-saving a stored block (incomplete-block repair) re-inserts the
-     * `block_transaction` links that are missing, as Postgres's
-     * ON CONFLICT DO NOTHING insert does.
-     */
-    const missingLinks = blockExists
-      ? await this.missingLinks(blockInternalId, block, operation, dependencies)
-      : [];
+    const newBlockCount = blocks.filter(
+      (block) => !storedBlocks.has(block.hash)
+    ).length;
+    const newBlockIds: bigint[] = [];
+    if (newBlockCount > 0) {
+      for (const segment of await context.ids.allocate(
+        'block',
+        newBlockCount
+      )) {
+        for (let id = segment.start; id < segment.end; id += 1n) {
+          newBlockIds.push(id);
+        }
+      }
+    }
+    interface BlockPlan {
+      block: ChaingraphBlock;
+      acceptanceByNode: Map<number, NodeAcceptance>;
+      blockExists: boolean;
+      blockInternalId: bigint;
+      acceptingNodes: number[];
+      missingLinks: number[];
+    }
+    const plans: BlockPlan[] = [];
+    let nextNewBlock = 0;
+    for (const { request } of batch.items) {
+      const { block } = request;
+      const acceptanceByNode = new Map<number, NodeAcceptance>();
+      request.nodeAcceptances.forEach((acceptance) => {
+        acceptanceByNode.set(acceptance.nodeInternalId, acceptance);
+      });
+      const nodes = [...acceptanceByNode.keys()].sort((a, b) => a - b);
+      const storedBlock = storedBlocks.get(block.hash);
+      const blockExists = storedBlock !== undefined;
+      let blockInternalId: bigint;
+      if (storedBlock === undefined) {
+        blockInternalId = newBlockIds[nextNewBlock]!;
+        nextNewBlock += 1;
+      } else {
+        blockInternalId = BigInt(storedBlock.internal_id);
+      }
+      const liveNodes = blockExists
+        ? await this.nodesAccepting(
+            blockInternalId,
+            nodes,
+            dependencies,
+            operation
+          )
+        : new Set<number>();
+      plans.push({
+        acceptanceByNode,
+        acceptingNodes: nodes.filter((node) => !liveNodes.has(node)),
+        block,
+        blockExists,
+        blockInternalId,
+        /*
+         * Re-saving a stored block (incomplete-block repair) re-inserts the
+         * `block_transaction` links that are missing, as Postgres's
+         * ON CONFLICT DO NOTHING insert does.
+         */
+        missingLinks: blockExists
+          ? await this.missingLinks(
+              blockInternalId,
+              block,
+              operation,
+              dependencies
+            )
+          : [],
+      });
+    }
     if (
-      blockExists &&
-      acceptingNodes.length === 0 &&
-      missingLinks.length === 0
+      plans.every(
+        (plan) =>
+          plan.blockExists &&
+          plan.acceptingNodes.length === 0 &&
+          plan.missingLinks.length === 0
+      )
     ) {
       // Postgres: every insert hits ON CONFLICT DO NOTHING
       operation.markDone();
-      return { attemptedSavedTransactions, transactionCacheMisses };
+      return results;
     }
+    const acceptingNodes = [
+      ...new Set(plans.flatMap((plan) => plan.acceptingNodes)),
+    ].sort((a, b) => a - b);
+    /** Per node, the batch's blocks it accepts now, in batch order. */
+    const plansOfNode = new Map<number, BlockPlan[]>(
+      acceptingNodes.map((node) => [
+        node,
+        plans.filter((plan) => plan.acceptingNodes.includes(node)),
+      ])
+    );
 
     const acceptedBefore = new Map<number, Set<string>>(
       acceptingNodes.map((node) => [node, new Set<string>()])
     );
     if (tipMode && acceptingNodes.length > 0) {
-      const preExisting = block.transactions
-        .map((transaction) => transaction.hash)
-        .filter((hash) => !inserted.has(hash));
+      const preExisting = uniqueHashes.filter((hash) => !insertedBy.has(hash));
       await this.loadAcceptedBefore(
         preExisting,
         acceptingNodes,
@@ -817,13 +1008,18 @@ export class BlockCommitter {
     /*
      * 2b. Each accepting node's mempool cleanup, in this commit: confirmed,
      * conflicting and cascading entries, and outstanding spends of entries
-     * whose creator this block makes accepted (wp5a-mempool.md).
+     * whose creator this batch makes accepted (wp5a-mempool.md).
      */
-    const blockTxByHash = new Map(
-      block.transactions.map((transaction) => [transaction.hash, transaction])
-    );
+    const batchTxByHash = new Map<string, ChaingraphTransaction>();
+    blocks.forEach((block) => {
+      block.transactions.forEach((transaction) => {
+        if (!batchTxByHash.has(transaction.hash)) {
+          batchTxByHash.set(transaction.hash, transaction);
+        }
+      });
+    });
     const creatorOutputs = (hash: string) => {
-      const transaction = blockTxByHash.get(hash);
+      const transaction = batchTxByHash.get(hash);
       return transaction === undefined
         ? undefined
         : transaction.outputs.map((output, index) =>
@@ -836,10 +1032,11 @@ export class BlockCommitter {
         dependencies.add(modifier);
       });
       if (hooks === undefined || context.mempool.isEmpty(node)) continue;
-      const inclusions = inclusionsOf(
-        block,
-        acceptanceByNode.get(node)!.acceptedAt
-      );
+      const inclusions = plansOfNode
+        .get(node)!
+        .flatMap((plan) =>
+          inclusionsOf(plan.block, plan.acceptanceByNode.get(node)!.acceptedAt)
+        );
       const known = await hooks.knownOutputsForConfirmed(
         node,
         inclusions,
@@ -862,35 +1059,53 @@ export class BlockCommitter {
 
     /*
      * 3. Resolve spent outputs: for new transactions (input rows), for the
-     * block row of a new block (generated value), and in tip mode for every
+     * block rows of new blocks (generated value), and in tip mode for every
      * transaction that becomes accepted (UTXO −1 rows).
      */
     const transitionTxs = new Set<string>();
     if (tipMode) {
       acceptingNodes.forEach((node) => {
-        block.transactions.forEach((transaction) => {
-          if (!acceptedBefore.get(node)!.has(transaction.hash)) {
-            transitionTxs.add(transaction.hash);
-          }
+        plansOfNode.get(node)!.forEach((plan) => {
+          plan.block.transactions.forEach((transaction) => {
+            if (!acceptedBefore.get(node)!.has(transaction.hash)) {
+              transitionTxs.add(transaction.hash);
+            }
+          });
         });
       });
     }
-    const needsSpends = (transaction: ChaingraphTransaction) =>
-      !transaction.isCoinbase &&
-      (!blockExists ||
-        inserted.has(transaction.hash) ||
-        transitionTxs.has(transaction.hash));
     const wanted = new Map<string, { hash: string; index: number }>();
-    block.transactions.filter(needsSpends).forEach((transaction) => {
-      transaction.inputs.forEach((input) => {
-        if (input.outpointTransactionHash === coinbaseHash) {
+    /** Per block: outpoints its rows need (block value, inputs, UTXO −1). */
+    const wantedOfPlan = new Map<BlockPlan, string[]>();
+    plans.forEach((plan) => {
+      const keys: string[] = [];
+      plan.block.transactions.forEach((transaction) => {
+        if (
+          transaction.isCoinbase ||
+          !(
+            !plan.blockExists ||
+            insertedBy.has(transaction.hash) ||
+            transitionTxs.has(transaction.hash)
+          )
+        ) {
           return;
         }
-        wanted.set(
-          outpointKey(input.outpointTransactionHash, input.outpointIndex),
-          { hash: input.outpointTransactionHash, index: input.outpointIndex }
-        );
+        transaction.inputs.forEach((input) => {
+          if (input.outpointTransactionHash === coinbaseHash) {
+            return;
+          }
+          const key = outpointKey(
+            input.outpointTransactionHash,
+            input.outpointIndex
+          );
+          keys.push(key);
+          wanted.set(key, {
+            hash: input.outpointTransactionHash,
+            index: input.outpointIndex,
+          });
+        });
       });
+      wantedOfPlan.set(plan, keys);
     });
     const resolved = await this.resolveSpends(wanted, operation);
     const unresolved = [...wanted.keys()].filter((key) => !resolved.has(key));
@@ -909,7 +1124,7 @@ export class BlockCommitter {
       .map((dependency) => dependency.seq)
       .filter((seq): seq is bigint => seq !== undefined);
     const commit = await context.commitLog.beginCommit({
-      blockHashHex: block.hash,
+      blockHashHex: blocks[blocks.length - 1]!.hash,
       dependsOn,
       kind: 'block',
       nodeScope,
@@ -947,54 +1162,48 @@ export class BlockCommitter {
       columnsOf('output'),
       encodeOutputRows(newTransactions, newContext)
     );
-    const inputRows = encodeInputRows(
-      newTransactions,
-      newContext,
-      resolveSpent
+    await insert(
+      'input',
+      columnsOf('input'),
+      encodeInputRows(newTransactions, newContext, resolveSpent)
     );
-    await insert('input', columnsOf('input'), inputRows);
     await insert(
       'transaction',
       columnsOf('transaction'),
       encodeTransactionRows(newTransactions, newContext)
     );
-    const allContext = {
-      commitSeq: commit.seq,
-      transactionInternalIds: internalIds,
-    };
-    const blockRowNow = !blockExists && unresolved.length === 0;
-    if (blockRowNow) {
-      await insert(
-        'block',
-        columnsOf('block'),
-        encodeBlockRows(
-          [
-            {
-              block,
-              generatedValueSatoshis: this.generatedValue(block, resolveSpent),
-              internalId: blockInternalId,
-            },
-          ],
-          commit.seq
-        )
-      );
-    }
-    if (!blockExists) {
-      await insert(
-        'block_transaction',
-        columnsOf('block_transaction'),
-        encodeBlockTransactionRows(block, blockInternalId, allContext)
-      );
-    } else if (missingLinks.length > 0) {
-      const writer = new RowBinaryWriter(missingLinks.length * 64);
-      missingLinks.forEach((index) => {
-        writer
-          .uint64(blockInternalId)
-          .uint32(index)
-          .uint64(internalIds[index]!)
-          .fixedString32(block.transactions[index]!.hash)
-          .uint64(commit.seq)
-          .endRow();
+    const unresolvedSet = new Set(unresolved);
+    const blockRowNow = (plan: BlockPlan) =>
+      !plan.blockExists &&
+      !wantedOfPlan.get(plan)!.some((key) => unresolvedSet.has(key));
+    await insert(
+      'block',
+      columnsOf('block'),
+      encodeBlockRows(
+        plans.filter(blockRowNow).map((plan) => ({
+          block: plan.block,
+          generatedValueSatoshis: this.generatedValue(plan.block, resolveSpent),
+          internalId: plan.blockInternalId,
+        })),
+        commit.seq
+      )
+    );
+    {
+      const writer = new RowBinaryWriter();
+      plans.forEach((plan) => {
+        const indexes = plan.blockExists
+          ? plan.missingLinks
+          : plan.block.transactions.map((_, index) => index);
+        indexes.forEach((index) => {
+          const transaction = plan.block.transactions[index]!;
+          writer
+            .uint64(plan.blockInternalId)
+            .uint32(index)
+            .uint64(idByHash.get(transaction.hash)!)
+            .fixedString32(transaction.hash)
+            .uint64(commit.seq)
+            .endRow();
+        });
       });
       await insert('block_transaction', columnsOf('block_transaction'), {
         data: writer.finish(),
@@ -1002,31 +1211,38 @@ export class BlockCommitter {
       });
     }
 
-    const nodeBlockRows: NodeBlockRow[] = acceptingNodes.map((node) => ({
-      acceptedAt: acceptanceByNode.get(node)!.acceptedAt,
-      blockHash: block.hash,
-      blockInternalId,
-      height: block.height,
-      nodeInternalId: node,
-      sign: 1,
-      version: commit.seq,
-    }));
+    const nodeBlockRows: NodeBlockRow[] = [];
+    const txAcceptanceRows: TxAcceptanceRow[] = [];
+    plans.forEach((plan) => {
+      plan.acceptingNodes.forEach((node) => {
+        const { acceptedAt } = plan.acceptanceByNode.get(node)!;
+        nodeBlockRows.push({
+          acceptedAt,
+          blockHash: plan.block.hash,
+          blockInternalId: plan.blockInternalId,
+          height: plan.block.height,
+          nodeInternalId: node,
+          sign: 1,
+          version: commit.seq,
+        });
+        plan.block.transactions.forEach((transaction) => {
+          txAcceptanceRows.push({
+            acceptedAt,
+            blockInternalId: plan.blockInternalId,
+            height: plan.block.height,
+            nodeInternalId: node,
+            sign: 1,
+            transactionHash: transaction.hash,
+            transactionInternalId: idByHash.get(transaction.hash)!,
+            version: commit.seq,
+          });
+        });
+      });
+    });
     await insert(
       'node_block',
       acceptanceColumns.node_block,
       encodeNodeBlockRows(nodeBlockRows, commit.seq)
-    );
-    const txAcceptanceRows: TxAcceptanceRow[] = acceptingNodes.flatMap((node) =>
-      block.transactions.map((transaction) => ({
-        acceptedAt: acceptanceByNode.get(node)!.acceptedAt,
-        blockInternalId,
-        height: block.height,
-        nodeInternalId: node,
-        sign: 1 as const,
-        transactionHash: transaction.hash,
-        transactionInternalId: idByHash.get(transaction.hash)!,
-        version: commit.seq,
-      }))
     );
     await insert(
       'tx_acceptance',
@@ -1058,14 +1274,27 @@ export class BlockCommitter {
     }[] = [];
     if (tipMode) {
       acceptingNodes.forEach((node) => {
+        /*
+         * One transition per (node, tx) over all the node's blocks in the
+         * batch: a tx in two of them (or stored before) counts once.
+         */
+        const transactions: {
+          transaction: ChaingraphTransaction;
+          internalId: bigint;
+        }[] = [];
+        plansOfNode.get(node)!.forEach((plan) => {
+          plan.block.transactions.forEach((transaction) => {
+            transactions.push({
+              internalId: idByHash.get(transaction.hash)!,
+              transaction,
+            });
+          });
+        });
         const delta = blockUtxoDelta({
           acceptedBefore: acceptedBefore.get(node)!,
           nodeInternalId: node,
           resolveSpent,
-          transactions: block.transactions.map((transaction) => ({
-            internalId: idByHash.get(transaction.hash)!,
-            transaction,
-          })),
+          transactions,
         });
         appendAll(utxoRows, delta.rows);
         delta.pending.forEach((item) => {
@@ -1091,15 +1320,19 @@ export class BlockCommitter {
     /* 5. Child-before-parent: pending spends, filled under this seq. */
     if (unresolved.length > 0) {
       const pendingInputs = newTransactions.flatMap((transaction) =>
-        transaction.inputs
-          .map((input, inputIndex) => ({ input, inputIndex, transaction }))
-          .filter(
-            ({ input }) =>
-              !transaction.isCoinbase &&
-              !resolved.has(
-                outpointKey(input.outpointTransactionHash, input.outpointIndex)
+        transaction.isCoinbase
+          ? []
+          : transaction.inputs
+              .map((input, inputIndex) => ({ input, inputIndex, transaction }))
+              .filter(
+                ({ input }) =>
+                  !resolved.has(
+                    outpointKey(
+                      input.outpointTransactionHash,
+                      input.outpointIndex
+                    )
+                  )
               )
-          )
       );
       const pendingRows = (sign: -1 | 1): PendingSpendRow[] =>
         pendingSpendRows(pendingInputs, pendingUtxo, sign);
@@ -1112,13 +1345,16 @@ export class BlockCommitter {
       await context.fault('incomplete', { kind: 'block', seq: commit.seq });
       /*
        * Every row but the fill is written and the commit is `incomplete`
-       * (it holds its nodes' watermarks): the caller may report the block as
-       * handled now, so the agent's bounded block buffer keeps downloading
-       * (the parent may still be queued behind this block). The commit
-       * completes in the background; if the process stops first, recovery
-       * aborts it and the next start downloads the block again.
+       * (it holds its nodes' watermarks): the callers may report the blocks
+       * as parked now, so the agent's bounded block buffer keeps downloading
+       * (the parent may still be queued behind them). The commit completes
+       * in the background; if the process stops first, recovery aborts it
+       * and the next start downloads the blocks again.
        */
-      onParked?.({ attemptedSavedTransactions, transactionCacheMisses });
+      operation.yieldLane();
+      batch.items.forEach((item, index) => {
+        item.onParked(results[index]!);
+      });
       const filled = await operation.whileWaiting(
         this.waitForPending(unresolved)
       );
@@ -1172,27 +1408,25 @@ export class BlockCommitter {
         { data: encodedFill.utxoByScript, rowCount: encodedFill.rowCount },
         'f0'
       );
-      if (!blockExists) {
-        await insert(
-          'block',
-          columnsOf('block'),
-          encodeBlockRows(
-            [
-              {
-                block,
-                generatedValueSatoshis: this.generatedValue(
-                  block,
-                  resolveSpent,
-                  true
-                ),
-                internalId: blockInternalId,
-              },
-            ],
-            commit.seq
-          ),
-          'f0'
-        );
-      }
+      await insert(
+        'block',
+        columnsOf('block'),
+        encodeBlockRows(
+          plans
+            .filter((plan) => !plan.blockExists && !blockRowNow(plan))
+            .map((plan) => ({
+              block: plan.block,
+              generatedValueSatoshis: this.generatedValue(
+                plan.block,
+                resolveSpent,
+                true
+              ),
+              internalId: plan.blockInternalId,
+            })),
+          commit.seq
+        ),
+        'f0'
+      );
       await insert(
         'pending_spend',
         acceptanceColumns.pending_spend,
@@ -1213,7 +1447,42 @@ export class BlockCommitter {
     operation.markCommitted();
     context.onCommitted(operation);
     await context.fault('committed', { kind: 'block', seq: commit.seq });
-    return { attemptedSavedTransactions, transactionCacheMisses };
+    return results;
+  }
+
+  /** Stored (valid-commit) blocks by hash: the first row per hash. */
+  private async lookupStoredBlocks(
+    hashes: readonly string[]
+  ): Promise<Map<string, { internal_id: string; commit_seq: string }>> {
+    const found = new Map<
+      string,
+      { internal_id: string; commit_seq: string }
+    >();
+    for (const chunk of chunked(
+      [...new Set(hashes)],
+      this.context.lookupChunkSize
+    )) {
+      const rows = await this.context.client.query<{
+        hash_hex: string;
+        internal_id: string;
+        commit_seq: string;
+      }>(
+        `SELECT lower(hex(hash)) AS hash_hex, internal_id, commit_seq FROM block
+         WHERE hash IN (SELECT toFixedString(unhex(h), 32) FROM (SELECT arrayJoin({hashes:Array(String)}) AS h))
+           AND ${validCommitSql()}
+         ORDER BY commit_seq`,
+        { fence: this.context.fence(), hashes: chunk }
+      );
+      rows.forEach((row) => {
+        if (!found.has(row.hash_hex)) {
+          found.set(row.hash_hex, {
+            commit_seq: row.commit_seq,
+            internal_id: row.internal_id,
+          });
+        }
+      });
+    }
+    return found;
   }
 
   /** Σ outputs − Σ spent outputs (coinbase inputs spend nothing). */
