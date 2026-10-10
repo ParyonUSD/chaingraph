@@ -1,5 +1,5 @@
 /* eslint-disable max-classes-per-file, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, @typescript-eslint/parameter-properties, no-await-in-loop, functional/no-loop-statement, max-params, functional/no-let, @typescript-eslint/init-declarations, class-methods-use-this, @typescript-eslint/no-loop-func, prefer-destructuring, require-atomic-updates, functional/no-mixed-type, no-continue, @typescript-eslint/member-ordering, max-depth, camelcase */
-// cspell:ignore clickhouse dedup unhex seqs varint
+// cspell:ignore clickhouse dedup unhex seqs varint retryable
 /**
  * `saveBlock` for the ClickHouse store (WP5a-core): one block = one commit
  * (plan §3.1), written in dependency order, per accepting node:

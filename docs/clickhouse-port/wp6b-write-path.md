@@ -96,14 +96,13 @@ of merges, now 78 parts and 44 MB). In the 4.3 s window:
   in tip mode the remaining inputs of transactions that become accepted after the wait). The commit is open the
   whole time, so the node's watermark is held exactly as before. A batch re-saving a stored block waits first
   (its node scope comes from stored state). Step order (fault-injection points) is unchanged.
-- Two running batches per node set in tip mode (`tipRunningBatches = 2`): the next batch resolves and encodes its
-  node-agnostic rows while the previous one waits on the server.
+- (Tried: two running batches per node set in tip mode, 3.9–4.1 s; reverted in §6, where parallel inserts within
+  a phase made one running batch both faster and better batched.)
 
-Result: converge 3.9–4.1 s (limit 6 s; target ≤ 3 s not reached). The remainder is JS CPU on the agent's one
+Result: converge 3.9–4.1 s with this change alone, 3.7 s with §6 (limit 6 s; target ≤ 3 s not reached). The remainder is JS CPU on the agent's one
 thread (parsing in the agent plus RowBinary encoding), not store round trips or server time; getting under 3 s
 needs encoding off the main thread (a worker for `encodeUtxoRows` / input rows) or a cheaper row encoder
 (`row-binary.ts` `uint64` via `writeBigUInt64LE` and hex `fixedString32` are ~25 % of the store's CPU). Not done.
-Catch-up `--quick` with two running batches: 636 blocks/s, 0.59 parts per block (was 0.33 with one).
 
 Test: `[e2e] … a new block behind a running re-org writes its node-agnostic rows first, its node facts after`
 (the re-org held at `node_block`; the new block's `output` row exists while the node sees nothing of it; final
@@ -141,7 +140,7 @@ harness itself does not pass the cap through yet, see the report).
 
 **Profile** (gate `concurrent`: mainnet-like 8 × 12,500 tx on node A, chipnet-like 50 × 2,000 tx on node B; CPU
 profiles of the three agent runs; `commit_log` timeline per node scope):
-- Writes are not serialised across nodes: A and B are separate batch lanes and their commits interleave every
+- Writes are not serialized across nodes: A and B are separate batch lanes and their commits interleave every
   0.5 s in the "together" phase. `VisibilityPublisher` (one publish in flight, ≥ 100 ms apart) and the id
   allocator chains were never on the critical path (one `visibility` insert per 100 ms; id ranges of 100,000).
 - Chipnet blocks commit one per commit even alone (~9.5 blocks/s): they arrive no faster than that, so the store

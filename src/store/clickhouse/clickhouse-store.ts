@@ -1,5 +1,5 @@
 /* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, functional/no-loop-statement, no-await-in-loop, @typescript-eslint/member-ordering, max-params, @typescript-eslint/parameter-properties, functional/no-let, @typescript-eslint/init-declarations, prefer-destructuring, @typescript-eslint/no-invalid-void-type */
-// cspell:ignore clickhouse dedup unhex seqs milli varint
+// cspell:ignore clickhouse dedup unhex seqs milli varint retryable
 /**
  * The ClickHouse `ChaingraphStore` (WP5a-core): nodes, blocks, header
  * acceptance, re-org release, the per-node UTXO set and incomplete-block

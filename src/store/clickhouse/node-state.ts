@@ -1,5 +1,5 @@
 /* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, @typescript-eslint/member-ordering, @typescript-eslint/no-invalid-void-type, class-methods-use-this, functional/no-let, functional/no-loop-statement, no-bitwise, complexity, functional/no-throw-statement, @typescript-eslint/no-use-before-define */
-// cspell:ignore clickhouse seqs
+// cspell:ignore clickhouse seqs retryable
 /**
  * Per-node in-memory state of the ClickHouse writer (WP5a-core):
  * - the node registry (name ↔ internal id);
