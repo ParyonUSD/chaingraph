@@ -218,6 +218,39 @@ node scripts/parity/compare.mjs --pg $PG --ch $CH --nodes 1 --every 100 --from 8
 node scripts/parity/compare.mjs … --tables tx_acceptance --hash-chunks 4096 --diff --out data/parity/debug
 ```
 
+### Postgres reference cache (`--pg-cache`, `--pg-only`, `--ch-only`)
+
+The Postgres side is the slow half (§7) and does not change between ClickHouse arms. Compute it once:
+
+```sh
+# 1. Postgres side only (no ClickHouse, no --ch): digests + timestamp-pass rows into the cache
+node scripts/parity/compare.mjs --pg $PG --nodes 1,39 --parallel 8 --timestamps exact \
+  --pg-cache data/parity/pg-cache --pg-only --out data/parity/pg
+# 2. each ClickHouse arm against it (no --pg; Postgres is never contacted)
+node scripts/parity/compare.mjs --ch $CH --ch-db cg --nodes 1,39 --parallel 8 --timestamps exact \
+  --pg-cache data/parity/pg-cache --ch-only --out data/parity/arm-a
+```
+
+- `--pg-cache <dir>` alone: the first run computes the Postgres side as usual and records it; later runs with the
+  same parameters read it and send no Postgres query. `--pg` is then optional.
+- Recorded: every per node/table/chunk digest (incl. the F1g `utxo` chunks and `mempool` chunks), the Postgres
+  `node` list, max height and per-node tips, and, under `--timestamps tolerance`, the sorted `s` + timestamp rows of
+  the timestamp tables (`node_block`, `node_transaction`, both histories) as `rows/*.jsonl.gz`.
+  `manifest.json` is written last, so an interrupted run leaves no usable cache.
+- **Parameters that must match:** nodes (resolved names), tables, `--chunk-blocks`, `--hash-chunks`,
+  `--utxo-chunks`, `--at-height`, `--every`/`--from`/`--to`, `--hash`, `--timestamps`, `--include-mempool`.
+  Mismatch → exit 2 naming the differing parameters, unless `--pg-cache-rebuild` (recompute and overwrite; needs
+  `--pg`). `--ts-tolerance-ms`, `--parallel`, `--diff`, `--ch-db` are free.
+- `--pg-only`: writes the cache, `<out>/pg-digests.tsv` and `<out>/summary.json` (`mode: pg-only`); exit 0. On a
+  matching cache it does nothing (say `--pg-cache-rebuild` to recompute).
+- `--ch-only`: requires a matching cache (exit 2 otherwise); never opens Postgres.
+- Height plan: a cached run keeps the cached max height (current mode). ClickHouse blocks above it land in one
+  extra tail chunk whose Postgres side is empty, so they show as mismatches rather than being missed.
+- `--diff` with the cache: row diffs come from the cached rows for the timestamp tables. Other tables' Postgres
+  rows are not cached; their `diff.txt` entry says so. Re-run that table/chunk without `--ch-only` to see rows.
+- The cache is a snapshot of Postgres when it was built (`summary.snapshot.postgres` names its time). Rebuild it
+  if the reference database changes.
+
 **G1 item 1 passes** when all of these exit 0:
 - the replay-end run for nodes 1 and 39 (all default tables, incl. `utxo` = F1g);
 - the window run.
@@ -254,6 +287,14 @@ Local only: Postgres `ch1-pg` localhost:15432 and ClickHouse `ch1-local` http://
 - all rows are under one committed `commit_log` seq `(1 << 40) | 1`, with `visibility` rows for nodes 0, 5 and 9,
   so the WP4 gate shows them;
 - mutations are later commits, each published the same way.
+
+**Cache checks (added 2026-10-10).** After the identical runs: `--pg-only` fills a cache (128 digests, 10
+timestamp row files); a second `--pg-only` is a no-op; `--ch-only` runs with an unreachable `--pg` match (default
+tolerance, and tolerance 0 ms from the cached rows); `--hash-chunks/--utxo-chunks 256` against the cache → exit 2
+naming both; `--ch-only --pg-cache-rebuild` → exit 2; a full run with `--pg-cache` writes it and the next run
+(unreachable `--pg`) reads it and matches. Among the mutations, `--ch-only` still detects the `node-b` `node_block`
+B3 row (row diff from the cache) and the `accepted_at` +3 s drift at tolerance 1 s. Result 2026-10-10: **25/25
+passed**, 18 s.
 
 **Result (2026-10-09, local ClickHouse 26.8.22.13, Postgres 14.24; 15/15 passed, 15 s):**
 

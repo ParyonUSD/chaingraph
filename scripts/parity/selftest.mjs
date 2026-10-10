@@ -23,6 +23,12 @@
  *    node-b gains a node_block fact; node-b gains a tx_acceptance fact; a
  *    Postgres output value changes; a ClickHouse accepted_at drifts by 3 s
  *    (tolerance 1 s: only the timestamp row; tolerance 5 s: nothing).
+ * 5. Postgres reference cache: --pg-only fills a --pg-cache, --ch-only runs
+ *    (with an unreachable --pg, so no Postgres query can happen) all match,
+ *    a parameter mismatch is refused (exit 2) and --pg-cache-rebuild is not
+ *    allowed with --ch-only; a cache written by a full run is read back; the
+ *    node_block mutation and the accepted_at drift are still detected from
+ *    the cache (the latter from the cached timestamp-pass rows).
  * Scratch databases are dropped unless --keep. Exit 0 = every expectation met.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -833,7 +839,7 @@ const record = (name, ok, detail) => {
   );
 };
 
-const runCompare = (label, connection, extra) => {
+const spawnCompare = (label, connection, extra) => {
   const out = join(options.out, label);
   const run = spawnSync(
     process.execPath,
@@ -856,6 +862,11 @@ const runCompare = (label, connection, extra) => {
     ],
     { encoding: 'utf8' }
   );
+  return { out, run };
+};
+
+const runCompare = (label, connection, extra) => {
+  const { out, run } = spawnCompare(label, connection, extra);
   if (run.status === 2)
     throw new Error(`compare ${label} errored:\n${run.stderr}${run.stdout}`);
   const summary = JSON.parse(readFileSync(join(out, 'summary.json'), 'utf8'));
@@ -1014,6 +1025,93 @@ const main = async () => {
       []
     );
 
+    // Postgres reference cache (--pg-cache / --pg-only / --ch-only).
+    const pgCache = join(options.out, 'pg-cache');
+    const cacheOnly = {
+      ...connection,
+      pg: 'postgres://nobody:none@127.0.0.1:9/unreachable', // proves --ch-only never connects
+    };
+    const cached = [...small, ...mempool, '--pg-cache', pgCache];
+    {
+      const { out, run } = spawnCompare('cache: --pg-only', connection, [
+        ...cached,
+        '--pg-only',
+      ]);
+      const manifest = JSON.parse(
+        readFileSync(join(pgCache, 'manifest.json'), 'utf8')
+      );
+      const digestCount = Object.keys(manifest.digests).length;
+      const rowFiles = Object.keys(manifest.rows).length;
+      const pgTsv = readFileSync(join(out, 'pg-digests.tsv'), 'utf8');
+      record(
+        'cache: --pg-only fills the cache',
+        run.status === 0 &&
+          digestCount > 0 &&
+          rowFiles > 0 &&
+          pgTsv.trim().split('\n').length - 1 === digestCount,
+        `exit ${run.status}, ${digestCount} digests, ${rowFiles} timestamp row files`
+      );
+    }
+    {
+      const { run } = spawnCompare('cache: --pg-only again', connection, [
+        ...cached,
+        '--pg-only',
+      ]);
+      record(
+        'cache: --pg-only on a matching cache is a no-op',
+        run.status === 0 && /already matches/.test(run.stderr),
+        `exit ${run.status}`
+      );
+    }
+    expectRun(
+      'cache: --ch-only (unreachable --pg), identical',
+      cacheOnly,
+      [...cached, '--ch-only'],
+      []
+    );
+    expectRun(
+      'cache: --ch-only, tolerance 0 ms (timestamp pass from cached rows)',
+      cacheOnly,
+      [...cached, '--ch-only', '--ts-tolerance-ms', '0'],
+      []
+    );
+    {
+      const { run } = spawnCompare('cache: parameter mismatch', cacheOnly, [
+        ...cached.map((value) => (value === '16' ? '256' : value)),
+        '--ch-only',
+      ]);
+      record(
+        'cache: parameter mismatch (--hash-chunks 256) refused',
+        run.status === 2 && /different parameters.*hashChunks/.test(run.stderr),
+        `exit ${run.status}: ${run.stderr.trim().split('\n')[0]}`
+      );
+    }
+    {
+      const { run } = spawnCompare('cache: rebuild with ch-only', cacheOnly, [
+        ...cached,
+        '--ch-only',
+        '--pg-cache-rebuild',
+      ]);
+      record(
+        'cache: --ch-only --pg-cache-rebuild refused',
+        run.status === 2,
+        `exit ${run.status}`
+      );
+    }
+    const fullRunCache = join(options.out, 'pg-cache-full');
+    expectRun(
+      'cache: full run writes --pg-cache (exact timestamps)',
+      connection,
+      [...small, '--timestamps', 'exact', '--pg-cache', fullRunCache],
+      []
+    );
+    expectRun(
+      'cache: next run reads it (unreachable --pg)',
+      cacheOnly,
+      [...small, '--timestamps', 'exact', '--pg-cache', fullRunCache],
+      []
+    );
+
     // Mutation 1: node-b gains a node_block fact (B3) in ClickHouse.
     const b3 = blockByKey.B3;
     const nodeB = nodes[1];
@@ -1028,6 +1126,12 @@ const main = async () => {
       'mutation: node-b gains node_block B3 (ClickHouse)',
       connection,
       [...small, ...mempool, '--timestamps', 'exact', '--diff'],
+      ['node-b\tnode_block']
+    );
+    expectRun(
+      'cache: --ch-only detects node-b node_block B3 (row diff from cache)',
+      cacheOnly,
+      [...cached, '--ch-only', '--diff'],
       ['node-b\tnode_block']
     );
     await clickhouse.command(nodeBlockRow(-1, epochOneSeq(3)));
@@ -1091,6 +1195,12 @@ const main = async () => {
       'mutation: accepted_at +3 s, tolerance 1 s',
       connection,
       [...small, ...mempool, '--ts-tolerance-ms', '1000'],
+      ['node-a\tnode_block:accepted_at']
+    );
+    expectRun(
+      'cache: --ch-only detects accepted_at +3 s, tolerance 1 s',
+      cacheOnly,
+      [...cached, '--ch-only', '--ts-tolerance-ms', '1000'],
       ['node-a\tnode_block:accepted_at']
     );
     expectRun(

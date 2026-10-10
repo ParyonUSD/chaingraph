@@ -9,6 +9,14 @@
  *     [--at-height H] [--every N --from H0 --to H1] [--tables t1,t2,…] [--include-mempool]
  *     [--hash sum|ordered] [--timestamps tolerance|exact|exclude] [--ts-tolerance-ms 120000]
  *     [--chunk-blocks 10000] [--hash-chunks 16] [--utxo-chunks 16] [--parallel 4] [--diff]
+ *     [--pg-cache <dir> [--pg-cache-rebuild] [--pg-only | --ch-only]]
+ *
+ * --pg-cache <dir>: the Postgres side (all digests, incl. F1g utxo, and the
+ * timestamp-pass rows) is written to <dir> on the first run and read from it
+ * on later runs with the same parameters, which then query no Postgres at all.
+ * A parameter mismatch is an error unless --pg-cache-rebuild. --pg-only fills
+ * the cache without touching ClickHouse; --ch-only requires a matching cache
+ * (no --pg needed).
  *
  * ClickHouse credentials: CH_USER / CH_PASSWORD (environment only).
  * A node is named as in both stores' `node.name`; a bare number that is not a
@@ -30,6 +38,15 @@ import {
   PostgresSnapshotPool,
   readClickHouseSnapshot,
 } from './lib/engines.mjs';
+import {
+  PgCacheWriter,
+  cacheParameters,
+  emptyDigest,
+  loadPgCache,
+  parameterDifferences,
+  readCachedRows,
+  taskKey,
+} from './lib/pg-cache.mjs';
 
 const diffRowLimit = 20;
 
@@ -49,6 +66,10 @@ const { values: options } = parseArgs({
     out: { type: 'string' },
     parallel: { default: '4', type: 'string' },
     pg: { type: 'string' },
+    'pg-cache': { type: 'string' },
+    'pg-cache-rebuild': { default: false, type: 'boolean' },
+    'pg-only': { default: false, type: 'boolean' },
+    'ch-only': { default: false, type: 'boolean' },
     tables: { type: 'string' },
     timestamps: { default: 'tolerance', type: 'string' },
     to: { type: 'string' },
@@ -156,8 +177,18 @@ const mergeStreams = async (pgRows, chRows, { limit, onPair }) => {
 };
 
 const main = async () => {
-  for (const required of ['pg', 'ch', 'nodes', 'out'])
+  const cacheDirectory = options['pg-cache'];
+  const pgOnly = options['pg-only'];
+  const chOnly = options['ch-only'];
+  const rebuild = options['pg-cache-rebuild'];
+  if (pgOnly && chOnly) fail('--pg-only and --ch-only are exclusive');
+  if ((pgOnly || chOnly || rebuild) && cacheDirectory === undefined)
+    fail('--pg-only, --ch-only and --pg-cache-rebuild need --pg-cache <dir>');
+  if (chOnly && rebuild)
+    fail('--ch-only cannot rebuild the cache (it never queries Postgres)');
+  for (const required of ['nodes', 'out'])
     if (options[required] === undefined) fail(`--${required} is required`);
+  if (!pgOnly && options.ch === undefined) fail('--ch is required');
   if (!['sum', 'ordered'].includes(options.hash))
     fail('--hash must be sum or ordered');
   if (!['tolerance', 'exact', 'exclude'].includes(options.timestamps))
@@ -188,34 +219,108 @@ const main = async () => {
   const log = options.quiet
     ? () => undefined
     : (message) => console.error(message);
+  const nodeTokens = options.nodes.split(',');
+  const resolveNode = (pgNodes, token) =>
+    pgNodes.find((node) => node.name === token) ??
+    pgNodes.find((node) => /^\d+$/.test(token) && node.id === token);
+  const wantedParameters = (nodeNames) =>
+    cacheParameters({
+      atHeight,
+      chunkBlocks,
+      every,
+      from: windowFrom,
+      hash: options.hash,
+      hashChunks: hashChunkCount,
+      includeMempool: options['include-mempool'],
+      nodes: nodeNames,
+      tables: tableNames,
+      timestamps: options.timestamps,
+      to: windowTo,
+      utxoChunks: utxoChunkCount,
+    });
+
+  // ---- Postgres reference cache: read (matching manifest) or write (none, or rebuild)
+  let cache;
+  if (cacheDirectory !== undefined && !rebuild) {
+    const manifest = loadPgCache(cacheDirectory);
+    if (manifest === undefined) {
+      if (chOnly)
+        fail(
+          `--ch-only: no Postgres cache in ${cacheDirectory} (fill it with --pg-only)`
+        );
+    } else {
+      const cachedNames = nodeTokens.map(
+        (token) => resolveNode(manifest.pgNodes, token)?.name ?? `?${token}`
+      );
+      const differences = parameterDifferences(
+        manifest.parameters,
+        wantedParameters(cachedNames)
+      );
+      if (differences.length > 0)
+        fail(
+          `--pg-cache ${cacheDirectory} was built with different parameters (${differences
+            .map(
+              (name) =>
+                `${name}: cached ${JSON.stringify(
+                  manifest.parameters?.[name] ?? null
+                )}`
+            )
+            .join(', ')}); use --pg-cache-rebuild or another directory`
+        );
+      cache = manifest;
+    }
+  }
+  const readCache = cache !== undefined;
+  if (!readCache && options.pg === undefined)
+    fail('--pg is required (no usable --pg-cache)');
+  if (pgOnly && readCache) {
+    // even with --quiet: nothing was recomputed
+    console.error(
+      `compare: --pg-only: cache ${cacheDirectory} already matches (created ${cache.createdAt}); use --pg-cache-rebuild to recompute`
+    );
+    return 0;
+  }
+  const cacheWriter =
+    cacheDirectory !== undefined && !readCache
+      ? new PgCacheWriter(cacheDirectory)
+      : undefined;
 
   mkdirSync(options.out, { recursive: true });
-  const postgres = new PostgresSnapshotPool(options.pg, parallel);
-  const clickhouse = new ClickHouseHttp(options.ch, options['ch-db']);
-  await postgres.open();
+  const postgres = readCache
+    ? undefined
+    : new PostgresSnapshotPool(options.pg, parallel);
+  const clickhouse = pgOnly
+    ? undefined
+    : new ClickHouseHttp(options.ch, options['ch-db']);
+  if (postgres !== undefined) await postgres.open();
   const started = Date.now();
   try {
     // ---- nodes (matched by name; ids differ between stores)
-    const pgNodes = await postgres.query(
-      'SELECT internal_id::text AS id, name FROM node'
-    );
-    const chNodes = await clickhouse.query(
-      'SELECT toString(internal_id) AS id, name FROM node_v'
-    );
-    const nodes = options.nodes.split(',').map((token) => {
-      const byName =
-        pgNodes.find((node) => node.name === token) ??
-        pgNodes.find((node) => /^\d+$/.test(token) && node.id === token);
+    const pgNodes = readCache
+      ? cache.pgNodes
+      : await postgres.query('SELECT internal_id::text AS id, name FROM node');
+    const chNodes =
+      clickhouse === undefined
+        ? undefined
+        : await clickhouse.query(
+            'SELECT toString(internal_id) AS id, name FROM node_v'
+          );
+    const nodes = nodeTokens.map((token) => {
+      const byName = resolveNode(pgNodes, token);
       if (byName === undefined) fail(`node ${token} not found in Postgres`);
+      if (chNodes === undefined) return { name: byName.name, pgId: byName.id };
       const chNode = chNodes.find((node) => node.name === byName.name);
       if (chNode === undefined)
         fail(`node ${byName.name} not found in ClickHouse`);
       return { chId: chNode.id, name: byName.name, pgId: byName.id };
     });
-    const snapshot = await readClickHouseSnapshot(
-      clickhouse,
-      nodes.map((node) => node.chId)
-    );
+    const snapshot =
+      clickhouse === undefined
+        ? { tail: [], visible: new Map(), visible0: '0' }
+        : await readClickHouseSnapshot(
+            clickhouse,
+            nodes.map((node) => node.chId)
+          );
     for (const node of nodes) node.visible = snapshot.visible.get(node.chId);
     const ctx = {
       atHeight,
@@ -227,31 +332,70 @@ const main = async () => {
     };
 
     // ---- heights
-    const [{ h: pgMax }] = await postgres.query(
-      'SELECT coalesce(max(height), -1)::text AS h FROM block'
-    );
-    const [{ h: chMax }] = await clickhouse.query(
-      `SELECT toString(if(count() = 0, -1, max(height))) AS h FROM block_at(visible0 = ${
-        ctx.ch.visible0
-      }, tail = [${ctx.ch.tail.join(', ')}])`
-    );
-    const maxHeight = atHeight ?? Math.max(Number(pgMax), Number(chMax));
-    const tipOf = async (node) => {
-      const [{ h: pgTip }] = await postgres.query(
+    const pgMax = readCache
+      ? cache.pgMaxHeight
+      : Number(
+          (
+            await postgres.query(
+              'SELECT coalesce(max(height), -1)::text AS h FROM block'
+            )
+          )[0].h
+        );
+    const chMax =
+      clickhouse === undefined
+        ? -1
+        : Number(
+            (
+              await clickhouse.query(
+                `SELECT toString(if(count() = 0, -1, max(height))) AS h FROM block_at(visible0 = ${
+                  ctx.ch.visible0
+                }, tail = [${ctx.ch.tail.join(', ')}])`
+              )
+            )[0].h
+          );
+    // A cached plan keeps its height range; ClickHouse blocks above it go to
+    // a tail chunk whose Postgres side is empty (Postgres had no such block).
+    const maxHeight =
+      atHeight ?? (readCache ? cache.maxHeight : Math.max(pgMax, chMax));
+    const pgTipOf = async (node) => {
+      if (readCache) {
+        const cached = cache.pgTips[node.name];
+        if (cached === undefined)
+          fail(`--pg-cache has no tip for node ${node.name}`);
+        return cached;
+      }
+      const [{ h }] = await postgres.query(
         `SELECT coalesce(max(b.height), -1)::text AS h FROM node_block nb JOIN block b ON b.internal_id = nb.block_internal_id WHERE nb.node_internal_id = ${node.pgId}`
       );
-      const [{ h: chTip }] = await clickhouse.query(
+      return Number(h);
+    };
+    const chTipOf = async (node) => {
+      if (clickhouse === undefined) return undefined;
+      const [{ h }] = await clickhouse.query(
         `SELECT toString(if(count() = 0, -1, max(height))) AS h FROM node_block_at(node = ${node.chId}, visible = ${node.visible})`
       );
-      return { chTip: Number(chTip), pgTip: Number(pgTip) };
+      return Number(h);
     };
-    for (const node of nodes) Object.assign(node, await tipOf(node));
+    for (const node of nodes) {
+      node.pgTip = await pgTipOf(node);
+      node.chTip = await chTipOf(node);
+    }
 
     // ---- plan
     const windowMode = every !== undefined;
     const blockChunks = windowMode
       ? heightChunks(windowFrom, windowTo, every, 'window')
       : heightChunks(0, maxHeight, chunkBlocks, 'height');
+    if (
+      readCache &&
+      !windowMode &&
+      atHeight === undefined &&
+      chMax > cache.maxHeight
+    )
+      blockChunks.push({
+        ...heightChunks(cache.maxHeight + 1, chMax, chMax, 'height')[0],
+        beyondCache: true,
+      });
     const txChunks = windowMode ? blockChunks : hashChunks(hashChunkCount, 'h');
     const tasks = [];
     const skipped = [];
@@ -304,7 +448,8 @@ const main = async () => {
               );
             } else if (
               atHeight !== undefined &&
-              (node.pgTip !== atHeight || node.chTip !== atHeight)
+              (node.pgTip !== atHeight ||
+                (clickhouse !== undefined && node.chTip !== atHeight))
             ) {
               skipped.push(
                 `utxo ${node.name}: --at-height ${atHeight} but tips are pg ${node.pgTip} / ch ${node.chTip}`
@@ -327,8 +472,118 @@ const main = async () => {
         )
         .join(', ')}, max height ${maxHeight}, hash ${
         options.hash
-      }, timestamps ${options.timestamps}`
+      }, timestamps ${options.timestamps}${
+        readCache
+          ? `, Postgres side from cache ${cacheDirectory}`
+          : cacheWriter === undefined
+          ? ''
+          : `, writing Postgres cache ${cacheDirectory}`
+      }${pgOnly ? ' (--pg-only)' : ''}`
     );
+
+    // ---- Postgres side: live (optionally recorded) or from the cache
+    const toDigest = (row) =>
+      options.hash === 'ordered' ? row.m : digestFromSums(row.a, row.b);
+    const pgDigestOf = async (task, inner) => {
+      if (readCache) {
+        if (task.chunk.beyondCache)
+          return { count: 0, md5: emptyDigest(options.hash) };
+        const cached = cache.digests[taskKey(task)];
+        if (cached === undefined)
+          fail(
+            `--pg-cache has no digest for ${taskKey(task).replace(
+              /\t/g,
+              ' '
+            )} (use --pg-cache-rebuild)`
+          );
+        return cached;
+      }
+      const [row] = await postgres.query(digestSql.pg(inner, options.hash));
+      const digest = { count: Number(row.n), md5: toDigest(row) };
+      cacheWriter?.setDigest(taskKey(task), digest.count, digest.md5);
+      return digest;
+    };
+    /** Sorted Postgres rows of a chunk; undefined when only the cache could have them and it does not. */
+    const pgRowsOf = (task, inner, tsCount) => {
+      if (readCache) {
+        if (task.chunk.beyondCache) return (async function* () {})();
+        const file = cache.rows[taskKey(task)];
+        return file === undefined
+          ? undefined
+          : readCachedRows(cacheDirectory, file);
+      }
+      const rows = postgres.stream(rowsSql.pg(inner, tsCount));
+      return cacheWriter !== undefined && tsCount > 0
+        ? cacheWriter.tee(taskKey(task), rows)
+        : rows;
+    };
+    const finishCache = () =>
+      cacheWriter?.finish({
+        createdAt: new Date().toISOString(),
+        maxHeight,
+        parameters: wantedParameters(nodes.map((node) => node.name)),
+        pgMaxHeight: pgMax,
+        pgNodes,
+        pgTips: Object.fromEntries(
+          nodes.map((node) => [node.name, node.pgTip])
+        ),
+      });
+
+    if (pgOnly) {
+      const pgResults = new Array(tasks.length);
+      let pgDone = 0;
+      await runPool(tasks, parallel, async (task, index) => {
+        const table = tables[task.name];
+        const inner = table.pg(ctx, task.chunk, task.node).sql;
+        const digest = await pgDigestOf(task, inner);
+        const tsColumns =
+          options.timestamps === 'tolerance' ? table.ts ?? [] : [];
+        if (tsColumns.length > 0)
+          await cacheWriter.store(
+            taskKey(task),
+            postgres.stream(rowsSql.pg(inner, tsColumns.length))
+          );
+        pgResults[index] = [
+          task.node?.name ?? '*',
+          task.name,
+          task.chunk.label,
+          digest.count,
+          digest.md5,
+        ].join('\t');
+        pgDone += 1;
+        if (pgDone % 50 === 0)
+          log(
+            `compare: ${pgDone}/${tasks.length} Postgres chunks (${Math.round(
+              (Date.now() - started) / 1000
+            )} s)`
+          );
+      });
+      finishCache();
+      writeFileSync(
+        join(options.out, 'pg-digests.tsv'),
+        `${['node\ttable\tchunk\tpg_count\tpg_md5', ...pgResults].join('\n')}\n`
+      );
+      const pgSummary = {
+        cache: cacheDirectory,
+        chunkTasks: tasks.length,
+        durationSeconds: Math.round((Date.now() - started) / 100) / 10,
+        hash: options.hash,
+        maxHeight,
+        mode: 'pg-only',
+        nodes,
+        skipped,
+        timestamps: options.timestamps,
+      };
+      writeFileSync(
+        join(options.out, 'summary.json'),
+        `${JSON.stringify(pgSummary, null, 2)}\n`
+      );
+      for (const note of skipped) log(`skipped: ${note}`);
+      log(
+        `compare: --pg-only: ${tasks.length} Postgres chunks cached in ${cacheDirectory} (${pgSummary.durationSeconds} s)`
+      );
+      return 0;
+    }
 
     // ---- run
     const results = new Array(tasks.length);
@@ -340,18 +595,16 @@ const main = async () => {
       const pgInner = table.pg(ctx, task.chunk, task.node).sql;
       const chInner = table.ch(ctx, task.chunk, task.node).sql;
       const [pgDigest, chDigest] = await Promise.all([
-        postgres.query(digestSql.pg(pgInner, options.hash)),
+        pgDigestOf(task, pgInner),
         clickhouse.query(digestSql.ch(chInner, options.hash)),
       ]);
-      const toDigest = (row) =>
-        options.hash === 'ordered' ? row.m : digestFromSums(row.a, row.b);
       const result = {
         ch_count: Number(chDigest[0].n),
         ch_md5: toDigest(chDigest[0]),
         chunk: task.chunk.label,
         node: task.node?.name ?? '*',
-        pg_count: Number(pgDigest[0].n),
-        pg_md5: toDigest(pgDigest[0]),
+        pg_count: pgDigest.count,
+        pg_md5: pgDigest.md5,
         table: task.name,
       };
       result.match =
@@ -360,12 +613,23 @@ const main = async () => {
 
       const tsColumns =
         options.timestamps === 'tolerance' ? table.ts ?? [] : [];
-      if (tsColumns.length > 0 || (options.diff && !result.match)) {
+      const pgRows =
+        tsColumns.length > 0 || (options.diff && !result.match)
+          ? pgRowsOf(task, pgInner, tsColumns.length)
+          : undefined;
+      if (pgRows === undefined && options.diff && !result.match)
+        diffs.push({
+          ...result,
+          note: 'Postgres rows not in --pg-cache (only timestamp-pass tables are); rerun this chunk without the cache for a row diff',
+          onlyCh: [],
+          onlyPg: [],
+        });
+      if (pgRows !== undefined) {
         let compared = 0;
         let over = 0;
         let maxDiff = 0;
         const { onlyCh, onlyChCount, onlyPg, onlyPgCount } = await mergeStreams(
-          postgres.stream(rowsSql.pg(pgInner, tsColumns.length)),
+          pgRows,
           clickhouse.stream(rowsSql.ch(chInner, tsColumns.length)),
           {
             limit: diffRowLimit,
@@ -516,9 +780,15 @@ const main = async () => {
         ? 'current'
         : `at height ${atHeight}`,
       nodes,
+      pgCache:
+        cacheDirectory === undefined
+          ? null
+          : { directory: cacheDirectory, used: readCache ? 'read' : 'written' },
       skipped,
       snapshot: {
-        postgres: 'exported REPEATABLE READ snapshot',
+        postgres: readCache
+          ? `--pg-cache ${cacheDirectory} (exported REPEATABLE READ snapshot of ${cache.createdAt})`
+          : 'exported REPEATABLE READ snapshot',
         clickhouse: { tail: ctx.ch.tail, visible0: ctx.ch.visible0 },
       },
       timestamps: options.timestamps,
@@ -532,7 +802,9 @@ const main = async () => {
       const text = diffs
         .map(
           (diff) =>
-            `== ${diff.node} ${diff.table} ${diff.chunk}: only in postgres ${diff.onlyPgCount}, only in clickhouse ${diff.onlyChCount}\n` +
+            (diff.note === undefined
+              ? `== ${diff.node} ${diff.table} ${diff.chunk}: only in postgres ${diff.onlyPgCount}, only in clickhouse ${diff.onlyChCount}\n`
+              : `== ${diff.node} ${diff.table} ${diff.chunk}: ${diff.note}\n`) +
             diff.onlyPg.map((line) => `- pg ${line}\n`).join('') +
             diff.onlyCh.map((line) => `+ ch ${line}\n`).join('')
         )
@@ -540,6 +812,7 @@ const main = async () => {
       writeFileSync(join(options.out, 'diff.txt'), text);
       if (text.length > 0) log(text.trimEnd());
     }
+    finishCache();
     for (const note of skipped) log(`skipped: ${note}`);
     log(
       `compare: ${
@@ -550,7 +823,7 @@ const main = async () => {
     );
     return mismatches.length === 0 ? 0 : 1;
   } finally {
-    await postgres.close();
+    await postgres?.close();
   }
 };
 
