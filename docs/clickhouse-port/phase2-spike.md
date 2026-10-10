@@ -47,7 +47,7 @@ snapshot value (`visible`, `visible0`, `tail`, `fence`, `void`, `node_internal_i
 text; every `{name:Type}` placeholder is either a snapshot parameter or a bound client value; a `Hex` that is not
 even-length hex is rejected by the scalar.
 
-Spike limit: all per-node roots of one operation must name the same node (one snapshot = one node). An operation
+Spike limit (lifted in [fix pass 3](fix-pass-3.md) §5: one snapshot now pins every node an operation names): all per-node roots of one operation must name the same node (one snapshot = one node). An operation
 naming two nodes gets a clear error. Full Phase 2 can read a multi-node snapshot in the same single statement
 (`visible(n)` for each named node; tail, void and fence are node-independent).
 
