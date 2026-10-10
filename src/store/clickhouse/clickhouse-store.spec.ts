@@ -1889,3 +1889,48 @@ e2e(
     t.is((await nodeView(client, node1)).blocks.length, 4);
   }
 );
+
+e2e(
+  '[e2e] ClickHouseStore: unknown spent outputs are looked up once per save, not once per resolution round',
+  async (t) => {
+    t.timeout(120_000);
+    const { client, name, openStore } = await scratch(t, 'lookups', {
+      lookupChunkSize: 100,
+      pendingSpendTimeoutMs: 1,
+    });
+    const store = await openStore();
+    const { node1 } = await registerNodes(store);
+    const spender = makeTx({
+      label: 'lookups-spender',
+      outputs: [{ lockingBytecode: p2pkh('x'), valueSatoshis: 1n }],
+      spends: Array.from({ length: 1_000 }, (_, index): [string, number] => [
+        sha(`lookups-nowhere-${index}`),
+        0,
+      ]),
+    });
+    const block = makeBlock(0, zeroHash, [
+      makeTx({
+        coinbase: true,
+        label: 'lookups-c0',
+        outputs: [{ lockingBytecode: p2pkh('m'), valueSatoshis: 1n }],
+      }),
+      spender,
+    ]);
+    const saved = await store.saveBlock({
+      block,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    await saved.committed;
+    await client.command('SYSTEM FLUSH LOGS');
+    const rows = await client.query<{ n: string }>(
+      `SELECT toString(count()) AS n FROM system.query_log
+       WHERE type = 'QueryFinish' AND current_database = {db:String}
+         AND query LIKE '%FROM output%' AND query LIKE '%arrayZip%'
+         AND event_time > now() - INTERVAL 5 MINUTE`,
+      { db: name }
+    );
+    // 1,000 unknown outpoints in chunks of 100: one round of 10 lookups
+    t.is(rows[0]!.n, '10');
+  }
+);

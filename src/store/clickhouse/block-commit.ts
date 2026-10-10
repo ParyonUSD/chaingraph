@@ -1060,10 +1060,17 @@ export class BlockCommitter {
       });
       wantedOfPlan.set(plan, keys);
     });
+    /*
+     * Outpoints already looked up (round 1) are not looked up again in round
+     * 2: a still-unknown spend stays pending (100k of them cost ~2 s of
+     * sequential lookups per extra round).
+     */
+    const attempted = new Set<string>();
     const resolveWanted = async () => {
       const missing = new Map(
-        [...wanted].filter(([key]) => !resolved.has(key))
+        [...wanted].filter(([key]) => !attempted.has(key))
       );
+      missing.forEach((_, key) => attempted.add(key));
       (await this.resolveSpends(missing, operation)).forEach((spend, key) => {
         resolved.set(key, spend);
         if (spend.owner !== undefined && spend.owner !== operation) {
