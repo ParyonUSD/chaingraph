@@ -223,7 +223,10 @@ export const scratch = async (
     }
     await client.close();
   });
-  const openStore = async (fault?: FaultInjector) => {
+  const openStore = async (
+    fault?: FaultInjector,
+    overrides: Partial<ClickHouseStoreOptions> = {}
+  ) => {
     const store = new ClickHouseStore({
       connection: connectionFor(name),
       fault,
@@ -231,6 +234,7 @@ export const scratch = async (
       pendingSpendTimeoutMs: 20_000,
       publisher: { minIntervalMs: 10 },
       ...storeOptions,
+      ...overrides,
     });
     await store.init();
     stores.push(store);
