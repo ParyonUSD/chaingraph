@@ -14,7 +14,7 @@ import LRU from 'lru-cache';
 import type pino from 'pino';
 
 import {
-  bitcoreBlockToChaingraphBlock,
+  bitcoreBlockToChaingraphBlockInSlices,
   bitcoreTransactionToChaingraphTransaction,
 } from './bitcore.js';
 import { BlockBuffer } from './components/block-buffer.js';
@@ -367,6 +367,9 @@ export class Agent {
    * The storage backend (see `src/store/`).
    */
   store: ChaingraphStore;
+
+  /** Block conversions, chained so blocks are buffered in arrival order. */
+  blockParses: Promise<void> = Promise.resolve();
 
   constructor(config: {
     logger: pino.BaseLogger;
@@ -1675,11 +1678,21 @@ export class Agent {
      * only meaningful differences in acceptance time are likely to be recorded.
      */
     const receivedTime = new Date();
-    setTimeout(() => {
-      const block = bitcoreBlockToChaingraphBlock(bitcoreBlock, height);
-      this.bufferParsedBlock(block, receivedTime);
-      callback(block);
-    });
+    /*
+     * One block at a time, in arrival order, each converted in slices so a
+     * large block does not hold the event loop (g1-fix-pass-2.md §1).
+     */
+    this.blockParses = this.blockParses
+      .then(async () =>
+        bitcoreBlockToChaingraphBlockInSlices(bitcoreBlock, height)
+      )
+      .then((block) => {
+        this.bufferParsedBlock(block, receivedTime);
+        callback(block);
+      })
+      .catch((error: unknown) => {
+        this.logger.fatal(error, 'Failed to parse a block.');
+      });
   }
 
   bufferParsedBlock(

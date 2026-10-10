@@ -61,4 +61,51 @@ export const bitcoreBlockToChaingraphBlock = (
   };
 };
 
+/** Transactions converted per turn of the event loop (`bitcoreBlockToChaingraphBlockInSlices`). */
+export const blockParseSliceTransactions = 5_000;
+
+/**
+ * As `bitcoreBlockToChaingraphBlock`, yielding to the event loop (setImmediate)
+ * every `sliceTransactions` transactions: a 32 MB block (~100k transactions)
+ * is ~0.8 s of conversion, which in one piece delays every timer, socket and
+ * commit of the agent (g1-fix-pass-2.md §1).
+ */
+export const bitcoreBlockToChaingraphBlockInSlices = async (
+  bitcoreBlock: BitcoreBlock,
+  height: number,
+  sliceTransactions = blockParseSliceTransactions
+): Promise<ChaingraphBlock> => {
+  const { transactions } = bitcoreBlock;
+  const converted: ChaingraphBlock['transactions'] = [];
+  const nextTurn = async () =>
+    new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+  // eslint-disable-next-line functional/no-loop-statement, functional/no-let
+  for (let start = 0; start < transactions.length; start += sliceTransactions) {
+    if (start > 0) {
+      // eslint-disable-next-line no-await-in-loop
+      await nextTurn();
+    }
+    transactions
+      .slice(start, start + sliceTransactions)
+      .forEach((transaction) => {
+        converted.push(bitcoreTransactionToChaingraphTransaction(transaction));
+      });
+  }
+  const header = bitcoreBlock.header.toObject();
+  return {
+    bits: header.bits,
+    hash: header.hash,
+    height,
+    merkleRoot: header.merkleRoot.toString('hex'),
+    nonce: header.nonce,
+    previousBlockHash: header.prevHash.toString('hex'),
+    sizeBytes: bitcoreBlock.toBuffer().length,
+    timestamp: header.time,
+    transactions: converted,
+    version: header.version,
+  };
+};
+
 export const messages = new bitcoreP2pCash.Messages();
