@@ -151,6 +151,12 @@ Both servers default `async_insert = 1`, `insert_deduplicate = 1`, `deduplicate_
 9. `commit_log.state` adds `incomplete` (§3.5). `state_rank` is MATERIALIZED from the enum
    (intent 1 < incomplete 2 < committed 3 < aborted 4), so `FINAL` yields the furthest state.
    `kind` adds `horizon_switch` (§3.8). Also `row_counts Map(LowCardinality(String), UInt64)` and `writer_epoch`.
+   `kind` also has `backfill` (= 9): the bulk data commit of an offline backfill (lab transform), with an all-zero
+   `block_hash` because it covers many blocks. Nothing keys on it: the store's `kind` reads are `horizon_switch` /
+   `utxo_build` (bulk-mode resume) and `kind = 'block'` only for aborted (`commit_void`) block commits.
+   Databases created before it: `apply.sh` re-runs the idempotent, metadata-only
+   `ALTER TABLE cg.commit_log MODIFY COLUMN kind Enum8(…, 'horizon_switch' = 8, 'backfill' = 9)` in
+   `040_bookkeeping.sql`; existing values keep their numbers.
 10. `writer_lease` is `ReplacingMergeTree(heartbeat_at)`, not KeeperMap (the local server has no Keeper).
 11. `pending_spend` is keyed by outpoint first (probed when a parent's outputs arrive), then node, then spender.
 12. `id_reservation` ranges are half-open `[range_start, range_end)`, with `writer_epoch`.

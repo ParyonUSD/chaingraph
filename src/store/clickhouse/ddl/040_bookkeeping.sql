@@ -4,7 +4,8 @@
 --   * commit_log.state adds 'incomplete' (§3.5: a commit with unresolved pending spends). Ranks:
 --     intent 1 < incomplete 2 < committed 3 < aborted 4; state_rank is MATERIALIZED from the enum, so
 --     FINAL always yields the furthest state. committed and aborted are both terminal and exclusive.
---   * commit_log.kind adds 'horizon_switch' (§3.8 "records the switch in commit_log").
+--   * commit_log.kind adds 'horizon_switch' (§3.8 "records the switch in commit_log") and 'backfill' (the bulk
+--     data commit written by an offline backfill, e.g. the lab transform; block_hash all-zero, no single block).
 --   * commit_log.row_counts is Map(table -> rows); writer_epoch ties each commit to a lease epoch.
 --   * writer_lease uses ReplacingMergeTree(heartbeat_at), not KeeperMap: the local docker server has no
 --     Keeper. It is advisory (no compare-and-set in ClickHouse); see README "at risk".
@@ -29,7 +30,7 @@ CREATE TABLE IF NOT EXISTS cg.commit_log
     state_rank    UInt8 MATERIALIZED toUInt8(state),
     node_scope    Array(UInt32),
     kind          Enum8('block' = 1, 'mempool_batch' = 2, 'reorg' = 3, 'header_accept' = 4, 'expiry' = 5,
-                        'utxo_build' = 6, 'fill_pending' = 7, 'horizon_switch' = 8),
+                        'utxo_build' = 6, 'fill_pending' = 7, 'horizon_switch' = 8, 'backfill' = 9),
     block_hash    FixedString(32),
     row_counts    Map(LowCardinality(String), UInt64),
     writer_epoch  UInt64,
@@ -42,6 +43,10 @@ ORDER BY commit_seq
 SETTINGS non_replicated_deduplication_window = 10000;
 
 ALTER TABLE cg.commit_log ADD COLUMN IF NOT EXISTS abort_reason String DEFAULT '';
+
+-- Databases created before 'backfill' existed: widen the enum (metadata-only; a no-op when already wide).
+ALTER TABLE cg.commit_log MODIFY COLUMN kind Enum8('block' = 1, 'mempool_batch' = 2, 'reorg' = 3, 'header_accept' = 4,
+    'expiry' = 5, 'utxo_build' = 6, 'fill_pending' = 7, 'horizon_switch' = 8, 'backfill' = 9);
 
 -- Aborted commits (WP4). Written before commit_log's 'aborted' row; the gate hides these seqs.
 CREATE TABLE IF NOT EXISTS cg.commit_void

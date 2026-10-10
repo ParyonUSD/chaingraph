@@ -1,10 +1,13 @@
 /* eslint-disable @typescript-eslint/no-magic-numbers, no-bitwise */
 // cspell:ignore dedup seqs
+import { readFileSync } from 'node:fs';
+
 import test from 'ava';
 
 import type { CommitLease, CommitLogClient } from './commit-log.js';
 import {
   CommitDependencyError,
+  commitKinds,
   CommitLog,
   CommitStateError,
   counterOfSeq,
@@ -54,6 +57,35 @@ test('seq layout: epoch in the high bits, counter >= 1', (t) => {
   t.throws(() => seqForEpoch(0n, 1n));
   t.throws(() => seqForEpoch(1n, 0n));
   t.throws(() => seqForEpoch(1n, 1n << 40n));
+});
+
+test('commitKinds: equals the commit_log.kind enum of the CREATE and the ALTER', (t) => {
+  const ddl = readFileSync(
+    new URL(
+      '../../../src/store/clickhouse/ddl/040_bookkeeping.sql',
+      import.meta.url
+    ),
+    'utf8'
+  );
+  const byText = (left: string, right: string) => left.localeCompare(right);
+  const enums = [...ddl.matchAll(/\bkind\s+Enum8\((?<values>[^)]*)\)/gu)].map(
+    (match) =>
+      [
+        ...(match.groups?.values ?? '').matchAll(
+          /'(?<name>\w+)'\s*=\s*(?<value>\d+)/gu
+        ),
+      ].map(
+        (entry) => `${entry.groups?.name ?? ''}=${entry.groups?.value ?? ''}`
+      )
+  );
+  t.is(enums.length, 2);
+  t.deepEqual(enums[1], enums[0]);
+  t.deepEqual(
+    (enums[0] ?? []).map((entry) => entry.split('=')[0] ?? '').sort(byText),
+    [...commitKinds].sort(byText)
+  );
+  t.true(enums[0]?.includes('backfill=9'));
+  t.true(enums[0]?.includes('block=1'));
 });
 
 test('dedupToken: seq:table:chunk', (t) => {

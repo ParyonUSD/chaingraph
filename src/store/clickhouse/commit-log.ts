@@ -43,15 +43,24 @@ export const dedupToken = (
   chunk: number | string = 0
 ) => `${seq}:${table}:${chunk}`;
 
-export type CommitKind =
-  | 'block'
-  | 'expiry'
-  | 'fill_pending'
-  | 'header_accept'
-  | 'horizon_switch'
-  | 'mempool_batch'
-  | 'reorg'
-  | 'utxo_build';
+/**
+ * Values of the `commit_log.kind` enum (ddl/040_bookkeeping.sql). `backfill`
+ * is the bulk data commit of an offline backfill (all-zero `block_hash`); the
+ * agent never writes it.
+ */
+export const commitKinds = [
+  'backfill',
+  'block',
+  'expiry',
+  'fill_pending',
+  'header_accept',
+  'horizon_switch',
+  'mempool_batch',
+  'reorg',
+  'utxo_build',
+] as const;
+
+export type CommitKind = (typeof commitKinds)[number];
 
 export type CommitState = 'aborted' | 'committed' | 'incomplete' | 'intent';
 
