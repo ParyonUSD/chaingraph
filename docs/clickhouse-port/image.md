@@ -67,8 +67,14 @@ Output: one line naming endpoint, database, user, DDL directory and files; then
 | `CHAINGRAPH_CLICKHOUSE_URL` | HTTP(S) endpoint, e.g. `http://clickhouse.<ns>.svc.cluster.local:8123` or Cloud `https://<host>:8443` (from a Secret if it embeds credentials) |
 | `CHAINGRAPH_CLICKHOUSE_DATABASE` | default `cg` |
 | `CHAINGRAPH_CLICKHOUSE_USER` / `_PASSWORD` | from a Secret; default `default` / empty. Credentials in the URL are used if these are empty |
+| `CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES` | in-flight cap; default `0` = unbounded. Lab: `16` (the Postgres pool size it is compared with) |
+| `CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS` | optional; default `60000`. Lab: `600000` (`wp5c-hardening.md` §4) |
+| `CHAINGRAPH_BLOCK_BUFFER_TARGET_SIZE_MB` | set explicitly (the automatic size is derived from the Postgres connection count). Lab: `512` |
+| `CHAINGRAPH_CLICKHOUSE_MAX_BLOCKS_PER_COMMIT` | optional; blocks per multi-block commit, default `64` (`wp6b-write-path.md`). Lab: `64` |
+| `CHAINGRAPH_CLICKHOUSE_MAX_BYTES_PER_COMMIT` | optional; block bytes per multi-block commit, default 32 MiB (a larger block commits alone). Lab: default (32 MiB) |
+| `CHAINGRAPH_CLICKHOUSE_LEASE_TTL_MS` | optional; writer lease TTL, integer ≥ 1000, default `120000` (`wp6b-gate-cost.md`). Lab: `120000` |
 | `CHAINGRAPH_CLICKHOUSE_DDL_DIR` | optional (DDL CLI only), override the DDL directory |
-| `CHAINGRAPH_POSTGRES_CONNECTION_STRING` | still required by `src/config.ts` in ClickHouse mode; the image's `defaults.env` already supplies a `localhost` value, but set an explicit dummy so a manifest does not silently depend on it, e.g. `postgres://unused:unused@127.0.0.1:1/unused` |
+| `CHAINGRAPH_POSTGRES_CONNECTION_STRING` | **not needed** with `CHAINGRAPH_STORE=clickhouse` (ignored if set; WP5c, `wp5c-hardening.md` §2); remove the dummy |
 | `CHAINGRAPH_TRUSTED_NODES` etc. | as for the Postgres agent |
 
 ## Verification (WP5c, 2026-10-09, image built from `f7b4481`, before the WP5a-mempool commits)

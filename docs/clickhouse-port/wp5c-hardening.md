@@ -9,10 +9,10 @@ precondition 0.3 (in-flight cap), §1.0 (dummy Postgres string), §1.3 (UTXO gro
 | §1 In-flight cap `CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES` | built, default 0 = unbounded (unchanged behaviour) | `node-state.ts` (`InFlightLimiter`, `SaveSlot`, `StoreOperation.whileWaiting`), `clickhouse-store.ts`, `block-commit.ts` |
 | §2 Postgres connection string optional in ClickHouse mode | built | `src/config.ts`, `src/store/index.ts`, `src/index.ts` (startup log line) |
 | §3 UTXO growth and compaction | design only (not built) | — (summary in `src/store/clickhouse/ddl/README.md`) |
-| §4 `forgetNodeValidation` caveat, stand-in spent outputs | assessed: neither bites the lab replay; one cap-specific variant fixed | `block-commit.ts` (timeout re-arm) |
+| §4 `forgetNodeValidation` caveat, stand-in spent outputs | assessed: neither bites the lab replay; the cap-specific variant is covered by registration at call time (re-arm removed 2026-10-10, `84a3a9c`) | `block-commit.ts`, `clickhouse-store.ts` |
 
 **Behaviour with the cap unset (0):** no limiter object exists, no operation gets a slot, every
-`whileWaiting` returns the wait unchanged, the pending-spend timeout fires once as before, and
+`whileWaiting` returns the wait unchanged, the pending-spend timeout fires once (as it now does with the cap too), and
 `poolStats()` returns exactly the WP5a values (live operations, `max` 0). Store behaviour, row output and
 timings of a run that does not set the variable are unchanged, so WP6 numbers taken on the earlier build stay
 valid. The only differences with the cap unset are config (Postgres string not required in ClickHouse mode)
@@ -77,11 +77,19 @@ Holding the slot through those waits instead parks N+1 in `waitForPending` with 
 forever: the run then ends only at `pendingSpendTimeoutMs`, with N+1's inputs stored as stand-ins (verified:
 the e2e test below reports `stuck` with the release removed).
 
-**The pending-spend timeout under the cap.** A parent registers its outputs only once it holds a slot, so a
-long queue could delay a parent past the child's `pendingSpendTimeoutMs` (60 s) and turn its spends into
-stand-ins (§4). The child's timeout is therefore re-armed while any call is queued for a slot; it fires only
-when the queue is empty, as in the unbounded store (where the queue is always empty, so behaviour is
-unchanged).
+**The pending-spend timeout under the cap.** Every save registers its outputs when it is called (WP6b
+multi-block commits), before any slot or batch-lane wait, and a save that waits for another save of the same
+block registers nothing new (that save registered them). A parent queued for a slot is therefore already
+visible to a parked child, and the child's `pendingSpendTimeoutMs` is armed once and never restarted, with or
+without the cap.
+
+> **Updated 2026-10-10 (`84a3a9c`).** As first built, a parent registered its outputs only once it held a
+> slot, so WP5c re-armed the child's timeout while any call was queued for a slot. That re-arm was removed:
+> the queue includes children that only gave their slot up for their own wait, so under a cap they completed
+> one at a time and the agent never finished initial sync with `CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES=16`
+> (the "cap-16 stall"); re-arming on saves that themselves wait behind the child is a deadlock. Registration
+> at call time makes the re-arm unnecessary. Regression tests: `[e2e] ClickHouseStore: initial sync of blocks
+> spending unknown outputs completes with in-flight cap …` (cap 2 and 16, per-block and batched).
 
 **Heartbeat (`poolStats`).** With the cap: `clients.active` = slots held, `clients.max` = the cap,
 `waitingRequests` = calls queued for a slot, `clients.total` = all live store operations (including parked
@@ -104,8 +112,9 @@ exceed the cap; working calls (the ones that issue ClickHouse inserts) cannot.
   Negative control: with `idle` made a no-op it reports `stuck`.
 - `[e2e] in-flight cap 1, a parked child outlives its pending timeout while its parent is queued for a slot:
   no stand-in`: child parked with a 300 ms timeout, an unrelated slow save (node 3) holds the only slot for
-  > 1 s, the parent queued: resolved spends and exact UTXO sets. Negative control: without the re-arm, b's
-  spends are stand-ins and the UTXO sets are wrong.
+  > 1 s, the parent queued: resolved spends and exact UTXO sets. (Negative control at the time: without the
+  re-arm, b's spends were stand-ins. Since `84a3a9c` the test passes without a re-arm because the parent
+  registered its outputs when called.)
 
 ## 2. Config: no Postgres connection string in ClickHouse mode
 
@@ -129,7 +138,9 @@ with the variable set loads, `CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES=-1` fail
 it only feeds the automatic block-buffer size (`CHAINGRAPH_BLOCK_BUFFER_TARGET_SIZE_MB` unset), so set the
 buffer explicitly (the lab does: 512).
 
-**Pod environment, for `image.md` "Pod environment (agent)"** (replace the Postgres row, add the cap row):
+**Pod environment.** Merged into `image.md` "Pod environment (agent)" on 2026-10-10 (with the WP6b
+`MAX_BLOCKS_PER_COMMIT` / `MAX_BYTES_PER_COMMIT` / `LEASE_TTL_MS` rows); that table is the current list. The
+rows as written for WP5c:
 
 | Var | Value |
 | --- | --- |
@@ -319,7 +330,8 @@ Two sources:
   its save, so this needs a parent block delayed by more than 60 s relative to a later block (e.g. a stalled
   transfer of 831,864, 31 MB, from a local BCHN). Unlikely, but silent if it happens: the `input` row keeps
   the stand-in and the parent's output stays unspent for the node, which parity would catch. The variant the
-  cap would have introduced (the parent queued for a slot past the timeout) is fixed (§1, re-arm). No cheap
+  cap would have introduced (the parent queued for a slot past the timeout) cannot occur: a save registers its
+outputs when called, before queueing (§1; the WP5c re-arm was removed 2026-10-10). No cheap
   general fix exists (resolving a block spender after its commit would need a later rewrite of `input`
   rows), so: **accepted, with two lab mitigations**: set `CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS=600000`
   (a child holds its nodes' watermark only while its parent is genuinely late, so a long bound costs nothing
@@ -349,4 +361,5 @@ Two sources:
 | e2e, Postgres (`CHAINGRAPH_E2E_POSTGRES_HOST=localhost CHAINGRAPH_E2E_POSTGRES_PORT=15432`) | 92 passed (8 s) |
 
 Negative controls (build output patched, not committed): slot held across waits → the cap-2 test reports
-`stuck`; timeout re-arm removed → the cap-1 test finds stand-in spends and wrong UTXO sets.
+`stuck`; timeout re-arm removed → the cap-1 test finds stand-in spends and wrong UTXO sets (on the WP5c
+build; since `84a3a9c` there is no re-arm and outputs register at call time, see §1).
