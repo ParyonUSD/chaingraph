@@ -58,7 +58,9 @@ export class BlockBuffer {
    * @param block - a reference to the block
    */
   removeBlock(block: ChaingraphBlock) {
-    this.bufferedBlocks.splice(this.bufferedBlocks.indexOf(block), 1);
+    const index = this.bufferedBlocks.indexOf(block);
+    if (index === -1) return;
+    this.bufferedBlocks.splice(index, 1);
     this.freedSpace();
   }
 

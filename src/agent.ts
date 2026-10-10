@@ -1695,6 +1695,12 @@ export class Agent {
       })
       .catch((err) => {
         this.logger.fatal(err);
+        /*
+         * The block was not saved; the next start downloads it again. Drop
+         * it from the buffer so the shutdown's drain can finish (it waits
+         * for an empty buffer, and this block would never leave it).
+         */
+        this.blockBuffer.removeBlock(block);
         // eslint-disable-next-line @typescript-eslint/no-floating-promises
         this.shutdown();
       });
@@ -1879,6 +1885,18 @@ export class Agent {
         error,
         `Parked block ${block.hash} (height ${block.height}) failed to commit.`
       );
+      /*
+       * As for a save that fails outright: the block is not saved, so stop
+       * (the next start downloads it again) rather than keep saving later
+       * blocks on top of it.
+       */
+      if (!this.willShutdown) {
+        this.logger.fatal(
+          `Parked block ${block.hash} (height ${block.height}) was not committed; shutting down.`
+        );
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        this.shutdown();
+      }
     });
   }
 
