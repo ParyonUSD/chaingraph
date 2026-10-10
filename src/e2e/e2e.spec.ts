@@ -109,7 +109,9 @@ const dbUpMigrationPaths = [
   ),
 ];
 
-const chaingraphInternalApiPort = '3201';
+// override when 3201 is taken (e.g. by the chipnet lab's agent)
+const chaingraphInternalApiPort =
+  process.env.CHAINGRAPH_E2E_INTERNAL_API_PORT ?? '3201';
 
 /**
  * TODO: test multiple network magic values
