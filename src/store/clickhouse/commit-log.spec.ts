@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-magic-numbers, no-bitwise */
-// cspell:ignore dedup seqs
+// cspell:ignore clickhouse dedup seqs
 import { readFileSync } from 'node:fs';
 
 import test from 'ava';
