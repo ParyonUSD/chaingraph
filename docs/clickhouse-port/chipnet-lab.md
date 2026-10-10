@@ -40,7 +40,7 @@ Both runs: `CHAINGRAPH_TRUSTED_NODES=chipnet-local:127.0.0.1:48333:chipnet`. The
 so parity compares like with like. Also `NODE_ENV=production` (JSON log lines on stdout → `agent.log`),
 `CHAINGRAPH_LOG_PATH=false`, `CHAINGRAPH_LOG_LEVEL_STDOUT=info`, `CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS=10000` and
 `NODE_OPTIONS=--max-old-space-size=8192`. The agent's cwd is `$CHIPNET_LAB_DIR/work-<store>`, which holds an empty
-`.env`, because `config.ts` requires one.
+`.env`, because `config.ts` at 67ffa00 requires one (since fix pass 3 the file is optional).
 
 | | Postgres run | ClickHouse run |
 |---|---|---|

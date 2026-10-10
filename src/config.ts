@@ -14,12 +14,20 @@ import dotenv from 'dotenv';
 import { bitcoreBlockToChaingraphBlock, messages } from './bitcore.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
 
-const dotEnvConfig = dotenv.config();
-if (dotEnvConfig.parsed === undefined) {
-  const error = dotEnvConfig.error ?? new Error('Unknown dotenv error.');
+/**
+ * The `.env` file of the working directory, if there is one. Without it the
+ * defaults (`defaults.env`) and the process environment apply. Any other
+ * failure to read or parse an existing file throws, as before.
+ */
+const loadDotEnv = (): { [key: string]: string } => {
+  const result = dotenv.config();
+  if (result.parsed !== undefined) return result.parsed;
+  const error = result.error ?? new Error('Unknown dotenv error.');
+  if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
   // eslint-disable-next-line functional/no-throw-statement
   throw error;
-}
+};
+const dotEnvParsed = loadDotEnv();
 const defaults = dotenv.parse(
   readFileSync(
     resolve(dirname(fileURLToPath(import.meta.url)), '../defaults.env')
@@ -28,7 +36,7 @@ const defaults = dotenv.parse(
 
 const configuration = {
   ...defaults,
-  ...dotEnvConfig.parsed,
+  ...dotEnvParsed,
   ...process.env,
 } as {
   [x: string]: string | undefined;
