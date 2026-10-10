@@ -2343,9 +2343,18 @@ test.serial(
     await waitForStdout(
       /Saved new block – height:\s+3163[^\n]+nodes: node1, node4/u
     );
+    /**
+     * The save log line can precede visibility (ClickHouse publishes the
+     * watermark asynchronously), so poll for the expected count; a wrong
+     * count still fails after the timeout with the last value read.
+     */
+    const expectedTransactionCount = tipA[tipStartIndex]!.transactions.length;
     t.deepEqual(
-      await getBlockTransactionCount(tipA[tipStartIndex]!.header.hash),
-      tipA[tipStartIndex]!.transactions.length
+      await waitForBlockTransactionCount(
+        tipA[tipStartIndex]!.header.hash,
+        expectedTransactionCount
+      ),
+      expectedTransactionCount
     );
   }
 );
