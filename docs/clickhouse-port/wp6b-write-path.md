@@ -74,3 +74,37 @@ recovery; the re-save of all 39 is exact).
 **Results.** Each call resolves with its own block's `attemptedSavedTransactions` / `transactionCacheMisses`
 (a tx inserted by an earlier block of the same batch counts as a cache miss for a later one, as Postgres would).
 If the batch parks, every call of it is answered as parked (see item 8 for the log).
+
+## 3. Re-org convergence (item 5)
+
+**Profile** (gate `reorg`, agent under the V8 sampling profiler, 0.5 ms; ClickHouse `query_log` per 100 ms).
+With items 1–4 in, converge was 4.3 s (WP6: 7.3 s; the 2 × 101 per-block commits had been 1,210 parts and 708 MB
+of merges, now 78 parts and 44 MB). In the 4.3 s window:
+- `removeStaleBlocksForNode` for both nodes: ~1.1 s of server time (the `INSERT … SELECT` inverses write
+  ~300k `utxo` and `utxo_by_script` rows and ~100k `tx_acceptance` rows per node), run concurrently for the two
+  nodes and overlapping the agent's own work. The ClickHouse server was idle most of the window.
+- The agent's single JS thread was the bottleneck: block parsing (`bitcoreBlockToChaingraphBlock`, agent code,
+  ~0.75 s for the 101 × 1,000-tx blocks), pinning/registering at append (~0.3 s), then the two batches (~1.7 s:
+  RowBinary encoding of `utxo`/`utxo_by_script` 0.3 s, inputs 0.16 s, outputs 0.1 s, the UTXO delta 0.17 s,
+  output-registry release 0.13 s, GC 0.4 s), with ~0.25 s idle between the two batches.
+
+**Changes.**
+- A batch of new blocks writes its node-agnostic rows (`output`, `input`, `transaction`, `block`,
+  `block_transaction`) right after `intent`, *before* it waits for the earlier operations of its nodes, and only
+  then decides and writes the per-node rows (`node_block`, `tx_acceptance`, mempool rows, `utxo`). Those rows decide
+  nothing from per-node state; spends are resolved in two rounds (the inputs the node-agnostic rows need first;
+  in tip mode the remaining inputs of transactions that become accepted after the wait). The commit is open the
+  whole time, so the node's watermark is held exactly as before. A batch re-saving a stored block waits first
+  (its node scope comes from stored state). Step order (fault-injection points) is unchanged.
+- Two running batches per node set in tip mode (`tipRunningBatches = 2`): the next batch resolves and encodes its
+  node-agnostic rows while the previous one waits on the server.
+
+Result: converge 3.9–4.1 s (limit 6 s; target ≤ 3 s not reached). The remainder is JS CPU on the agent's one
+thread (parsing in the agent plus RowBinary encoding), not store round trips or server time; getting under 3 s
+needs encoding off the main thread (a worker for `encodeUtxoRows` / input rows) or a cheaper row encoder
+(`row-binary.ts` `uint64` via `writeBigUInt64LE` and hex `fixedString32` are ~25 % of the store's CPU). Not done.
+Catch-up `--quick` with two running batches: 636 blocks/s, 0.59 parts per block (was 0.33 with one).
+
+Test: `[e2e] … a new block behind a running re-org writes its node-agnostic rows first, its node facts after`
+(the re-org held at `node_block`; the new block's `output` row exists while the node sees nothing of it; final
+state exact).

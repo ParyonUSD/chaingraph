@@ -1434,11 +1434,19 @@ e2e(
       'blocks 2..20 were one commit, which crashed'
     );
     await crashing.simulateCrash();
-    // before recovery the crashed batch is invisible to both nodes (watermark)
+    /*
+     * before recovery the crashed batch is invisible to both nodes
+     * (watermark); block 1 may or may not have been published before the crash
+     */
     for (const node of [node1, node2]) {
-      t.deepEqual(
-        (await nodeView(client, node)).blocks,
-        blocks.slice(0, 2).map((block) => block.hash)
+      const seen = (await nodeView(client, node)).blocks;
+      t.true(
+        [1, 2].some(
+          (count) =>
+            JSON.stringify(seen) ===
+            JSON.stringify(blocks.slice(0, count).map((block) => block.hash))
+        ),
+        `node ${node} sees ${seen.length} blocks`
       );
     }
 
@@ -1532,6 +1540,96 @@ e2e(
       blocks.map((block) => block.hash)
     );
     t.deepEqual(view.utxo, expectedUnspent(blocks));
+    t.deepEqual(await badUtxoSums(client), []);
+  }
+);
+
+e2e(
+  '[e2e] ClickHouseStore: a new block behind a running re-org writes its node-agnostic rows first, its node facts after (WP6b item 5)',
+  async (t) => {
+    t.timeout(120_000);
+    const { client, openStore } = await scratch(t, 'pipeline');
+    let releaseReorg: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      releaseReorg = resolve;
+    });
+    let reorgHeld: (() => void) | undefined;
+    const reorgReached = new Promise<void>((resolve) => {
+      reorgHeld = resolve;
+    });
+    const store = await openStore(async (step, context) => {
+      if (context.kind === 'reorg' && step === 'node_block') {
+        reorgHeld?.();
+        await held;
+      }
+    });
+    const { node1 } = await registerNodes(store);
+    const chain = threeBlockChain();
+    for (const block of [chain.block0, chain.block1, chain.block2]) {
+      await store.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: [acceptance(node1)],
+      });
+    }
+    const reorg = store.removeStaleBlocksForNode(node1, [chain.block2.hash]);
+    await reorgReached;
+    const competing = makeBlock(
+      2,
+      chain.block1.hash,
+      [
+        makeTx({
+          coinbase: true,
+          label: 'pipeline-c2',
+          outputs: [{ lockingBytecode: p2pkh('miner'), valueSatoshis: 1n }],
+        }),
+      ],
+      'pipeline-block-2'
+    );
+    const saved = store.saveBlock({
+      block: competing,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    const outputRows = async () =>
+      Number(
+        (
+          await client.query<{ n: string }>(
+            `SELECT toString(count()) AS n FROM output
+             WHERE transaction_hash = toFixedString(unhex({hash:String}), 32)`,
+            { hash: competing.transactions[0]!.hash }
+          )
+        )[0]!.n
+      );
+    let rows = 0;
+    for (let tries = 0; tries < 200 && rows === 0; tries += 1) {
+      rows = await outputRows();
+      if (rows === 0) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 10);
+        });
+      }
+    }
+    t.is(rows, 1, 'the output row is written while the re-org is held');
+    await store.publishWatermarks();
+    t.false(
+      (await nodeView(client, node1)).blocks.includes(competing.hash),
+      'and nothing of the block is visible to the node yet'
+    );
+    releaseReorg!();
+    await reorg;
+    await saved;
+    await store.publishWatermarks();
+    const view = await nodeView(client, node1);
+    t.deepEqual(view.blocks, [
+      chain.block0.hash,
+      chain.block1.hash,
+      competing.hash,
+    ]);
+    t.deepEqual(
+      view.utxo,
+      expectedUnspent([chain.block0, chain.block1, competing])
+    );
     t.deepEqual(await badUtxoSums(client), []);
   }
 );
