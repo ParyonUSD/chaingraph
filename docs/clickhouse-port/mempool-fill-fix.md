@@ -1,4 +1,4 @@
-<!-- cspell:ignore chipnet seqs BCHN dedup subquery -->
+<!-- cspell:ignore chipnet seqs BCHN dedup subquery SIGTERM -->
 
 # Mempool fill fix: stand-in input rows resolved exactly
 
@@ -173,7 +173,7 @@ For the lab: `scripts/chipnet-lab/ch1-chipnet-stand-in-check.mjs <agent dir> <ur
 
 ## 5. Tests
 
-New `stand-in.spec.ts`, `[e2e]`, 12 tests. The first four run with UTXO on and off. Each checks the child's
+New `stand-in.spec.ts`, `[e2e]`, 13 tests (the last one is §7's). The first four run with UTXO on and off. Each checks the child's
 `input_at` rows per input (value, bytecode, category, FT, capability, commitment) and the stand-in check. The
 fixture follows the chipnet case: child x spends u:0 (a token output: FT 50 + mutable NFT), u:1 and v:0, so it has two
 unknown parents.
@@ -187,6 +187,7 @@ unknown parents.
 | restart repair: registry forgotten, parents' block leaves 3 stand-ins (the old behavior), the next start repairs them in one commit | red | green |
 | race: parents' block while x's commit is paused with its groups `open` (x resolves them) / `live` (the block resolves them and commits after x) | n/a (new fault steps) | green |
 | crash at each of x's commit steps (13 points, including between P's and C's commits): stand-in check clean before and after recovery; x absent or with its stand-ins; then the parents resolve it | red | green |
+| §7: orphan chain released at once (child's save begins before its parent's) | red (no save settles) | green |
 
 The red run used a frozen export of dda146c with only the new spec and the checker method. The lines asserting the
 in-memory registry were removed, and the race tests were skipped because their fault steps do not exist there.
@@ -219,3 +220,37 @@ sent to a node keeps its 300 s timeout.
 its children's `input` rows or their UTXO −1 rows. This would need the stand-in groups of §2 for block commits, plus a
 per-node UTXO −1 when the parent arrives. After the agent fix, the trigger is a node that takes more than 60 s to
 deliver a requested block.
+
+## 7. Found on the way: a chain of orphans released together stalled every later commit
+
+The UTXO-on run on 59af34f started tracking the mempool at 21:49:37Z.
+
+**What happened.**
+- At 21:56:47Z it released a burst of orphans: two chains of chained spends, each transaction also spending one
+  unknown parent.
+- Three commits went through. Then seven `mempool_batch` commits (and their seven `fill_pending` P's) stayed at
+  `intent` with every row written, and `visible(0)` = `visible(1)` stayed at `…160`.
+- The agent was idle (0.1 % CPU). Every later block and mempool commit queued behind them (51 aborted on SIGTERM).
+
+**Root cause** (older than this pass; the stand-ins only made the burst visible):
+- Mempool commits waited for a `PredecessorBarrier`: every operation registered earlier on the same node had to
+  settle first.
+- Orphans released together start their saves in timer or wake-up order, not in chain order. So a child's operation
+  E could begin before its parent's operation L. E then read L's outputs from the output registry (L pins them as
+  soon as it starts), which made E depend on L's commit, while L's barrier waited for E: a wait cycle.
+- Block commits already avoid this with `awaitCommitOrder`, which skips an earlier operation that itself waits for
+  this one.
+
+**Fix** (`mempool-commit.ts`):
+- Mempool commits (save, validation, sweep, expiry) no longer take the barrier as a dependency. `writeCommit` calls
+  `awaitCommitOrder` after its data dependencies, as block commits do.
+- Order stays per node: commit after every earlier operation of the nodes, unless that operation waits for this
+  commit. A failed earlier operation still poisons the later ones.
+- In the cycle case L commits first. That is also the only order a reader may see, because the child spends the
+  parent.
+
+**Test.** `stand-in.spec`: "orphan chain released at once". g, x1 (spends g:1) and x2 (spends g:0 and x1:0) are
+saved for one node. x2 and x1 park. Saving g wakes x2 before x1, so x2's operation begins first and reads x1's
+outputs.
+- Before the fix: no save ever settles.
+- After: all three are in the mempool, the stand-in check is clean and the UTXO sums are 0 or 1.

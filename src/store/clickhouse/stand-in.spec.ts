@@ -37,6 +37,8 @@ import { pinnedView, readSnapshot, snapshotParams } from './visibility.js';
 
 const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
 
+const byHex = (a: string, b: string) => (a < b ? -1 : Number(a > b));
+
 const at = (seconds: number) =>
   new Date(Date.UTC(2026, 9, 10, 20, 0, 0) + seconds * 1_000);
 
@@ -654,5 +656,80 @@ e2e(
     }
     t.log(`${crashPoints} crash points`);
     t.true(crashPoints >= 4);
+  }
+);
+
+e2e(
+  "[e2e] orphan chain released at once (chipnet lab): a child whose save began before its parent's does not deadlock with it",
+  async (t) => {
+    const env = await scratch(
+      t,
+      'orphan_chain',
+      { orphanGraceMs: 30_000 },
+      'ch1_standin'
+    );
+    const store = await env.openStore();
+    const nodes = await registerNodes(store);
+    const chain = threeBlockChain();
+    for (const block of [chain.block0, chain.block1]) {
+      await store.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: [acceptance(nodes.node1, at(0))],
+      });
+    }
+    /* g is the grandparent; x1 spends g:1; x2 spends g:0 and x1:0 */
+    const g = makeTx({
+      label: 'chain-g',
+      outputs: [
+        { lockingBytecode: p2pkh('g0'), valueSatoshis: 1_000n },
+        { lockingBytecode: p2pkh('g1'), valueSatoshis: 2_000n },
+      ],
+      spends: [[chain.a.hash, 1]],
+    });
+    const x1 = makeTx({
+      label: 'chain-x1',
+      outputs: [{ lockingBytecode: p2pkh('x1'), valueSatoshis: 1_900n }],
+      spends: [[g.hash, 1]],
+    });
+    const x2 = makeTx({
+      label: 'chain-x2',
+      outputs: [{ lockingBytecode: p2pkh('x2'), valueSatoshis: 2_800n }],
+      spends: [
+        [g.hash, 0],
+        [x1.hash, 0],
+      ],
+    });
+    const validation = [{ nodeInternalId: nodes.node1, validatedAt: at(30) }];
+    /* both park; saving g registers g:0 (wakes x2) before g:1 (wakes x1) */
+    const parked = Promise.all([
+      store.saveMempoolTransaction(x2, validation),
+      store.saveMempoolTransaction(x1, validation),
+    ]);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 200);
+    });
+    const all = Promise.all([
+      parked,
+      store.saveMempoolTransaction(g, validation),
+    ]).then(() => 'saved' as const);
+    const outcome = await Promise.race([
+      all,
+      new Promise<'stuck'>((resolve) => {
+        setTimeout(() => {
+          resolve('stuck');
+        }, 15_000);
+      }),
+    ]);
+    t.is(outcome, 'saved', 'every save settles (no wait cycle)');
+    if (outcome !== 'saved') return;
+    await store.publishWatermarks();
+    const checker = new ClickHouseChecker(env.client, env.client.database, {});
+    t.deepEqual(
+      (await checker.mempool('node-one')).map((row) => row.hash).sort(byHex),
+      [g.hash, x1.hash, x2.hash].sort(byHex)
+    );
+    await assertClean(t, checker, 'chain');
+    t.deepEqual(await badUtxoSums(env.client), []);
   }
 );

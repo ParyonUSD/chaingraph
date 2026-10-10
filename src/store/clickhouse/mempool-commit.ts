@@ -66,6 +66,7 @@ import type {
 } from './node-state.js';
 import {
   acceptanceColumns,
+  awaitCommitOrder,
   awaitDependencies,
   deferred,
   encodePendingSpendRows,
@@ -609,7 +610,7 @@ export class MempoolCommitter {
       let commit: OpenCommit | undefined;
       try {
         await waitForPredecessorRows(operation);
-        const dependencies = new Set<StoreOperation>(operation.predecessors);
+        const dependencies = new Set<StoreOperation>();
         await this.ensureFresh(operation, [node]);
         const mempool = this.mempool.node(node);
         if (mempool.txs.size === 0) {
@@ -733,7 +734,7 @@ export class MempoolCommitter {
     let commit: OpenCommit | undefined;
     try {
       await waitForPredecessorRows(operation);
-      const dependencies = new Set<StoreOperation>(operation.predecessors);
+      const dependencies = new Set<StoreOperation>();
       await this.ensureFresh(operation, [nodeInternalId]);
       const mempool = this.mempool.node(nodeInternalId);
       const hash = [...mempool.txs.entries()].find(
@@ -1656,9 +1657,6 @@ export class MempoolCommitter {
     orphanParents: readonly TxKey[] = []
   ): Promise<OpenCommit | undefined> {
     await waitForPredecessorRows(operation);
-    operation.predecessors.forEach((predecessor) => {
-      dependencies.add(predecessor);
-    });
     const nodes = [...byNode.keys()].sort((a, b) => a - b);
     await this.ensureFresh(operation, nodes);
     const pendingNodes = nodes.filter(
@@ -1912,6 +1910,16 @@ export class MempoolCommitter {
     await context.fault('rows-written', { kind, seq: commit.seq });
     await (context.abandon?.race(awaitDependencies(dependencies, operation)) ??
       awaitDependencies(dependencies, operation));
+    /*
+     * Commit order per node, as for block commits (`awaitCommitOrder`): after
+     * every earlier operation of the nodes has settled, except one that
+     * itself waits for this commit. That happens when orphans are released
+     * together: a child's save can begin before its parent's and still read
+     * the parent's outputs from the registry. A plain barrier on every
+     * earlier operation (as before) was a wait cycle that stalled every
+     * later commit of the nodes (chipnet lab, mempool-fill-fix.md §7).
+     */
+    await awaitCommitOrder(operation, context.abandon);
     /*
      * Stand-in groups: a save of the parent that found one `open` left it
      * to this commit (resolved under this seq, chunk `sc`); the others
