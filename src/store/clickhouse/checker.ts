@@ -5,8 +5,9 @@
  *
  * Every read method takes ONE `readSnapshot` and then reads only the pinned
  * gated views of `ddl/050_views.sql` with that snapshot's parameters:
- * node-scoped facts through `<view>_at(node, visible)`, node-agnostic facts
- * through `<view>_at(visible0, tail)`. All views of one call therefore see
+ * node-scoped facts through `<view>_at(node, visible, fence, void)`,
+ * node-agnostic facts through `<view>_at(visible0, tail, fence, void)`
+ * (`pinnedView`). All views of one call therefore see
  * the same set of commits, so no assertion can observe a torn save; rows of
  * uncommitted, aborted (void) or fenced commits are never seen.
  *
@@ -49,13 +50,13 @@ import type {
 
 import type { ClickHouseClient, QueryParams } from './client.js';
 import { quoteIdentifier } from './client.js';
-import type { VisibilitySnapshot } from './visibility.js';
 import {
-  agnosticViewParams,
   gateSql,
   nodeAgnosticId,
   nodeViewParams,
+  pinnedView,
   readSnapshot,
+  snapshotParams,
 } from './visibility.js';
 
 const hashBytes = 32;
@@ -70,12 +71,6 @@ const hexOf = (column: string) => `lower(hex(${column}))`;
 const msOf = (column: string) => `toUnixTimestamp64Milli(${column})`;
 const dateOf = (ms: string | null) =>
   ms === null ? null : new Date(Number(ms));
-
-/** Parameters every pinned view of one snapshot needs. */
-const snapshotParams = (snapshot: VisibilitySnapshot): QueryParams => ({
-  ...agnosticViewParams(snapshot),
-  ...nodeViewParams(snapshot),
-});
 
 /** One transaction as stored, ready for `encodeTransaction`. */
 interface StoredTransaction {
@@ -735,11 +730,7 @@ export class ClickHouseChecker implements StoreChecker {
         transaction_internal_id: string;
         version: string;
       }>(
-        `WITH ${gateSql.fenceWith.replace(
-          /FROM epoch_fence/u,
-          `FROM ${this.db}.epoch_fence`
-        )}
-         SELECT commit_seq, height, time_ms, transaction_internal_id, version
+        `SELECT commit_seq, height, time_ms, transaction_internal_id, version
          FROM (
            SELECT commit_seq, sign, version, transaction_internal_id,
                   ${isAcceptance ? 'height' : '0'} AS height,
@@ -749,12 +740,12 @@ export class ClickHouseChecker implements StoreChecker {
            WHERE node_internal_id = {node:UInt32}
              AND transaction_hash = ${hashParam('hash')}
              ${isAcceptance ? 'AND block_internal_id = 0' : ''}
-             AND ${this.qualifiedGate(gateSql.visibleAt())}
+             AND ${gateSql.visibleAt('commit_seq', `${this.db}.commit_void`)}
          )
          WHERE live > 0 AND sign = 1
          ORDER BY version DESC
          LIMIT 1`,
-        { hash, node: nodeId, visible: snapshot.visible }
+        { ...nodeViewParams(snapshot), hash }
       );
       return row;
     };
@@ -833,18 +824,9 @@ export class ClickHouseChecker implements StoreChecker {
 
   /* -------------------------------------------------------------- helpers */
 
-  /** `db.view(node = …, visible = …)` or `db.view(visible0 = …, tail = …)`. */
+  /** `db.view(node, visible, fence, void)` or `db.view(visible0, tail, fence, void)`. */
   private view(name: string) {
-    const nodeScoped =
-      !/^(?:block|block_transaction|input|output|transaction)_at$/u.test(name);
-    return nodeScoped
-      ? `${this.db}.${name}(node = {node:UInt32}, visible = {visible:UInt64})`
-      : `${this.db}.${name}(visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)})`;
-  }
-
-  /** `gateSql` reads `commit_void`; qualify it with the database. */
-  private qualifiedGate(sql: string) {
-    return sql.replace(/FROM commit_void/gu, `FROM ${this.db}.commit_void`);
+    return pinnedView(name, this.db);
   }
 
   private async agnosticSnapshot(): Promise<QueryParams> {

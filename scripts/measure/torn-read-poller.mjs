@@ -75,8 +75,11 @@ const nodeGate = `node_internal_id = {node:UInt32}
   AND (bitShiftRight(commit_seq, 40) > length(fence_max_seq)
        OR commit_seq <= arrayElement(fence_max_seq, bitShiftRight(commit_seq, 40)))`;
 
-const agnostic = (name) => `${name}_at(visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)})`;
-const pinned = (name) => `${name}_at(node = {node:UInt32}, visible = {visible:UInt64})`;
+// WP6b builds export pinnedView (views take fence/void too); older builds take the WP4 arguments.
+const agnostic = (name) =>
+  visibility.pinnedView?.(`${name}_at`) ?? `${name}_at(visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)})`;
+const pinned = (name) =>
+  visibility.pinnedView?.(`${name}_at`) ?? `${name}_at(node = {node:UInt32}, visible = {visible:UInt64})`;
 
 const queries = {
   blockInvariant: `SELECT

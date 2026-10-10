@@ -39,7 +39,9 @@ const client = new ClickHouseClient({ database: options.database, password: '', 
 const pageSize = Number(options.page);
 const snapshot = await visibility.readSnapshot(client, visibility.nodeAgnosticId);
 const params = visibility.agnosticViewParams(snapshot);
-const view = (name) => `${name}_at(visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)})`;
+// WP6b builds export pinnedView (views take fence/void too); older builds take the WP4 arguments.
+const view = (name) =>
+  visibility.pinnedView?.(`${name}_at`) ?? `${name}_at(visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)})`;
 
 const mask64 = (1n << 64n) - 1n;
 const scan = async ({ name, keyColumns, pageQuery, fullQuery }) => {

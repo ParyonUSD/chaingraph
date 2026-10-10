@@ -23,7 +23,7 @@ import type { ClickHouseStoreOptions } from './clickhouse-store.js';
 import { ClickHouseStore, linkedBlockSize } from './clickhouse-store.js';
 import { ClickHouseClient } from './client.js';
 import { e2eClickHouseUrl } from './test-support.js';
-import { readSnapshot } from './visibility.js';
+import { pinnedView, readSnapshot, snapshotParams } from './visibility.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -268,43 +268,38 @@ export const notSaved = () => false;
 /** What a reader of node n sees, through the pinned `*_at` views of one snapshot. */
 export const nodeView = async (client: ClickHouseClient, node: number) => {
   const snapshot = await readSnapshot(client, node);
-  const params = {
-    node,
-    tail: snapshot.committedTail,
-    visible: snapshot.visible,
-    visible0: snapshot.visible0,
-  };
+  const params = snapshotParams(snapshot);
   const [blocks, txs, utxo, utxoByScript, history, inputs] = await Promise.all([
     client.query<{ hash: string; height: number; accepted: string | null }>(
       `SELECT lower(hex(block_hash)) AS hash, height, toString(accepted_at) AS accepted
-       FROM node_block_at(node = {node:UInt32}, visible = {visible:UInt64}) ORDER BY height`,
+       FROM ${pinnedView('node_block_at')} ORDER BY height`,
       params
     ),
     client.query<{ hash: string; block: string }>(
       `SELECT lower(hex(transaction_hash)) AS hash, toString(block_internal_id) AS block
-       FROM tx_acceptance_at(node = {node:UInt32}, visible = {visible:UInt64}) ORDER BY hash`,
+       FROM ${pinnedView('tx_acceptance_at')} ORDER BY hash`,
       params
     ),
     client.query<{ key: string; amount: string | null; category: string }>(
       `SELECT concat(lower(hex(transaction_hash)), ':', toString(output_index)) AS key,
          fungible_token_amount AS amount, lower(hex(token_category)) AS category
-       FROM utxo_at(node = {node:UInt32}, visible = {visible:UInt64}) ORDER BY key`,
+       FROM ${pinnedView('utxo_at')} ORDER BY key`,
       params
     ),
     client.query<{ key: string }>(
       `SELECT concat(lower(hex(transaction_hash)), ':', toString(output_index)) AS key
-       FROM utxo_by_script_at(node = {node:UInt32}, visible = {visible:UInt64}) ORDER BY key`,
+       FROM ${pinnedView('utxo_by_script_at')} ORDER BY key`,
       params
     ),
     client.query<{ block: string; removed: string }>(
       `SELECT toString(block_internal_id) AS block, toString(removed_at) AS removed
-       FROM node_block_history_at(node = {node:UInt32}, visible = {visible:UInt64})`,
+       FROM ${pinnedView('node_block_history_at')}`,
       params
     ),
     client.query<{ key: string; amount: string | null; value: string }>(
       `SELECT concat(lower(hex(transaction_hash)), ':', toString(input_index)) AS key,
          fungible_token_amount AS amount, toString(value_satoshis) AS value
-       FROM input_at(visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)}) ORDER BY key`,
+       FROM ${pinnedView('input_at')} ORDER BY key`,
       params
     ),
   ]);

@@ -1,5 +1,5 @@
-/* eslint-disable camelcase, @typescript-eslint/naming-convention, functional/no-mixed-type, functional/no-try-statement, @typescript-eslint/parameter-properties */
-// cspell:ignore clickhouse seqs
+/* eslint-disable camelcase, @typescript-eslint/naming-convention, functional/no-mixed-type, functional/no-try-statement, @typescript-eslint/parameter-properties, max-classes-per-file, complexity */
+// cspell:ignore clickhouse seqs subquery subqueries
 /**
  * Per-node visibility watermarks (plan §3.2, WP4).
  *
@@ -87,10 +87,36 @@ export const readWatermark = async (
   return BigInt(rows[0]?.visible ?? '0');
 };
 
+/** Low 40 bits of a `commit_seq`: the counter within its epoch. */
+export const counterMaskSeq = 1_099_511_627_775n;
+
+/**
+ * At most this many aborted seqs are passed inline as the `void` parameter
+ * (about 17 bytes each; ClickHouse rejects a single HTTP parameter over
+ * `http_max_field_value_size`, 128 KiB by default). Above it the snapshot
+ * passes `[voidOverflowSentinel]` and the pinned views fall back to the
+ * `commit_void` subquery. Compaction/recovery may later truncate void rows to
+ * keep the set small (see docs/clickhouse-port/wp6b-gate-cost.md).
+ */
+export const voidInlineLimit = 4096;
+
+/** `void = [voidOverflowSentinel]`: the views read `commit_void` themselves. Never a real seq (epoch 2^24 - 1). */
+export const voidOverflowSentinel = 18_446_744_073_709_551_615n;
+
+/**
+ * Budget for the encoded `fence` parameter (one counter per epoch). An epoch
+ * that never committed costs 2 bytes ("0,"), so this is tens of thousands of
+ * lease epochs; beyond it `readSnapshot` throws `GateParameterOverflowError`.
+ */
+export const fenceParamMaxBytes = 120_000;
+
+export class GateParameterOverflowError extends Error {}
+
 /**
  * One reader's pinned view of the store. Pass `nodeViewParams` to every
  * node-scoped `*_at` view and `agnosticViewParams` to every node-agnostic
  * `*_at` view of one request: all of them then see the same commits.
+ * Everything the gate needs is in here, so the views run no subqueries.
  */
 export interface VisibilitySnapshot {
   nodeId: number;
@@ -100,63 +126,194 @@ export interface VisibilitySnapshot {
   visible0: bigint;
   /** Committed seqs above visible0 at snapshot time. */
   committedTail: bigint[];
+  /**
+   * Per epoch e (index e - 1, dense from epoch 1 to the snapshot's highest
+   * epoch): the highest valid counter of e, or `counterMaskSeq` if e is not
+   * fenced.
+   */
+  fence: bigint[];
+  /** Aborted seqs up to the snapshot's highest seq, or `[voidOverflowSentinel]`. */
+  void: bigint[];
+  /** True when `void` is the overflow sentinel. */
+  voidOverflow: boolean;
 }
 
 /**
- * Read a snapshot. Order matters: visible(n) first, then visible(0) with the
- * committed tail in one statement. Any commit up to visible(n) (and every
- * commit it depends on) was committed before visible(n) was read, so it is at
- * most the later visible(0) or in the later tail: node-agnostic rows of a visible
- * node-n fact are always visible in the same snapshot.
+ * The snapshot query. One statement; the scalar subqueries run in data
+ * dependency order (each references the previous result, so ClickHouse must
+ * evaluate it first):
+ * 1. visible(n) and visible(0), from one read of `visibility`;
+ * 2. the committed tail above visible(0);
+ * 3. `bound` = the highest seq any view of this snapshot can show; the void
+ *    set up to `bound` (read after 1-2, so every aborted seq at or below a
+ *    watermark is in it: abort writes `commit_void` before the commit
+ *    becomes terminal, and watermarks only pass terminal commits);
+ * 4. the fences of epochs up to `bound`'s epoch (read after 1-2: a new
+ *    holder writes its fences before its first commit).
+ * Any commit up to visible(n) (and every commit it depends on) was committed
+ * before visible(n) was read, so it is at most visible(0) or in the tail:
+ * node-agnostic rows of a visible node-n fact are always visible in the same
+ * snapshot.
+ */
+export const snapshotSql = (tables: {
+  visibility: string;
+  commitLog: string;
+  commitVoid: string;
+  epochFence: string;
+}) => `WITH
+  (SELECT (maxIf(visible_seq, node_internal_id = {node:UInt32}), maxIf(visible_seq, node_internal_id = 0))
+   FROM ${
+     tables.visibility
+   } WHERE node_internal_id IN (0, {node:UInt32})) AS marks,
+  (SELECT arraySort(groupArray(commit_seq)) FROM ${tables.commitLog}
+   WHERE state = 'committed' AND commit_seq > marks.2) AS tail_seqs,
+  greatest(marks.1, marks.2, arrayMax(arrayPushBack(tail_seqs, toUInt64(0)))) AS bound,
+  (SELECT groupArray(commit_seq) FROM
+     (SELECT DISTINCT commit_seq FROM ${
+       tables.commitVoid
+     } WHERE commit_seq <= bound
+      ORDER BY commit_seq LIMIT {voidLimit:UInt32})) AS void_seqs,
+  (SELECT (groupArray(epoch), groupArray(max_valid_seq)) FROM
+     (SELECT epoch, min(max_valid_seq) AS max_valid_seq FROM ${
+       tables.epochFence
+     }
+      WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences
+SELECT
+  toString(marks.1) AS visible,
+  toString(marks.2) AS visible0,
+  arrayMap(x -> toString(x), tail_seqs) AS tail,
+  arrayMap(x -> toString(x), void_seqs) AS void,
+  arrayMap(e -> toString(if(indexOf(fences.1, e) = 0, ${counterMaskSeq.toString()},
+                            bitAnd(fences.2[indexOf(fences.1, e)], ${counterMaskSeq.toString()}))),
+           range(1, toUInt64(bitShiftRight(bound, 40)) + 1)) AS fence`;
+
+const snapshotQuery = snapshotSql({
+  commitLog: 'commit_log',
+  commitVoid: 'commit_void',
+  epochFence: 'epoch_fence',
+  visibility: 'visibility',
+});
+
+/** Bytes of an array parameter as the HTTP interface encodes it: `[a,b,…]`. */
+const encodedLength = (values: readonly bigint[]) =>
+  values.reduce((total, value) => total + value.toString().length + 1, 1);
+
+/**
+ * Read a snapshot in one query (see `snapshotSql` for the order argument).
+ * Throws `GateParameterOverflowError` if the fence would not fit in one HTTP
+ * parameter.
  */
 export const readSnapshot = async (
   client: Pick<ClickHouseClient, 'query'>,
   nodeId: number
 ): Promise<VisibilitySnapshot> => {
-  const visible = await readWatermark(client, nodeId);
-  const rows = await client.query<{ visible0: string; tail: string[] }>(
-    `WITH (SELECT max(visible_seq) FROM visibility WHERE node_internal_id = 0) AS v0
-     SELECT v0 AS visible0, arraySort(groupArray(commit_seq)) AS tail
-     FROM commit_log
-     WHERE state = 'committed' AND commit_seq > v0`
-  );
+  const rows = await client.query<{
+    visible: string;
+    visible0: string;
+    tail: string[];
+    void: string[];
+    fence: string[];
+  }>(snapshotQuery, { node: nodeId, voidLimit: voidInlineLimit + 1 });
   const [row] = rows;
+  const voidSeqs = (row?.void ?? []).map(BigInt);
+  const voidOverflow = voidSeqs.length > voidInlineLimit;
+  const fence = (row?.fence ?? []).map(BigInt);
+  if (encodedLength(fence) > fenceParamMaxBytes) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new GateParameterOverflowError(
+      `The epoch fence has ${fence.length} epochs (${encodedLength(
+        fence
+      )} bytes as a parameter, limit ${fenceParamMaxBytes}); see docs/clickhouse-port/wp6b-gate-cost.md.`
+    );
+  }
   return {
     committedTail: (row?.tail ?? []).map(BigInt),
+    fence,
     nodeId,
-    visible,
+    visible: BigInt(row?.visible ?? '0'),
     visible0: BigInt(row?.visible0 ?? '0'),
+    void: voidOverflow ? [voidOverflowSentinel] : voidSeqs,
+    voidOverflow,
   };
 };
 
-/** Parameters for node-scoped pinned views: `utxo_at(node = …, visible = …)`. */
+/** `node = …, visible = …, fence = …, void = …` for a node-scoped `*_at` view. */
+export const nodeViewArgs =
+  'node = {node:UInt32}, visible = {visible:UInt64}, fence = {fence:Array(UInt64)}, void = {void:Array(UInt64)}';
+
+/** `visible0 = …, tail = …, fence = …, void = …` for a node-agnostic `*_at` view. */
+export const agnosticViewArgs =
+  'visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)}, fence = {fence:Array(UInt64)}, void = {void:Array(UInt64)}';
+
+/** The node-agnostic pinned views; every other `*_at` view is node-scoped. */
+export const agnosticPinnedViews: readonly string[] = [
+  'block_at',
+  'block_transaction_at',
+  'input_at',
+  'output_at',
+  'transaction_at',
+];
+
+/**
+ * A pinned view call with its query-parameter placeholders, e.g.
+ * `pinnedView('utxo_at')` = `utxo_at(node = {node:UInt32}, …)`. Bind
+ * `snapshotParams(snapshot)` (or the node/agnostic subset).
+ */
+export const pinnedView = (name: string, qualifier = '') =>
+  `${qualifier === '' ? '' : `${qualifier}.`}${name}(${
+    agnosticPinnedViews.includes(name) ? agnosticViewArgs : nodeViewArgs
+  })`;
+
+/** Parameters for node-scoped pinned views: `utxo_at(${nodeViewArgs})`. */
 export const nodeViewParams = (snapshot: VisibilitySnapshot) => ({
+  fence: snapshot.fence,
   node: snapshot.nodeId,
   visible: snapshot.visible,
+  void: snapshot.void,
 });
 
-/** Parameters for node-agnostic pinned views: `output_at(visible0 = …, tail = …)`. */
+/** Parameters for node-agnostic pinned views: `output_at(${agnosticViewArgs})`. */
 export const agnosticViewParams = (snapshot: VisibilitySnapshot) => ({
+  fence: snapshot.fence,
   tail: snapshot.committedTail,
   visible0: snapshot.visible0,
+  void: snapshot.void,
+});
+
+/** Every parameter of one snapshot (for requests that use both view kinds). */
+export const snapshotParams = (snapshot: VisibilitySnapshot) => ({
+  ...agnosticViewParams(snapshot),
+  ...nodeViewParams(snapshot),
 });
 
 /**
- * SQL fragments of the gate for ad-hoc readers (the checker, verifiers) that
- * read base tables. They mirror ddl/050_views.sql. Bind `{visible:UInt64}`.
+ * SQL fragments of the gate for ad-hoc readers that read base tables. They
+ * mirror ddl/050_views.sql.
+ * - `fenceWith` / `validCommit`: the subquery form of the `*_v` views
+ *   (reads `epoch_fence` and `commit_void`).
+ * - `pinnedValid` / `visibleAt`: the parameter form of the `*_at` views; bind
+ *   `nodeViewParams(snapshot)` (`visible`, `fence`, `void`).
  */
 export const gateSql = {
   /** Prepend as a `WITH` item: `WITH ${gateSql.fenceWith} SELECT …`. */
   fenceWith: `(SELECT arrayMap(t -> t.2, arraySort(groupArray((epoch, max_valid_seq))))
      FROM (SELECT epoch, min(max_valid_seq) AS max_valid_seq FROM epoch_fence GROUP BY epoch)) AS fence_max_seq`,
+  /** Rows of a valid commit per the snapshot's `fence` and `void` parameters. */
+  pinnedValid: (column = 'commit_seq', commitVoid = 'commit_void') =>
+    `bitAnd(${column}, ${counterMaskSeq.toString()}) <= arrayElement({fence:Array(UInt64)}, bitShiftRight(${column}, 40))
+  AND NOT has({void:Array(UInt64)}, ${column})
+  AND (NOT has({void:Array(UInt64)}, ${voidOverflowSentinel.toString()}) OR ${column} NOT IN (SELECT commit_seq FROM ${commitVoid}))`,
   /** Rows of a valid commit (not void, not fenced); needs `fenceWith`. */
   validCommit: (column = 'commit_seq') =>
     `${column} NOT IN (SELECT commit_seq FROM commit_void)
   AND (bitShiftRight(${column}, 40) > length(fence_max_seq)
        OR ${column} <= arrayElement(fence_max_seq, bitShiftRight(${column}, 40)))`,
-  /** Rows visible at a pinned node watermark; needs `fenceWith`. */
-  visibleAt: (column = 'commit_seq') =>
-    `${column} <= {visible:UInt64} AND ${gateSql.validCommit(column)}`,
+  /** Rows visible in a snapshot at node watermark `visible`. */
+  visibleAt: (column = 'commit_seq', commitVoid = 'commit_void') =>
+    `${column} <= {visible:UInt64} AND ${gateSql.pinnedValid(
+      column,
+      commitVoid
+    )}`,
 };
 
 export interface PublisherOptions {

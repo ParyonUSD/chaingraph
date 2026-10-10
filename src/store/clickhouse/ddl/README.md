@@ -17,7 +17,7 @@ Files run in order; every statement is `IF NOT EXISTS`, so re-running is safe.
 | `020_acceptance.sql` | node_block, node_transaction, tx_acceptance, node_block_history, node_transaction_history |
 | `030_utxo.sql` | utxo, utxo_by_script |
 | `040_bookkeeping.sql` | commit_log, commit_void, epoch_fence, visibility, id_reservation, writer_lease, pending_spend |
-| `050_views.sql` | visibility gate views: `*_v` (live watermark) and `*_at` (pinned watermark, WP4); `CREATE OR REPLACE` |
+| `050_views.sql` | visibility gate views: `*_v` (live, subqueries; ad-hoc use) and `*_at` (pinned, pure parameters; the API path, WP4/WP6b); `CREATE OR REPLACE` |
 | `060_projections.sql` | the §2.1/§2.4 projections as `ALTER TABLE … ADD PROJECTION IF NOT EXISTS` |
 
 Server-fact checks are in `../checks/` (`run.sh <url> <file>`); results below.
@@ -73,8 +73,8 @@ Projections (060): `block.p_height (height)`, `transaction.p_id (internal_id)`,
 | `node_block_history_v` | `node` | same | none | 5, 6, 7 |
 | `node_transaction_history_v` | `node` | same | none | 5, 6, 7 |
 | `block_v`, `transaction_v`, `block_transaction_v`, `output_v`, `input_v` | none | (`seq <= visible(0)` or in the committed tail above `visible(0)`), not void, not fenced | none | 7 (node-agnostic; no acceptance fields) |
-| every node-scoped `*_at` (WP4) | `node`, `visible` | as `*_v`, with `least(visible, live visible(n))` | as `*_v` | pins one watermark across views (no torn reads) |
-| `block_at`, `transaction_at`, `block_transaction_at`, `output_at`, `input_at` (WP4) | `visible0`, `tail` | (`seq <= least(visible0, live visible(0))` or `seq` in `tail` and committed), not void, not fenced | none | pinned node-agnostic snapshot |
+| every node-scoped `*_at` (WP4, WP6b) | `node`, `visible`, `fence`, `void` | `seq <= visible`, `seq & 0xFFFFFFFFFF <= fence[seq >> 40]`, `seq` not in `void` (all parameters; no subqueries) | as `*_v` | pins one snapshot across views (no torn reads) |
+| `block_at`, `transaction_at`, `block_transaction_at`, `output_at`, `input_at` (WP4, WP6b) | `visible0`, `tail`, `fence`, `void` | (`seq <= visible0` or `seq` in `tail`), fence and void as above | none | pinned node-agnostic snapshot |
 | `node_v` | none | `FINAL` | Replacing | 7 (name → id) |
 
 Querying a node-scoped view without `node` is an error, so no acceptance answer can be had without naming
@@ -86,6 +86,13 @@ folded to a constant (`commit_seq <= 5`); `output_v` filtered on `locking_byteco
 WP4 re-verified this for the `*_at` views (`visibility.spec.ts`, `[e2e] pinned views keep primary-key and
 projection use`): `utxo_at` reads 1/13 granules on `(node_internal_id, token_category)`, `output_at` reads
 projection `p_script`; the fence array and watermark fold to constants in `PREWHERE`.
+
+WP6b made the `*_at` views pure filters: `readSnapshot` reads the watermarks, the committed tail, the void set
+and the fence in one query, and every `*_at` view takes them as parameters (contract in the `050_views.sql`
+header and `docs/clickhouse-port/wp6b-gate-cost.md`). `EXPLAIN indexes = 1` is unchanged: the same primary-key
+conditions, parts and granules; `p_script` is still read for `output_at`. When the void set exceeds
+`voidInlineLimit` the snapshot passes the overflow sentinel and the views fall back to the `commit_void`
+subquery; otherwise that branch is constant-folded away and `commit_void` is not read.
 
 Note for WP4: `force_optimize_projection = 1` gives a false "No projection is used" through the gated views,
 because it also applies to the `visibility`/`commit_log` subqueries. Use `EXPLAIN projections = 1` instead.

@@ -4,7 +4,7 @@ import test from 'ava';
 
 import type { ClickHouseClient } from './client.js';
 import type { CommitLease } from './commit-log.js';
-import { CommitLog, seqForEpoch } from './commit-log.js';
+import { CommitLog, counterOfSeq, seqForEpoch } from './commit-log.js';
 import type { ScratchDatabase, TestSave } from './test-support.js';
 import {
   createScratchDatabase,
@@ -18,10 +18,15 @@ import {
 import {
   agnosticViewParams,
   computeWatermarks,
+  counterMaskSeq,
   nodeViewParams,
+  pinnedView,
   readSnapshot,
   readWatermark,
+  snapshotParams,
   VisibilityPublisher,
+  voidInlineLimit,
+  voidOverflowSentinel,
 } from './visibility.js';
 
 const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
@@ -166,6 +171,29 @@ const withScratch = async (
 
 const category = hashOf(0xcafe);
 
+/** `visibleOfSave` through the pinned `*_at` views of one fresh snapshot. */
+const pinnedOfSave = async (client: ClickHouseClient, save: TestSave) => {
+  const snapshot = await readSnapshot(client, save.nodeId);
+  const params = { ...snapshotParams(snapshot), tx: save.transactionId };
+  const count = async (view: string) =>
+    Number(
+      (
+        await client.query<{ c: string }>(
+          `SELECT count() AS c FROM ${pinnedView(
+            view
+          )} WHERE transaction_internal_id = {tx:UInt64}`,
+          params
+        )
+      )[0]?.c
+    );
+  return {
+    output: await count('output_at'),
+    tx_acceptance: await count('tx_acceptance_at'),
+    utxo: await count('utxo_at'),
+    utxo_by_script: await count('utxo_by_script_at'),
+  };
+};
+
 e2e(
   '[e2e] watermark advances only when all earlier commits for the node are terminal',
   async (t) => {
@@ -220,6 +248,15 @@ e2e(
       utxo: 3,
       utxo_by_script: 3,
     });
+    // the pinned views agree exactly with the live ones
+    t.deepEqual(
+      await pinnedOfSave(client, abortedSave),
+      await visibleOfSave(client, abortedSave)
+    );
+    t.deepEqual(
+      await pinnedOfSave(client, keptSave),
+      await visibleOfSave(client, keptSave)
+    );
     // the base table still has the aborted rows (GC is a later mutation)
     const raw = await client.query<{ c: string }>(
       'SELECT count() AS c FROM utxo WHERE commit_seq = {seq:UInt64}',
@@ -247,13 +284,13 @@ e2e(
         outputs: string;
       }>(
         `SELECT
-         (SELECT count() FROM tx_acceptance_at(node = {node:UInt32}, visible = {visible:UInt64})
+         (SELECT count() FROM ${pinnedView('tx_acceptance_at')}
            WHERE transaction_internal_id = {tx:UInt64}) AS acceptance,
-         (SELECT count() FROM utxo_at(node = {node:UInt32}, visible = {visible:UInt64}) AS u
-           INNER JOIN tx_acceptance_at(node = {node:UInt32}, visible = {visible:UInt64}) AS a
+         (SELECT count() FROM ${pinnedView('utxo_at')} AS u
+           INNER JOIN ${pinnedView('tx_acceptance_at')} AS a
            ON u.transaction_hash = a.transaction_hash
            WHERE u.transaction_internal_id = {tx:UInt64}) AS utxo,
-         (SELECT count() FROM output_at(visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)})
+         (SELECT count() FROM ${pinnedView('output_at')}
            WHERE transaction_internal_id = {tx:UInt64}) AS outputs`,
         { ...node, ...agnostic, tx: save.transactionId }
       );
@@ -284,13 +321,104 @@ e2e(
     const after = await readSnapshot(client, 1);
     t.true(after.visible >= commit.seq);
     t.deepEqual(await pinnedRead(after), all);
-    // the old snapshot stays pinned: still nothing (a forged larger W is clamped, never needed)
+    // the old snapshot stays pinned: still nothing
     t.deepEqual(await pinnedRead(before), none);
-    t.deepEqual(await pinnedRead({ ...before, visible: 2n ** 64n - 1n }), {
-      ...none,
-      acceptance: '1',
-      utxo: '2',
-    });
+    /*
+     * The views trust their parameters (no clamp to the live watermark;
+     * readSnapshot is their only source). A forged W still cannot reach past
+     * the snapshot's `fence`, which covers only the epochs up to the
+     * snapshot's highest seq (here none: nothing was allocated yet) ...
+     */
+    t.deepEqual(await pinnedRead({ ...before, visible: 2n ** 64n - 1n }), none);
+    // ... while within the fenced range a forged W shows what is committed and valid up to it
+    t.deepEqual(
+      await pinnedRead({
+        ...before,
+        fence: after.fence,
+        visible: 2n ** 64n - 1n,
+      }),
+      { ...none, acceptance: '1', utxo: '2' }
+    );
+  }
+);
+
+e2e(
+  '[e2e] pinned views: fenced rows stay hidden; a void set over the inline limit falls back to commit_void',
+  async (t) => {
+    const { client, newClient } = await withScratch('pinned', t);
+    const staleClient = newClient();
+    t.teardown(async () => staleClient.close());
+    const stale = await writer(staleClient, 1n);
+    const before = { category, nodeId: 1, outputs: 2, transactionId: 30 };
+    const beforeCommit = await runSave(staleClient, stale.log, before);
+    await stale.log.markCommitted(beforeCommit.seq, testSaveRowCounts(before));
+    await stale.publisher.publishWatermark();
+    // epoch 3 takes over: fences epochs 1 and 2 at their highest seqs
+    const fresh = await writer(client, 3n);
+    t.deepEqual(
+      fresh.recovery.fences.map((fence) => fence.epoch),
+      [1n, 2n]
+    );
+    // the stale epoch-1 writer ignores the takeover: commits and publishes
+    const late = { category, nodeId: 1, outputs: 2, transactionId: 31 };
+    const lateCommit = await runSave(staleClient, stale.log, late);
+    await stale.log.markCommitted(lateCommit.seq, testSaveRowCounts(late));
+    await stale.publisher.publishWatermark();
+    // the fresh writer commits and publishes, so every watermark passes the stale seqs
+    const kept = { category, nodeId: 1, outputs: 3, transactionId: 32 };
+    const keptCommit = await runSave(client, fresh.log, kept);
+    await fresh.log.markCommitted(keptCommit.seq, testSaveRowCounts(kept));
+    const aborted = { category, nodeId: 1, outputs: 2, transactionId: 33 };
+    const abortedCommit = await runSave(client, fresh.log, aborted);
+    await fresh.log.markAborted(abortedCommit.seq, 'test');
+    await fresh.publisher.publishWatermark();
+
+    const snapshot = await readSnapshot(client, 1);
+    t.true(snapshot.visible >= keptCommit.seq);
+    t.true(snapshot.visible > lateCommit.seq);
+    // fence: one counter per epoch 1..3; epoch 1 ends at `before`, epoch 2 never committed, 3 is live
+    t.deepEqual(snapshot.fence, [
+      counterOfSeq(beforeCommit.seq),
+      0n,
+      counterMaskSeq,
+    ]);
+    t.deepEqual(snapshot.void, [abortedCommit.seq]);
+    t.false(snapshot.voidOverflow);
+    const expectAll = (save: TestSave) => testSaveRowCounts(save);
+    const expectNone = {
+      output: 0,
+      tx_acceptance: 0,
+      utxo: 0,
+      utxo_by_script: 0,
+    };
+    const check = async (label: string) => {
+      t.deepEqual(await pinnedOfSave(client, before), expectAll(before), label);
+      t.deepEqual(await pinnedOfSave(client, late), expectNone, label);
+      t.deepEqual(await pinnedOfSave(client, kept), expectAll(kept), label);
+      t.deepEqual(await pinnedOfSave(client, aborted), expectNone, label);
+      // pinned = live for every save
+      const pairs = await Promise.all(
+        [before, late, kept, aborted].map(async (save) =>
+          Promise.all([pinnedOfSave(client, save), visibleOfSave(client, save)])
+        )
+      );
+      pairs.forEach(([pinned, live]) => {
+        t.deepEqual(pinned, live, label);
+      });
+    };
+    await check('inline void');
+
+    // more aborted seqs than the inline limit (in epoch 2, which has no rows)
+    await client.command(
+      `INSERT INTO commit_void (commit_seq, reason, writer_epoch, voided_at)
+       SELECT bitShiftLeft(toUInt64(2), 40) + 1 + number, 'test', 2, now64(3, 'UTC')
+       FROM numbers({count:UInt32})`,
+      { count: voidInlineLimit + 1 }
+    );
+    const overflow = await readSnapshot(client, 1);
+    t.true(overflow.voidOverflow);
+    t.deepEqual(overflow.void, [voidOverflowSentinel]);
+    await check('void overflow');
   }
 );
 
@@ -345,6 +473,12 @@ e2e(
         crashAfter >= 5 ? 'all' : 'none',
         `crash after step ${crashAfter}, before recovery`
       );
+      t.deepEqual(
+        // eslint-disable-next-line no-await-in-loop
+        await pinnedOfSave(client, save),
+        seenBefore,
+        `crash after step ${crashAfter}, before recovery: pinned = live`
+      );
       // eslint-disable-next-line no-await-in-loop
       await writerClient.close();
       // restart: a new epoch recovers and publishes
@@ -352,6 +486,12 @@ e2e(
       const restarted = await writer(client, epoch + 1n);
       // eslint-disable-next-line no-await-in-loop
       const seenAfter = await visibleOfSave(client, save);
+      t.deepEqual(
+        // eslint-disable-next-line no-await-in-loop
+        await pinnedOfSave(client, save),
+        seenAfter,
+        `crash after step ${crashAfter}, after recovery: pinned = live`
+      );
       const expectedAfter = crashAfter >= 4 ? 'all' : 'none';
       t.is(
         nodeFactsVisibility(seenAfter, save),
@@ -420,7 +560,9 @@ e2e(
     // node 1 holds the even numbers; category 8 has 200 of them
     const category8 = `${'0'.repeat(63)}8`;
     const utxoPlan = await explain(
-      'SELECT * FROM utxo_at(node = {node:UInt32}, visible = {visible:UInt64}) WHERE token_category = unhex({category:String})',
+      `SELECT * FROM ${pinnedView(
+        'utxo_at'
+      )} WHERE token_category = unhex({category:String})`,
       { ...nodeViewParams(snapshot), category: category8 }
     );
     t.regex(utxoPlan, /token_category/u);
@@ -431,14 +573,16 @@ e2e(
     const granulesTotal = utxoGranules?.groups?.total ?? '';
     t.true(granulesRead !== '' && Number(granulesRead) <= 2, utxoPlan);
     const outputPlan = await explain(
-      'SELECT * FROM output_at(visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)}) WHERE locking_bytecode_prefix = {prefix:String}',
+      `SELECT * FROM ${pinnedView(
+        'output_at'
+      )} WHERE locking_bytecode_prefix = {prefix:String}`,
       { ...agnosticViewParams(snapshot), prefix: 'script1234' }
     );
     t.regex(outputPlan, /ReadFromMergeTree \(p_script\)/u);
     // and the answers are right, within a row budget only an index allows
     const rows = await client.query<{ c: string }>(
       `SELECT
-       (SELECT count() FROM utxo_at(node = {node:UInt32}, visible = {visible:UInt64})
+       (SELECT count() FROM ${pinnedView('utxo_at')}
          WHERE token_category = unhex({category:String})) AS c`,
       { ...nodeViewParams(snapshot), category: category8 },
       { max_rows_to_read: '20000' }
