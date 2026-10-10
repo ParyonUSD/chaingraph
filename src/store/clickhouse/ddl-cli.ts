@@ -13,6 +13,7 @@
  */
 import {
   applyClickHouseDdl,
+  checkTableSettings,
   ddlFiles,
   listClickHouseTables,
   resolveDdlDirectory,
@@ -81,6 +82,20 @@ const run = async (settings: ReturnType<typeof settingsFromEnv>) => {
   if (tables.length === 0) {
     fail(`No tables in ${database} after applying the DDL.`);
   }
+  const { applied, mismatches } = await checkTableSettings(server, database, {
+    directory,
+  });
+  if (mismatches.length > 0) {
+    fail(
+      `table settings differ from the DDL (CREATE TABLE IF NOT EXISTS keeps an existing table as it is; recreate these tables): ${mismatches
+        .map(
+          ({ actual, expected, setting, table }) =>
+            `${table}.${setting} is ${actual ?? 'unset'}, DDL says ${expected}`
+        )
+        .join('; ')}`
+    );
+  }
+  log(`table settings as in the DDL: ${applied.join(' ')}`);
   log(
     `ok, ${statements} statement(s) in ${
       Date.now() - started

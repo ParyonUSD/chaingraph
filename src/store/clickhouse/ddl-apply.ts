@@ -171,3 +171,84 @@ export const listClickHouseTables = async (
     await client.close();
   }
 };
+
+/** Table settings the DDL pins (and the agent's lookups depend on). */
+const checkedTableSettings = [
+  'index_granularity',
+  'min_compress_block_size',
+  'max_compress_block_size',
+] as const;
+
+const settingValue = (settings: string, name: string) =>
+  new RegExp(`\\b${name}\\s*=\\s*(\\d+)`, 'u').exec(settings)?.[1];
+
+/**
+ * Per table, the checked settings its `CREATE TABLE` in the DDL declares
+ * (tables declaring none are left out).
+ */
+export const ddlTableSettings = (directory = resolveDdlDirectory()) => {
+  const expected = new Map<string, Map<string, string>>();
+  ddlFiles(directory)
+    .flatMap((file) => ddlStatements(readFileSync(file, 'utf8'), 'cg'))
+    .forEach((statement) => {
+      const create =
+        /CREATE TABLE IF NOT EXISTS cg\.(?<table>\w+)[\s\S]*\)\s*ENGINE[\s\S]*?\bSETTINGS\b(?<settings>[\s\S]*)$/u.exec(
+          statement
+        );
+      if (create === null) return;
+      const settings = new Map<string, string>();
+      checkedTableSettings.forEach((name) => {
+        const value = settingValue(create.groups!.settings!, name);
+        if (value !== undefined) settings.set(name, value);
+      });
+      if (settings.size > 0) expected.set(create.groups!.table!, settings);
+    });
+  return expected;
+};
+
+export interface TableSettingMismatch {
+  table: string;
+  setting: string;
+  expected: string;
+  /** `undefined`: the table does not set it (server default) or is missing. */
+  actual: string | undefined;
+}
+
+/**
+ * Compare the checked settings of the tables in `database` with the DDL.
+ * `CREATE TABLE IF NOT EXISTS` never changes an existing table, so a
+ * database created by an older DDL (or by hand) keeps its old granularity:
+ * this is how the DDL CLI notices (g1-fix-pass-2.md §2).
+ */
+export const checkTableSettings = async (
+  server: ClickHouseServer,
+  database: string,
+  { directory = resolveDdlDirectory() } = {}
+) => {
+  ddlStatements('', database);
+  const expected = ddlTableSettings(directory);
+  const client = adminClient(server);
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const rows = await client.query<{ name: string; engine: string }>(
+      'SELECT name, engine_full AS engine FROM system.tables WHERE database = {database:String}',
+      { database }
+    );
+    const engineOf = new Map(rows.map((row) => [row.name, row.engine]));
+    const mismatches: TableSettingMismatch[] = [];
+    const applied: string[] = [];
+    expected.forEach((settings, table) => {
+      settings.forEach((value, setting) => {
+        const actual = settingValue(engineOf.get(table) ?? '', setting);
+        if (actual === value) {
+          applied.push(`${table}.${setting}=${value}`);
+        } else {
+          mismatches.push({ actual, expected: value, setting, table });
+        }
+      });
+    });
+    return { applied, mismatches };
+  } finally {
+    await client.close();
+  }
+};

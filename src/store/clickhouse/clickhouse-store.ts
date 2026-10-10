@@ -156,9 +156,10 @@ export interface ClickHouseStoreOptions {
  * Hex hashes per array query parameter: 1,000 × ~67 bytes stays under the
  * server's `http_max_field_value_size` (128 KiB); 2,000 did not
  * ("HTML Form Exception: Field value too long" on a 2,000-block header
- * acceptance).
+ * acceptance). 750: a 3,000-input batch's spent-output lookup is four
+ * chunks, all in flight at once (`lookupConcurrency`; g1-fix-pass-2.md §2).
  */
-const defaultLookupChunkSize = 1_000;
+const defaultLookupChunkSize = 750;
 const defaultPendingSpendTimeoutMs = 60_000;
 const defaultHorizonBatchHeights = 10_000;
 const defaultOrphanGraceMs = 1_000;

@@ -8,6 +8,11 @@
 --   * every row carries commit_seq UInt64 (the save that wrote it, §3.1); the gate views (050) hide
 --     rows of unresolved/aborted commits, so these engines never need FINAL.
 --   * index_granularity = 1024 on point-lookup/join tables (plan §2). 256 is the Phase 1 comparison arm.
+--   * output: index_granularity = 128 and 4 KiB compressed blocks. The writer resolves every spent
+--     output by (transaction_hash, output_index) (one random granule per spent tx per part); at 1024
+--     rows and 64 KiB-1 MiB blocks that read and decompressed ~1,500 rows / ~100 KB per outpoint
+--     (G1 lab: 0.5-2.7 s per lookup; g1-fix-pass-2.md §2). Its projections (060) keep 1024 and the
+--     default block sizes via WITH SETTINGS, so script/category reads are unchanged.
 --
 -- Choices where the plan is silent (also listed in README.md):
 --   * Timestamps are DateTime64(3, 'UTC'): the agent writes JS Dates (ms), so ms is exact.
@@ -90,7 +95,8 @@ CREATE TABLE IF NOT EXISTS cg.output
 ENGINE = MergeTree
 PARTITION BY intDiv(commit_seq, 1048576)
 ORDER BY (transaction_hash, output_index)
-SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+SETTINGS index_granularity = 128, min_compress_block_size = 4096, max_compress_block_size = 4096,
+         non_replicated_deduplication_window = 10000;
 
 -- input carries the spent output's attributes (plan §2.1 "Why input carries the spent output's attributes").
 -- Rows for inputs whose outpoint is not yet stored are written by the fill_pending commit (see README).

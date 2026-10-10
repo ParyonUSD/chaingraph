@@ -34,7 +34,7 @@ engine as written. VersionedCollapsingMergeTree appends `version` to the sorting
 | block | MergeTree / SharedMergeTree | `hash` | none | 1024 | node-agnostic data (7) |
 | transaction | MergeTree / SharedMergeTree | `hash` | `intDiv(commit_seq, 2^20)` | 1024 | node-agnostic (7) |
 | block_transaction | MergeTree / SharedMergeTree | `block_internal_id, transaction_index` | `intDiv(commit_seq, 2^20)` | 1024 | node-agnostic (7) |
-| output | MergeTree / SharedMergeTree | `transaction_hash, output_index` | `intDiv(commit_seq, 2^20)` | 1024 | node-agnostic (7) |
+| output | MergeTree / SharedMergeTree | `transaction_hash, output_index` | `intDiv(commit_seq, 2^20)` | 128, 4 KiB blocks (projections: 1024, default blocks) | node-agnostic (7) |
 | input | MergeTree / SharedMergeTree | `transaction_hash, input_index` | `intDiv(commit_seq, 2^20)` | 1024 | node-agnostic (7) |
 | node | ReplacingMergeTree(updated_at) / SharedReplacingMergeTree | `internal_id` | none | 8192 | registry; resolves name → id (7) |
 | node_block | VersionedCollapsingMergeTree(sign, version) / SharedVersionedCollapsingMergeTree | `node_internal_id, block_internal_id, version` | none | 8192 | 1, 2, 4 |

@@ -130,6 +130,57 @@ export const chunked = <T>(items: readonly T[], size: number): T[][] => {
 };
 
 /**
+ * Store lookups of one call run at most this many chunk queries at once
+ * (g1-fix-pass-2.md §2: the lab's per-batch lookups ran their chunks one
+ * after another).
+ */
+export const lookupConcurrency = 4;
+
+/**
+ * `work` over `chunked(items, size)`, at most `concurrency` chunks at a
+ * time; results in chunk order.
+ */
+export const mapChunksConcurrently = async <T, R>(
+  items: readonly T[],
+  size: number,
+  concurrency: number,
+  work: (chunk: T[]) => Promise<R>
+): Promise<R[]> => {
+  const chunks = chunked(items, size);
+  const results: R[] = new Array<R>(chunks.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < chunks.length) {
+      const index = next;
+      next += 1;
+      results[index] = await work(chunks[index]!);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, chunks.length) }, worker)
+  );
+  return results;
+};
+
+const compareText = (a: string, b: string) => (a < b ? -1 : Number(a > b));
+
+/**
+ * Distinct outpoints in primary-key order of `output` (hash, then index), so
+ * each lookup chunk covers one contiguous key range.
+ */
+export const sortedOutpoints = (
+  outpoints: readonly { hash: string; index: number }[]
+) => {
+  const byKey = new Map<string, { hash: string; index: number }>();
+  outpoints.forEach((item) => {
+    byKey.set(`${item.hash}:${item.index}`, item);
+  });
+  return [...byKey.values()].sort(
+    (a, b) => compareText(a.hash, b.hash) || a.index - b.index
+  );
+};
+
+/**
  * Transactions known to this writer: pinned while the operation writing them
  * is live (so concurrent saves reuse one id), then remembered (bounded).
  */
@@ -326,31 +377,42 @@ export const lookupStoredOutputs = async (
   outpoints: readonly { hash: string; index: number }[]
 ): Promise<{ output: UtxoOutput; seq: bigint }[]> => {
   const results: { output: UtxoOutput; seq: bigint }[] = [];
-  for (const chunk of chunked(outpoints, context.lookupChunkSize)) {
-    const rows = await context.client.query<StoredOutputRow>(
-      `SELECT lower(hex(transaction_hash)) AS hash, output_index, transaction_internal_id, value_satoshis,
+  const chunkRows = await mapChunksConcurrently(
+    sortedOutpoints(outpoints),
+    context.lookupChunkSize,
+    lookupConcurrency,
+    async (chunk) =>
+      context.client.query<StoredOutputRow>(
+        `SELECT lower(hex(transaction_hash)) AS hash, output_index, transaction_internal_id, value_satoshis,
          lower(hex(locking_bytecode)) AS locking_bytecode, lower(hex(token_category)) AS token_category,
          fungible_token_amount, nonfungible_token_capability,
          lower(hex(nonfungible_token_commitment)) AS nonfungible_token_commitment, commit_seq
        FROM output
-       WHERE transaction_hash IN (SELECT toFixedString(unhex(h), 32) FROM (SELECT arrayJoin({hashes:Array(String)}) AS h))
-         AND (transaction_hash, output_index) IN (
+       WHERE (transaction_hash, output_index) IN (
            SELECT toFixedString(unhex(p.1), 32), p.2
            FROM (SELECT arrayJoin(arrayZip({hashes:Array(String)}, {indexes:Array(UInt32)})) AS p))
          AND ${validCommitSql()}`,
-      {
-        fence: context.fence(),
-        hashes: chunk.map((item) => item.hash),
-        indexes: chunk.map((item) => item.index),
-      }
-    );
+        {
+          fence: context.fence(),
+          hashes: chunk.map((item) => item.hash),
+          indexes: chunk.map((item) => item.index),
+        },
+        /*
+         * The table's own key: output is tuned for these lookups (granularity
+         * 128, 4 KiB blocks), its projections are not, and p_category (zero
+         * category first, then the hash) looks cheaper by marks.
+         */
+        { optimize_use_projections: 0 }
+      )
+  );
+  chunkRows.forEach((rows) => {
     rows.forEach((row) => {
       results.push({
         output: storedOutputToUtxo(row),
         seq: BigInt(row.commit_seq),
       });
     });
-  }
+  });
   return results;
 };
 
@@ -360,18 +422,24 @@ export const lookupStoredTransactions = async (
   hashes: readonly string[]
 ): Promise<Map<string, { internalId: bigint; seq: bigint }>> => {
   const found = new Map<string, { internalId: bigint; seq: bigint }>();
-  for (const chunk of chunked(hashes, context.lookupChunkSize)) {
-    const rows = await context.client.query<{
-      hash_hex: string;
-      internal_id: string;
-      commit_seq: string;
-    }>(
-      `SELECT lower(hex(hash)) AS hash_hex, internal_id, commit_seq FROM transaction
+  const chunkRows = await mapChunksConcurrently(
+    [...new Set(hashes)].sort(compareText),
+    context.lookupChunkSize,
+    lookupConcurrency,
+    async (chunk) =>
+      context.client.query<{
+        hash_hex: string;
+        internal_id: string;
+        commit_seq: string;
+      }>(
+        `SELECT lower(hex(hash)) AS hash_hex, internal_id, commit_seq FROM transaction
        WHERE hash IN (SELECT toFixedString(unhex(h), 32) FROM (SELECT arrayJoin({hashes:Array(String)}) AS h))
          AND ${validCommitSql()}
        ORDER BY commit_seq`,
-      { fence: context.fence(), hashes: chunk }
-    );
+        { fence: context.fence(), hashes: chunk }
+      )
+  );
+  chunkRows.forEach((rows) => {
     rows.forEach((row) => {
       if (!found.has(row.hash_hex)) {
         found.set(row.hash_hex, {
@@ -380,7 +448,7 @@ export const lookupStoredTransactions = async (
         });
       }
     });
-  }
+  });
   return found;
 };
 
