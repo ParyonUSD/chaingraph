@@ -1752,7 +1752,7 @@ export class Agent {
     );
 
     const startTime = Date.now();
-    const { attemptedSavedTransactions, transactionCacheMisses } =
+    const { attemptedSavedTransactions, transactionCacheMisses, committed } =
       await this.store.saveBlock({
         block,
         isSavedTransaction: (hash) =>
@@ -1815,13 +1815,12 @@ export class Agent {
       savedTransactionCount,
       durationMs
     )}, ${formatTransactionRate(savedTransactionCount, durationMs)})`;
-    if (isHistoricalSync) {
-      this.logger.debug(blockSyncLog);
-      this.logger.trace(blockInsertLog);
-    } else {
-      this.logger.info(blockSyncLog);
-      this.logger.debug(blockInsertLog);
-    }
+    this.reportSavedBlock({
+      block,
+      committed,
+      isHistoricalSync,
+      logs: [blockSyncLog, blockInsertLog],
+    });
 
     nodeAcceptances.forEach((acceptance) => {
       const { syncState } = this.nodes[acceptance.nodeName]!;
@@ -1836,6 +1835,51 @@ export class Agent {
       this.currentIncompleteBlockRepair = undefined;
     }
     this.blockBuffer.removeBlock(block);
+  }
+
+  /**
+   * Log "Saved new block" once the block is committed. A ClickHouse save
+   * that waits for a parent block's outputs answers early with `committed`
+   * (its commit is incomplete and invisible): it is logged as parked now
+   * (the agent releases it from the block buffer so the parent can still be
+   * downloaded) and as saved when `committed` resolves.
+   */
+  reportSavedBlock({
+    block,
+    committed,
+    isHistoricalSync,
+    logs: [blockSyncLog, blockInsertLog],
+  }: {
+    block: ChaingraphBlock;
+    committed: Promise<void> | undefined;
+    isHistoricalSync: boolean;
+    logs: [string, string];
+  }) {
+    const logSaved = () => {
+      if (isHistoricalSync) {
+        this.logger.debug(blockSyncLog);
+        this.logger.trace(blockInsertLog);
+      } else {
+        this.logger.info(blockSyncLog);
+        this.logger.debug(blockInsertLog);
+      }
+    };
+    if (committed === undefined) {
+      logSaved();
+      return;
+    }
+    const parkedLog = `Parked block – height: ${block.height} | hash: ${block.hash} – waiting for a parent block's outputs before it is committed.`;
+    if (isHistoricalSync) {
+      this.logger.debug(parkedLog);
+    } else {
+      this.logger.info(parkedLog);
+    }
+    committed.then(logSaved, (error: unknown) => {
+      this.logger.error(
+        error,
+        `Parked block ${block.hash} (height ${block.height}) failed to commit.`
+      );
+    });
   }
 
   /**

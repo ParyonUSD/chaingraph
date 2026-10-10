@@ -658,10 +658,17 @@ export class ClickHouseStore implements ChaingraphStore {
     });
     /*
      * A block of a batch waiting for its parent's outputs resolves once the
-     * commit is `incomplete` (block-commit.ts); everything else resolves on
-     * commit.
+     * commit is `incomplete` (block-commit.ts), with `committed` (resolves
+     * when the commit is committed, rejects if it fails), so the agent can
+     * keep downloading and still log "Saved new block" only once it is
+     * saved; everything else resolves on commit.
      */
-    return Promise.race([full, parked.promise]);
+    const early = parked.promise.then((result) => {
+      const committed = full.then(() => undefined);
+      committed.catch(() => undefined);
+      return { ...result, committed };
+    });
+    return Promise.race([full, early]);
   }
 
   /**

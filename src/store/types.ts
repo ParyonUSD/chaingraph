@@ -167,6 +167,13 @@ export interface ChaingraphStore {
   }) => Promise<{
     attemptedSavedTransactions: ChaingraphTransaction[];
     transactionCacheMisses: number;
+    /**
+     * ClickHouse only: set when the call is answered before the block is
+     * committed (it waits for a parent block's outputs); resolves once the
+     * block is committed (as a call without it resolves), rejects if that
+     * fails.
+     */
+    committed?: Promise<void>;
   }>;
 
   /**

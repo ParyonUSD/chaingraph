@@ -1716,3 +1716,48 @@ for (const [cap, maxBlocksPerCommit] of [
     }
   );
 }
+
+e2e(
+  '[e2e] ClickHouseStore: a parked save is answered with `committed`, which resolves only once the block is committed (WP6b item 8)',
+  async (t) => {
+    t.timeout(120_000);
+    const { client, openStore } = await scratch(t, 'parked');
+    const store = await openStore();
+    const { node1 } = await registerNodes(store);
+    const chain = threeBlockChain();
+    const saved = await store.saveBlock({
+      block: chain.block0,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    t.is(saved.committed, undefined, 'a committed save has no `committed`');
+    const child = await store.saveBlock({
+      block: chain.block2,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    t.not(child.committed, undefined, 'the child parked');
+    let childCommitted = false;
+    const committedPromise = child.committed!.then(() => {
+      childCommitted = true;
+    });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 300);
+    });
+    t.false(childCommitted, 'not committed while its parent is missing');
+    await store.publishWatermarks();
+    t.false((await nodeView(client, node1)).blocks.includes(chain.block2.hash));
+    await store.saveBlock({
+      block: chain.block1,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    await committedPromise;
+    await store.publishWatermarks();
+    t.deepEqual((await nodeView(client, node1)).blocks, [
+      chain.block0.hash,
+      chain.block1.hash,
+      chain.block2.hash,
+    ]);
+  }
+);

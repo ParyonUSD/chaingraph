@@ -108,3 +108,31 @@ Catch-up `--quick` with two running batches: 636 blocks/s, 0.59 parts per block 
 Test: `[e2e] … a new block behind a running re-org writes its node-agnostic rows first, its node facts after`
 (the re-org held at `node_block`; the new block's `output` row exists while the node sees nothing of it; final
 state exact).
+
+## 4. Truthful "Saved new block" (item 8)
+
+A save that parks (child before parent: its commit is `incomplete`, invisible) still answers early, so the
+agent releases the block from its bounded buffer and keeps downloading (the parent may be behind it). The answer
+now carries `committed: Promise<void>` (optional field on the `saveBlock` result in `src/store/types.ts`;
+Postgres never sets it). The agent (`Agent.reportSavedBlock`) logs
+`Parked block – height: H | hash: X – waiting for a parent block's outputs before it is committed.` at once and the
+unchanged `Saved new block – …` line only when `committed` resolves (an error is logged if the commit fails; the
+store also reports it through `onError`). A save that commits normally logs exactly as before. Sync-state
+bookkeeping (`markHeightAsSynced`, buffer removal) is unchanged. Test: `[e2e] a parked save is answered with
+committed …` (not resolved while the parent is missing and the node sees nothing; resolves after the parent).
+
+## 5. In-flight cap: the stall after initial sync
+
+WP6b-C saw the agent stop after "Agent: initial sync is complete." with `CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES=16`
+(reproduced at 2276ee1 with the e2e suite and the cap passed to the agent: initial sync fell to ~13 blocks/s at the
+tail and the test timed out). Cause: WP5c re-armed a parked child's pending-spend timeout while any call was queued
+for a slot, and children resuming after their own wait are such calls, so under a cap the e2e mockchain's children
+(every input spends an unknown outpoint) completed one at a time. With multi-block commits a re-arm keyed on
+"something not yet registered" deadlocked instead (state dump with cap 2: a parked child on node 1, two `1,2`
+batches waiting for its rows holding the lane, a queued re-save of a block in flight keeping the re-arm alive).
+Fix: no re-arm. Every save registers its outputs when it is called, before any slot or lane wait, and a save that
+waits for another save of the same block registers nothing new, so a parent that exists is visible to the child at
+once; the timeout fires once. Tests: `[e2e] initial sync of blocks spending unknown outputs completes with in-flight
+cap 2 / 16` (300 blocks, per-block and batched commits, then `finishInitialSync` and `enableMempoolTracking`);
+agent e2e 45/45 with cap 2 and with cap 16 (frozen copy with the cap added to the e2e agent environment; the
+harness itself does not pass the cap through yet, see the report).

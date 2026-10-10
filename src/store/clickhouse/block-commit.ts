@@ -234,6 +234,12 @@ export interface WriterContext {
 export interface SaveBlockResult {
   attemptedSavedTransactions: ChaingraphTransaction[];
   transactionCacheMisses: number;
+  /**
+   * Only on a parked save (child-before-parent: answered while its commit is
+   * `incomplete`): resolves once the block is committed, rejects if the
+   * commit fails.
+   */
+  committed?: Promise<void>;
 }
 
 interface StoredOutputRow {
