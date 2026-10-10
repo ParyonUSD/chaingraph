@@ -91,14 +91,16 @@ export const readWatermark = async (
 export const counterMaskSeq = 1_099_511_627_775n;
 
 /**
- * At most this many aborted seqs are passed inline as the `void` parameter
- * (about 17 bytes each; ClickHouse rejects a single HTTP parameter over
- * `http_max_field_value_size`, 128 KiB by default). Above it the snapshot
- * passes `[voidOverflowSentinel]` and the pinned views fall back to the
- * `commit_void` subquery. Compaction/recovery may later truncate void rows to
- * keep the set small (see docs/clickhouse-port/wp6b-gate-cost.md).
+ * At most this many aborted seqs are passed inline as the `void` parameter.
+ * Each element costs about 1.1 us per view per query (WP6b: +0.3 ms at 256,
+ * +5 ms at 4096 per view), so past this size the `commit_void` subquery
+ * fallback is cheaper: the snapshot passes `[voidOverflowSentinel]` and the
+ * pinned views read `commit_void` themselves. (The hard cap would be
+ * `http_max_field_value_size`, 128 KiB, about 7,500 seqs.) Compaction or
+ * recovery should truncate void rows once their data rows are gone, to keep
+ * the set small (docs/clickhouse-port/wp6b-gate-cost.md).
  */
-export const voidInlineLimit = 4096;
+export const voidInlineLimit = 512;
 
 /** `void = [voidOverflowSentinel]`: the views read `commit_void` themselves. Never a real seq (epoch 2^24 - 1). */
 export const voidOverflowSentinel = 18_446_744_073_709_551_615n;
