@@ -93,6 +93,9 @@ export const metricQueries = {
       SELECT count() AS parts FROM system.parts
       WHERE database = {database:String} AND active
       GROUP BY table, partition_id)`,
+  /** Inactive parts (merged away or replaced, waiting for cleanup) of the database: count and bytes on disk. */
+  inactiveParts: `SELECT toString(count()) AS parts, toString(sum(bytes_on_disk)) AS bytes FROM system.parts
+      WHERE database = {database:String} AND NOT active`,
   /** Peak server memory of one INSERT (the Postgres "~3 GB per block" note). */
   maxInsertMemory: `SELECT toString(max(memory_usage)) AS bytes, toString(count()) AS inserts
     FROM system.query_log
@@ -223,23 +226,27 @@ const eventValues = async (client) =>
   Object.fromEntries((await client.query(metricQueries.eventSnapshot, { names: eventCounters })).map((row) => [row.name, Number(row.value)]));
 
 /**
- * Start a measured window: server time, event counters, and a 1 s sampler of
- * the busiest (table, partition)'s active part count.
+ * Start a measured window: server time, event counters, and a 0.5 s sampler of
+ * the busiest (table, partition)'s active part count and the database's
+ * inactive parts (count and bytes on disk).
  */
 export const writeMetricsStart = async (session) => {
   const { client, databaseName } = session;
   const [{ now: since }] = await client.query(metricQueries.serverNow);
   const events = await eventValues(client);
-  const sampler = { maxActiveParts: 0, running: true };
+  const sampler = { maxActiveParts: 0, maxInactiveBytes: 0, maxInactiveParts: 0, running: true };
   const sample = async () => {
     while (sampler.running) {
       try {
         const [row] = await client.query(metricQueries.maxActiveParts, { database: databaseName });
         sampler.maxActiveParts = Math.max(sampler.maxActiveParts, Number(row.parts));
+        const [inactive] = await client.query(metricQueries.inactiveParts, { database: databaseName });
+        sampler.maxInactiveParts = Math.max(sampler.maxInactiveParts, Number(inactive.parts));
+        sampler.maxInactiveBytes = Math.max(sampler.maxInactiveBytes, Number(inactive.bytes));
       } catch {
         // sampling is best-effort
       }
-      await sleep(1000);
+      await sleep(500);
     }
   };
   sampler.done = sample();
@@ -280,6 +287,9 @@ export const writeMetricsSince = async (session, start) => {
     },
     delayedInserts: delta.DelayedInserts,
     maxActiveParts,
+    /** Peak inactive parts / bytes of the database while the window ran (sampled every 0.5 s). */
+    maxInactiveBytes: start.sampler.maxInactiveBytes,
+    maxInactiveParts: start.sampler.maxInactiveParts,
     maxInsertMemoryBytes: Number(insertMemory.bytes),
     mergeBytesWritten: Number(partLog.merge_bytes),
     merges: Number(partLog.merges),

@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS cg.node_block
 )
 ENGINE = VersionedCollapsingMergeTree(sign, version)
 ORDER BY (node_internal_id, block_internal_id)
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 CREATE TABLE IF NOT EXISTS cg.node_transaction
 (
@@ -40,7 +42,9 @@ CREATE TABLE IF NOT EXISTS cg.node_transaction
 )
 ENGINE = VersionedCollapsingMergeTree(sign, version)
 ORDER BY (node_internal_id, transaction_internal_id)
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 -- tx-accepted(n, t) as one table: one row per (tx, node, accepting block or 0 = mempool).
 CREATE TABLE IF NOT EXISTS cg.tx_acceptance
@@ -58,6 +62,8 @@ CREATE TABLE IF NOT EXISTS cg.tx_acceptance
 ENGINE = VersionedCollapsingMergeTree(sign, version)
 ORDER BY (transaction_hash, node_internal_id, block_internal_id)
 SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5,
          deduplicate_merge_projection_mode = 'rebuild';
 
 CREATE TABLE IF NOT EXISTS cg.node_block_history
@@ -71,7 +77,9 @@ CREATE TABLE IF NOT EXISTS cg.node_block_history
 )
 ENGINE = MergeTree
 ORDER BY (node_internal_id, removed_at, block_internal_id)
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 -- replaced_at NULL = confirmed (moved from mempool into an accepted block).
 CREATE TABLE IF NOT EXISTS cg.node_transaction_history
@@ -85,4 +93,6 @@ CREATE TABLE IF NOT EXISTS cg.node_transaction_history
 )
 ENGINE = MergeTree
 ORDER BY (node_internal_id, transaction_internal_id, internal_id)
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;

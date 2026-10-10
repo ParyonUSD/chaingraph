@@ -209,6 +209,14 @@ WP5a-core amendments (design: `docs/clickhouse-port/wp5a-core.md`):
 25. `utxo.created_height` / `utxo_by_script.created_height` are always written as 0 (wp5a-core.md
     decision (i)): `unspent_output(node)` (F1g) returns output columns only, and every row of one outpoint
     must carry identical non-key values for the views' `any()` to be exact. Use `tx_acceptance_at` for heights.
+26. Part cleanup on every table (fix-pass-3.md §3): `old_parts_lifetime = 30, cleanup_delay_period = 5,
+    max_cleanup_delay_period = 10, cleanup_delay_period_random_add = 5` (server defaults 480 / 30 / 300 / 10).
+    A sync of small blocks commits many times a second and merges rewrite the young parts constantly; with
+    the defaults the merged-away parts stay ~8 minutes and fill a disk (gate catch-up, 60k blocks: 7.3–9.6 GB
+    inactive). 30 s still outlives the Linux dirty-page writeback (30 s expiry), which is what the lifetime
+    protects against on a crash. These settings change on a live table: the DDL CLI aligns them with
+    `ALTER TABLE … MODIFY SETTING` (`alignTableSettings`), so re-running the CLI is the re-apply path for an
+    existing database. Granularity and block sizes cannot be altered: a differing table still fails the CLI.
 
 ## Differences: Cloud 26.6 vs local 26.8
 

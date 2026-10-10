@@ -86,7 +86,7 @@ const gitRevision = (directory) => {
 
 const settings = {
   blockBufferMb: 128,
-  catchUpBlocks: options.quick ? 1_000 : 10_000,
+  catchUpBlocks: Number(process.env.INGESTION_GATE_CATCHUP_BLOCKS ?? (options.quick ? 1_000 : 10_000)),
   catchUpTransactionsPerBlock: 20,
   concurrentChipnetBlocks: 50,
   concurrentChipnetTransactionsPerBlock: 2_000,
@@ -199,7 +199,7 @@ const summaryColumns = (name, result) => {
     replay: `drain ${formatValue('drainSeconds', result.drainSeconds)}`,
     reorg: `converge ${formatValue('convergeSeconds', result.convergeSeconds)}`,
     concurrent: `ratio ${formatValue('concurrencyRatio', result.concurrencyRatio)} (${Math.round(result.together?.transactionsPerSecond ?? 0)} vs ${Math.round(result.mainnetAlone?.transactionsPerSecond ?? 0)}+${Math.round(result.chipnetAlone?.transactionsPerSecond ?? 0)} tx/s)`,
-    'catch-up': `${result.blocksPerSecond?.toFixed(1)} blocks/s`,
+    'catch-up': `${result.blocksPerSecond?.toFixed(1)} blocks/s${result.maxInactiveBytes === undefined ? '' : `, inactive peak ${(result.maxInactiveBytes / 1e6).toFixed(1)} MB / ${result.maxInactiveParts} parts`}`,
   }[name];
   return {
     heap: result.peakHeapBytes ? formatValue('peakHeapBytes', result.peakHeapBytes) : '',

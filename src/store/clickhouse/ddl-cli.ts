@@ -12,6 +12,7 @@
  * credentials.
  */
 import {
+  alignTableSettings,
   applyClickHouseDdl,
   checkTableSettings,
   ddlFiles,
@@ -81,6 +82,11 @@ const run = async (settings: ReturnType<typeof settingsFromEnv>) => {
   const tables = await listClickHouseTables(server, database);
   if (tables.length === 0) {
     fail(`No tables in ${database} after applying the DDL.`);
+  }
+  // settings that can change on a live table (part cleanup): aligned in place
+  const altered = await alignTableSettings(server, database, { directory });
+  if (altered.length > 0) {
+    log(`altered to the DDL's settings: ${altered.join(' ')}`);
   }
   const { applied, mismatches } = await checkTableSettings(server, database, {
     directory,

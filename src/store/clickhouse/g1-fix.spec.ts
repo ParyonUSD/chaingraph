@@ -784,3 +784,74 @@ const shutdownScenario = (utxo: 'off' | 'on') => {
 
 shutdownScenario('on');
 shutdownScenario('off');
+
+/* -------------------------------------------------------------------- */
+/* fix pass 3, item 3: a stream of small blocks makes few commits        */
+/* -------------------------------------------------------------------- */
+
+const streamCommits = async (
+  t: ExecutionContext,
+  label: string,
+  batchLingerMs: number
+) => {
+  const chain = chainOf(151, `stream-${label}`);
+  const harness = await fixScratch(t, `stream_${label}`, {
+    batchLingerMs,
+    pendingSpendTimeoutMs: 20_000,
+  });
+  const store = await harness.openStore();
+  const { node1 } = await registerNodes(store);
+  // the agent's catch-up: a block every 4 ms, saves not awaited
+  const saves: Promise<unknown>[] = [];
+  for (const block of chain.slice(0, 150)) {
+    saves.push(
+      store
+        .saveBlock({
+          block,
+          isSavedTransaction: notSaved,
+          nodeAcceptances: [acceptance(node1)],
+        })
+        .then(async (result) => result.committed)
+    );
+    await sleep(4);
+  }
+  await Promise.all(saves);
+  const streamed = (await commitStates(harness.client)).length;
+  // a quiet lane: the next block starts at once (no linger at the tip)
+  await sleep(Math.max(batchLingerMs, 50) * 2);
+  const started = Date.now();
+  await store.saveBlock({
+    block: chain[150]!,
+    isSavedTransaction: notSaved,
+    nodeAcceptances: [acceptance(node1)],
+  });
+  const tipMs = Date.now() - started;
+  await store.operations.drain();
+  await store.publishWatermarks();
+  await assertNodeParity(t, harness.client, node1, chain, {
+    exactBlocks: chain.length,
+    utxo: true,
+  });
+  return { streamed, tipMs };
+};
+
+e2e(
+  '[e2e] fix pass 3: a stream of small blocks lingers into few large commits; a block on a quiet lane starts at once',
+  async (t) => {
+    t.timeout(180_000);
+    const without = await streamCommits(t, 'direct', 0);
+    const lingering = await streamCommits(t, 'linger', 300);
+    t.log(
+      `150 blocks streamed: ${without.streamed} commits without linger, ${lingering.streamed} with 300 ms; tip block saved in ${lingering.tipMs} ms`
+    );
+    t.true(
+      lingering.streamed <= 6,
+      `few commits with linger (${lingering.streamed})`
+    );
+    t.true(lingering.streamed < without.streamed);
+    t.true(
+      lingering.tipMs < 300,
+      `no linger at the tip (${lingering.tipMs} ms)`
+    );
+  }
+);

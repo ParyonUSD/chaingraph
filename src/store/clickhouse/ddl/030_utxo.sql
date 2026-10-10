@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS cg.utxo
 )
 ENGINE = VersionedCollapsingMergeTree(sign, version)
 ORDER BY (node_internal_id, token_category, nonfungible_token_commitment_key, transaction_hash, output_index)
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 -- locking_bytecode_prefix = substring(locking_bytecode, 1, 25), matching Postgres's
 -- output_search_index key substring(..., 0, 26).
@@ -56,4 +58,6 @@ CREATE TABLE IF NOT EXISTS cg.utxo_by_script
 )
 ENGINE = VersionedCollapsingMergeTree(sign, version)
 ORDER BY (node_internal_id, locking_bytecode_prefix, transaction_hash, output_index)
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;

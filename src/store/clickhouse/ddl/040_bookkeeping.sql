@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS cg.commit_log
 )
 ENGINE = ReplacingMergeTree(state_rank)
 ORDER BY commit_seq
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 ALTER TABLE cg.commit_log ADD COLUMN IF NOT EXISTS abort_reason String DEFAULT '';
 
@@ -58,7 +60,9 @@ CREATE TABLE IF NOT EXISTS cg.commit_void
 )
 ENGINE = MergeTree
 ORDER BY commit_seq
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 -- Epoch fences (WP4): rows of epoch `epoch` with commit_seq > max_valid_seq are invisible.
 -- One row per epoch below the current lease epoch (dense from 1); readers take min() per epoch.
@@ -71,7 +75,9 @@ CREATE TABLE IF NOT EXISTS cg.epoch_fence
 )
 ENGINE = MergeTree
 ORDER BY epoch
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 -- Per-node watermark. node_internal_id 0 = the node-agnostic data watermark.
 CREATE TABLE IF NOT EXISTS cg.visibility
@@ -82,7 +88,9 @@ CREATE TABLE IF NOT EXISTS cg.visibility
 )
 ENGINE = ReplacingMergeTree(visible_seq)
 ORDER BY node_internal_id
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 CREATE TABLE IF NOT EXISTS cg.id_reservation
 (
@@ -95,7 +103,9 @@ CREATE TABLE IF NOT EXISTS cg.id_reservation
 )
 ENGINE = MergeTree
 ORDER BY (id_kind, range_start)
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 -- One row per (claim, heartbeat); Replacing keeps the latest heartbeat of each claim. Times are the
 -- server's (now64), so claim order does not depend on agent clocks.
@@ -110,7 +120,9 @@ CREATE TABLE IF NOT EXISTS cg.writer_lease
 )
 ENGINE = ReplacingMergeTree(heartbeat_at)
 ORDER BY (lease_name, epoch, agent_id)
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 -- Inputs whose spent output is not yet stored (child-before-parent, §3.5), per node.
 CREATE TABLE IF NOT EXISTS cg.pending_spend
@@ -127,4 +139,6 @@ CREATE TABLE IF NOT EXISTS cg.pending_spend
 )
 ENGINE = VersionedCollapsingMergeTree(sign, version)
 ORDER BY (outpoint_transaction_hash, outpoint_index, node_internal_id, spender_transaction_hash, spender_input_index)
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;

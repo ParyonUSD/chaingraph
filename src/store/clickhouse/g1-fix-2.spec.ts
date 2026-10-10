@@ -15,7 +15,11 @@ import {
   mapChunksConcurrently,
   sortedOutpoints,
 } from './block-commit.js';
-import { checkTableSettings, ddlTableSettings } from './ddl-apply.js';
+import {
+  alignTableSettings,
+  checkTableSettings,
+  ddlTableSettings,
+} from './ddl-apply.js';
 import { createScratchDatabase, e2eClickHouseUrl } from './test-support.js';
 
 const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
@@ -60,12 +64,38 @@ test('sortedOutpoints: distinct, in (hash, index) order', (t) => {
 
 test('the DDL pins output to granularity 128 with 4 KiB blocks', (t) => {
   const settings = ddlTableSettings();
-  t.deepEqual(Object.fromEntries(settings.get('output')!), {
-    index_granularity: '128',
-    max_compress_block_size: '4096',
-    min_compress_block_size: '4096',
-  });
+  const output = settings.get('output')!;
+  t.deepEqual(
+    Object.fromEntries(
+      [...output].filter(
+        ([name]) => !name.includes('cleanup') && !name.startsWith('old_parts')
+      )
+    ),
+    {
+      index_granularity: '128',
+      max_compress_block_size: '4096',
+      min_compress_block_size: '4096',
+    }
+  );
   t.is(settings.get('input')!.get('index_granularity'), '1024');
+});
+
+const partCleanup = [
+  ['old_parts_lifetime', '30'],
+  ['cleanup_delay_period', '5'],
+  ['max_cleanup_delay_period', '10'],
+  ['cleanup_delay_period_random_add', '5'],
+] as const;
+
+test('the DDL sets the part cleanup settings on every table (fix pass 3)', (t) => {
+  const settings = ddlTableSettings();
+  t.is(settings.size, 20);
+  const wrong = [...settings].flatMap(([table, values]) =>
+    partCleanup
+      .filter(([name, value]) => values.get(name) !== value)
+      .map(([name]) => `${table}.${name}`)
+  );
+  t.deepEqual(wrong, []);
 });
 
 e2e(
@@ -89,10 +119,62 @@ e2e(
         {
           actual: '8192',
           expected: '1024',
+          missing: false,
           setting: 'index_granularity',
           table: 'input',
         },
+        ...partCleanup.map(([setting, expected]) => ({
+          actual: undefined,
+          expected,
+          missing: false,
+          setting,
+          table: 'input',
+        })),
       ]);
+      /*
+       * fix pass 3: the ALTER path aligns the part cleanup settings in place,
+       * never the granularity (which needs a recreate)
+       */
+      t.deepEqual(await alignTableSettings(server, scratch.name), [
+        'input.old_parts_lifetime: unset→30',
+        'input.cleanup_delay_period: unset→5',
+        'input.max_cleanup_delay_period: unset→10',
+        'input.cleanup_delay_period_random_add: unset→5',
+      ]);
+      t.deepEqual(
+        (await checkTableSettings(server, scratch.name)).mismatches.map(
+          (mismatch) => `${mismatch.table}.${mismatch.setting}`
+        ),
+        ['input.index_granularity']
+      );
+      t.deepEqual(await alignTableSettings(server, scratch.name), []);
+      const [row] = await scratch.client.query<{ value: string }>(
+        `SELECT value FROM system.merge_tree_settings WHERE name = 'old_parts_lifetime'`
+      );
+      t.is(row?.value, '480', 'the server default stays (table-level only)');
+    } finally {
+      await scratch.drop();
+    }
+  }
+);
+
+e2e(
+  '[e2e] alignTableSettings: a table with other part cleanup values (the chipnet lab) is altered back to the DDL',
+  async (t) => {
+    const scratch = await createScratchDatabase('fix3_align');
+    try {
+      const server = { url: e2eClickHouseUrl! };
+      await scratch.client.command(
+        'ALTER TABLE output MODIFY SETTING old_parts_lifetime = 5, cleanup_delay_period = 1'
+      );
+      t.deepEqual(await alignTableSettings(server, scratch.name), [
+        'output.old_parts_lifetime: 5→30',
+        'output.cleanup_delay_period: 1→5',
+      ]);
+      t.deepEqual(
+        (await checkTableSettings(server, scratch.name)).mismatches,
+        []
+      );
     } finally {
       await scratch.drop();
     }

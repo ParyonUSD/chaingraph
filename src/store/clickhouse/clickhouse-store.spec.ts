@@ -1378,7 +1378,10 @@ e2e(
   '[e2e] ClickHouseStore: queued blocks are coalesced into multi-block commits, all-or-none per node (WP6b item 4)',
   async (t) => {
     t.timeout(300_000);
-    const { client, openStore } = await scratch(t, 'batch');
+    // no linger (fix-pass-3.md §3): block 1 must start alone right after block 0
+    const { client, openStore } = await scratch(t, 'batch', {
+      batchLingerMs: 0,
+    });
     const blocks = linearChain(41, 'batch');
     const both = () => [acceptance(1), acceptance(2)];
     const control = { commits: 0, crash: false, holdFirst: false };

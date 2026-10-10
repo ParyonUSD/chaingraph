@@ -20,6 +20,8 @@
 --     so the writer cannot get them wrong and -1 rows always match +1 rows.
 --   * non_replicated_deduplication_window = 10000 on every agent-written MergeTree table, so
 --     insert_deduplication_token works on plain MergeTree (§3.4); 10000 mirrors the replicated default.
+--   * old_parts_lifetime 30 s and fast cleanup on every table (fix-pass-3.md §3): with the server defaults
+--     (480 s) a small-block sync filled the disk with merged-away parts. The DDL CLI ALTERs them in place.
 --   * block and block_transaction also get granularity 1024 (point lookups / joins);
 --     block_transaction is partitioned like transaction (420 M rows, GC by commit_seq); block is not (1.3 M).
 --   * transaction/block version is Int32 (plan), Postgres stored bigint; values fit the 4-byte field.
@@ -43,7 +45,9 @@ CREATE TABLE IF NOT EXISTS cg.block
 )
 ENGINE = MergeTree
 ORDER BY hash
-SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 CREATE TABLE IF NOT EXISTS cg.transaction
 (
@@ -61,7 +65,9 @@ CREATE TABLE IF NOT EXISTS cg.transaction
 ENGINE = MergeTree
 PARTITION BY intDiv(commit_seq, 1048576)
 ORDER BY hash
-SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 CREATE TABLE IF NOT EXISTS cg.block_transaction
 (
@@ -74,7 +80,9 @@ CREATE TABLE IF NOT EXISTS cg.block_transaction
 ENGINE = MergeTree
 PARTITION BY intDiv(commit_seq, 1048576)
 ORDER BY (block_internal_id, transaction_index)
-SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 CREATE TABLE IF NOT EXISTS cg.output
 (
@@ -96,7 +104,9 @@ ENGINE = MergeTree
 PARTITION BY intDiv(commit_seq, 1048576)
 ORDER BY (transaction_hash, output_index)
 SETTINGS index_granularity = 128, min_compress_block_size = 4096, max_compress_block_size = 4096,
-         non_replicated_deduplication_window = 10000;
+         non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 -- input carries the spent output's attributes (plan §2.1 "Why input carries the spent output's attributes").
 -- Rows for inputs whose outpoint is not yet stored are written by the fill_pending commit (see README).
@@ -123,7 +133,9 @@ CREATE TABLE IF NOT EXISTS cg.input
 ENGINE = MergeTree
 PARTITION BY intDiv(commit_seq, 1048576)
 ORDER BY (transaction_hash, input_index)
-SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000;
+SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
 
 -- WP5a: the spent output's fungible_token_amount (plan gap found by WP2), so inputs.outpoint FT filters need
 -- no join. Databases created before WP5a get the column here; see README item 23 for their projections.
@@ -143,4 +155,6 @@ CREATE TABLE IF NOT EXISTS cg.node
 )
 ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY internal_id
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;

@@ -123,6 +123,31 @@ export interface ClickHouseStoreOptions {
    */
   maxBytesPerCommit?: number;
   /**
+   * Small blocks: a batch keeps taking blocks past `maxBlocksPerCommit`, up
+   * to this many, while its block bytes stay within `smallBatchBytes`
+   * (`CHAINGRAPH_CLICKHOUSE_SMALL_BLOCKS_PER_COMMIT`, default 1024; when
+   * `maxBlocksPerCommit` is passed as an option, default that value, i.e.
+   * off). A sync of small blocks (early chain) then commits a few times a
+   * second instead of ~15, which is what fills disk with inactive parts
+   * (fix-pass-3.md §3). Big blocks are unaffected.
+   */
+  smallBlocksPerCommit?: number;
+  /**
+   * The bytes budget of a batch grown past `maxBlocksPerCommit`
+   * (`CHAINGRAPH_CLICKHOUSE_SMALL_BATCH_BYTES`, default 4 MiB).
+   */
+  smallBatchBytes?: number;
+  /**
+   * While a lane streams small blocks (its previous batch started less than
+   * this long ago), its open batch waits until this long after that start
+   * before it starts, collecting blocks
+   * (`CHAINGRAPH_CLICKHOUSE_BATCH_LINGER_MS`, default 200; 0 = off; when
+   * `maxBlocksPerCommit` is passed as an option, default 0). A batch that
+   * is no longer small (`smallBlocksPerCommit` blocks or `smallBatchBytes`)
+   * starts at once; a block arriving after a quiet lane (the tip) too.
+   */
+  batchLingerMs?: number;
+  /**
    * Batches of one node set running at once (default: 1 in tip mode, 4 in
    * bulk mode). Tests raise it (with `maxBlocksPerCommit: 1`) to get the
    * per-block concurrency of the non-batched store.
@@ -171,6 +196,9 @@ const headerVarintThresholds = [252, 65_535, 4_294_967_295];
 
 const defaultMaxBlocksPerCommit = 64;
 const defaultMaxBytesPerCommit = 32 * 1024 * 1024;
+const defaultSmallBlocksPerCommit = 1024;
+const defaultSmallBatchBytes = 4 * 1024 * 1024;
+const defaultBatchLingerMs = 200;
 /** Running batches per node set: tip mode decides from stored state, so 1. */
 const tipRunningBatches = 1;
 /** Bulk-mode saves decide nothing from stored state: a few overlap. */
@@ -180,7 +208,21 @@ interface BatchLane {
   open: BlockBatch | undefined;
   queue: BlockBatch[];
   running: number;
+  /** When the lane last started a batch (ms). */
+  lastStartedAt: number;
+  /** A deferred `startBatches` while the open batch lingers. */
+  lingerTimer: ReturnType<typeof setTimeout> | undefined;
 }
+
+const nonNegativeIntegerFromEnvironment = (name: string, fallback: number) => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be an integer >= 0 (got ${raw}).`);
+  }
+  return value;
+};
 
 const positiveIntegerFromEnvironment = (name: string, fallback: number) => {
   const raw = process.env[name];
@@ -351,6 +393,12 @@ export class ClickHouseStore implements ChaingraphStore {
 
   private readonly maxBytesPerCommit: number;
 
+  private readonly smallBlocksPerCommit: number;
+
+  private readonly smallBatchBytes: number;
+
+  private readonly batchLingerMs: number;
+
   constructor(private readonly options: ClickHouseStoreOptions) {
     this.lookupChunkSize = options.lookupChunkSize ?? defaultLookupChunkSize;
     if (options.utxo !== undefined && !['off', 'on'].includes(options.utxo)) {
@@ -378,6 +426,32 @@ export class ClickHouseStore implements ChaingraphStore {
         'CHAINGRAPH_CLICKHOUSE_MAX_BYTES_PER_COMMIT',
         defaultMaxBytesPerCommit
       );
+    this.smallBlocksPerCommit = Math.max(
+      this.maxBlocksPerCommit,
+      options.smallBlocksPerCommit ??
+        (options.maxBlocksPerCommit === undefined
+          ? positiveIntegerFromEnvironment(
+              'CHAINGRAPH_CLICKHOUSE_SMALL_BLOCKS_PER_COMMIT',
+              defaultSmallBlocksPerCommit
+            )
+          : options.maxBlocksPerCommit)
+    );
+    this.smallBatchBytes = Math.min(
+      this.maxBytesPerCommit,
+      options.smallBatchBytes ??
+        positiveIntegerFromEnvironment(
+          'CHAINGRAPH_CLICKHOUSE_SMALL_BATCH_BYTES',
+          defaultSmallBatchBytes
+        )
+    );
+    this.batchLingerMs =
+      options.batchLingerMs ??
+      (options.maxBlocksPerCommit === undefined
+        ? nonNegativeIntegerFromEnvironment(
+            'CHAINGRAPH_CLICKHOUSE_BATCH_LINGER_MS',
+            defaultBatchLingerMs
+          )
+        : 0);
     this.outputs = new OutputRegistry<StoreOperation>(
       options.recentOutputCapacity
     );
@@ -932,6 +1006,15 @@ export class ClickHouseStore implements ChaingraphStore {
     let batch = lane.open;
     if (batch !== undefined && this.canAppend(batch, args.block)) {
       committer.append(batch, item);
+      if (
+        lane.lingerTimer !== undefined &&
+        this.lingerFor(lane, batch, Date.now()) === 0
+      ) {
+        // the lingering batch is no longer small: start it now
+        clearTimeout(lane.lingerTimer);
+        lane.lingerTimer = undefined;
+        this.startBatches(lane);
+      }
     } else {
       // a block saved by another live operation: wait for it, alone
       const deferPrepare = committer.isInFlight(args.block.hash);
@@ -983,7 +1066,13 @@ export class ClickHouseStore implements ChaingraphStore {
   private batchLane(key: string): BatchLane {
     let lane = this.batchLanes.get(key);
     if (lane === undefined) {
-      lane = { open: undefined, queue: [], running: 0 };
+      lane = {
+        lastStartedAt: 0,
+        lingerTimer: undefined,
+        open: undefined,
+        queue: [],
+        running: 0,
+      };
       this.batchLanes.set(key, lane);
     }
     return lane;
@@ -994,8 +1083,7 @@ export class ClickHouseStore implements ChaingraphStore {
     return (
       batch.state === 'open' &&
       !batch.deferPrepare &&
-      batch.items.length < this.maxBlocksPerCommit &&
-      batch.bytes + block.sizeBytes <= this.maxBytesPerCommit &&
+      this.batchHasRoomFor(batch, block) &&
       // no other operation was registered on these nodes since: order kept
       this.operations.isLatestOnItsNodes(batch.operation) &&
       !batch.blockHashes.has(block.hash) &&
@@ -1012,12 +1100,58 @@ export class ClickHouseStore implements ChaingraphStore {
     );
   }
 
+  /**
+   * The size limits of a batch: `maxBlocksPerCommit` blocks within
+   * `maxBytesPerCommit`; small blocks may grow it to `smallBlocksPerCommit`
+   * blocks within `smallBatchBytes` (fewer commits, so fewer parts).
+   */
+  private batchHasRoomFor(batch: BlockBatch, block: ChaingraphBlock) {
+    const bytes = batch.bytes + block.sizeBytes;
+    if (bytes > this.maxBytesPerCommit) return false;
+    return (
+      batch.items.length < this.maxBlocksPerCommit ||
+      (batch.items.length < this.smallBlocksPerCommit &&
+        bytes <= this.smallBatchBytes)
+    );
+  }
+
+  /**
+   * How long the lane's open `batch` should still wait for more blocks: only
+   * while it is small and the lane started a batch less than
+   * `batchLingerMs` ago (a stream of small blocks: fewer, larger commits;
+   * fix-pass-3.md §3). 0: start now.
+   */
+  private lingerFor(lane: BatchLane, batch: BlockBatch, now: number) {
+    if (
+      this.batchLingerMs === 0 ||
+      lane.open !== batch ||
+      batch.items.length >= this.smallBlocksPerCommit ||
+      batch.bytes >= this.smallBatchBytes ||
+      this.abandonSignal.abandoned
+    ) {
+      return 0;
+    }
+    return Math.max(0, lane.lastStartedAt + this.batchLingerMs - now);
+  }
+
   private startBatches(lane: BatchLane) {
     const limit =
       this.options.runningBatchesPerNodeSet ??
       (this.mode === 'tip' ? tipRunningBatches : bulkRunningBatches);
     while (lane.running < limit && lane.queue.length > 0) {
+      const now = Date.now();
+      const wait = this.lingerFor(lane, lane.queue[0]!, now);
+      if (wait > 0) {
+        if (lane.lingerTimer === undefined) {
+          lane.lingerTimer = setTimeout(() => {
+            lane.lingerTimer = undefined;
+            this.startBatches(lane);
+          }, wait);
+        }
+        return;
+      }
       const batch = lane.queue.shift()!;
+      lane.lastStartedAt = now;
       batch.state = 'started';
       if (lane.open === batch) lane.open = undefined;
       lane.running += 1;

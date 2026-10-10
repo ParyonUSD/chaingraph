@@ -172,11 +172,29 @@ export const listClickHouseTables = async (
   }
 };
 
-/** Table settings the DDL pins (and the agent's lookups depend on). */
+/**
+ * Part cleanup settings: how long merged-away parts stay on disk. The
+ * server defaults (480 s, cleanup every 30-300 s) let a sync of small blocks
+ * fill a disk with inactive parts (fix-pass-3.md §3). They can change on a
+ * live table, so the DDL CLI aligns them (`alignTableSettings`).
+ */
+const alterableTableSettings: ReadonlySet<string> = new Set([
+  'old_parts_lifetime',
+  'cleanup_delay_period',
+  'max_cleanup_delay_period',
+  'cleanup_delay_period_random_add',
+]);
+
+/**
+ * Table settings the DDL pins: the granularity and block sizes the agent's
+ * lookups depend on (fixed at CREATE: a differing table must be recreated)
+ * and the part cleanup settings (altered in place).
+ */
 const checkedTableSettings = [
   'index_granularity',
   'min_compress_block_size',
   'max_compress_block_size',
+  ...alterableTableSettings,
 ] as const;
 
 const settingValue = (settings: string, name: string) =>
@@ -212,6 +230,8 @@ export interface TableSettingMismatch {
   expected: string;
   /** `undefined`: the table does not set it (server default) or is missing. */
   actual: string | undefined;
+  /** The table does not exist. */
+  missing: boolean;
 }
 
 /**
@@ -243,7 +263,13 @@ export const checkTableSettings = async (
         if (actual === value) {
           applied.push(`${table}.${setting}=${value}`);
         } else {
-          mismatches.push({ actual, expected: value, setting, table });
+          mismatches.push({
+            actual,
+            expected: value,
+            missing: !engineOf.has(table),
+            setting,
+            table,
+          });
         }
       });
     });
@@ -251,4 +277,58 @@ export const checkTableSettings = async (
   } finally {
     await client.close();
   }
+};
+
+/**
+ * The ALTER path for settings that can change on a live table (the part
+ * cleanup settings): `ALTER TABLE … MODIFY SETTING` for every such mismatch
+ * with the DDL. Others (granularity, block sizes) are left for
+ * `checkTableSettings` to report. Returns the settings changed
+ * (`table.setting: old→new`).
+ */
+export const alignTableSettings = async (
+  server: ClickHouseServer,
+  database: string,
+  { directory = resolveDdlDirectory() } = {}
+) => {
+  const { mismatches } = await checkTableSettings(server, database, {
+    directory,
+  });
+  const byTable = new Map<string, TableSettingMismatch[]>();
+  mismatches
+    .filter(
+      (mismatch) =>
+        alterableTableSettings.has(mismatch.setting) &&
+        // a missing table is not altered (the check reports it)
+        !mismatch.missing
+    )
+    .forEach((mismatch) => {
+      byTable.set(mismatch.table, [
+        ...(byTable.get(mismatch.table) ?? []),
+        mismatch,
+      ]);
+    });
+  if (byTable.size === 0) return [];
+  const client = adminClient(server);
+  const changed: string[] = [];
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    // eslint-disable-next-line functional/no-loop-statement
+    for (const [table, items] of byTable) {
+      // eslint-disable-next-line no-await-in-loop
+      await client.command(
+        `ALTER TABLE ${database}.${table} MODIFY SETTING ${items
+          .map((item) => `${item.setting} = ${item.expected}`)
+          .join(', ')}`
+      );
+      items.forEach((item) => {
+        changed.push(
+          `${table}.${item.setting}: ${item.actual ?? 'unset'}→${item.expected}`
+        );
+      });
+    }
+  } finally {
+    await client.close();
+  }
+  return changed;
 };
