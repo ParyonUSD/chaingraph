@@ -108,9 +108,22 @@ export const dropDatabase = async ({ agentDirectory, baseUrl, databaseName }) =>
   await modules.ddl.dropClickHouseDatabase(adminServer(baseUrl), databaseName);
 };
 
+/**
+ * The gate's fixtures spend outpoints that never exist (the base chain and the
+ * first block of every sequence). The store waits `pendingSpendTimeoutMs`
+ * (default 60 s) for such parents before writing the inputs with a stand-in,
+ * holding the node's watermark meanwhile: every scenario would include a
+ * 60 s wait. As in the e2e harness the gate sets 1 ms (override with
+ * INGESTION_GATE_CH_PENDING_SPEND_TIMEOUT_MS). Spends of blocks the gate does
+ * provide (burst, catch-up, re-org, concurrent sequences) still resolve from
+ * the output registry or the store as on mainnet.
+ */
+const pendingSpendTimeoutMs = process.env.INGESTION_GATE_CH_PENDING_SPEND_TIMEOUT_MS ?? '1';
+
 /** Agent environment for this backend (the agent's config still requires a Postgres string). */
 export const agentEnvironment = ({ baseUrl, databaseName }) => ({
   CHAINGRAPH_CLICKHOUSE_DATABASE: databaseName,
+  CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS: pendingSpendTimeoutMs,
   CHAINGRAPH_CLICKHOUSE_URL: baseUrl,
   CHAINGRAPH_POSTGRES_CONNECTION_STRING: 'postgres://unused:unused@127.0.0.1:1/unused',
   CHAINGRAPH_STORE: 'clickhouse',

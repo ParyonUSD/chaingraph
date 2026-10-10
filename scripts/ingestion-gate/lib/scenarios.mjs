@@ -29,7 +29,8 @@ const chipnetLikeMagic = magicFromLabel('grpc');
 const databaseName = 'chaingraph_ingestion_gate';
 const baseChainLength = 5;
 let nonceCounter = 1;
-let nextPort = 19433;
+// INGESTION_GATE_NODE_PORT lets two gates (other checkouts) run side by side
+let nextPort = Number(process.env.INGESTION_GATE_NODE_PORT ?? 19433);
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
@@ -131,6 +132,7 @@ const measureIngestion = async ({ backend, environment, node, blocks, announce, 
   announce();
   const finished = await waitFor(async () => (await acceptedBlockCount(client, node.name, hashes)) === hashes.length, {
     description: `${node.name} accepting ${hashes.length} block(s)`,
+    agent,
     intervalMs: pollMs,
     timeoutMs,
   });
@@ -219,7 +221,7 @@ export const reorgScenario = async (context) => {
 
     context.log('reorg: syncing 100-block branch A on both nodes');
     nodes.forEach((node) => node.appendViaInventory(chainA));
-    await waitFor(async () => (await sequential(nodes, (node) => acceptedBlockCount(client, node.name, chainAHashes))).every((count) => count === 100), { description: 'branch A accepted by both nodes', intervalMs: 100, timeoutMs: 600_000 });
+    await waitFor(async () => (await sequential(nodes, (node) => acceptedBlockCount(client, node.name, chainAHashes))).every((count) => count === 100), { agent: environment.agent, description: 'branch A accepted by both nodes', intervalMs: 100, timeoutMs: 600_000 });
 
     const toHash = (raw) => Buffer.from(raw).reverse().toString('hex');
     const confirmedHashes = confirmedMempool.mempoolTransactions.map((raw) => toHash(doubleSha256(raw)));
@@ -228,7 +230,7 @@ export const reorgScenario = async (context) => {
       [...confirmedMempool.mempoolTransactions, ...unconfirmedMempool.mempoolTransactions].forEach((raw) => node.sendTransaction(raw));
     });
     const allMempoolHashes = [...confirmedHashes, ...unconfirmedHashes];
-    await waitFor(async () => (await sequential(nodes, (node) => mempoolRowCount(client, node.name, allMempoolHashes))).every((count) => count === allMempoolHashes.length), { description: '40 mempool transactions recorded for both nodes', intervalMs: 50, timeoutMs: 60_000 });
+    await waitFor(async () => (await sequential(nodes, (node) => mempoolRowCount(client, node.name, allMempoolHashes))).every((count) => count === allMempoolHashes.length), { agent: environment.agent, description: '40 mempool transactions recorded for both nodes', intervalMs: 50, timeoutMs: 60_000 });
 
     context.log('reorg: switching both nodes to 101-block branch B');
     const metricsStart = await context.backend.writeMetricsStart(client);
@@ -239,7 +241,7 @@ export const reorgScenario = async (context) => {
         const counts = (await sequential(nodes, async (node) => [await acceptedBlockCount(client, node.name, chainBHashes), await acceptedBlockCount(client, node.name, chainAHashes)])).flat();
         return counts[0] === 101 && counts[1] === 0 && counts[2] === 101 && counts[3] === 0;
       },
-      { description: 'both nodes converged on branch B', intervalMs: 50, timeoutMs: 600_000 }
+      { agent: environment.agent, description: 'both nodes converged on branch B', intervalMs: 50, timeoutMs: 600_000 }
     );
     const writeMetrics = await context.backend.writeMetricsSince(client, metricsStart);
     // give mempool cleanup triggers/agent a moment, then check final state
@@ -317,6 +319,7 @@ const runConcurrentCase = async (context, label, workloads) => {
         for (const block of plan.blocks) {
           plan.node.announceViaHeaders([block]);
           await waitFor(async () => (await backend.acceptedBlockCount(pollers[index], plan.node.name, [block.hash])) === 1, {
+            agent: environment.agent,
             description: `${plan.node.name} block ${block.hash}`,
             intervalMs: 5,
             timeoutMs: 600_000,
@@ -381,7 +384,7 @@ export const catchUpScenario = async (context) => {
     const metricsStart = await context.backend.writeMetricsStart(client);
     const started = Date.now();
     node.appendViaInventory(blocks);
-    const finished = await waitFor(async () => (await nodeBlockCount(client, node.name)) === expectedNodeBlocks, { description: `${blockCount} catch-up blocks accepted`, intervalMs: 100, timeoutMs: 3_600_000 });
+    const finished = await waitFor(async () => (await nodeBlockCount(client, node.name)) === expectedNodeBlocks, { agent: environment.agent, description: `${blockCount} catch-up blocks accepted`, intervalMs: 100, timeoutMs: 3_600_000 });
     const wallMs = finished - started;
     const writeMetrics = await context.backend.writeMetricsSince(client, metricsStart);
     const blockTransactionRows = await blockTransactionCount(client, hashes);

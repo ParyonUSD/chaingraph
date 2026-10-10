@@ -172,10 +172,12 @@ export const blockTransactionCount = async (client, blockHashes) =>
     ).rows[0].count
   );
 
-export const waitFor = async (predicate, { timeoutMs, intervalMs = 25, description }) => {
+export const waitFor = async (predicate, { timeoutMs, intervalMs = 25, description, agent }) => {
   const started = Date.now();
   for (;;) {
     if (await predicate()) return Date.now();
+    // an agent that dies mid-scenario (e.g. a crash on the max block) fails at once instead of after timeoutMs
+    if (agent?.exited) throw new Error(`agent exited (code ${agent.exitCode}) while waiting for: ${description}\n--- last output ---\n${agent.stdoutBuffer.slice(-3000)}`);
     if (Date.now() - started > timeoutMs) {
       throw new Error(`timed out after ${timeoutMs / 1000}s waiting for: ${description}`);
     }

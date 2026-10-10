@@ -2,17 +2,17 @@
   "max-block": {
     "maxWallSeconds": 10,
     "maxPeakHeapBytes": 1700000000,
-    "maxBytesWritten": null,
-    "maxPartsCreated": null,
-    "maxMergeSeconds": null,
+    "maxBytesWritten": 245000000,
+    "maxPartsCreated": 34,
+    "maxMergeSeconds": 2,
     "maxDelayedInserts": 0,
     "maxRejectedInserts": 0
   },
   "burst": {
     "maxDrainSeconds": 30,
-    "maxBytesWritten": null,
-    "maxPartsCreated": null,
-    "maxMergeSeconds": null,
+    "maxBytesWritten": 800000000,
+    "maxPartsCreated": 88,
+    "maxMergeSeconds": 2,
     "maxDelayedInserts": 0,
     "maxRejectedInserts": 0
   },

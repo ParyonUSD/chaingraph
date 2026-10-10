@@ -91,7 +91,7 @@ const settings = {
   concurrentMainnetBlocks: 8,
   concurrentMainnetTransactionsPerBlock: 12_500,
   denseTransactionsPerBlock: 100_000,
-  internalApiPort: 3299,
+  internalApiPort: Number(process.env.INGESTION_GATE_API_PORT ?? 3299),
   postgresMaxConnections: 8,
   reorgTransactionsPerBlock: 1_000,
 };
