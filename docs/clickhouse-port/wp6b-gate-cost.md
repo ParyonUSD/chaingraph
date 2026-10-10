@@ -288,5 +288,5 @@ against the new views, in three modes:
 - `writer-lease.ts` (+ spec).
 - `scripts/measure/gate-cost.mjs`. New flags: `--legacy-views`, `--void-pad N`, `--void-overflow`. It now saves
   EXPLAIN for every query, and the address query uses the `String` prefix type.
-- **Callers outside this work package** that still pass the WP4 arguments and must switch to
-  `pinnedView` / `snapshotParams`: `scripts/ingestion-gate/lib/clickhouse.mjs` (C).
+- **Callers outside this work package.** `scripts/ingestion-gate/lib/clickhouse.mjs` (C) passed the WP4 arguments.
+  It has switched to `pinnedView` (`31d8475`).
