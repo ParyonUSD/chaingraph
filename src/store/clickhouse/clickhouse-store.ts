@@ -149,7 +149,7 @@ const headerVarintThresholds = [252, 65_535, 4_294_967_295];
 const defaultMaxBlocksPerCommit = 64;
 const defaultMaxBytesPerCommit = 32 * 1024 * 1024;
 /** Running batches per node set: tip mode decides from stored state, so 1. */
-const tipRunningBatches = 2;
+const tipRunningBatches = 1;
 /** Bulk-mode saves decide nothing from stored state: a few overlap. */
 const bulkRunningBatches = 4;
 

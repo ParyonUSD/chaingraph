@@ -136,3 +136,29 @@ once; the timeout fires once. Tests: `[e2e] initial sync of blocks spending unkn
 cap 2 / 16` (300 blocks, per-block and batched commits, then `finishInitialSync` and `enableMempoolTracking`);
 agent e2e 45/45 with cap 2 and with cap 16 (frozen copy with the cap added to the e2e agent environment; the
 harness itself does not pass the cap through yet, see the report).
+
+## 6. Concurrency ratio (item 6)
+
+**Profile** (gate `concurrent`: mainnet-like 8 × 12,500 tx on node A, chipnet-like 50 × 2,000 tx on node B; CPU
+profiles of the three agent runs; `commit_log` timeline per node scope):
+- Writes are not serialised across nodes: A and B are separate batch lanes and their commits interleave every
+  0.5 s in the "together" phase. `VisibilityPublisher` (one publish in flight, ≥ 100 ms apart) and the id
+  allocator chains were never on the critical path (one `visibility` insert per 100 ms; id ranges of 100,000).
+- Chipnet blocks commit one per commit even alone (~9.5 blocks/s): they arrive no faster than that, so the store
+  keeps up with arrivals and batching has nothing to coalesce. The agent's single JS thread is ~50 % busy alone
+  and ~65 % together (block parsing in the agent ~35 % of busy time, RowBinary encoding/UTXO derivation in the
+  store ~45 %, GC ~10 %); when mainnet runs, chipnet arrivals slow to ~5 blocks/s. The Postgres store does no
+  per-row encoding in JS, which is why the same agent reaches 0.79 there.
+
+**Changes.**
+- The inserts of one phase go out concurrently (node-agnostic: `output`, `input`, `transaction`, `block`,
+  `block_transaction`; per node: `node_block`, `tx_acceptance`, mempool rows, `utxo`, `utxo_by_script`); only the
+  phases are ordered (intent → node-agnostic → wait for earlier operations → per-node → fill → committed). They are
+  rows of one open commit, so their order is invisible to readers and to recovery. Per-batch latency drops from
+  ~9 sequential inserts to two rounds.
+- Back to one running batch per node set in tip mode (two cost batching without helping once inserts are parallel).
+
+Result: everything faster (alone 28.0k + 19.2k tx/s, together 26.6–27.2k tx/s; WP6 25.1k + 15.4k / 22.3k) but the
+ratio stays 0.55–0.58 (limit 0.6, target 0.7 not reached): together is bounded by the agent's JS thread, which both
+networks share. Re-org converge with these changes: 3.73 s. Next step (not done): RowBinary encoding and UTXO row
+derivation in a worker thread, or a cheaper encoder (`row-binary.ts`).

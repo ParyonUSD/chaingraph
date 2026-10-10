@@ -1761,3 +1761,36 @@ e2e(
     ]);
   }
 );
+
+e2e(
+  '[e2e] ClickHouseStore: the inserts of one commit phase go out concurrently, the phases stay ordered (WP6b item 6)',
+  async (t) => {
+    t.timeout(120_000);
+    const events: string[] = [];
+    const { openStore } = await scratch(t, 'phases');
+    const store = await openStore(async (step, context) => {
+      if (context.kind !== 'block') return;
+      events.push(`${step}:start`);
+      if (step === 'output') {
+        // a slow output insert must not hold up the other node-agnostic inserts
+        await new Promise((resolve) => {
+          setTimeout(resolve, 300);
+        });
+      }
+      events.push(`${step}:end`);
+    });
+    const { node1 } = await registerNodes(store);
+    const chain = threeBlockChain();
+    await store.saveBlock({
+      block: chain.block0,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    const index = (event: string) => events.indexOf(event);
+    t.true(index('input:end') < index('output:end'), events.join(' '));
+    t.true(index('block_transaction:end') < index('output:end'));
+    // per-node rows only after every node-agnostic insert
+    t.true(index('output:end') < index('node_block:start'));
+    t.true(index('utxo:end') < index('rows-written:start'));
+  }
+);

@@ -1105,34 +1105,52 @@ export class BlockCommitter {
         (transaction) => idByHash.get(transaction.hash)!
       ),
     };
-    await insert(
-      'output',
-      columnsOf('output'),
-      encodeOutputRows(newTransactions, newContext)
+    /*
+     * Inserts of one phase go out concurrently: independent rows of the same
+     * open commit (none is visible before it commits), so their order does
+     * not matter to readers or to recovery; only the phases are ordered
+     * (intent, node-agnostic rows, per-node rows, fill, committed).
+     */
+    const agnosticWrites: Promise<void>[] = [];
+    agnosticWrites.push(
+      insert(
+        'output',
+        columnsOf('output'),
+        encodeOutputRows(newTransactions, newContext)
+      )
     );
-    await insert(
-      'input',
-      columnsOf('input'),
-      encodeInputRows(newTransactions, newContext, resolveSpent)
+    agnosticWrites.push(
+      insert(
+        'input',
+        columnsOf('input'),
+        encodeInputRows(newTransactions, newContext, resolveSpent)
+      )
     );
-    await insert(
-      'transaction',
-      columnsOf('transaction'),
-      encodeTransactionRows(newTransactions, newContext)
+    agnosticWrites.push(
+      insert(
+        'transaction',
+        columnsOf('transaction'),
+        encodeTransactionRows(newTransactions, newContext)
+      )
     );
     const blockRowNow = (plan: BlockPlan) =>
       !plan.blockExists &&
       !wantedOfPlan.get(plan)!.some((key) => agnosticUnresolved.has(key));
-    await insert(
-      'block',
-      columnsOf('block'),
-      encodeBlockRows(
-        plans.filter(blockRowNow).map((plan) => ({
-          block: plan.block,
-          generatedValueSatoshis: this.generatedValue(plan.block, resolveSpent),
-          internalId: plan.blockInternalId,
-        })),
-        commit.seq
+    agnosticWrites.push(
+      insert(
+        'block',
+        columnsOf('block'),
+        encodeBlockRows(
+          plans.filter(blockRowNow).map((plan) => ({
+            block: plan.block,
+            generatedValueSatoshis: this.generatedValue(
+              plan.block,
+              resolveSpent
+            ),
+            internalId: plan.blockInternalId,
+          })),
+          commit.seq
+        )
       )
     );
     {
@@ -1152,11 +1170,15 @@ export class BlockCommitter {
             .endRow();
         });
       });
-      await insert('block_transaction', columnsOf('block_transaction'), {
-        data: writer.finish(),
-        rowCount: writer.rowCount,
-      });
+      agnosticWrites.push(
+        insert('block_transaction', columnsOf('block_transaction'), {
+          data: writer.finish(),
+          rowCount: writer.rowCount,
+        })
+      );
     }
+
+    await Promise.all(agnosticWrites);
 
     /* 5. Per-node decisions: after every earlier operation of the nodes. */
     await waitForEarlier();
@@ -1278,15 +1300,20 @@ export class BlockCommitter {
         });
       });
     });
-    await insert(
-      'node_block',
-      acceptanceColumns.node_block,
-      encodeNodeBlockRows(nodeBlockRows, commit.seq)
+    const nodeWrites: Promise<void>[] = [];
+    nodeWrites.push(
+      insert(
+        'node_block',
+        acceptanceColumns.node_block,
+        encodeNodeBlockRows(nodeBlockRows, commit.seq)
+      )
     );
-    await insert(
-      'tx_acceptance',
-      acceptanceColumns.tx_acceptance,
-      encodeTxAcceptanceRows(txAcceptanceRows, commit.seq)
+    nodeWrites.push(
+      insert(
+        'tx_acceptance',
+        acceptanceColumns.tx_acceptance,
+        encodeTxAcceptanceRows(txAcceptanceRows, commit.seq)
+      )
     );
 
     const utxoRows: UtxoRow[] = [];
@@ -1297,12 +1324,14 @@ export class BlockCommitter {
        * horizon build only covers transactions in bulk-period blocks)
        */
       appendAll(utxoRows, mempoolRows.utxo);
-      await hooks.insertChangeRows(
-        commit,
-        'block',
-        { ...mempoolRows, utxo: [] },
-        'm',
-        rowCounts
+      nodeWrites.push(
+        hooks.insertChangeRows(
+          commit,
+          'block',
+          { ...mempoolRows, utxo: [] },
+          'm',
+          rowCounts
+        )
       );
     }
     const pendingUtxo: {
@@ -1347,16 +1376,22 @@ export class BlockCommitter {
       });
     }
     const encodedUtxo = encodeUtxoRows(utxoRows, commit.seq);
-    await insert('utxo', utxoColumns, {
-      data: encodedUtxo.utxo,
-      rowCount: encodedUtxo.rowCount,
-    });
-    await insert('utxo_by_script', utxoByScriptColumns, {
-      data: encodedUtxo.utxoByScript,
-      rowCount: encodedUtxo.rowCount,
-    });
+    nodeWrites.push(
+      insert('utxo', utxoColumns, {
+        data: encodedUtxo.utxo,
+        rowCount: encodedUtxo.rowCount,
+      })
+    );
+    nodeWrites.push(
+      insert('utxo_by_script', utxoByScriptColumns, {
+        data: encodedUtxo.utxoByScript,
+        rowCount: encodedUtxo.rowCount,
+      })
+    );
 
-    /* 5. Child-before-parent: pending spends, filled under this seq. */
+    await Promise.all(nodeWrites);
+
+    /* 6. Child-before-parent: pending spends, filled under this seq. */
     if (unresolved.length > 0) {
       const pendingInputs = newTransactions.flatMap((transaction) =>
         transaction.isCoinbase
