@@ -31,7 +31,14 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { defaultTables, digestSql, rowsSql, tables } from './lib/canonical.mjs';
+import {
+  agnosticArgs,
+  defaultTables,
+  digestSql,
+  nodeArgs,
+  rowsSql,
+  tables,
+} from './lib/canonical.mjs';
 import { addDigests, digestFromSums } from './lib/digest.mjs';
 import {
   ClickHouseHttp,
@@ -316,7 +323,7 @@ const main = async () => {
     });
     const snapshot =
       clickhouse === undefined
-        ? { tail: [], visible: new Map(), visible0: '0' }
+        ? { fence: [], tail: [], visible: new Map(), visible0: '0', void: [] }
         : await readClickHouseSnapshot(
             clickhouse,
             nodes.map((node) => node.chId)
@@ -324,7 +331,12 @@ const main = async () => {
     for (const node of nodes) node.visible = snapshot.visible.get(node.chId);
     const ctx = {
       atHeight,
-      ch: { tail: snapshot.tail, visible0: snapshot.visible0 },
+      ch: {
+        fence: snapshot.fence,
+        tail: snapshot.tail,
+        visible0: snapshot.visible0,
+        void: snapshot.void,
+      },
       historyHeight: every === undefined ? atHeight : windowTo,
       includeMempool: options['include-mempool'],
       nodes,
@@ -347,9 +359,9 @@ const main = async () => {
         : Number(
             (
               await clickhouse.query(
-                `SELECT toString(if(count() = 0, -1, max(height))) AS h FROM block_at(visible0 = ${
-                  ctx.ch.visible0
-                }, tail = [${ctx.ch.tail.join(', ')}])`
+                `SELECT toString(if(count() = 0, -1, max(height))) AS h FROM block_at${agnosticArgs(
+                  ctx
+                )}`
               )
             )[0].h
           );
@@ -372,7 +384,10 @@ const main = async () => {
     const chTipOf = async (node) => {
       if (clickhouse === undefined) return undefined;
       const [{ h }] = await clickhouse.query(
-        `SELECT toString(if(count() = 0, -1, max(height))) AS h FROM node_block_at(node = ${node.chId}, visible = ${node.visible})`
+        `SELECT toString(if(count() = 0, -1, max(height))) AS h FROM node_block_at${nodeArgs(
+          node,
+          ctx
+        )}`
       );
       return Number(h);
     };

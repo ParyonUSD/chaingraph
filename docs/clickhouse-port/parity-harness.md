@@ -14,7 +14,7 @@ Code: `scripts/parity/` (node ESM `.mjs`, no build step).
 |---|---|
 | `compare.mjs` | CLI: plans chunks, runs both engines, writes TSV + summary, exit code |
 | `lib/canonical.mjs` | canonical row definition per table, for both engines; digest and row-stream SQL |
-| `lib/engines.mjs` | Postgres pool on one exported snapshot; ClickHouse HTTP; the WP4 snapshot read |
+| `lib/engines.mjs` | Postgres pool on one exported snapshot; ClickHouse HTTP; the one-query gate snapshot read |
 | `lib/digest.mjs` | the `sum` digest (JS reference, mod 2^64 reduction, addition) |
 | `selftest.mjs` | scratch databases, identical seed, mutations; `node scripts/parity/selftest.mjs` |
 | `sql/f1g-unspent-output.sql` | F1g `unspent_output(node_name)`, verbatim from `origin/perf/unspent-output-root` (6b8e24e), for the self-test's scratch Postgres |
@@ -160,9 +160,10 @@ running digest up to each window ("as of height hi").
 **Consistency.**
 - Postgres: one coordinator opens `REPEATABLE READ READ ONLY` and calls `pg_export_snapshot()`. Every worker
   connection (`--parallel`) runs `SET TRANSACTION SNAPSHOT`, so all chunks see one database state.
-- ClickHouse: the WP4 `readSnapshot` order. Read `visible(n)` for every compared node first, then `visible(0)` and
-  the committed tail once. Every query passes them to the pinned views: `*_at(node, visible)` and
-  `*_at(visible0, tail)`. All chunks see one gated state, and an open commit is never half-visible.
+- ClickHouse: one snapshot query (`readClickHouseSnapshot`, mirroring WP6b `readSnapshot`): `visible(n)` of every
+  compared node and `visible(0)` from one read of `visibility`, then the committed tail, then the void set and the
+  per-epoch fence. Every query passes them as literals to the pinned views: `*_at(node, visible, fence, void)` and
+  `*_at(visible0, tail, fence, void)`. All chunks see one gated state, and an open commit is never half-visible.
 
 **Output.**
 - `<out>/parity.tsv`: `node, table, chunk, pg_count, ch_count, pg_md5, ch_md5, match`. It holds the chunk rows,

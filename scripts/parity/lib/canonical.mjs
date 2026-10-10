@@ -109,10 +109,17 @@ const chHashRange = (column, chunk) =>
   `${column} >= unhex('${chunk.lo}')` +
   (chunk.hi === undefined ? '' : ` AND ${column} < unhex('${chunk.hi}')`);
 
-/** ClickHouse pinned-view arguments (WP4 readSnapshot). */
+/** ClickHouse pinned-view arguments (readClickHouseSnapshot; contract in ddl/050_views.sql). */
+const gateArgs = (ctx) =>
+  `fence = [${ctx.ch.fence.join(', ')}], void = [${ctx.ch.void.join(', ')}]`;
 const agnostic = (ctx) =>
-  `(visible0 = ${ctx.ch.visible0}, tail = [${ctx.ch.tail.join(', ')}])`;
-const nodeArgs = (node) => `(node = ${node.chId}, visible = ${node.visible})`;
+  `(visible0 = ${ctx.ch.visible0}, tail = [${ctx.ch.tail.join(
+    ', '
+  )}], ${gateArgs(ctx)})`;
+export const nodeArgs = (node, ctx) =>
+  `(node = ${node.chId}, visible = ${node.visible}, ${gateArgs(ctx)})`;
+
+export const agnosticArgs = agnostic;
 
 const sqlString = (value) => `'${String(value).replace(/'/g, "''")}'`;
 
@@ -169,9 +176,7 @@ const chScope = (ctx, chunk) => {
         .map(
           (
             node
-          ) => ` UNION DISTINCT SELECT transaction_hash AS hash FROM node_transaction_at${nodeArgs(
-            node
-          )}
+          ) => ` UNION DISTINCT SELECT transaction_hash AS hash FROM node_transaction_at${nodeArgs(node, ctx)}
           WHERE ${chHashRange('transaction_hash', chunk)}`
         )
         .join('')
@@ -458,7 +463,7 @@ export const tables = {
           chExpr.nullness('nb.accepted_at'),
         ],
         ['nb.accepted_at'],
-        `FROM node_block_at${nodeArgs(node)} AS nb WHERE ${heightBetween(
+        `FROM node_block_at${nodeArgs(node, ctx)} AS nb WHERE ${heightBetween(
           'nb.height',
           chunk
         )}`
@@ -519,9 +524,7 @@ export const tables = {
               chExpr.string('-'),
             ],
             [],
-            `FROM tx_acceptance_at${nodeArgs(
-              node
-            )} AS ta WHERE ta.block_internal_id = 0`
+            `FROM tx_acceptance_at${nodeArgs(node, ctx)} AS ta WHERE ta.block_internal_id = 0`
           ),
         };
       }
@@ -548,7 +551,7 @@ export const tables = {
             chExpr.int('ta.height'),
           ],
           [],
-          `FROM tx_acceptance_at${nodeArgs(node)} AS ta
+          `FROM tx_acceptance_at${nodeArgs(node, ctx)} AS ta
            INNER JOIN (SELECT internal_id, hash FROM block_at${agnostic(
              ctx
            )}) AS b ON b.internal_id = ta.block_internal_id
@@ -577,7 +580,7 @@ export const tables = {
         ctx,
         [chExpr.hex('nt.transaction_hash'), chExpr.nullness('nt.validated_at')],
         ['nt.validated_at'],
-        `FROM node_transaction_at${nodeArgs(node)} AS nt`
+        `FROM node_transaction_at${nodeArgs(node, ctx)} AS nt`
       ),
     }),
   },
@@ -613,7 +616,7 @@ export const tables = {
           chExpr.nullness('h.accepted_at'),
         ],
         ['h.accepted_at', 'h.removed_at'],
-        `FROM node_block_history_at${nodeArgs(node)} AS h
+        `FROM node_block_history_at${nodeArgs(node, ctx)} AS h
          INNER JOIN (SELECT internal_id, hash, height FROM block_at${agnostic(
            ctx
          )}) AS b ON b.internal_id = h.block_internal_id
@@ -653,13 +656,11 @@ export const tables = {
           chExpr.nullness('h.replaced_at'),
         ],
         ['h.validated_at', 'h.replaced_at'],
-        `FROM node_transaction_history_at${nodeArgs(node)} AS h
+        `FROM node_transaction_history_at${nodeArgs(node, ctx)} AS h
          INNER JOIN (SELECT internal_id, hash FROM transaction_at${agnostic(
            ctx
          )}
-                     WHERE internal_id IN (SELECT transaction_internal_id FROM node_transaction_history_at${nodeArgs(
-                       node
-                     )})) AS t
+                     WHERE internal_id IN (SELECT transaction_internal_id FROM node_transaction_history_at${nodeArgs(node, ctx)})) AS t
            ON t.internal_id = h.transaction_internal_id`
       ),
     }),
@@ -686,7 +687,7 @@ export const tables = {
         ctx,
         outputFields(chExpr, 'u'),
         [],
-        `FROM utxo_at${nodeArgs(node)} AS u WHERE ${chHashRange(
+        `FROM utxo_at${nodeArgs(node, ctx)} AS u WHERE ${chHashRange(
           'u.transaction_hash',
           chunk
         )}`

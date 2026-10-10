@@ -7,10 +7,10 @@
  * (`SET TRANSACTION SNAPSHOT`), so all chunks of one run read one consistent
  * database state, however long the run takes.
  *
- * ClickHouse: plain HTTP. Consistency comes from the WP4 pinned views
- * (`*_at`): the harness reads visible(n) of every compared node first, then
- * visible(0) and the committed tail once (the readSnapshot order), and passes
- * the same values to every query of the run. Credentials come from CH_USER /
+ * ClickHouse: plain HTTP. Consistency comes from the pinned views (`*_at`,
+ * WP4/WP6b): the harness reads one snapshot (watermarks, committed tail, void
+ * set, epoch fence) in one query (`readClickHouseSnapshot`) and passes the
+ * same values to every query of the run. Credentials come from CH_USER /
  * CH_PASSWORD (never argv).
  */
 import pg from 'pg';
@@ -172,21 +172,51 @@ export class ClickHouseHttp {
   }
 }
 
-/** Read the WP4 snapshot for the compared nodes: visible(n) first, then visible(0) + committed tail. */
+/**
+ * Read the WP4/WP6b snapshot for the compared nodes in ONE query, mirroring
+ * visibility.ts `snapshotSql`: visible(n) of every compared node and
+ * visible(0) from one read of `visibility`, then the committed tail above
+ * visible(0), then (data-dependent, so evaluated after) the void set and the
+ * per-epoch fence up to the snapshot's highest seq. The harness inlines the
+ * values as literals, so there is no parameter size limit and the void set is
+ * never truncated (the views' overflow fallback is not used).
+ */
 export const readClickHouseSnapshot = async (clickhouse, chNodeIds) => {
-  const visible = new Map();
-  for (const id of chNodeIds) {
-    const [row] = await clickhouse.query(
-      `SELECT toString(max(visible_seq)) AS v FROM visibility WHERE node_internal_id = ${Number(
-        id
-      )}`
-    );
-    visible.set(id, row?.v ?? '0');
-  }
+  const ids = chNodeIds.map((id) => Number(id));
+  const counterMask = '1099511627775';
   const [row] = await clickhouse.query(
-    `WITH (SELECT max(visible_seq) FROM visibility WHERE node_internal_id = 0) AS v0
-     SELECT toString(v0) AS visible0, arrayMap(x -> toString(x), arraySort(groupArray(commit_seq))) AS tail
-     FROM commit_log WHERE state = 'committed' AND commit_seq > v0`
+    `WITH
+       (SELECT groupArray((n, v)) FROM
+          (SELECT node_internal_id AS n, max(visible_seq) AS v FROM visibility
+           WHERE node_internal_id IN (${[0, ...ids].join(', ')}) GROUP BY n)) AS marks,
+       arrayMax(arrayMap(m -> if(m.1 = 0, m.2, toUInt64(0)), arrayPushBack(marks, (toUInt32(0), toUInt64(0))))) AS v0,
+       (SELECT arraySort(groupArray(commit_seq)) FROM commit_log
+        WHERE state = 'committed' AND commit_seq > v0) AS tail_seqs,
+       greatest(arrayMax(arrayMap(m -> m.2, arrayPushBack(marks, (toUInt32(0), toUInt64(0))))),
+                arrayMax(arrayPushBack(tail_seqs, toUInt64(0)))) AS bound,
+       (SELECT arraySort(groupUniqArray(commit_seq)) FROM commit_void WHERE commit_seq <= bound) AS void_seqs,
+       (SELECT (groupArray(epoch), groupArray(max_valid_seq)) FROM
+          (SELECT epoch, min(max_valid_seq) AS max_valid_seq FROM epoch_fence
+           WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences
+     SELECT
+       arrayMap(id -> toString(arrayMax(arrayMap(m -> if(m.1 = id, m.2, toUInt64(0)),
+                                                 arrayPushBack(marks, (toUInt32(0), toUInt64(0)))))),
+                [${ids.length === 0 ? '' : ids.join(', ')}]::Array(UInt32)) AS visible,
+       toString(v0) AS visible0,
+       arrayMap(x -> toString(x), tail_seqs) AS tail,
+       arrayMap(x -> toString(x), void_seqs) AS void,
+       arrayMap(e -> toString(if(indexOf(fences.1, e) = 0, ${counterMask},
+                                 bitAnd(fences.2[indexOf(fences.1, e)], ${counterMask}))),
+                range(1, toUInt64(bitShiftRight(bound, 40)) + 1)) AS fence`
   );
-  return { tail: row?.tail ?? [], visible, visible0: row?.visible0 ?? '0' };
+  const visible = new Map(
+    chNodeIds.map((id, index) => [id, row?.visible?.[index] ?? '0'])
+  );
+  return {
+    fence: row?.fence ?? [],
+    tail: row?.tail ?? [],
+    visible,
+    visible0: row?.visible0 ?? '0',
+    void: row?.void ?? [],
+  };
 };
