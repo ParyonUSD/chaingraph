@@ -19,6 +19,25 @@ import { pathToFileURL } from 'node:url';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Hex hashes per array query parameter, as the store's `defaultLookupChunkSize`
+ * (`src/store/clickhouse/clickhouse-store.ts`): 1,000 × ~67 bytes stays under
+ * the server's `http_max_field_value_size` (128 KiB). The catch-up scenario
+ * reads 10,000 block hashes at once ("Field value too long" in one parameter).
+ */
+export const hashChunkSize = 1_000;
+
+/** `list` split into consecutive slices of at most `size` (none for an empty list). */
+export const chunked = (list, size = hashChunkSize) =>
+  Array.from({ length: Math.ceil(list.length / size) }, (_, index) => list.slice(index * size, (index + 1) * size));
+
+/** Sum of `read(chunk)` over the chunks of `hashes`, one chunk at a time. */
+const sumOverChunks = async (hashes, read) => {
+  let total = 0;
+  for (const chunk of chunked(hashes)) total += await read(chunk);
+  return total;
+};
+
 /** Agent-compiled modules (checker, views, DDL) of the agent under test. */
 const loadModules = async (agentDirectory) => {
   const load = (path) => import(pathToFileURL(join(agentDirectory, 'build/store/clickhouse', path)).href);
@@ -146,19 +165,30 @@ export const countRows = async (session, table) => {
   return Number(row.c);
 };
 
-/** Blocks among `blockHashes` accepted by `nodeName` (pinned `node_block_at`, via the checker). */
-export const acceptedBlockCount = async (session, nodeName, blockHashes) => session.checker.acceptedBlockCount(nodeName, blockHashes);
+/**
+ * Blocks among `blockHashes` accepted by `nodeName` (pinned `node_block_at`,
+ * via the checker), summed over chunks of `hashChunkSize` hashes (one
+ * snapshot per chunk; the gate polls until the count is complete).
+ */
+export const acceptedBlockCount = async (session, nodeName, blockHashes) =>
+  sumOverChunks(blockHashes, (chunk) => session.checker.acceptedBlockCount(nodeName, chunk));
 
-/** Linked transactions of the given blocks, one pinned snapshot for the whole set. */
+/**
+ * Linked transactions of the given blocks, one pinned snapshot for the whole
+ * set, summed over chunks of `hashChunkSize` hashes (the hashes are distinct
+ * blocks, so the chunk counts add up).
+ */
 export const blockTransactionCount = async (session, blockHashes) => {
   const params = await agnosticParams(session);
-  const [row] = await session.client.query(
-    `SELECT toString(count()) AS c FROM ${agnosticView(session, 'block_transaction')}
-     WHERE block_internal_id IN (SELECT internal_id FROM ${agnosticView(session, 'block')}
-                                 WHERE has(arrayMap(h -> toFixedString(unhex(h), 32), {hashes:Array(String)}), hash))`,
-    { ...params, hashes: blockHashes }
-  );
-  return Number(row.c);
+  return sumOverChunks(blockHashes, async (chunk) => {
+    const [row] = await session.client.query(
+      `SELECT toString(count()) AS c FROM ${agnosticView(session, 'block_transaction')}
+       WHERE block_internal_id IN (SELECT internal_id FROM ${agnosticView(session, 'block')}
+                                   WHERE has(arrayMap(h -> toFixedString(unhex(h), 32), {hashes:Array(String)}), hash))`,
+      { ...params, hashes: chunk }
+    );
+    return Number(row.c);
+  });
 };
 
 /** Accepted blocks of a node: `{ height, hash }`, by height. */
@@ -178,10 +208,13 @@ export const nodeBlockCount = async (session, nodeName) => {
   return Number(row.c);
 };
 
-export const mempoolRowCount = async (session, nodeName, transactionHashes) => (await session.checker.mempoolMembership(nodeName, transactionHashes)).size;
+/** Mempool rows among `transactionHashes` (distinct hashes, summed over chunks). */
+export const mempoolRowCount = async (session, nodeName, transactionHashes) =>
+  sumOverChunks(transactionHashes, async (chunk) => (await session.checker.mempoolMembership(nodeName, chunk)).size);
 
+/** Distinct `transactionHashes` archived in the node's history (summed over chunks of distinct hashes). */
 export const historyNodeCount = async (session, nodeName, transactionHashes) =>
-  new Set((await session.checker.transactionHistory(nodeName, transactionHashes)).map((row) => row.hash)).size;
+  sumOverChunks(transactionHashes, async (chunk) => new Set((await session.checker.transactionHistory(nodeName, chunk)).map((row) => row.hash)).size);
 
 /** Per node: mempool transactions confirmed in a block the same node accepts. */
 export const confirmedButInMempoolCount = async (session, nodeName) => (await session.checker.confirmedButInMempool(nodeName)).length;
