@@ -22,6 +22,7 @@ import type {
 import bitcoreP2pCash, {
   BitcoreInventoryType,
 } from '@chaingraph/bitcore-p2p-cash';
+import type { ExecutionContext } from 'ava';
 import test from 'ava';
 import type { ExecaChildProcess } from 'execa';
 import { execa } from 'execa';
@@ -36,7 +37,7 @@ import {
   applyClickHouseDdl,
   dropClickHouseDatabase,
 } from '../store/clickhouse/ddl-apply.js';
-import { eventually } from '../store/eventually.js';
+import { eventually, eventuallyEqual, readTwice } from '../store/eventually.js';
 import type { ChaingraphTransaction } from '../types/chaingraph.js';
 
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
@@ -562,32 +563,66 @@ const handleStdout = () => {
 };
 
 const seconds = 1000;
-const tenSeconds = 10_000;
 /**
- * Returns a promise that resolves when the `search` string is found in stdout.
+ * Waits on agent events scale with the backend. Postgres keeps the original
+ * 10 s / 60 s; ClickHouse saves each small block with about 11 inserts, so its
+ * initial sync of the 3,001-block mockchain takes 20–30 s (not 2 s) and it
+ * shares the machine with other agents' gates.
+ *
+ * - `stdoutTimeoutMs`: one log line after one action (a block, a request).
+ * - `batchTimeoutMs`: a log line after tens of blocks (re-org feeds,
+ *   one-by-one sync, a shutdown that drains in-flight saves).
+ * - `syncTimeoutMs`: initial sync / catch-up of the whole mockchain (cap).
+ * - `visibleTimeoutMs`: a store read after a log line or event (the line can
+ *   precede visibility, e.g. batched mempool commits).
+ * - `syncVisibleTimeoutMs`: a store read that waits for sync-scale work
+ *   (catch-up of a new node, the incomplete-block repair scan).
+ * - `clickHouseTestTimeoutMs`: per-test AVA timeout on ClickHouse (overrides
+ *   the CLI `--timeout`, which is an inactivity timeout shorter than a sync).
+ */
+/* eslint-disable @typescript-eslint/no-magic-numbers */
+const stdoutTimeoutMs = isClickHouseE2e ? 30_000 : 10_000;
+const batchTimeoutMs = isClickHouseE2e ? 60_000 : 10_000;
+const syncTimeoutMs = isClickHouseE2e ? 120_000 : 60_000;
+const visibleTimeoutMs = isClickHouseE2e ? 10_000 : 3_000;
+const syncVisibleTimeoutMs = isClickHouseE2e ? 60_000 : 10_000;
+const clickHouseTestTimeoutMs = 180_000;
+/* eslint-enable @typescript-eslint/no-magic-numbers */
+/**
+ * Returns a promise that resolves when the `search` string is found in stdout
+ * (the buffer since the last `clearStdoutBuffer`), or rejects after `timeout`
+ * (a test failure, not an uncaught exception, so the rest of the run and
+ * `test.after.always` still run).
  * @param search - the string to search for in stdout
  *
  * TODO: if AVA is running in debug mode, disable timeout (https://github.com/avajs/ava/issues/3152)
  */
-const waitForStdout = async (search: RegExp | string, timeout = tenSeconds) => {
+const waitForStdout = async (
+  search: RegExp | string,
+  timeout = stdoutTimeoutMs
+) => {
   logger.debug(`Waiting for stdout: ${search.toString()}`);
-  const timeoutId = setTimeout(() => {
-    // eslint-disable-next-line functional/no-throw-statement
-    throw new Error(
-      `Test failed after waiting ${
-        timeout / seconds
-      }s for the stdout search: ${search.toString()}`
-    );
-  }, timeout);
-  const promise = new Promise<void>((res) => {
-    waitingForStdout.push({
+  const promise = new Promise<void>((res, reject) => {
+    const timer: { id?: ReturnType<typeof setTimeout> } = {};
+    const task = {
       pattern: search,
       resolver: () => {
         logger.debug(`Heard stdout: ${search.toString()}`);
-        clearTimeout(timeoutId);
+        clearTimeout(timer.id);
         res();
       },
-    });
+    };
+    timer.id = setTimeout(() => {
+      waitingForStdout = waitingForStdout.filter((other) => other !== task);
+      reject(
+        new Error(
+          `Test failed after waiting ${
+            timeout / seconds
+          }s for the stdout search: ${search.toString()}`
+        )
+      );
+    }, timeout);
+    waitingForStdout.push(task);
   });
   handleStdout();
   return promise;
@@ -597,7 +632,85 @@ const clearStdoutBuffer = () => {
   stdoutBuffer = '';
 };
 
-test.serial('[e2e] spawn chaingraph', async (t) => {
+/**
+ * A healthy run prints a few MB between clears. If an agent loops on an error
+ * the buffer would grow past V8's string limit and crash the worker (an
+ * uncaught `RangeError: Invalid string length` that also skips
+ * `test.after.always`), so keep only the newest `maxStdoutBufferLength`
+ * characters; waits still fail on their own timeout.
+ */
+/* eslint-disable @typescript-eslint/no-magic-numbers */
+const maxStdoutBufferLength = 64 * 1024 * 1024;
+const keptStdoutLength = maxStdoutBufferLength / 2;
+/* eslint-enable @typescript-eslint/no-magic-numbers */
+const appendStdout = (chunk: unknown) => {
+  stdoutBuffer += String(chunk);
+  if (stdoutBuffer.length > maxStdoutBufferLength) {
+    logger.warn('e2e: stdout buffer over 64 MiB; keeping the newest half.');
+    stdoutBuffer = stdoutBuffer.slice(-keptStdoutLength);
+  }
+  handleStdout();
+};
+
+/**
+ * `test.serial` for tests that drive the agent: on ClickHouse the test gets
+ * `clickHouseTestTimeoutMs` (its waits are longer than the CLI timeout);
+ * on Postgres the CLI `--timeout` applies, as before.
+ */
+const serialTest = (
+  title: string,
+  implementation: (t: ExecutionContext) => Promise<void> | void
+) => {
+  test.serial(title, async (t) => {
+    if (isClickHouseE2e) {
+      t.timeout(clickHouseTestTimeoutMs);
+    }
+    await implementation(t);
+  });
+};
+
+/**
+ * Wait (at most `timeout`) for an agent sent SIGINT to exit; resolves its exit
+ * code (`-1` on timeout, after SIGKILL). A graceful shutdown drains the block
+ * buffer, closes the store, logs "Exiting..." and exits 0; a forced or failed
+ * shutdown exits 1. The exit code is asserted rather than the "Exiting..."
+ * line: the agent logs through a pino transport worker, and its last stdout
+ * lines can be lost when the process exits (seen on macOS, ClickHouse run,
+ * HEAD 66a1620: "Exiting..." in the log file, never on stdout). Once the
+ * process has exited, stdout is complete, so the line is checked and a
+ * missing one is logged.
+ */
+const waitForGracefulExit = async (
+  agentProcess: ExecaChildProcess,
+  timeout: number
+) => {
+  const exitCode = await new Promise<number>((res) => {
+    const timer = setTimeout(() => {
+      agentProcess.kill('SIGKILL');
+      res(-1);
+    }, timeout);
+    agentProcess
+      .then(
+        (result) => result.exitCode,
+        (error: { exitCode?: number }) => error.exitCode ?? -1
+      )
+      .then((code) => {
+        clearTimeout(timer);
+        res(code);
+      })
+      .catch(() => {
+        res(-1);
+      });
+  });
+  if (!stdoutBuffer.includes('Exiting...')) {
+    logger.warn(
+      `e2e: agent exited with code ${exitCode} but "Exiting..." never reached stdout.`
+    );
+  }
+  return exitCode;
+};
+
+serialTest('[e2e] spawn chaingraph', async (t) => {
   chaingraphProcess = execa('node', ['./bin/chaingraph.js'], {
     env: e2eEnvVariables,
     stdio: 'pipe',
@@ -607,8 +720,7 @@ test.serial('[e2e] spawn chaingraph', async (t) => {
     return;
   }
   chaingraphProcess.stdout.on('data', (chunk) => {
-    stdoutBuffer += chunk;
-    handleStdout();
+    appendStdout(chunk);
   });
   await waitForStdout('Starting Chaingraph...');
   t.pass();
@@ -620,7 +732,7 @@ const enum StatusCode {
   notFound = 404,
 }
 
-test.serial('[e2e] api /health-check is alive', async (t) => {
+serialTest('[e2e] api /health-check is alive', async (t) => {
   const healthCheckResponse = await got(
     `http://localhost:${chaingraphInternalApiPort}/health-check`
   );
@@ -628,21 +740,21 @@ test.serial('[e2e] api /health-check is alive', async (t) => {
   t.deepEqual(healthCheckResponse.body, '{"status":"alive"}');
 });
 
-test.serial('[e2e] connects to trusted nodes', async (t) => {
+serialTest('[e2e] connects to trusted nodes', async (t) => {
   await waitForStdout('node1: connected to node');
   await waitForStdout('node2: connected to node');
   await waitForStdout('node3: connected to node');
   t.pass();
 });
 
-test.serial('[e2e] downloads all header chains', async (t) => {
+serialTest('[e2e] downloads all header chains', async (t) => {
   await waitForStdout(/node1[^\n]+headers-syncing completed/u);
   await waitForStdout(/node2[^\n]+headers-syncing completed/u);
   await waitForStdout(/node3[^\n]+headers-syncing completed/u);
   t.pass();
 });
 
-test.serial(
+serialTest(
   '[e2e] restores sync-state from database on restart (during initial sync)',
   async (t) => {
     await waitForStdout(
@@ -652,7 +764,19 @@ test.serial(
     chaingraphProcess!.kill('SIGINT');
     // chaingraphProcess!.kill('SIGTERM');
     await waitForStdout('Shutting down...');
-    await waitForStdout('Exiting...');
+    /*
+     * Shutdown waits for in-flight block saves (on ClickHouse, thousands of
+     * initial-sync saves can be in flight).
+     */
+    t.deepEqual(
+      await waitForGracefulExit(chaingraphProcess!, batchTimeoutMs),
+      0
+    );
+    /*
+     * From here on, lines must come from the restarted agent (the first one
+     * also printed "Restored chain for node …").
+     */
+    clearStdoutBuffer();
     chaingraphProcess2 = execa('node', ['./bin/chaingraph.js'], {
       env: e2eEnvVariables,
       stdio: 'pipe',
@@ -662,8 +786,7 @@ test.serial(
       return;
     }
     chaingraphProcess2.stdout.on('data', (chunk) => {
-      stdoutBuffer += chunk;
-      handleStdout();
+      appendStdout(chunk);
     });
     await waitForStdout('Starting Chaingraph...');
     await waitForStdout('Restored chain for node node1');
@@ -711,7 +834,10 @@ const waitForTransactionSaveConflict = async (
   await waitForTransactionSaveConflict(transactionHash, remainingAttempts - 1);
 };
 
-const blockRepairTimeoutMs = 10_000;
+/**
+ * The incomplete-block repair scan runs after the restarted agent's catch-up.
+ */
+const blockRepairTimeoutMs = syncVisibleTimeoutMs;
 const getBlockTransactionCount = async (blockHash: string) =>
   checker.blockTransactionCount(blockHash);
 const waitForBlockTransactionCount = async (
@@ -790,35 +916,45 @@ const waitForConfirmedMempoolArchive = async () =>
     }
   );
 
-test.serial(
+serialTest(
   '[e2e] ignores inbound transactions before initial sync is complete',
   async (t) => {
     peers.node1.sendMessage(
       new peers.node1.messages.Transaction(new Transaction(halTxRaw))
     );
-    const delay = 1000;
-    await sleep(delay);
-    t.false(await checker.transactionExists(halTxHash));
-    t.pass();
+    /*
+     * Negative check: the transaction must still be absent after a bounded
+     * wait, and stay absent across two reads 1 s apart.
+     */
+    const gapMs = 1000;
+    t.deepEqual(
+      await readTwice(async () => checker.transactionExists(halTxHash), gapMs),
+      [false, false]
+    );
   }
 );
 
 const oneMinute = 60_000;
-test.serial('[e2e] completes initial sync', async (t) => {
-  t.timeout(oneMinute);
+serialTest('[e2e] completes initial sync', async (t) => {
+  t.timeout(isClickHouseE2e ? clickHouseTestTimeoutMs : oneMinute);
   await waitForStdout(
     /Saved new block – height:\s+3000[^\n]+nodes: node1, node2, node3/u,
-    oneMinute
+    syncTimeoutMs
   );
-  await waitForStdout('Agent: initial sync is complete.');
+  /*
+   * Blocks are saved concurrently, so height 3000 can be logged before lower
+   * heights; the agent reports completion once every block is saved.
+   */
+  await waitForStdout('Agent: initial sync is complete.', syncTimeoutMs);
   if (isClickHouseE2e) {
     /*
-     * On Postgres the `[postgres]` index test below waits for this; on
-     * ClickHouse (where it is skipped) the bulk-horizon UTXO build runs
-     * before mempool tracking starts, and the next tests announce
-     * transactions that are ignored until it has.
+     * On Postgres the `[postgres]` index test below waits for this and then
+     * clears the stdout buffer; on ClickHouse (where it is skipped) the
+     * bulk-horizon UTXO build runs before mempool tracking starts, and the
+     * next tests announce transactions that are ignored until it has.
      */
-    await waitForStdout('Agent: enabled mempool tracking.', oneMinute);
+    await waitForStdout('Agent: enabled mempool tracking.', syncTimeoutMs);
+    clearStdoutBuffer();
   }
   t.pass();
 });
@@ -911,7 +1047,7 @@ const storeKnownBlockHashes = async () => {
   }
 };
 
-test.serial(
+serialTest(
   '[e2e] getAllKnownBlockHashes returns hex hashes for every known block',
   async (t) => {
     const originalPostgresConnectionString =
@@ -920,12 +1056,26 @@ test.serial(
       postgresE2eConnectionStringTestDb;
     // eslint-disable-next-line functional/no-try-statement
     try {
-      const hashes = await storeKnownBlockHashes();
       /*
        * Convert client-side (the previous implementation) to verify the
        * SQL-side `encode(...)` used by `getAllKnownBlockHashes` matches it.
+       * Both reads are taken together until they agree (or the timeout).
        */
-      const expected = await checker.allBlockHashes();
+      const { expected, hashes } = await eventually(
+        async () => ({
+          expected: await checker.allBlockHashes(),
+          hashes: await storeKnownBlockHashes(),
+        }),
+        {
+          isDone: (reads) =>
+            reads.expected.length > 0 &&
+            reads.expected.join() ===
+              [...reads.hashes]
+                .sort((a, b) => (a < b ? -1 : Number(a > b)))
+                .join(),
+          timeoutMs: visibleTimeoutMs,
+        }
+      );
       t.true(expected.length > 0);
       t.deepEqual(
         [...hashes].sort((a, b) => (a < b ? -1 : Number(a > b))),
@@ -1723,7 +1873,7 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
   }
 );
 
-test.serial(
+serialTest(
   '[e2e] after initial sync is complete, requests transactions as they are announced',
   async (t) => {
     const node3RequestedTx = new Promise((res) => {
@@ -1740,22 +1890,33 @@ test.serial(
   }
 );
 
-test.serial(
+serialTest(
   '[e2e] after initial sync is complete, saves inbound transactions as they are received',
   async (t) => {
     peers.node1.sendMessage(
       new peers.node1.messages.Transaction(new Transaction(halTxRaw))
     );
     t.deepEqual(
-      await eventually(async () => checker.encodedTransactionHex(halTxHash)),
+      await eventuallyEqual(
+        async () => checker.encodedTransactionHex(halTxHash),
+        halTxRaw,
+        { timeoutMs: visibleTimeoutMs }
+      ),
       halTxRaw
     );
-    t.deepEqual(await checker.validatingNodes(halTxHash), ['node1']);
+    t.deepEqual(
+      await eventuallyEqual(
+        async () => checker.validatingNodes(halTxHash),
+        ['node1'],
+        { timeoutMs: visibleTimeoutMs }
+      ),
+      ['node1']
+    );
     t.pass();
   }
 );
 
-test.serial(
+serialTest(
   '[e2e] records validation when another node announces a known transaction',
   async (t) => {
     peers.node2.sendMessage(
@@ -1763,31 +1924,42 @@ test.serial(
     );
     const expectedNodes = ['node1', 'node2'];
     t.deepEqual(
-      await eventually(async () => checker.validatingNodes(halTxHash), {
-        isDone: (nodes) => nodes.length === expectedNodes.length,
-      }),
+      await eventuallyEqual(
+        async () => checker.validatingNodes(halTxHash),
+        expectedNodes,
+        { timeoutMs: visibleTimeoutMs }
+      ),
       expectedNodes
     );
     t.deepEqual(await checker.transactionRowCount(halTxHash), 1);
     await checker.forgetNodeValidation('node2', halTxHash);
-    t.deepEqual(await checker.validatingNodes(halTxHash), ['node1']);
+    t.deepEqual(
+      await eventuallyEqual(
+        async () => checker.validatingNodes(halTxHash),
+        ['node1'],
+        { timeoutMs: visibleTimeoutMs }
+      ),
+      ['node1']
+    );
   }
 );
 
-test.serial('[e2e] handles first chipnet CashTokens transaction', async (t) => {
+serialTest('[e2e] handles first chipnet CashTokens transaction', async (t) => {
   peers.node1.sendMessage(
     new peers.node1.messages.Transaction(new Transaction(chipnetCashTokensTx))
   );
   t.deepEqual(
-    await eventually(async () =>
-      checker.encodedTransactionHex(chipnetCashTokensTxHash)
+    await eventuallyEqual(
+      async () => checker.encodedTransactionHex(chipnetCashTokensTxHash),
+      chipnetCashTokensTx,
+      { timeoutMs: visibleTimeoutMs }
     ),
     chipnetCashTokensTx
   );
   t.pass();
 });
 
-test.serial(
+serialTest(
   '[e2e] after initial sync is complete, requests and saves inbound transactions as they are announced',
   async (t) => {
     peers.node1.sendMessage(
@@ -1796,21 +1968,31 @@ test.serial(
       )
     );
     t.deepEqual(
-      await eventually(async () => checker.encodedTransactionHex(halTxSpent)),
+      await eventuallyEqual(
+        async () => checker.encodedTransactionHex(halTxSpent),
+        halTxSpentRaw,
+        { timeoutMs: visibleTimeoutMs }
+      ),
       halTxSpentRaw
     );
     t.pass();
   }
 );
 
-test.serial('[e2e] get hex-encoded genesis block header', async (t) => {
+serialTest('[e2e] get hex-encoded genesis block header', async (t) => {
+  const expected =
+    '0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c';
   t.deepEqual(
-    await checker.encodedBlockHeaderHex({ height: 0 }),
-    '0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c'
+    await eventuallyEqual(
+      async () => checker.encodedBlockHeaderHex({ height: 0 }),
+      expected,
+      { timeoutMs: visibleTimeoutMs }
+    ),
+    expected
   );
 });
 
-test.serial('[e2e] get hex-encoded genesis block transaction', async (t) => {
+serialTest('[e2e] get hex-encoded genesis block transaction', async (t) => {
   t.deepEqual(
     await checker.encodedTransactionHex(
       '4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b'
@@ -1819,14 +2001,14 @@ test.serial('[e2e] get hex-encoded genesis block transaction', async (t) => {
   );
 });
 
-test.serial(
+serialTest(
   '[e2e] get hex-encoded genesis block (with transaction)',
   async (t) => {
     t.deepEqual(await checker.encodedBlockHex({ height: 0 }), genesisBlockRaw);
   }
 );
 
-test.serial('[e2e] value aggregates handle coinbase-only blocks', async (t) => {
+serialTest('[e2e] value aggregates handle coinbase-only blocks', async (t) => {
   t.deepEqual(await checker.blockValueAggregates({ height: 0 }), {
     fee: 0n,
     generated: 5000000000n,
@@ -1835,7 +2017,7 @@ test.serial('[e2e] value aggregates handle coinbase-only blocks', async (t) => {
   });
 });
 
-test.serial(
+serialTest(
   '[e2e] get hex-encoded block with multiple transactions',
   async (t) => {
     const blockWithMultipleTransactions = mockchainBeforeFork[1]!;
@@ -1891,12 +2073,24 @@ const newBlocks = (
   );
 };
 
-test.serial(
+serialTest(
   '[e2e] syncs blocks as they arrive, handles multiple chain tips',
   async (t) => {
     const [, tx1] = tipA[0]!.transactions;
     peers.node1.sendMessage(new peers.node1.messages.Transaction(tx1));
     logger.debug(`node1: sent tipA[0] transaction 0: ${tx1!.hash}`);
+    /*
+     * The block must find tx1 already saved ("new txs: 3/4" below), so wait
+     * for it to reach node1's mempool before announcing the block.
+     */
+    const tx1InMempool = await eventually(
+      async () => checker.mempoolMembership('node1', [tx1!.hash]),
+      {
+        isDone: (members) => members.has(tx1!.hash),
+        timeoutMs: visibleTimeoutMs,
+      }
+    );
+    t.true(tx1InMempool.has(tx1!.hash));
     newBlocks('node1', [tipA[0]!]);
     newBlocks('node2', [tipB[0]!]);
     newBlocks('node3', [tipB[0]!]);
@@ -1918,7 +2112,7 @@ test.serial(
   }
 );
 
-test.serial('[e2e] handles re-org of a single block', async (t) => {
+serialTest('[e2e] handles re-org of a single block', async (t) => {
   newBlocks('node1', [tipA[1]!]);
   newBlocks('node2', [tipB[1]!]);
   chainStates.node3.pop();
@@ -1939,17 +2133,22 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   t.pass();
 });
 
-test.serial('[e2e] new block saved after reorg', async (t) => {
-  const acceptedBlocks = await checker.acceptedBlocks('node3', {
-    height: splitHeight + 1,
-  });
-  t.deepEqual(
-    acceptedBlocks.map(({ hash, height }) => ({ hash, height })),
-    [{ hash: tipA[0]!.header.hash, height: splitHeight + 1 }]
+serialTest('[e2e] new block saved after reorg', async (t) => {
+  const expected = [{ hash: tipA[0]!.header.hash, height: splitHeight + 1 }];
+  const acceptedBlocks = await eventuallyEqual(
+    async () =>
+      (
+        await checker.acceptedBlocks('node3', {
+          height: splitHeight + 1,
+        })
+      ).map(({ hash, height }) => ({ hash, height })),
+    expected,
+    { timeoutMs: visibleTimeoutMs }
   );
+  t.deepEqual(acceptedBlocks, expected);
 });
 
-test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
+serialTest('[e2e] handles reversal of single-block re-org', async (t) => {
   const tipStartIndex = 2;
   const tipEnd = 6;
   newBlocks('node1', tipA.slice(tipStartIndex, tipEnd));
@@ -1970,7 +2169,7 @@ test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
   t.pass();
 });
 
-test.serial('[e2e] handles re-org of 6 blocks', async (t) => {
+serialTest('[e2e] handles re-org of 6 blocks', async (t) => {
   const tipStartIndex = 6;
   const tipEnd = 7;
   newBlocks('node1', tipA.slice(tipStartIndex, tipEnd));
@@ -1989,7 +2188,7 @@ test.serial('[e2e] handles re-org of 6 blocks', async (t) => {
   t.pass();
 });
 
-test.serial('[e2e] handles reversal of 6 block re-org', async (t) => {
+serialTest('[e2e] handles reversal of 6 block re-org', async (t) => {
   const tipStartIndex = 6;
   const tipEnd = 8;
   newBlocks('node2', tipB.slice(tipStartIndex, tipEnd));
@@ -2024,7 +2223,7 @@ const slowFeedBlocks = (
   }
 };
 
-test.serial('[e2e] handles re-org of 100 blocks', async (t) => {
+serialTest('[e2e] handles re-org of 100 blocks', async (t) => {
   const tipEnd = 101;
   slowFeedBlocks('node1', tipA.slice(7, tipEnd));
   slowFeedBlocks('node2', tipB.slice(8, tipEnd));
@@ -2043,16 +2242,21 @@ test.serial('[e2e] handles re-org of 100 blocks', async (t) => {
     )}`
   );
   await waitForStdout(
-    /node3: re-organization detected beginning at height: 3001. The following stale blocks were removed:/u
+    /node3: re-organization detected beginning at height: 3001. The following stale blocks were removed:/u,
+    batchTimeoutMs
   );
-  await waitForStdout(/Saved new block – height:\s+3100[^\n]+nodes: node2/u);
   await waitForStdout(
-    /Saved new block – height:\s+3100[^\n]+nodes: node1, node3/u
+    /Saved new block – height:\s+3100[^\n]+nodes: node2/u,
+    batchTimeoutMs
+  );
+  await waitForStdout(
+    /Saved new block – height:\s+3100[^\n]+nodes: node1, node3/u,
+    batchTimeoutMs
   );
   t.pass();
 });
 
-test.serial('[e2e] records stale blocks', async (t) => {
+serialTest('[e2e] records stale blocks', async (t) => {
   const tipStartIndex = 101;
   const tipEnd1 = 150;
   const tipEnd2 = 160;
@@ -2060,7 +2264,10 @@ test.serial('[e2e] records stale blocks', async (t) => {
   slowFeedBlocks('node2', tipB.slice(tipStartIndex, tipEnd1));
   slowFeedBlocks('node3', tipA.slice(tipStartIndex, tipEnd1));
   newBlocks('node3', tipAStale150);
-  await waitForStdout(/Saved new block – height:\s+3153[^\n]+nodes: node3/u);
+  await waitForStdout(
+    /Saved new block – height:\s+3153[^\n]+nodes: node3/u,
+    batchTimeoutMs
+  );
   chainStates.node3.splice(splitHeight + tipEnd1 + 1);
   slowFeedBlocks('node1', tipA.slice(tipEnd1, tipEnd2));
   slowFeedBlocks('node2', tipB.slice(tipEnd1, tipEnd2));
@@ -2070,18 +2277,24 @@ test.serial('[e2e] records stale blocks', async (t) => {
     chainStates.node3.map((block) => block.header.hash)
   );
   await waitForStdout(
-    /node3: re-organization detected beginning at height: 3151. The following stale blocks were removed:/u
+    /node3: re-organization detected beginning at height: 3151. The following stale blocks were removed:/u,
+    batchTimeoutMs
   );
-  await waitForStdout(/Saved new block – height:\s+3160[^\n]+nodes: node2/u);
   await waitForStdout(
-    /Saved new block – height:\s+3160[^\n]+nodes: node1, node3/u
+    /Saved new block – height:\s+3160[^\n]+nodes: node2/u,
+    batchTimeoutMs
+  );
+  await waitForStdout(
+    /Saved new block – height:\s+3160[^\n]+nodes: node1, node3/u,
+    batchTimeoutMs
   );
   t.pass();
 });
 /* eslint-enable @typescript-eslint/no-magic-numbers */
 
-const doubleSpendSaveTimeoutMs = 5_000;
-test.serial(
+// eslint-disable-next-line @typescript-eslint/no-magic-numbers
+const doubleSpendSaveTimeoutMs = Math.max(visibleTimeoutMs, 5_000);
+serialTest(
   '[e2e] records double-spends accepted via mempool and via block',
   async (t) => {
     // eslint-disable-next-line prefer-destructuring
@@ -2117,7 +2330,10 @@ test.serial(
     const doubleSpendHashes = [tx1!.hash, mock1.hash];
     const history = await eventually(
       async () => checker.transactionHistory('node1', doubleSpendHashes),
-      { isDone: (rows) => rows.length === doubleSpendHashes.length }
+      {
+        isDone: (rows) => rows.length === doubleSpendHashes.length,
+        timeoutMs: visibleTimeoutMs,
+      }
     );
     t.deepEqual(
       history.map((row) => row.hash),
@@ -2143,7 +2359,7 @@ const allNodesBeforeRestart = ['node1', 'node2', 'node3'];
 const mempoolHashes = async (node: string) =>
   (await checker.mempool(node)).map((entry) => entry.hash);
 
-test.serial(
+serialTest(
   '[e2e] removes node_transaction entries which are confirmed by a block',
   async (t) => {
     const [, tx1, tx2, tx3] = tipA[161]!.transactions;
@@ -2162,9 +2378,11 @@ test.serial(
       halTxHash,
     ];
     t.deepEqual(
-      await eventually(async () => mempoolHashes('node1'), {
-        isDone: (hashes) => hashes.length === expectedMempool1.length,
-      }),
+      await eventuallyEqual(
+        async () => mempoolHashes('node1'),
+        expectedMempool1,
+        { timeoutMs: visibleTimeoutMs }
+      ),
       expectedMempool1
     );
     t.deepEqual(await mempoolHashes('node2'), []);
@@ -2182,9 +2400,11 @@ test.serial(
     );
     const expectedMempool2 = [chipnetCashTokensTxHash, halTxSpent, halTxHash];
     t.deepEqual(
-      await eventually(async () => mempoolHashes('node1'), {
-        isDone: (hashes) => hashes.length === expectedMempool2.length,
-      }),
+      await eventuallyEqual(
+        async () => mempoolHashes('node1'),
+        expectedMempool2,
+        { timeoutMs: visibleTimeoutMs }
+      ),
       expectedMempool2
     );
     t.deepEqual(await mempoolHashes('node2'), []);
@@ -2201,12 +2421,13 @@ test.serial(
   }
 );
 
-test.serial('[e2e] shuts down with SIGINT', async (t) => {
+serialTest('[e2e] shuts down with SIGINT', async (t) => {
   chaingraphProcess2!.kill('SIGINT');
   await waitForStdout('Shutting down...');
-  await waitForStdout('Exiting...');
-  await chaingraphProcess2;
-  t.pass();
+  t.deepEqual(
+    await waitForGracefulExit(chaingraphProcess2!, batchTimeoutMs),
+    0
+  );
 });
 
 const historicalRepairTipIndex = 161;
@@ -2214,16 +2435,21 @@ const historicalRepairTransactionIndex = 1;
 const historicalRepairBlock = tipA[historicalRepairTipIndex]!;
 const historicalRepairBlockHash = historicalRepairBlock.header.hash;
 
-test.serial(
+serialTest(
   '[e2e] prepares incomplete historical block transaction before restart',
   async (t) => {
     const transactionHash =
       historicalRepairBlock.transactions[historicalRepairTransactionIndex]!
         .hash;
     t.deepEqual(
-      await checker.blockTransactionAt(
-        historicalRepairBlockHash,
-        historicalRepairTransactionIndex
+      await eventuallyEqual(
+        async () =>
+          checker.blockTransactionAt(
+            historicalRepairBlockHash,
+            historicalRepairTransactionIndex
+          ),
+        transactionHash,
+        { timeoutMs: visibleTimeoutMs }
       ),
       transactionHash
     );
@@ -2231,14 +2457,18 @@ test.serial(
       historicalRepairBlockHash,
       historicalRepairTransactionIndex
     );
+    const expectedCount = historicalRepairBlock.transactions.length - 1;
     t.deepEqual(
-      await getBlockTransactionCount(historicalRepairBlockHash),
-      historicalRepairBlock.transactions.length - 1
+      await waitForBlockTransactionCount(
+        historicalRepairBlockHash,
+        expectedCount
+      ),
+      expectedCount
     );
   }
 );
 
-test.serial(
+serialTest(
   '[e2e] restores sync-state from database on restart (after initial sync)',
   async (t) => {
     chaingraphProcess3 = execa('node', ['./bin/chaingraph.js'], {
@@ -2250,8 +2480,7 @@ test.serial(
       return;
     }
     chaingraphProcess3.stdout.on('data', (chunk) => {
-      stdoutBuffer += chunk;
-      handleStdout();
+      appendStdout(chunk);
     });
     await waitForStdout('Starting Chaingraph...');
     await waitForStdout('Restored chain for node node1');
@@ -2261,23 +2490,27 @@ test.serial(
   }
 );
 
-test.serial('[e2e] catches up a new node via headers', async (t) => {
-  t.timeout(oneMinute);
+serialTest('[e2e] catches up a new node via headers', async (t) => {
+  t.timeout(isClickHouseE2e ? clickHouseTestTimeoutMs : oneMinute);
   await waitForStdout(
     `node4: accepted 2000 existing blocks from height 1 to height 2000 (hash: ${
       chainStates.node3[2000]!.header.hash
     })`,
-    oneMinute
+    syncTimeoutMs
   );
   await waitForStdout(
     `node4: accepted 1162 existing blocks from height 2001 to height 3162 (hash: ${
       chainStates.node3[3162]!.header.hash
-    })`
+    })`,
+    syncTimeoutMs
   );
   const expectedCount = 3163;
   const node4Blocks = await eventually(
     async () => checker.acceptedBlocks('node4'),
-    { isDone: (blocks) => blocks.length === expectedCount }
+    {
+      isDone: (blocks) => blocks.length === expectedCount,
+      timeoutMs: syncVisibleTimeoutMs,
+    }
   );
   t.deepEqual(node4Blocks.length, expectedCount);
   const node4Tip = node4Blocks[node4Blocks.length - 1]!;
@@ -2285,14 +2518,14 @@ test.serial('[e2e] catches up a new node via headers', async (t) => {
     { hash: node4Tip.hash, height: node4Tip.height },
     { hash: tipA[161]!.header.hash, height: 3162 }
   );
-  await waitForStdout('Agent: enabled mempool tracking.');
+  await waitForStdout('Agent: enabled mempool tracking.', syncTimeoutMs);
   t.pass();
 });
 
-test.serial(
+serialTest(
   '[e2e] self-heals incomplete historical block transactions on startup',
   async (t) => {
-    t.timeout(oneMinute);
+    t.timeout(isClickHouseE2e ? clickHouseTestTimeoutMs : oneMinute);
     t.deepEqual(
       await waitForBlockTransactionCount(
         historicalRepairBlockHash,
@@ -2303,18 +2536,15 @@ test.serial(
   }
 );
 
-test.serial(
-  '[e2e] handles empty headers messages (fully-synced)',
-  async (t) => {
-    peers.node1.sendMessage(new peers.node1.messages.Headers([]));
-    await waitForStdout(
-      'node1: received empty headers message – headers-syncing completed'
-    );
-    t.pass();
-  }
-);
+serialTest('[e2e] handles empty headers messages (fully-synced)', async (t) => {
+  peers.node1.sendMessage(new peers.node1.messages.Headers([]));
+  await waitForStdout(
+    'node1: received empty headers message – headers-syncing completed'
+  );
+  t.pass();
+});
 
-test.serial(
+serialTest(
   '[e2e] saves block transactions if previously announced tx is seen but not yet saved',
   async (t) => {
     const tipStartIndex = 162;
@@ -2359,7 +2589,7 @@ test.serial(
   }
 );
 
-test.serial('[e2e] syncs remaining blocks one-by-one', async (t) => {
+serialTest('[e2e] syncs remaining blocks one-by-one', async (t) => {
   const tipStartIndex = 163;
   slowFeedBlocks('node1', tipA.slice(tipStartIndex), 1);
   slowFeedBlocks('node2', tipB.slice(tipStartIndex), 1);
@@ -2379,14 +2609,18 @@ test.serial('[e2e] syncs remaining blocks one-by-one', async (t) => {
       .slice(0, splitHeight + 1)
       .map((block) => block.header.hash)
   );
-  await waitForStdout(/Saved new block – height:\s+3200[^\n]+nodes: node2/u);
   await waitForStdout(
-    /Saved new block – height:\s+3200[^\n]+nodes: node1, node4/u
+    /Saved new block – height:\s+3200[^\n]+nodes: node2/u,
+    batchTimeoutMs
+  );
+  await waitForStdout(
+    /Saved new block – height:\s+3200[^\n]+nodes: node1, node4/u,
+    batchTimeoutMs
   );
   t.pass();
 });
 
-test.serial('[e2e] [api] 404: logs unknown request urls', async (t) => {
+serialTest('[e2e] [api] 404: logs unknown request urls', async (t) => {
   const res = await got(
     `http://localhost:${chaingraphInternalApiPort}/unknown-URL`,
     { throwHttpErrors: false }
@@ -2412,7 +2646,7 @@ const validRequestWithoutNode = {
   session_variables: { 'x-hasura-role': 'public' },
 };
 
-test.serial(
+serialTest(
   '[e2e] [api] /send-transaction: malformed (missing input)',
   async (t) => {
     const res = await got.post(
@@ -2429,7 +2663,7 @@ test.serial(
   }
 );
 
-test.serial(
+serialTest(
   '[e2e] [api] /send-transaction: malformed (missing encoded_hex)',
   async (t) => {
     const res = await got.post(
@@ -2447,7 +2681,7 @@ test.serial(
   }
 );
 
-test.serial(
+serialTest(
   '[e2e] [api] /send-transaction: malformed (missing node_internal_id)',
   async (t) => {
     const res = await got.post(
@@ -2462,7 +2696,7 @@ test.serial(
   }
 );
 
-test.serial(
+serialTest(
   '[e2e] [api] /send-transaction: malformed (node_internal_id is not a number)',
   async (t) => {
     const res = await got.post(
@@ -2485,7 +2719,7 @@ test.serial(
   }
 );
 
-test.serial(
+serialTest(
   '[e2e] [api] /send-transaction: malformed (encoded_hex is not a string)',
   async (t) => {
     const res = await got.post(
@@ -2508,7 +2742,7 @@ test.serial(
   }
 );
 
-test.serial(
+serialTest(
   '[e2e] [api] /send-transaction: unknown node_internal_id',
   async (t) => {
     const res = await got.post(
@@ -2544,7 +2778,7 @@ test.serial(
 
 // eslint-disable-next-line functional/no-let
 let node1InternalId = 0;
-test.serial('[e2e] [api] /send-transaction: invalid TX', async (t) => {
+serialTest('[e2e] [api] /send-transaction: invalid TX', async (t) => {
   node1InternalId = (await checker.nodeInternalId('node1'))!;
   const res = await got.post(
     `http://localhost:${chaingraphInternalApiPort}/send-transaction`,
@@ -2575,7 +2809,7 @@ test.serial('[e2e] [api] /send-transaction: invalid TX', async (t) => {
   );
 });
 
-test.serial('[e2e] [api] /send-transaction: valid', async (t) => {
+serialTest('[e2e] [api] /send-transaction: valid', async (t) => {
   const res = await got.post(
     `http://localhost:${chaingraphInternalApiPort}/send-transaction`,
     {
