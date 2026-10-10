@@ -171,6 +171,10 @@ database.
 For the lab: `scripts/chipnet-lab/ch1-chipnet-stand-in-check.mjs <agent dir> <url> <database>` prints JSON and exits
 1 if either list is non-empty. On the full chipnet database it takes about 1 s.
 
+Lab results: [chipnet-lab.md](chipnet-lab.md), second run.
+- Agent 1817583: `input_spent` parity matches, the stand-in check is clean, and the UTXO-on stored set equals v1.
+- The 59af34f pass resolved 13 live stand-in groups in a block commit.
+
 ## 5. Tests
 
 New `stand-in.spec.ts`, `[e2e]`, 13 tests (the last one is §7's). The first four run with UTXO on and off. Each checks the child's

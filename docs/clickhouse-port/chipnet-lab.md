@@ -116,7 +116,7 @@ $S/ch1-chipnet-parity.sh            # at the new common height (live tip, re-org
 $S/ch1-chipnet-cleanup.sh --yes     # when done
 ```
 
-## Results (2026-10-10, agent 50e8d2e)
+## Results, first run (2026-10-10, agent 50e8d2e)
 
 Setup:
 - Docker Desktop VM: 14 CPUs, ~42 GB RAM, 850 GiB free.
@@ -200,6 +200,112 @@ Postgres is correct here: it joins `input` to `output`. ClickHouse API readers o
 columns would see value 0 and empty bytecode for these inputs. Next step: a regression test for "mempool child
 stored with pending spends, restart, block containing parent and child". Possibly also without the restart, if the
 fill skips already-stored children in general. The databases are kept as they are for inspection.
+
+Fixed in c967a0c ([mempool-fill-fix.md](mempool-fill-fix.md)). The restart was not needed: the same happens in one
+process. The new stand-in check listed exactly these three inputs on this database before it was dropped.
+
+## Results, second run (2026-10-10/11, agent 1817583)
+
+Agent 1817583 contains three fixes:
+- c967a0c: the mempool fill fix;
+- 59af34f: download retry;
+- 1817583: mempool commit order.
+
+The two later fixes were found by the earlier passes of this run (see "Earlier passes" below). Every number in
+this section is from 1817583.
+
+Changes from the first run:
+- **Agent.** Frozen export `agent-1817583` (git archive + `.yarn` a9d1c68, offline install, build).
+- **ClickHouse settings: agent defaults except `UTXO=off`.** No in-flight cap; 64 blocks per commit; the fix-pass-3
+  batch linger (200 ms, small batches up to 1,024 blocks / 4 MiB). `ch1-chipnet-run.sh` leaves a setting out when
+  `CHIPNET_CH_MAX_IN_FLIGHT_SAVES=` / `CHIPNET_CH_MAX_BLOCKS_PER_COMMIT=` are set empty, and takes
+  `CHIPNET_CH_UTXO`.
+- **Production DDL part cleanup.** `old_parts_lifetime = 30` etc., via `CHIPNET_CH_PART_CLEANUP=`; the first run used
+  the lab-only 5 s.
+- **Databases.** `chipnet_ch` was dropped and recreated. `chipnet_pg` was kept as the reference; its agent (same
+  export) followed the tip during the check.
+
+### Sync from genesis (ClickHouse, UTXO off)
+
+| | first run (50e8d2e, cap 16, 64/commit, lab cleanup 5 s) | **second run (1817583, defaults + linger, DDL 30 s)** |
+|---|---|---|
+| start → every block accepted | 18:45:09Z → +484 s | 22:08:01Z → **+484 s** (`initial sync is complete` +479 s) |
+| chain at tip | 327,302 blocks, 2,844,337 txs | 327,323 blocks, 2,845,030 txs |
+| tx/s to tip | 5,877 | **5,878** |
+| max event-loop delay (10 s windows) | 871 ms, 0 windows ≥ 1 s | 904 ms, 0 windows ≥ 1 s |
+| errors / warnings | 0 / 0 | 0 / 0 |
+| active parts: max / max per partition | 86 / 17 | 73 / 15 |
+| inactive bytes, peak | 1.90 GB (lab 5 s lifetime) | 4.30 GB (DDL 30 s lifetime), back to ~0 after the sync |
+| `part_log`: new parts | 316,908 (5.32 GiB) | **23,960** (4.15 GiB) |
+| `part_log`: merges | 84,038, writing 49.4 GiB in 1,004 s of merge time | **5,140**, writing 15.6 GiB in 106 s |
+| delayed / rejected inserts | 0 / 0 | 0 / 0 |
+| size on disk after the sync | 4.73 GiB | 4.71 GiB (`input` 2.52, `output` 1.40 GiB, `transaction` 258, `tx_acceptance` 237, `block_transaction` 225, `block` 75 MiB) |
+
+Reading:
+- The linger cuts insert parts 13× and merge writes 3×, at the same wall time.
+- The inactive peak is higher only because the DDL keeps merged-away parts for 30 s instead of the lab's 5 s.
+- The earlier passes gave the same sync numbers:
+  - c967a0c: 485 s, 5,865 tx/s, 953 ms max delay, 82 / 15 parts, 4.30 GB inactive peak;
+  - 59af34f: 484 s, 5,878 tx/s, 966 ms max delay, 74 / 16 parts, 4.05 GB inactive peak.
+
+### Follow the tip ≥ 30 min, both agents at once
+
+- **Timing.** ClickHouse followed from 22:16:05Z and Postgres from 22:16:06Z; both stopped at 22:46:39Z (30.6 min).
+- **Traffic.** 2 new blocks (327,324–327,325) and 122 ClickHouse mempool commits.
+- **Errors.** Neither agent logged an error or a warning.
+- **Max event-loop delay.** ClickHouse 226 ms; Postgres 67 ms.
+- **Stand-ins.** This window had no orphan, so no stand-in. The fix's path ran live in the 59af34f pass below, and in
+  the UTXO-on run.
+
+### Parity at H = 327,325 (both stopped)
+
+| table | rows | result |
+|---|---|---|
+| block | 327,326 | match |
+| block_transaction, transaction | 2,845,061 | match |
+| output | 7,835,461 | match |
+| input | 6,952,881 | match |
+| **input_spent** | 6,625,555 | **match** (the first run's mismatch is gone) |
+| tx_acceptance | 2,845,061 | match |
+| node_block_history | 0 | match |
+| node_block | 327,326 | 1 chunk: 20 blocks (327,293–327,312) have `accepted_at` on Postgres and NULL on ClickHouse, the 2 h rule of the first run. Postgres saved them live; ClickHouse synced them ≥ 2 h after their block times. |
+| node_transaction_history | 410 vs 29 | 381 Postgres-only, **0 ClickHouse-only**. Postgres has kept its history since 18:33Z; `chipnet_ch` is new since 22:08Z. |
+
+**Stand-in check on `chipnet_ch`** (`ch1-chipnet-stand-in-check.mjs`): clean, 0 mismatched and 0 duplicated (0.8 s).
+On the first run's database it had listed exactly the three inputs of `d9444345…` (0.9 s).
+
+### UTXO on (`chipnet_ch_utxo`, same agent and defaults, `CHIPNET_CH_UTXO=on`)
+
+- **Sync.** 22:47:53Z, +484 s to every block, 5,878 tx/s. Max event-loop delay 888 ms (0 windows ≥ 1 s), no warnings.
+  Parts 82 / 19; inactive peak 4.32 GB.
+- **Follow.** It followed the tip for 10 min: 16 mempool commits.
+- **Stand-ins.** Two stand-in groups (two `fill_pending` commits), whose parents were still unmined at stop.
+- **Checks after stop:**
+  - every commit is `committed`;
+  - the stand-in check is clean;
+  - `ch1-chipnet-utxo-check.mjs`: the stored UTXO set equals the v1 definition, **1,209,921 = 1,209,921**, nothing
+    only on one side (8.7 s).
+
+### Earlier passes of this run (superseded, kept for the findings)
+
+- **c967a0c (mempool fill fix only), UTXO off.** Sync and parity as above; `input_spent` matched. A mid-follow
+  restart of the ClickHouse agent left no error. Its UTXO-on sync then hit the agent download stall
+  (mempool-fill-fix.md §6):
+  - 4 blocks arrived 5 min late;
+  - `pending_spend_timeout` ×2;
+  - the stand-in check flagged 59 block inputs, and the stored UTXO set had 59 outpoints too many against v1.
+
+  Fixed in 59af34f.
+- **59af34f, UTXO off.** The fix's path ran live in this pass. The agent started tracking the mempool at 21:08:34Z.
+  By 21:19Z it had saved 11 children of 13 never-seen parents: 13 stand-in groups, 14 inputs. Block 327,319 (commit
+  `1099511630142`) then wrote the 14 real `input` rows, the 13 resolutions and the 14 `pending_spend` −1 rows. The
+  stand-in check was clean before and after the block. Parity at 327,319 matched every table except the
+  `node_block` 2 h rule and Postgres-only history. The UTXO-on sync then stalled (mempool-fill-fix.md §7):
+  - a chain of orphans was released together;
+  - seven mempool commits stayed at `intent`;
+  - the watermarks froze.
+
+  Fixed in 1817583.
 
 ## Footprint estimate (before the runs)
 
