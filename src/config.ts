@@ -531,6 +531,26 @@ if (!Number.isInteger(maxInFlightSavesValue) || maxInFlightSavesValue < 0) {
  */
 const clickhouseMaxInFlightSaves = maxInFlightSavesValue;
 
+const clickhouseUtxoValue = optionalString(
+  optionalOptions.CHAINGRAPH_CLICKHOUSE_UTXO,
+  'on'
+);
+if (clickhouseUtxoValue !== 'on' && clickhouseUtxoValue !== 'off') {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_CLICKHOUSE_UTXO' environment variable: ${clickhouseUtxoValue}. Must be 'on' or 'off'.`
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_CLICKHOUSE_UTXO` environment variable (default:
+ * `on`). `off`: the ClickHouse store never writes the stored UTXO tables
+ * (`utxo`, `utxo_by_script`) and skips the horizon UTXO build; unspent
+ * outputs are computed at query time from output/input/acceptance, as in
+ * upstream Chaingraph v1 (docs/clickhouse-port/utxo-off.md). Set it once per
+ * database. Ignored by the Postgres store.
+ */
+const clickhouseUtxo: 'off' | 'on' = clickhouseUtxoValue;
+
 /**
  * `true` if the `NODE_ENV` environment variable is `production`.
  */
@@ -550,6 +570,7 @@ export {
   clickhousePassword,
   clickhouseUrl,
   clickhouseUser,
+  clickhouseUtxo,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
   mempoolTransactionExpirationMs,

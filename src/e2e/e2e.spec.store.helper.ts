@@ -123,7 +123,15 @@ const clickHousePassThroughVariables = [
   'CHAINGRAPH_CLICKHOUSE_MAX_BYTES_PER_COMMIT',
   'CHAINGRAPH_CLICKHOUSE_LEASE_TTL_MS',
   'CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS',
+  'CHAINGRAPH_CLICKHOUSE_UTXO',
 ] as const;
+
+/**
+ * The agent's `CHAINGRAPH_CLICKHOUSE_UTXO` (passed through): the checker
+ * answers `unspent` at query time when it is `off`.
+ */
+export const e2eClickHouseUtxo = (): 'off' | 'on' =>
+  process.env.CHAINGRAPH_CLICKHOUSE_UTXO === 'off' ? 'off' : 'on';
 
 const clickHousePassThroughEnvironment = (): { [key: string]: string } =>
   Object.fromEntries(

@@ -60,6 +60,7 @@ import {
   dropStaleClickHouseE2eDatabases,
   e2eClickHouseDatabase,
   e2eClickHouseServer,
+  e2eClickHouseUtxo,
   e2eStore,
   e2eStoreEnvironment,
   isClickHouseE2e,
@@ -263,6 +264,7 @@ const setUpClickHouse = async () => {
   checker = createChecker({
     backend: 'clickhouse',
     client: clickHouseClient,
+    utxo: e2eClickHouseUtxo(),
   });
 };
 

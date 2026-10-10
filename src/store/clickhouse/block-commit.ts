@@ -228,7 +228,18 @@ export interface WriterContext {
   mempoolHooks?: () => MempoolCommitter | undefined;
   /** Shutdown: abandon waits and uncommitted work. */
   abandon?: AbandonSignal;
+  /**
+   * `false` (`CHAINGRAPH_CLICKHOUSE_UTXO=off`): never write `utxo` /
+   * `utxo_by_script` rows. Default `true`.
+   */
+  utxo?: boolean;
 }
+
+/** The stored UTXO tables (skipped entirely when the context's `utxo` is false). */
+export const utxoTables: ReadonlySet<string> = new Set([
+  'utxo',
+  'utxo_by_script',
+]);
 
 /** Postgres's saveBlock result semantics. */
 export interface SaveBlockResult {
@@ -377,15 +388,19 @@ export const assignTransactionIds = (
  * Pure: the UTXO rows of one block for one accepting node (plan §2.3): every
  * transaction not already accepted by the node becomes accepted (+1 outputs,
  * −1 spent outputs). Spends whose output is not yet known are returned in
- * `pending` (their −1 rows are written by the fill step).
+ * `pending` (their −1 rows are written by the fill step). With
+ * `utxo: false` (`CHAINGRAPH_CLICKHOUSE_UTXO=off`) no rows are produced;
+ * `pending` and `transitions` are unchanged (pending spends still resolve).
  */
 export const blockUtxoDelta = ({
   nodeInternalId,
   transactions,
   acceptedBefore,
   resolveSpent,
+  utxo = true,
 }: {
   nodeInternalId: number;
+  utxo?: boolean;
   transactions: readonly {
     transaction: ChaingraphTransaction;
     internalId: bigint;
@@ -435,6 +450,9 @@ export const blockUtxoDelta = ({
           spentOutputs.push(spent);
         }
       });
+    }
+    if (!utxo) {
+      return;
     }
     appendAll(
       rows,
@@ -1101,6 +1119,7 @@ export class BlockCommitter {
     operation.seq = commit.seq;
     await context.fault('intent', { kind: 'block', seq: commit.seq });
     const rowCounts: { [table: string]: number } = {};
+    const utxoEnabled = context.utxo !== false;
     const insert = async (
       table: string,
       columns: readonly string[],
@@ -1108,6 +1127,9 @@ export class BlockCommitter {
       chunk: number | string = 0
     ) => {
       if (encoded.rowCount === 0) {
+        return;
+      }
+      if (!utxoEnabled && utxoTables.has(table)) {
         return;
       }
       await context.client.insertRowBinary(table, columns, encoded.data, {
@@ -1338,7 +1360,9 @@ export class BlockCommitter {
 
     const utxoRows: UtxoRow[] = [];
     if (hooks !== undefined && mempoolChanges.length > 0) {
-      const mempoolRows = changeRows(mempoolChanges, historyIds);
+      const mempoolRows = changeRows(mempoolChanges, historyIds, {
+        utxo: utxoEnabled,
+      });
       /*
        * mempool-originated UTXO rows are written in every mode (the bulk
        * horizon build only covers transactions in bulk-period blocks)
@@ -1383,6 +1407,7 @@ export class BlockCommitter {
           nodeInternalId: node,
           resolveSpent,
           transactions,
+          utxo: utxoEnabled,
         });
         appendAll(utxoRows, delta.rows);
         delta.pending.forEach((item) => {
@@ -1481,7 +1506,7 @@ export class BlockCommitter {
         'f0'
       );
       const fillUtxo = pendingUtxo
-        .filter((item) => resolved.has(item.key))
+        .filter((item) => utxoEnabled && resolved.has(item.key))
         .map(
           (item): UtxoRow => ({
             nodeInternalId: item.node,

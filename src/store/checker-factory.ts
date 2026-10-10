@@ -12,14 +12,21 @@ import { createPostgresChecker } from './postgres/checker.js';
 import type { ChaingraphStoreBackend } from './types.js';
 
 export type CheckerConnection =
-  | { backend: 'clickhouse'; client: ClickHouseClient; database?: string }
+  | {
+      backend: 'clickhouse';
+      client: ClickHouseClient;
+      database?: string;
+      /** The store's `CHAINGRAPH_CLICKHOUSE_UTXO` (default `on`). */
+      utxo?: 'off' | 'on';
+    }
   | { backend: 'postgres'; db: PostgresQueryable };
 
 export const createChecker = (connection: CheckerConnection): StoreChecker =>
   connection.backend === 'clickhouse'
     ? createClickHouseChecker(
         connection.client,
-        connection.database ?? connection.client.database
+        connection.database ?? connection.client.database,
+        { utxo: connection.utxo }
       )
     : createPostgresChecker(connection.db);
 

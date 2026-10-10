@@ -1,4 +1,4 @@
-/* eslint-disable camelcase, @typescript-eslint/naming-convention, complexity, max-params */
+/* eslint-disable max-lines, camelcase, @typescript-eslint/naming-convention, complexity, max-params */
 // cspell:ignore clickhouse unhex seqs milli noncoinbase dedup
 /**
  * `StoreChecker` over the ClickHouse store (WP5b).
@@ -147,9 +147,17 @@ const groupBy = <Row extends { transaction_hash_hex: string }>(rows: Row[]) =>
 export class ClickHouseChecker implements StoreChecker {
   private readonly db: string;
 
-  // eslint-disable-next-line @typescript-eslint/parameter-properties
-  constructor(private readonly client: ClickHouseClient, database: string) {
+  /** `false`: the store runs with `CHAINGRAPH_CLICKHOUSE_UTXO=off`. */
+  private readonly utxoTables: boolean;
+
+  constructor(
+    // eslint-disable-next-line @typescript-eslint/parameter-properties
+    private readonly client: ClickHouseClient,
+    database: string,
+    options: { utxo?: 'off' | 'on' } = {}
+  ) {
     this.db = quoteIdentifier(database);
+    this.utxoTables = options.utxo !== 'off';
   }
 
   /* ---------------------------------------------------------------- nodes */
@@ -552,6 +560,9 @@ export class ClickHouseChecker implements StoreChecker {
   /**
    * The node's UTXO set: `utxo_by_script_at` when scoped by locking bytecode
    * (its key is the 25-byte prefix), otherwise `utxo_at` (keyed by category).
+   * With utxo off (no stored UTXO tables) it is computed at query time, as
+   * in Chaingraph v1: outputs of transactions accepted by the node, minus
+   * outpoints spent by an input of a transaction accepted by the node.
    */
   readonly unspent = async (
     node: string,
@@ -560,6 +571,9 @@ export class ClickHouseChecker implements StoreChecker {
     const params = await this.nodeSnapshot(node);
     if (params === undefined) {
       return [];
+    }
+    if (!this.utxoTables) {
+      return this.unspentAtQueryTime(params, scope);
     }
     const byScript = scope.lockingBytecode !== undefined;
     const conditions = [
@@ -829,6 +843,54 @@ export class ClickHouseChecker implements StoreChecker {
     return pinnedView(name, this.db);
   }
 
+  /**
+   * `unspent` without the stored UTXO tables, through the pinned views of
+   * one node snapshot: output_at ⋈ tx_acceptance_at, anti-joined with the
+   * outpoints of input_at rows of accepted transactions.
+   */
+  private async unspentAtQueryTime(
+    params: QueryParams,
+    scope: { category?: string; lockingBytecode?: string }
+  ) {
+    const acceptedSql = `SELECT transaction_hash FROM ${this.view(
+      'tx_acceptance_at'
+    )}`;
+    const conditions = [
+      `transaction_hash IN (${acceptedSql})`,
+      `(transaction_hash, output_index) NOT IN (
+         SELECT outpoint_transaction_hash, outpoint_index FROM ${this.view(
+           'input_at'
+         )}
+         WHERE transaction_hash IN (${acceptedSql}))`,
+      ...(scope.lockingBytecode === undefined
+        ? []
+        : ['locking_bytecode = unhex({lockingBytecode:String})']),
+      ...(scope.category === undefined
+        ? []
+        : [`token_category = ${hashParam('category')}`]),
+    ];
+    const rows = await this.client.query<{
+      output_index: number;
+      transaction_hash_hex: string;
+    }>(
+      `SELECT DISTINCT ${hexOf(
+        'transaction_hash'
+      )} AS transaction_hash_hex, output_index
+       FROM ${this.view('output_at')}
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY transaction_hash_hex, output_index`,
+      {
+        ...params,
+        category: scope.category ?? '',
+        lockingBytecode: scope.lockingBytecode ?? '',
+      }
+    );
+    return rows.map<CheckerOutpoint>((row) => ({
+      outputIndex: Number(row.output_index),
+      transactionHash: row.transaction_hash_hex,
+    }));
+  }
+
   private async agnosticSnapshot(): Promise<QueryParams> {
     return snapshotParams(await readSnapshot(this.client, nodeAgnosticId));
   }
@@ -977,5 +1039,6 @@ export class ClickHouseChecker implements StoreChecker {
 /** The ClickHouse checker for `client`'s database. */
 export const createClickHouseChecker = (
   client: ClickHouseClient,
-  database = client.database
-): StoreChecker => new ClickHouseChecker(client, database);
+  database = client.database,
+  options: { utxo?: 'off' | 'on' } = {}
+): StoreChecker => new ClickHouseChecker(client, database, options);

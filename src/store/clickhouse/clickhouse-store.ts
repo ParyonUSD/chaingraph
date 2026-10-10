@@ -126,6 +126,13 @@ export interface ClickHouseStoreOptions {
   runningBatchesPerNodeSet?: number;
   /** Test hook: called between the steps of every commit. */
   fault?: FaultInjector;
+  /**
+   * Stored UTXO tables (`CHAINGRAPH_CLICKHOUSE_UTXO`, default `on`). `off`:
+   * no `utxo` / `utxo_by_script` row is ever written and `finishInitialSync`
+   * skips the UTXO build (docs/clickhouse-port/utxo-off.md). Set once per
+   * database: flipping it on an existing database is not supported.
+   */
+  utxo?: 'off' | 'on';
   /** Background errors (watermark publishing, lease loss). */
   onError?: (error: unknown) => void;
   /**
@@ -314,10 +321,19 @@ export class ClickHouseStore implements ChaingraphStore {
 
   private readonly maxBlocksPerCommit: number;
 
+  /** `false` when `utxo: 'off'`: the stored UTXO tables are never written. */
+  private readonly utxoEnabled: boolean;
+
   private readonly maxBytesPerCommit: number;
 
   constructor(private readonly options: ClickHouseStoreOptions) {
     this.lookupChunkSize = options.lookupChunkSize ?? defaultLookupChunkSize;
+    if (options.utxo !== undefined && !['off', 'on'].includes(options.utxo)) {
+      throw new RangeError(
+        `utxo must be 'on' or 'off' (got ${String(options.utxo)}).`
+      );
+    }
+    this.utxoEnabled = options.utxo !== 'off';
     const cap = options.maxInFlightSaves ?? 0;
     if (!Number.isInteger(cap) || cap < 0) {
       throw new RangeError(
@@ -425,6 +441,7 @@ export class ClickHouseStore implements ChaingraphStore {
       pendingSpendTimeoutMs:
         this.options.pendingSpendTimeoutMs ?? defaultPendingSpendTimeoutMs,
       transactions: this.transactions,
+      utxo: this.utxoEnabled,
     });
     this.mempoolCommitter = new MempoolCommitter({
       abandon: this.abandonSignal,
@@ -451,6 +468,7 @@ export class ClickHouseStore implements ChaingraphStore {
       pendingSpendTimeoutMs:
         this.options.pendingSpendTimeoutMs ?? defaultPendingSpendTimeoutMs,
       transactions: this.transactions,
+      utxo: this.utxoEnabled,
     });
     const nodes = await client.query<{ internal_id: number; name: string }>(
       'SELECT internal_id, name FROM node FINAL'
@@ -459,13 +477,21 @@ export class ClickHouseStore implements ChaingraphStore {
       this.nodes.set(node.name, Number(node.internal_id));
       publisher.registerNode(Number(node.internal_id));
     });
-    const horizon = await client.query<{ commit_seq: string; kind: string }>(
-      `SELECT commit_seq, kind FROM (
+    /*
+     * With utxo off, leaving bulk mode is a `horizon_switch` commit with
+     * row count `bulk_exit` (there is no `utxo_build`).
+     */
+    const horizon = await client.query<{
+      bulk_exit: string;
+      commit_seq: string;
+      kind: string;
+    }>(
+      `SELECT commit_seq, kind, row_counts['bulk_exit'] AS bulk_exit FROM (
          SELECT * FROM commit_log FINAL WHERE kind IN ('horizon_switch', 'utxo_build'))
        WHERE state = 'committed' ORDER BY commit_seq DESC LIMIT 1`
     );
     const last = horizon[0];
-    if (last?.kind === 'horizon_switch') {
+    if (last?.kind === 'horizon_switch' && Number(last.bulk_exit) === 0) {
       this.mode = 'bulk';
       this.bulkStartSeq = BigInt(last.commit_seq);
     } else {
@@ -1119,7 +1145,7 @@ export class ClickHouseStore implements ChaingraphStore {
         WHERE node_internal_id = {node:UInt32} AND commit_seq = {seq:UInt64}`;
       const acceptedTxsSql = `SELECT transaction_hash FROM block_transaction
         WHERE block_internal_id IN (${acceptedBlocksSql}) AND ${validCommitSql()}`;
-      if (this.mode === 'tip') {
+      if (this.mode === 'tip' && this.utxoEnabled) {
         const deltas = `SELECT transaction_hash, toInt8(1) AS d
           FROM (SELECT DISTINCT transaction_hash FROM (${acceptedTxsSql}))
           WHERE transaction_hash NOT IN (
@@ -1163,7 +1189,9 @@ export class ClickHouseStore implements ChaingraphStore {
         await hooks.insertChangeRows(
           commit,
           'header_accept',
-          changeRows(mempoolChanges, historyIds),
+          changeRows(mempoolChanges, historyIds, {
+            utxo: this.utxoEnabled,
+          }),
           'm',
           rowCounts
         );
@@ -1336,7 +1364,7 @@ export class ClickHouseStore implements ChaingraphStore {
         WHERE node_internal_id = {node:UInt32} AND commit_seq = {seq:UInt64} AND sign = -1`;
       const staleTxsSql = `SELECT transaction_hash FROM block_transaction
         WHERE block_internal_id IN (${staleBlocksSql}) AND ${validCommitSql()}`;
-      if (this.mode === 'tip') {
+      if (this.mode === 'tip' && this.utxoEnabled) {
         const deltas = `SELECT transaction_hash, toInt8(-1) AS d
           FROM (SELECT DISTINCT transaction_hash FROM (${staleTxsSql}))
           WHERE transaction_hash NOT IN (
@@ -1569,6 +1597,30 @@ export class ClickHouseStore implements ChaingraphStore {
   ): Promise<void> {
     this.assertOpen();
     if (this.mode !== 'bulk') {
+      return;
+    }
+    if (!this.utxoEnabled) {
+      /*
+       * utxo off: no UTXO build and no `utxo_build` commit; only the switch
+       * back to tip mode, recorded as a `horizon_switch` with `bulk_exit`.
+       */
+      await this.runExclusive(async () => {
+        const commitLog = this.requireCommitLog();
+        const commit = await commitLog.beginCommit({
+          kind: 'horizon_switch',
+          nodeScope: [],
+        });
+        await commitLog.markCommitted(commit.seq, {
+          bulk_exit: 1,
+          bulk_start: this.bulkStartSeq,
+        });
+        this.mode = 'tip';
+      });
+      await this.requirePublisher()
+        .publishWatermark()
+        .catch((error: unknown) => {
+          hooks.onNonFatalError(error);
+        });
       return;
     }
     await this.runExclusive(async () => {

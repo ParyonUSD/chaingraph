@@ -204,9 +204,10 @@ export const leaseTtlMs = 1_500;
 export const scratch = async (
   t: ExecutionContext,
   label: string,
-  storeOptions: Partial<ClickHouseStoreOptions> = {}
+  storeOptions: Partial<ClickHouseStoreOptions> = {},
+  prefix = 'ch1_wp5a'
 ) => {
-  const name = `ch1_wp5a_${label}_${randomBytes(4).toString('hex')}`;
+  const name = `${prefix}_${label}_${randomBytes(4).toString('hex')}`;
   await execFileAsync('bash', [applyScript, e2eClickHouseUrl!, name], {
     env: process.env,
     timeout: 120_000,

@@ -6,6 +6,7 @@ import {
   clickhousePassword,
   clickhouseUrl,
   clickhouseUser,
+  clickhouseUtxo,
 } from '../config.js';
 import { instances } from '../logging.js';
 
@@ -44,6 +45,8 @@ export interface StoreConfig {
     user: string;
     /** In-flight cap (0 or undefined: unbounded). */
     maxInFlightSaves?: number;
+    /** Stored UTXO tables (`CHAINGRAPH_CLICKHOUSE_UTXO`; default `on`). */
+    utxo?: 'off' | 'on';
   };
 }
 
@@ -60,6 +63,7 @@ export const storeConfigFromEnvironment = (): StoreConfig => ({
     password: clickhousePassword,
     url: clickhouseUrl,
     user: clickhouseUser,
+    utxo: clickhouseUtxo,
   },
 });
 
@@ -87,6 +91,7 @@ export const createStore = (
         );
       },
       pendingSpendTimeoutMs: pendingSpendTimeoutFromEnvironment(),
+      utxo: config.clickhouse.utxo,
     });
     if (config.abandonOnShutdownSignals === true) {
       ['SIGINT', 'SIGTERM'].forEach((signal) => {

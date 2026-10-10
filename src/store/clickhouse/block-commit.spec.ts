@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import test from 'ava';
 
 import type { ChaingraphTransaction } from '../../types/chaingraph.js';
+import type { Outpoint } from '../mempool-graph.js';
 
 import {
   appendAll,
@@ -15,6 +16,12 @@ import {
   minMax,
   pendingSpendRows,
 } from './block-commit.js';
+import { changeRows } from './mempool-commit.js';
+import type {
+  LiveMempoolEntry,
+  MempoolTxFacts,
+  NodeMempoolChange,
+} from './mempool-state.js';
 import type { UtxoOutput } from './utxo.js';
 
 const execFileAsync = promisify(execFile);
@@ -139,6 +146,82 @@ test('blockUtxoDelta: per node, only transactions not already accepted transitio
     )
     .reduce((sum, row) => sum + row.sign, 0);
   t.is(t10, 0);
+});
+
+test('utxo off: the pure transition functions produce no utxo rows; pending spends and other rows are unchanged', (t) => {
+  const transactions = [
+    { internalId: 2n, transaction: tx('t1', [['old', 0]], 2) },
+    { internalId: 3n, transaction: tx('t2', [['unknown', 4]], 1) },
+  ];
+  const resolveSpent = (hash: string, index: number) =>
+    hash === 'old' ? stored(hash, index) : undefined;
+  const deltaOf = (utxo: boolean) =>
+    blockUtxoDelta({
+      acceptedBefore: new Set(),
+      nodeInternalId: 1,
+      resolveSpent,
+      transactions,
+      utxo,
+    });
+  const on = deltaOf(true);
+  const off = deltaOf(false);
+  t.true(on.rows.length > 0);
+  t.deepEqual(off.rows, []);
+  t.deepEqual(off.pending, on.pending);
+  t.deepEqual(off.transitions, on.transitions);
+
+  // every mempool transition: addition, replacement archive, confirmation, resolution
+  const spends: Outpoint[] = ['old:0', 'gone:1'];
+  const facts = (hash: string, internalId: bigint): MempoolTxFacts => ({
+    hash,
+    internalId,
+    outputs: [stored(hash, 0)],
+    spends,
+    spent: new Map<Outpoint, UtxoOutput>([['old:0', stored('old', 0)]]),
+  });
+  const entry = (internalId: bigint): LiveMempoolEntry => ({
+    internalId,
+    spends,
+    unresolved: new Set<Outpoint>(['gone:1']),
+    validatedAt: new Date(0),
+  });
+  const changes: NodeMempoolChange[] = [
+    {
+      addition: { facts: facts('add', 5n), validatedAt: new Date(1) },
+      archives: [
+        {
+          cause: 'conflict',
+          entry: entry(6n),
+          facts: facts('replaced', 6n),
+          replacedAt: new Date(2),
+          tx: 'replaced',
+        },
+        {
+          cause: 'confirmed',
+          entry: entry(7n),
+          facts: facts('mined', 7n),
+          replacedAt: null,
+          tx: 'mined',
+        },
+      ],
+      node: 1,
+      resolutions: [
+        {
+          inputIndex: 1,
+          outpoint: 'late:0',
+          output: stored('late', 0),
+          spender: 'waiting',
+        },
+      ],
+    },
+  ];
+  const historyIds = [10n, 11n];
+  const rowsOn = changeRows(changes, historyIds);
+  const rowsOff = changeRows(changes, historyIds, { utxo: false });
+  t.true(rowsOn.utxo.length > 0);
+  t.deepEqual(rowsOff.utxo, []);
+  t.deepEqual({ ...rowsOff, utxo: [] }, { ...rowsOn, utxo: [] });
+  t.true(rowsOff.pendingSpend.length > 0);
 });
 
 test('appendAll / minMax: 300k elements without a stack overflow (WP6b item 1)', async (t) => {

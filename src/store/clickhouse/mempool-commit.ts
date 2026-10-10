@@ -45,6 +45,7 @@ import {
   lookupStoredTransactions,
   SimulatedCrash,
   storedOutputToUtxo,
+  utxoTables,
 } from './block-commit.js';
 import type { OpenCommit } from './commit-log.js';
 import { segmentIds } from './id-allocator.js';
@@ -200,7 +201,8 @@ const outpointParts = (spent: string) => {
  */
 export const changeRows = (
   changes: readonly NodeMempoolChange[],
-  historyIds: readonly bigint[]
+  historyIds: readonly bigint[],
+  { utxo = true }: { utxo?: boolean } = {}
 ): MempoolRows => {
   const rows: MempoolRows = {
     history: [],
@@ -208,6 +210,12 @@ export const changeRows = (
     pendingSpend: [],
     txAcceptance: [],
     utxo: [],
+  };
+  /** `utxo: false` (`CHAINGRAPH_CLICKHOUSE_UTXO=off`): `rows.utxo` stays empty. */
+  const utxoRows = {
+    push: (row: UtxoRow) => {
+      if (utxo) rows.utxo.push(row);
+    },
   };
   let nextId = 0;
   const takeId = () => {
@@ -243,7 +251,7 @@ export const changeRows = (
       )
     );
     change.resolutions.forEach((resolution) => {
-      rows.utxo.push({
+      utxoRows.push({
         nodeInternalId: node,
         output: resolution.output,
         sign: -1,
@@ -306,7 +314,7 @@ export const changeRows = (
       }
       const { facts } = archive;
       facts.outputs.forEach((output) => {
-        rows.utxo.push({ nodeInternalId: node, output, sign: -1 });
+        utxoRows.push({ nodeInternalId: node, output, sign: -1 });
       });
       entry.spends.forEach((spent) => {
         if (entry.unresolved.has(spent)) return;
@@ -316,7 +324,7 @@ export const changeRows = (
             `No facts for ${spent}, spent by archived mempool tx ${archive.tx}.`
           );
         }
-        rows.utxo.push({ nodeInternalId: node, output, sign: 1 });
+        utxoRows.push({ nodeInternalId: node, output, sign: 1 });
       });
     });
     if (change.addition !== undefined) {
@@ -339,7 +347,7 @@ export const changeRows = (
         version: 0n,
       });
       facts.outputs.forEach((output) => {
-        rows.utxo.push({ nodeInternalId: node, output, sign: 1 });
+        utxoRows.push({ nodeInternalId: node, output, sign: 1 });
       });
       facts.spends.forEach((spent, inputIndex) => {
         const output = facts.spent.get(spent);
@@ -348,7 +356,7 @@ export const changeRows = (
             pending(node, facts.hash, spent, inputIndex, 1)
           );
         } else {
-          rows.utxo.push({ nodeInternalId: node, output, sign: -1 });
+          utxoRows.push({ nodeInternalId: node, output, sign: -1 });
         }
       });
     }
@@ -995,6 +1003,7 @@ export class MempoolCommitter {
       encoded: { data: Uint8Array; rowCount: number }
     ) => {
       if (encoded.rowCount === 0) return;
+      if (this.context.utxo === false && utxoTables.has(table)) return;
       await client.insertRowBinary(table, columns, encoded.data, {
         deduplicationToken: commit.token(table, chunk),
       });
@@ -1784,7 +1793,9 @@ export class MempoolCommitter {
   ): Promise<OpenCommit> {
     const { context } = this;
     const historyIds = await this.historyIds(changes);
-    const rows = changeRows(changes, historyIds);
+    const rows = changeRows(changes, historyIds, {
+      utxo: context.utxo !== false,
+    });
     const nodeScope = [...new Set(changes.map((change) => change.node))].sort(
       (a, b) => a - b
     );
@@ -1813,6 +1824,7 @@ export class MempoolCommitter {
         encoded: { data: Uint8Array; rowCount: number }
       ) => {
         if (encoded.rowCount === 0) return;
+        if (context.utxo === false && utxoTables.has(table)) return;
         await context.client.insertRowBinary(
           table,
           columnsOf(table as keyof typeof rowBinaryTableColumns),
