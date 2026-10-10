@@ -1161,3 +1161,99 @@ e2e(
     t.true((await store.getAllKnownBlockHashes()).includes(chain.block2.hash));
   }
 );
+
+/* -------------------------------------------------------------------- */
+/* WP6b: write path at scale (docs/clickhouse-port/wp6b-write-path.md)   */
+/* -------------------------------------------------------------------- */
+
+/**
+ * Two blocks with `txCount × outputsPerTx` outputs each; every output of
+ * block 1 is spent in block 2 (block 2: 150k inputs, 150k outputs, so a
+ * tip-mode commit with 300k UTXO rows).
+ */
+const wideChain = (txCount: number, outputsPerTx: number) => {
+  const c0 = makeTx({
+    coinbase: true,
+    label: 'wide-c0',
+    outputs: Array.from({ length: txCount }, (_, index) => ({
+      lockingBytecode: p2pkh(`wide-miner-${index}`),
+      valueSatoshis: 1_000_000_000n,
+    })),
+  });
+  const block0 = makeBlock(0, zeroHash, [c0], 'wide-block-0');
+  const fanOut = Array.from({ length: txCount }, (_, txIndex) =>
+    makeTx({
+      label: `wide-fan-${txIndex}`,
+      outputs: Array.from({ length: outputsPerTx }, (__, index) => ({
+        lockingBytecode: p2pkh(`wide-${index % 97}`),
+        valueSatoshis: 1_000n + BigInt(index),
+      })),
+      spends: [[c0.hash, txIndex]],
+    })
+  );
+  const c1 = makeTx({
+    coinbase: true,
+    label: 'wide-c1',
+    outputs: [{ lockingBytecode: p2pkh('miner'), valueSatoshis: 1n }],
+  });
+  const block1 = makeBlock(1, block0.hash, [c1, ...fanOut], 'wide-block-1');
+  const fanIn = fanOut.map((parent, txIndex) =>
+    makeTx({
+      label: `wide-next-${txIndex}`,
+      outputs: Array.from({ length: outputsPerTx }, (__, index) => ({
+        lockingBytecode: p2pkh(`wide-next-${index % 89}`),
+        valueSatoshis: 500n + BigInt(index),
+      })),
+      spends: parent.outputs.map((__, index): [string, number] => [
+        parent.hash,
+        index,
+      ]),
+    })
+  );
+  const c2 = makeTx({
+    coinbase: true,
+    label: 'wide-c2',
+    outputs: [{ lockingBytecode: p2pkh('miner'), valueSatoshis: 1n }],
+  });
+  const block2 = makeBlock(2, block1.hash, [c2, ...fanIn], 'wide-block-2');
+  return { block0, block1, block2 };
+};
+
+const utxoCountAt = async (
+  client: Parameters<typeof nodeView>[0],
+  node: number
+) => {
+  const [{ visible }] = (await client.query<{ visible: string }>(
+    'SELECT max(visible_seq) AS visible FROM visibility WHERE node_internal_id = {node:UInt32}',
+    { node }
+  )) as [{ visible: string }];
+  const rows = await client.query<{ n: string; s: string }>(
+    `SELECT toString(count()) AS n, toString(sum(value_satoshis)) AS s
+     FROM utxo_at(node = {node:UInt32}, visible = {visible:UInt64})`,
+    { node, visible }
+  );
+  return rows[0]!;
+};
+
+e2e(
+  '[e2e] ClickHouseStore: a block with 150k inputs and 150k outputs (300k UTXO rows) commits in tip mode',
+  async (t) => {
+    t.timeout(300_000);
+    const { client, openStore } = await scratch(t, 'wide');
+    const store = await openStore();
+    const { node1 } = await registerNodes(store);
+    const { block0, block1, block2 } = wideChain(50, 3_000);
+    for (const block of [block0, block1, block2]) {
+      await store.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: [acceptance(node1)],
+      });
+    }
+    await store.publishWatermarks();
+    const unspent = await utxoCountAt(client, node1);
+    // block 2's 150k outputs and the two 1-sat coinbase outputs; everything else is spent
+    t.is(unspent.n, String(150_000 + 2));
+    t.deepEqual(await badUtxoSums(client), []);
+  }
+);

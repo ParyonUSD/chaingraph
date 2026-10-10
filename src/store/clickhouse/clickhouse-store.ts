@@ -30,9 +30,11 @@ import type {
 
 import type { FaultInjector, SaveBlockResult } from './block-commit.js';
 import {
+  appendAll,
   BlockCommitter,
   chunked,
   freshen,
+  minMax,
   SimulatedCrash,
   TransactionRegistry,
 } from './block-commit.js';
@@ -619,8 +621,9 @@ export class ClickHouseStore implements ChaingraphStore {
         commit_seq: string;
       }[] = [];
       for (const chunk of chunked(hashes, this.lookupChunkSize)) {
-        stored.push(
-          ...(await client.query<{
+        appendAll(
+          stored,
+          await client.query<{
             hash_hex: string;
             internal_id: string;
             height: number;
@@ -632,7 +635,7 @@ export class ClickHouseStore implements ChaingraphStore {
                AND ${validCommitSql()}
              ORDER BY commit_seq`,
             { fence: this.fenceArray, hashes: chunk }
-          ))
+          )
         );
       }
       const blocks = new Map<string, (typeof stored)[number]>();
@@ -846,8 +849,9 @@ export class ClickHouseStore implements ChaingraphStore {
         [...new Set(staleChain)],
         this.lookupChunkSize
       )) {
-        liveRows.push(
-          ...(await client.query<(typeof liveRows)[number]>(
+        appendAll(
+          liveRows,
+          await client.query<(typeof liveRows)[number]>(
             `SELECT block_internal_id AS block, lower(hex(any(block_hash))) AS hash,
                any(height) AS block_height,
                toUnixTimestamp64Milli(argMaxIf(accepted_at, version, sign > 0)) AS accepted_ms,
@@ -859,7 +863,7 @@ export class ClickHouseStore implements ChaingraphStore {
              GROUP BY block_internal_id
              HAVING sum(sign) > 0`,
             { fence: this.fenceArray, hashes: chunk, node: nodeInternalId }
-          ))
+          )
         );
       }
       if (liveRows.length === 0) {
@@ -933,11 +937,13 @@ export class ClickHouseStore implements ChaingraphStore {
         kind: 'reorg',
         seq: commit.seq,
       });
-      const heights = liveRows.map((row) => Number(row.block_height));
+      const [minHeight, maxHeight] = minMax(
+        liveRows.map((row) => Number(row.block_height))
+      );
       const params = {
         fence: this.fenceArray,
-        maxHeight: Math.max(...heights),
-        minHeight: Math.min(...heights),
+        maxHeight,
+        minHeight,
         node: nodeInternalId,
         seq: commit.seq,
       };

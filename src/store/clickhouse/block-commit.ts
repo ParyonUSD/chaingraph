@@ -93,6 +93,32 @@ const unknownSpentOutput: SpentOutput = {
   valueSatoshis: 0n,
 };
 
+/**
+ * `target.push(...items)` without spreading into a call: a spread passes
+ * every element as an argument, which overflows the stack for arrays of
+ * ~100k+ elements (a 100k-tx block has 300k UTXO rows).
+ */
+export const appendAll = <T>(target: T[], items: readonly T[]): T[] => {
+  for (const item of items) {
+    target.push(item);
+  }
+  return target;
+};
+
+/** Smallest and largest of a non-empty list, without spreading into a call. */
+export const minMax = (values: readonly number[]): [number, number] => {
+  if (values.length === 0) {
+    throw new RangeError('minMax of an empty list.');
+  }
+  let low = Infinity;
+  let high = -Infinity;
+  for (const value of values) {
+    if (value < low) low = value;
+    if (value > high) high = value;
+  }
+  return [low, high];
+};
+
 export const chunked = <T>(items: readonly T[], size: number): T[][] => {
   const chunks: T[][] = [];
   for (let index = 0; index < items.length; index += size) {
@@ -407,8 +433,9 @@ export const blockUtxoDelta = ({
         }
       });
     }
-    rows.push(
-      ...utxoRowsForTransition({
+    appendAll(
+      rows,
+      utxoRowsForTransition({
         delta: 1,
         nodeInternalId,
         outputs: transaction.outputs.map((output, outputIndex) => ({
@@ -970,7 +997,7 @@ export class BlockCommitter {
        * mempool-originated UTXO rows are written in every mode (the bulk
        * horizon build only covers transactions in bulk-period blocks)
        */
-      utxoRows.push(...mempoolRows.utxo);
+      appendAll(utxoRows, mempoolRows.utxo);
       await hooks.insertChangeRows(
         commit,
         'block',
@@ -996,7 +1023,7 @@ export class BlockCommitter {
             transaction,
           })),
         });
-        utxoRows.push(...delta.rows);
+        appendAll(utxoRows, delta.rows);
         delta.pending.forEach((item) => {
           pendingUtxo.push({
             inputIndex: item.inputIndex,

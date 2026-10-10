@@ -1,15 +1,22 @@
 /* eslint-disable @typescript-eslint/no-magic-numbers, max-params, @typescript-eslint/require-array-sort-compare */
 // cspell:ignore clickhouse
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
 import test from 'ava';
 
 import type { ChaingraphTransaction } from '../../types/chaingraph.js';
 
 import {
+  appendAll,
   assignTransactionIds,
   blockUtxoDelta,
   chunked,
+  minMax,
 } from './block-commit.js';
 import type { UtxoOutput } from './utxo.js';
+
+const execFileAsync = promisify(execFile);
 
 test('chunked: splits into bounded chunks', (t) => {
   t.deepEqual(chunked([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
@@ -131,4 +138,34 @@ test('blockUtxoDelta: per node, only transactions not already accepted transitio
     )
     .reduce((sum, row) => sum + row.sign, 0);
   t.is(t10, 0);
+});
+
+test('appendAll / minMax: 300k elements without a stack overflow (WP6b item 1)', async (t) => {
+  const items = Array.from({ length: 300_000 }, (_, index) => index);
+  const target = [-1];
+  t.is(appendAll(target, items).length, 300_001);
+  t.is(target[300_000], 299_999);
+  t.deepEqual(minMax([5, ...items, -3]), [-3, 299_999]);
+  t.throws(() => minMax([]), { instanceOf: RangeError });
+  /*
+   * AVA's worker threads have a larger stack than a process's main thread
+   * (where the agent runs), so check the main-thread case in a child
+   * process: the spread overflows there, the helpers do not.
+   */
+  const moduleUrl = new URL('./block-commit.js', import.meta.url).href;
+  const { stdout } = await execFileAsync(process.execPath, [
+    '--input-type=module',
+    '-e',
+    `import { appendAll, minMax } from ${JSON.stringify(moduleUrl)};
+     const items = Array.from({ length: 300000 }, (_, index) => index);
+     let spread = 'ok';
+     try { [].push(...items); } catch (error) { spread = error.constructor.name; }
+     const appended = appendAll([], items).length;
+     console.log(JSON.stringify({ appended, range: minMax(items), spread }));`,
+  ]);
+  t.deepEqual(JSON.parse(stdout), {
+    appended: 300_000,
+    range: [0, 299_999],
+    spread: 'RangeError',
+  });
 });
