@@ -129,19 +129,20 @@ export const agentEnvironment = ({ baseUrl, databaseName }) => ({
   CHAINGRAPH_STORE: 'clickhouse',
 });
 
-/** Pinned parameters for node-agnostic views (`*_at(visible0, tail)`). */
+/** Pinned parameters for node-agnostic views (`*_at(visible0, tail, fence, void)`). */
 const agnosticParams = async (session) => {
   const { visibility } = session.modules;
   const snapshot = await visibility.readSnapshot(session.client, visibility.nodeAgnosticId);
   return visibility.agnosticViewParams(snapshot);
 };
 
-const agnosticView = (name) => `${name}_at(visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)})`;
+/** The agent's own pinned-view call text (`visibility.pinnedView`), so the gate follows its view signature. */
+const agnosticView = (session, name) => session.modules.visibility.pinnedView(`${name}_at`);
 
 /** Rows of a node-agnostic table visible through its gated view. */
 export const countRows = async (session, table) => {
   const params = await agnosticParams(session);
-  const [row] = await session.client.query(`SELECT toString(count()) AS c FROM ${agnosticView(table)}`, params);
+  const [row] = await session.client.query(`SELECT toString(count()) AS c FROM ${agnosticView(session, table)}`, params);
   return Number(row.c);
 };
 
@@ -152,8 +153,8 @@ export const acceptedBlockCount = async (session, nodeName, blockHashes) => sess
 export const blockTransactionCount = async (session, blockHashes) => {
   const params = await agnosticParams(session);
   const [row] = await session.client.query(
-    `SELECT toString(count()) AS c FROM ${agnosticView('block_transaction')}
-     WHERE block_internal_id IN (SELECT internal_id FROM ${agnosticView('block')}
+    `SELECT toString(count()) AS c FROM ${agnosticView(session, 'block_transaction')}
+     WHERE block_internal_id IN (SELECT internal_id FROM ${agnosticView(session, 'block')}
                                  WHERE has(arrayMap(h -> toFixedString(unhex(h), 32), {hashes:Array(String)}), hash))`,
     { ...params, hashes: blockHashes }
   );
@@ -171,7 +172,7 @@ export const nodeBlockCount = async (session, nodeName) => {
   const { visibility } = session.modules;
   const snapshot = await visibility.readSnapshot(session.client, nodeId);
   const [row] = await session.client.query(
-    'SELECT toString(count()) AS c FROM node_block_at(node = {node:UInt32}, visible = {visible:UInt64})',
+    `SELECT toString(count()) AS c FROM ${visibility.pinnedView('node_block_at')}`,
     visibility.nodeViewParams(snapshot)
   );
   return Number(row.c);
