@@ -61,6 +61,8 @@ import {
 
 const hashBytes = 32;
 const zeroCategoryHex = '00'.repeat(hashBytes);
+/** Rows listed per kind by `standInCheck` unless asked otherwise. */
+const defaultStandInCheckLimit = 100;
 const byHex = (a: string, b: string) => (a < b ? -1 : Number(a > b));
 const hashParam = (name: string) =>
   `toFixedString(unhex({${name}:String}), 32)`;
@@ -833,6 +835,73 @@ export class ClickHouseChecker implements StoreChecker {
         (all, row) => ({ ...all, [row.name]: 'enabled' }),
         {}
       ),
+    };
+  };
+
+  /* ------------------------------------------------------- stand-in check */
+
+  /**
+   * The stand-in check (docs/clickhouse-port/mempool-fill-fix.md), on ONE
+   * node-agnostic snapshot: `mismatched` = visible inputs (not coinbase)
+   * whose spent output is visible but whose spent-output columns (value,
+   * locking bytecode, token category, FT amount, NFT capability and
+   * commitment) differ from it, e.g. a stand-in left after its parent was
+   * stored; `duplicated` = inputs with more than one visible row (a stand-in
+   * and its real row both visible). Both must be empty. `limit` caps each
+   * list. Reads every visible input and output: for tests and the lab.
+   */
+  readonly standInCheck = async ({ limit = defaultStandInCheckLimit } = {}) => {
+    const params = await this.agnosticSnapshot();
+    const attributes =
+      'cityHash64(toString((value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment)))';
+    const [mismatched, duplicated] = await Promise.all([
+      this.client.query<{
+        tx: string;
+        input_index: number;
+        outpoint_hash: string;
+        outpoint_index: number;
+      }>(
+        `SELECT ${hexOf(
+          'i.transaction_hash'
+        )} AS tx, i.input_index AS input_index,
+           ${hexOf(
+             'i.outpoint_transaction_hash'
+           )} AS outpoint_hash, i.outpoint_index AS outpoint_index
+         FROM (SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index, ${attributes} AS h
+               FROM ${this.view('input_at')}
+               WHERE outpoint_transaction_hash != toFixedString(unhex({zero:String}), 32)) AS i
+         INNER JOIN (SELECT transaction_hash, output_index, ${attributes} AS h
+                     FROM ${this.view('output_at')}) AS o
+           ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index
+         WHERE i.h != o.h
+         ORDER BY tx, input_index
+         LIMIT {limit:UInt32}`,
+        { ...params, limit, zero: zeroCategoryHex }
+      ),
+      this.client.query<{ tx: string; input_index: number; rows: string }>(
+        `SELECT ${hexOf(
+          'transaction_hash'
+        )} AS tx, input_index, toString(count()) AS rows
+         FROM ${this.view('input_at')}
+         GROUP BY transaction_hash, input_index
+         HAVING count() > 1
+         ORDER BY tx, input_index
+         LIMIT {limit:UInt32}`,
+        { ...params, limit }
+      ),
+    ]);
+    return {
+      duplicated: duplicated.map((row) => ({
+        inputIndex: Number(row.input_index),
+        rows: Number(row.rows),
+        transactionHash: row.tx,
+      })),
+      mismatched: mismatched.map((row) => ({
+        inputIndex: Number(row.input_index),
+        outpointIndex: Number(row.outpoint_index),
+        outpointTransactionHash: row.outpoint_hash,
+        transactionHash: row.tx,
+      })),
     };
   };
 

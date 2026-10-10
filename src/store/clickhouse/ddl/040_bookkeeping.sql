@@ -142,3 +142,37 @@ ORDER BY (outpoint_transaction_hash, outpoint_index, node_internal_id, spender_t
 SETTINGS non_replicated_deduplication_window = 10000,
          old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
          cleanup_delay_period_random_add = 5;
+
+-- Stand-in input rows (docs/clickhouse-port/mempool-fill-fix.md). A mempool transaction saved while a spent output
+-- was unknown (an orphan released by the grace period or a full pool) gets `input` rows with a stand-in spent
+-- output (value 0, empty bytecode, no token). Those rows carry their own seq P (a `fill_pending` commit, one per
+-- unknown parent transaction), not the transaction's seq C. One row per stand-in input: P, its owner C and the input.
+-- Readers (visibility.ts snapshotSql) hide every row of P while C is not visible, and once a commit that resolves P
+-- (input_stand_in_resolution) is visible; that commit carries the input rows with the real spent output.
+CREATE TABLE IF NOT EXISTS cg.input_stand_in
+(
+    stand_in_seq               UInt64,
+    owner_seq                  UInt64,
+    transaction_hash           FixedString(32),
+    input_index                UInt32,
+    outpoint_transaction_hash  FixedString(32),
+    outpoint_index             UInt32,
+    commit_seq                 UInt64
+)
+ENGINE = MergeTree
+ORDER BY (stand_in_seq, transaction_hash, input_index)
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
+
+-- P is resolved by commit_seq: that commit wrote the real `input` rows of every input of P.
+CREATE TABLE IF NOT EXISTS cg.input_stand_in_resolution
+(
+    stand_in_seq  UInt64,
+    commit_seq    UInt64
+)
+ENGINE = MergeTree
+ORDER BY (stand_in_seq, commit_seq)
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;

@@ -273,6 +273,18 @@ export const validCommitSql = (column = 'commit_seq') =>
          OR ${column} <= arrayElement({fence:Array(UInt64)}, bitShiftRight(${column}, 40))))`;
 
 /**
+ * Writer-side: `input` rows of a stand-in seq that no longer counts
+ * (docs/clickhouse-port/mempool-fill-fix.md): its owner is void, or a valid
+ * commit resolved it (that commit carries the real rows). Without it a
+ * transaction would have two `input` rows per resolved input.
+ */
+export const liveStandInSql = (column = 'commit_seq') =>
+  `(${column} NOT IN (SELECT stand_in_seq FROM input_stand_in_resolution
+                     WHERE commit_seq NOT IN (SELECT commit_seq FROM commit_void))
+    AND ${column} NOT IN (SELECT stand_in_seq FROM input_stand_in
+                         WHERE owner_seq IN (SELECT commit_seq FROM commit_void)))`;
+
+/**
  * As `validCommitSql`, and also not one of this writer's open commits
  * (`{open:Array(UInt64)}`): the latest committed state.
  */
@@ -316,6 +328,7 @@ WITH
     FROM input AS i INNER JOIN deltas AS d ON i.transaction_hash = d.transaction_hash
     WHERE i.transaction_hash IN (SELECT transaction_hash FROM deltas)
       AND ${validCommitSql('i.commit_seq')}
+      AND ${liveStandInSql('i.commit_seq')}
   )
 SELECT ${select('o', 'toInt8(d.d)')}
 FROM output AS o INNER JOIN deltas AS d ON o.transaction_hash = d.transaction_hash

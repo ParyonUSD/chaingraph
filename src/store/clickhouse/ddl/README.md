@@ -16,7 +16,7 @@ Files run in order; every statement is `IF NOT EXISTS`, so re-running is safe.
 | `010_core.sql` | block, transaction, block_transaction, output, input, node |
 | `020_acceptance.sql` | node_block, node_transaction, tx_acceptance, node_block_history, node_transaction_history |
 | `030_utxo.sql` | utxo, utxo_by_script |
-| `040_bookkeeping.sql` | commit_log, commit_void, epoch_fence, visibility, id_reservation, writer_lease, pending_spend |
+| `040_bookkeeping.sql` | commit_log, commit_void, epoch_fence, visibility, id_reservation, writer_lease, pending_spend, input_stand_in, input_stand_in_resolution |
 | `050_views.sql` | visibility gate views: `*_v` (live, subqueries; ad-hoc use) and `*_at` (pinned, pure parameters; the API path, WP4/WP6b); `CREATE OR REPLACE` |
 | `060_projections.sql` | the §2.1/§2.4 projections as `ALTER TABLE … ADD PROJECTION IF NOT EXISTS` |
 
@@ -51,6 +51,8 @@ engine as written. VersionedCollapsingMergeTree appends `version` to the sorting
 | epoch_fence (WP4) | MergeTree / SharedMergeTree | `epoch` | none | 8192 | 4 (stale-writer fencing) |
 | writer_lease | ReplacingMergeTree(heartbeat_at) / SharedReplacingMergeTree | `lease_name, epoch, agent_id` (WP4) | none | 8192 | single writer (precondition of 4) |
 | pending_spend | VCMT / SharedVCMT | `outpoint_transaction_hash, outpoint_index, node_internal_id, spender_transaction_hash, spender_input_index, version` | none | 8192 | 1, 2, 4 (child-before-parent) |
+| input_stand_in | MergeTree / SharedMergeTree | `stand_in_seq, transaction_hash, input_index` | none | 8192 | 4, 5 (stand-in `input` rows; read by the gate) |
+| input_stand_in_resolution | MergeTree / SharedMergeTree | `stand_in_seq, commit_seq` | none | 8192 | 4, 5 (resolved stand-ins; read by the gate) |
 
 Projections (060): `block.p_height (height)`, `transaction.p_id (internal_id)`,
 `block_transaction.p_tx (transaction_hash)`, `output.p_script (locking_bytecode_prefix, transaction_hash, output_index)`,
@@ -217,6 +219,17 @@ WP5a-core amendments (design: `docs/clickhouse-port/wp5a-core.md`):
     protects against on a crash. These settings change on a live table: the DDL CLI aligns them with
     `ALTER TABLE … MODIFY SETTING` (`alignTableSettings`), so re-running the CLI is the re-apply path for an
     existing database. Granularity and block sizes cannot be altered: a differing table still fails the CLI.
+
+Mempool fill fix (design: `docs/clickhouse-port/mempool-fill-fix.md`):
+
+27. `input_stand_in` / `input_stand_in_resolution`. Item 15 is replaced: a mempool transaction saved with an
+    unknown spent output writes that input's `input` row with a stand-in spent output (value 0, empty bytecode,
+    no token) under its own `fill_pending` commit P (one per unknown parent transaction), never under the
+    transaction's seq C. `input_stand_in` lists P's inputs and its owner C; `input_stand_in_resolution` names the
+    commit R that wrote the real rows of P's inputs. The snapshot (`visibility.ts` `snapshotSql`) adds P to the
+    `void` parameter while C is not visible and once R is visible, so a reader sees the stand-in exactly while C
+    is visible and R is not, and never both rows. `input_v` applies the same rule with subqueries. **Apply the
+    DDL before starting an agent of this version**: the snapshot reads both tables.
 
 ## Differences: Cloud 26.6 vs local 26.8
 

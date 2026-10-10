@@ -177,7 +177,8 @@ export class ClickHouseHttp {
  * visibility.ts `snapshotSql`: visible(n) of every compared node and
  * visible(0) from one read of `visibility`, then the committed tail above
  * visible(0), then (data-dependent, so evaluated after) the void set and the
- * per-epoch fence up to the snapshot's highest seq. The harness inlines the
+ * per-epoch fence up to the snapshot's highest seq, and last the hidden
+ * stand-in seqs (snapshotSql step 5, appended to the void set). The harness inlines the
  * values as literals, so there is no parameter size limit and the void set is
  * never truncated (the views' overflow fallback is not used).
  */
@@ -197,14 +198,24 @@ export const readClickHouseSnapshot = async (clickhouse, chNodeIds) => {
        (SELECT arraySort(groupUniqArray(commit_seq)) FROM commit_void WHERE commit_seq <= bound) AS void_seqs,
        (SELECT (groupArray(epoch), groupArray(max_valid_seq)) FROM
           (SELECT epoch, min(max_valid_seq) AS max_valid_seq FROM epoch_fence
-           WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences
+           WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences,
+       (SELECT groupUniqArray(seq) FROM
+          (SELECT stand_in_seq AS seq, owner_seq AS by_seq, toUInt8(0) AS resolves
+           FROM input_stand_in WHERE stand_in_seq <= bound
+           UNION ALL
+           SELECT stand_in_seq, commit_seq, toUInt8(1)
+           FROM input_stand_in_resolution WHERE stand_in_seq <= bound)
+        WHERE resolves = toUInt8(
+          ((by_seq <= v0 AND by_seq NOT IN (SELECT commit_seq FROM commit_void)) OR has(tail_seqs, by_seq))
+          AND (indexOf(fences.1, bitShiftRight(by_seq, 40)) = 0
+               OR by_seq <= fences.2[indexOf(fences.1, bitShiftRight(by_seq, 40))]))) AS stand_in_hidden
      SELECT
        arrayMap(id -> toString(arrayMax(arrayMap(m -> if(m.1 = id, m.2, toUInt64(0)),
                                                  arrayPushBack(marks, (toUInt32(0), toUInt64(0)))))),
                 [${ids.length === 0 ? '' : ids.join(', ')}]::Array(UInt32)) AS visible,
        toString(v0) AS visible0,
        arrayMap(x -> toString(x), tail_seqs) AS tail,
-       arrayMap(x -> toString(x), void_seqs) AS void,
+       arrayMap(x -> toString(x), arrayConcat(void_seqs, arraySort(stand_in_hidden))) AS void,
        arrayMap(e -> toString(if(indexOf(fences.1, e) = 0, ${counterMask},
                                  bitAnd(fences.2[indexOf(fences.1, e)], ${counterMask}))),
                 range(1, toUInt64(bitShiftRight(bound, 40)) + 1)) AS fence`

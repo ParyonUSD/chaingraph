@@ -89,7 +89,8 @@ const partCleanup = [
 
 test('the DDL sets the part cleanup settings on every table (fix pass 3)', (t) => {
   const settings = ddlTableSettings();
-  t.is(settings.size, 20);
+  // 20 tables, plus input_stand_in and input_stand_in_resolution (mempool-fill-fix.md)
+  t.is(settings.size, 22);
   const wrong = [...settings].flatMap(([table, values]) =>
     partCleanup
       .filter(([name, value]) => values.get(name) !== value)

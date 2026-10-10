@@ -39,6 +39,7 @@ import {
   BlockCommitter,
   chunked,
   freshen,
+  lookupStoredOutputs,
   minMax,
   SimulatedCrash,
   TransactionRegistry,
@@ -74,10 +75,12 @@ import {
   waitForPredecessorRows,
 } from './node-state.js';
 import { RowBinaryWriter } from './row-binary.js';
+import { loadStandIns, repairStandIns, StandInRegistry } from './stand-in.js';
 import {
   committedSql,
   heightBatches,
   horizonDeltasSql,
+  outpointKey,
   OutputRegistry,
   utxoDeltaInsertSql,
   validCommitSql,
@@ -363,6 +366,9 @@ export class ClickHouseStore implements ChaingraphStore {
 
   transactions: TransactionRegistry;
 
+  /** Unresolved stand-in `input` rows (stand-in.ts); rebuilt per epoch. */
+  standIns = new StandInRegistry();
+
   /** Incremented when the writer lease is lost (work of older generations is re-run). */
   private generation = 0;
 
@@ -547,6 +553,7 @@ export class ClickHouseStore implements ChaingraphStore {
       outputs: this.outputs,
       pendingSpendTimeoutMs:
         this.options.pendingSpendTimeoutMs ?? defaultPendingSpendTimeoutMs,
+      standIns: this.standIns,
       transactions: this.transactions,
       utxo: this.utxoEnabled,
       // eslint-disable-next-line sort-keys
@@ -611,6 +618,7 @@ export class ClickHouseStore implements ChaingraphStore {
       outputs: this.outputs,
       pendingSpendTimeoutMs:
         this.options.pendingSpendTimeoutMs ?? defaultPendingSpendTimeoutMs,
+      standIns: this.standIns,
       transactions: this.transactions,
       utxo: this.utxoEnabled,
     });
@@ -642,6 +650,49 @@ export class ClickHouseStore implements ChaingraphStore {
       this.mode = 'tip';
     }
     await this.mempoolCommitter.rebuild();
+    await this.recoverStandIns(client, commitLog);
+  }
+
+  /**
+   * Load the unresolved stand-in groups (stand-in.ts) and resolve, in one
+   * `fill_pending` commit, those whose parent outputs are stored: an earlier
+   * epoch stored the parent but stopped before it could resolve them.
+   */
+  private async recoverStandIns(
+    client: ClickHouseClient,
+    commitLog: CommitLog
+  ) {
+    const groups = await loadStandIns({ client }, this.fenceArray);
+    if (groups.length === 0) return;
+    const outpoints = groups.flatMap((group) =>
+      group.members.map((member) => ({
+        hash: member.input.outpointTransactionHash,
+        index: member.input.outpointIndex,
+      }))
+    );
+    const stored = new Map(
+      (
+        await lookupStoredOutputs(
+          {
+            client,
+            fence: () => this.fenceArray,
+            lookupChunkSize: this.lookupChunkSize,
+          },
+          outpoints
+        )
+      ).map(({ output }) => [
+        outpointKey(output.transactionHash, output.outputIndex),
+        output,
+      ])
+    );
+    const { left } = await repairStandIns(
+      { client, commitLog, standIns: this.standIns },
+      groups,
+      stored
+    );
+    left.forEach((group) => {
+      this.standIns.add(group);
+    });
   }
 
   /**
@@ -725,6 +776,7 @@ export class ClickHouseStore implements ChaingraphStore {
     this.transactions = new TransactionRegistry(
       this.options.recentTransactionCapacity
     );
+    this.standIns = new StandInRegistry();
     this.batchLanes.clear();
     this.batchResults.clear();
     this.abandonSignal = new AbandonSignal();

@@ -378,6 +378,8 @@ WHERE (commit_seq <= {visible0:UInt64} OR has({tail:Array(UInt64)}, commit_seq))
   AND NOT has({void:Array(UInt64)}, commit_seq)
   AND (NOT has({void:Array(UInt64)}, 18446744073709551615) OR commit_seq NOT IN (SELECT commit_seq FROM cg.commit_void));
 
+-- input_v also hides stand-in seqs (040 input_stand_in; visibility.ts snapshotSql step 5): a stand-in seq is hidden
+-- while its owner is not visible and once a commit resolving it is.
 CREATE OR REPLACE VIEW cg.input_v AS
 WITH
     (SELECT arrayMap(t -> t.2, arraySort(groupArray((epoch, max_valid_seq))))
@@ -388,7 +390,20 @@ WHERE (commit_seq <= (SELECT max(visible_seq) FROM cg.visibility WHERE node_inte
                          WHERE state = 'committed' AND commit_seq > (SELECT max(visible_seq) FROM cg.visibility WHERE node_internal_id = 0)))
   AND commit_seq NOT IN (SELECT commit_seq FROM cg.commit_void)
   AND (bitShiftRight(commit_seq, 40) > length(fence_max_seq)
-       OR commit_seq <= arrayElement(fence_max_seq, bitShiftRight(commit_seq, 40)));
+       OR commit_seq <= arrayElement(fence_max_seq, bitShiftRight(commit_seq, 40)))
+  AND commit_seq NOT IN (
+      SELECT seq FROM
+        (SELECT stand_in_seq AS seq, owner_seq AS by_seq, toUInt8(0) AS resolves FROM cg.input_stand_in
+         UNION ALL
+         SELECT stand_in_seq, commit_seq, toUInt8(1) FROM cg.input_stand_in_resolution)
+      WHERE resolves = toUInt8(
+        ((by_seq <= (SELECT max(visible_seq) FROM cg.visibility WHERE node_internal_id = 0)
+          AND by_seq NOT IN (SELECT commit_seq FROM cg.commit_void))
+         OR by_seq IN (SELECT commit_seq FROM cg.commit_log
+                       WHERE state = 'committed'
+                         AND commit_seq > (SELECT max(visible_seq) FROM cg.visibility WHERE node_internal_id = 0)))
+        AND (bitShiftRight(by_seq, 40) > length(fence_max_seq)
+             OR by_seq <= arrayElement(fence_max_seq, bitShiftRight(by_seq, 40)))));
 
 CREATE OR REPLACE VIEW cg.input_at AS
 SELECT *, locking_bytecode_prefix, nonfungible_token_commitment_key FROM cg.input

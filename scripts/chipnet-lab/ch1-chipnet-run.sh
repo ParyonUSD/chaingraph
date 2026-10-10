@@ -170,12 +170,15 @@ case $action in
         CHAINGRAPH_STORE=clickhouse
         CHAINGRAPH_CLICKHOUSE_URL="$CHIPNET_CH_URL"
         CHAINGRAPH_CLICKHOUSE_DATABASE="$CHIPNET_CH_DB"
-        CHAINGRAPH_CLICKHOUSE_UTXO=off
-        CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES="${CHIPNET_CH_MAX_IN_FLIGHT_SAVES:-16}"
-        CHAINGRAPH_CLICKHOUSE_MAX_BLOCKS_PER_COMMIT="${CHIPNET_CH_MAX_BLOCKS_PER_COMMIT:-64}"
+        CHAINGRAPH_CLICKHOUSE_UTXO="${CHIPNET_CH_UTXO:-off}"
         CHAINGRAPH_POSTGRES_CONNECTION_STRING=postgres://unused:unused@127.0.0.1:1/unused
         CHAINGRAPH_INTERNAL_API_PORT="$CHIPNET_CH_API_PORT"
       )
+      # Set to empty to leave the agent's default (cap: unbounded; blocks per commit: 64, with the batch linger).
+      in_flight=${CHIPNET_CH_MAX_IN_FLIGHT_SAVES-16}
+      blocks_per_commit=${CHIPNET_CH_MAX_BLOCKS_PER_COMMIT-64}
+      if [[ -n $in_flight ]]; then agent_env+=(CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES="$in_flight"); fi
+      if [[ -n $blocks_per_commit ]]; then agent_env+=(CHAINGRAPH_CLICKHOUSE_MAX_BLOCKS_PER_COMMIT="$blocks_per_commit"); fi
     fi
     node_options=${CHIPNET_NODE_OPTIONS:---max-old-space-size=8192}
     # Non-secret settings of this run (the Postgres URL holds only the lab's well-known password).

@@ -138,6 +138,14 @@ export const voidOverflowSentinel = 18_446_744_073_709_551_615n;
  */
 export const fenceParamMaxBytes = 120_000;
 
+/**
+ * Budget for the hidden stand-in seqs appended to `void` (about 5,000 seqs).
+ * Each resolved stand-in seq stays hidden until its rows are removed, so
+ * the set grows with every stand-in ever resolved (rare: mempool orphans
+ * released without their parents); see docs/clickhouse-port/mempool-fill-fix.md.
+ */
+export const hiddenParamMaxBytes = 100_000;
+
 export class GateParameterOverflowError extends Error {}
 
 /**
@@ -160,9 +168,12 @@ export interface VisibilitySnapshot {
    * fenced.
    */
   fence: bigint[];
-  /** Aborted seqs up to the snapshot's highest seq, or `[voidOverflowSentinel]`. */
+  /**
+   * Aborted seqs up to the snapshot's highest seq (or `[voidOverflowSentinel]`),
+   * then the hidden stand-in seqs (`snapshotSql` step 5).
+   */
   void: bigint[];
-  /** True when `void` is the overflow sentinel. */
+  /** True when `void` starts with the overflow sentinel. */
   voidOverflow: boolean;
 }
 
@@ -197,7 +208,15 @@ export interface MultiNodeSnapshot {
  *    `commit_void` before the commit becomes terminal, and watermarks only
  *    pass terminal commits);
  * 4. the fences of epochs up to `bound`'s epoch (read after 1-2: a new
- *    holder writes its fences before its first commit).
+ *    holder writes its fences before its first commit);
+ * 5. the hidden stand-in seqs (read after 1-4): a stand-in seq P
+ *    (`input_stand_in`, docs/clickhouse-port/mempool-fill-fix.md) is hidden
+ *    while its owner C is not visible in this snapshot, and once a commit R
+ *    resolving it (`input_stand_in_resolution`) is. "Visible" is the
+ *    node-agnostic rule of the views: at most visible(0) and not void, or in
+ *    the tail; and not fenced. P's and R's rows in these tables are written
+ *    before P / R commit, so a P or R this snapshot shows has its rows read
+ *    here. The caller appends the hidden seqs to `void`.
  * Any commit up to visible(n) (and every commit it depends on) was committed
  * before visible(n) was read, so it is at most visible(0) or in the tail:
  * node-agnostic rows of a visible node-n fact are always visible in the same
@@ -208,6 +227,8 @@ export const snapshotSql = (tables: {
   commitLog: string;
   commitVoid: string;
   epochFence: string;
+  standIn?: string;
+  standInResolution?: string;
 }) => `WITH
   (SELECT maxMap([node_internal_id], [visible_seq]) FROM ${tables.visibility}
    WHERE node_internal_id = 0 OR has({nodes:Array(UInt32)}, node_internal_id)) AS max_by_node,
@@ -227,12 +248,27 @@ export const snapshotSql = (tables: {
      (SELECT epoch, min(max_valid_seq) AS max_valid_seq FROM ${
        tables.epochFence
      }
-      WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences
+      WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences,
+  (SELECT groupUniqArray(seq) FROM
+     (SELECT stand_in_seq AS seq, owner_seq AS by_seq, toUInt8(0) AS resolves
+      FROM ${tables.standIn ?? 'input_stand_in'} WHERE stand_in_seq <= bound
+      UNION ALL
+      SELECT stand_in_seq, commit_seq, toUInt8(1)
+      FROM ${
+        tables.standInResolution ?? 'input_stand_in_resolution'
+      } WHERE stand_in_seq <= bound)
+   WHERE resolves = toUInt8(
+     ((by_seq <= marks.2 AND by_seq NOT IN (SELECT commit_seq FROM ${
+       tables.commitVoid
+     })) OR has(tail_seqs, by_seq))
+     AND (indexOf(fences.1, bitShiftRight(by_seq, 40)) = 0
+          OR by_seq <= fences.2[indexOf(fences.1, bitShiftRight(by_seq, 40))]))) AS stand_in_hidden
 SELECT
   arrayMap(x -> toString(x), marks.1) AS visible,
   toString(marks.2) AS visible0,
   arrayMap(x -> toString(x), tail_seqs) AS tail,
   arrayMap(x -> toString(x), void_seqs) AS void,
+  arrayMap(x -> toString(x), arraySort(stand_in_hidden)) AS hidden,
   arrayMap(e -> toString(if(indexOf(fences.1, e) = 0, ${counterMaskSeq.toString()},
                             bitAnd(fences.2[indexOf(fences.1, e)], ${counterMaskSeq.toString()}))),
            range(1, toUInt64(bitShiftRight(bound, 40)) + 1)) AS fence`;
@@ -263,11 +299,13 @@ export const readSnapshotMulti = async (
     visible0: string;
     tail: string[];
     void: string[];
+    hidden: string[];
     fence: string[];
   }>(snapshotQuery, { nodes, voidLimit: voidInlineLimit + 1 });
   const [row] = rows;
   const voidSeqs = (row?.void ?? []).map(BigInt);
   const voidOverflow = voidSeqs.length > voidInlineLimit;
+  const hidden = (row?.hidden ?? []).map(BigInt);
   const fence = (row?.fence ?? []).map(BigInt);
   if (encodedLength(fence) > fenceParamMaxBytes) {
     // eslint-disable-next-line functional/no-throw-statement
@@ -275,6 +313,14 @@ export const readSnapshotMulti = async (
       `The epoch fence has ${fence.length} epochs (${encodedLength(
         fence
       )} bytes as a parameter, limit ${fenceParamMaxBytes}); see docs/clickhouse-port/wp6b-gate-cost.md.`
+    );
+  }
+  if (encodedLength(hidden) > hiddenParamMaxBytes) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new GateParameterOverflowError(
+      `${hidden.length} hidden stand-in seqs (${encodedLength(
+        hidden
+      )} bytes as a parameter, limit ${hiddenParamMaxBytes}); see docs/clickhouse-port/mempool-fill-fix.md.`
     );
   }
   const visible = row?.visible ?? [];
@@ -286,7 +332,7 @@ export const readSnapshotMulti = async (
     visibleByNode: new Map(
       nodes.map((node, index) => [node, BigInt(visible[index] ?? '0')])
     ),
-    void: voidOverflow ? [voidOverflowSentinel] : voidSeqs,
+    void: [...(voidOverflow ? [voidOverflowSentinel] : voidSeqs), ...hidden],
     voidOverflow,
   };
 };

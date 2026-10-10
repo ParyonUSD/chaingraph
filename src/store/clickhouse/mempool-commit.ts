@@ -73,13 +73,22 @@ import {
   waitForPredecessorRows,
 } from './node-state.js';
 import { RowBinaryWriter } from './row-binary.js';
-import type { SpentOutput } from './row-encoders.js';
 import {
   encodeInputRows,
   encodeOutputRows,
   encodeTransactionRows,
   rowBinaryTableColumns,
 } from './row-encoders.js';
+import type { StandInGroup } from './stand-in.js';
+import {
+  abortStandIns,
+  commitStandIns,
+  followClaims,
+  openStandIns,
+  registerStandIns,
+  settleStandIns,
+  writeResolutions,
+} from './stand-in.js';
 import type { UtxoOutput, UtxoRow } from './utxo.js';
 import {
   encodeUtxoRows,
@@ -396,12 +405,6 @@ export const factsFromTransaction = (
   };
 };
 
-/** Coinbase-like stand-in written on `input` rows whose spent output is unknown. */
-const unknownSpentOutput: SpentOutput = {
-  lockingBytecode: '',
-  valueSatoshis: 0n,
-};
-
 /* ------------------------------------------------------------ context */
 
 export interface MempoolContext extends WriterContext {
@@ -490,6 +493,9 @@ const pairArraySql = (hashes: string, indexes: string) =>
 
 export class MempoolCommitter {
   constructor(private readonly context: MempoolContext) {}
+
+  /** Stand-in groups of each live save (aborted with it on failure). */
+  private readonly standInsOf = new Map<StoreOperation, StandInGroup[]>();
 
   private get mempool() {
     return this.context.mempool;
@@ -1250,13 +1256,24 @@ export class MempoolCommitter {
     error: unknown,
     method: string
   ) {
+    const standIns = this.standInsOf.get(operation) ?? [];
+    this.standInsOf.delete(operation);
     if (!(error instanceof SimulatedCrash)) {
       this.mempool.markStale(operation);
+      await abortStandIns(
+        this.context,
+        standIns,
+        `${method} failed: ${String(error)}`
+      );
       if (commit !== undefined) {
         await this.context.commitLog
           .abortIfOpen(commit.seq, `${method} failed: ${String(error)}`)
           .catch(() => undefined);
       }
+    } else {
+      standIns.forEach((group) => {
+        this.context.standIns.remove(group);
+      });
     }
     operation.markFailed(error);
   }
@@ -1812,6 +1829,7 @@ export class MempoolCommitter {
     operation.seq = commit.seq;
     await context.fault('intent', { kind, seq: commit.seq });
     const rowCounts: { [table: string]: number } = {};
+    let standInGroups: StandInGroup[] = [];
     if (base !== undefined) {
       const columnsOf = (table: keyof typeof rowBinaryTableColumns) =>
         rowBinaryTableColumns[table].map(([name]) => name);
@@ -1838,27 +1856,89 @@ export class MempoolCommitter {
         'output',
         encodeOutputRows([base.transaction], transactionContext)
       );
-      await insert(
-        'input',
-        encodeInputRows(
-          [base.transaction],
-          transactionContext,
-          (hash, index) =>
-            base.resolvedSpend(outpointKey(hash, index)) ?? unknownSpentOutput
-        )
+      /*
+       * Spent outputs still unknown get stand-in rows under their own seq
+       * (stand-in.ts). The output registry is checked again here, in the
+       * same tick as the groups are registered: a parent registered since
+       * the lookup is used directly, a later one finds the group.
+       */
+      const encodedInputs = encodeInputRows(
+        [base.transaction],
+        transactionContext,
+        (hash, index) => {
+          const key = outpointKey(hash, index);
+          return base.resolvedSpend(key) ?? context.outputs.lookup(key)?.output;
+        }
       );
+      standInGroups = registerStandIns(
+        context.standIns,
+        base.transaction,
+        base.internalId,
+        encodedInputs.pending,
+        { operation, seq: commit.seq }
+      );
+      if (standInGroups.length > 0) {
+        this.standInsOf.set(operation, standInGroups);
+      }
+      await insert('input', encodedInputs);
+      if (standInGroups.length > 0) {
+        await openStandIns(context, standInGroups);
+        await context.fault('stand-in', { kind, seq: commit.seq });
+      }
       await insert(
         'transaction',
         encodeTransactionRows([base.transaction], transactionContext)
       );
+      /* stand-in rows of mempool children of this transaction */
+      const claims = context.standIns.claim([base.transaction]);
+      claims.forEach(({ group }) => {
+        if (
+          group.owner !== undefined &&
+          group.owner !== operation &&
+          !group.owner.finished
+        ) {
+          dependencies.add(group.owner);
+        }
+      });
+      followClaims(
+        context.standIns,
+        operation,
+        claims.map(({ group }) => group)
+      );
+      await writeResolutions(context, commit, claims, rowCounts);
     }
     await this.insertChangeRows(commit, kind, rows, '0', rowCounts);
     operation.markRowsWritten();
     await context.fault('rows-written', { kind, seq: commit.seq });
     await (context.abandon?.race(awaitDependencies(dependencies, operation)) ??
       awaitDependencies(dependencies, operation));
+    /*
+     * Stand-in groups: a save of the parent that found one `open` left it
+     * to this commit (resolved under this seq, chunk `sc`); the others
+     * become `live` (the parent's save resolves them). Then every P commits
+     * before this commit.
+     */
+    const selfResolved = settleStandIns(standInGroups);
+    if (standInGroups.length > 0) {
+      await context.fault('stand-in-settled', { kind, seq: commit.seq });
+    }
+    await writeResolutions(
+      context,
+      commit,
+      selfResolved.map((group) => ({ group, outputs: group.parentOutputs! })),
+      rowCounts,
+      'c'
+    );
+    await commitStandIns(context, standInGroups);
+    if (standInGroups.length > 0) {
+      await context.fault('stand-in-committed', { kind, seq: commit.seq });
+    }
     await context.commitLog.markCommitted(commit.seq, rowCounts);
     operation.markCommitted();
+    this.standInsOf.delete(operation);
+    selfResolved.forEach((group) => {
+      context.standIns.remove(group);
+    });
     await context.fault('committed', { kind, seq: commit.seq });
     return commit;
   }

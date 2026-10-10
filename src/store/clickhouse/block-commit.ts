@@ -55,6 +55,8 @@ import {
   encodeTransactionRows,
   rowBinaryTableColumns,
 } from './row-encoders.js';
+import type { StandInRegistry } from './stand-in.js';
+import { followClaims, writeResolutions } from './stand-in.js';
 import type {
   OutputRegistry,
   RegisteredOutput,
@@ -276,6 +278,8 @@ export interface WriterContext {
   fault: FaultInjector;
   lookupChunkSize: number;
   pendingSpendTimeoutMs: number;
+  /** Unresolved stand-in `input` rows (stand-in.ts). */
+  standIns: StandInRegistry;
   /** The mempool committer (block acceptance cleans the node's mempool). */
   mempoolHooks?: () => MempoolCommitter | undefined;
   /** Shutdown: abandon waits and uncommitted work. */
@@ -1372,6 +1376,29 @@ export class BlockCommitter {
     }
 
     await Promise.all(agnosticWrites);
+    /*
+     * 4b. Stand-in `input` rows of mempool children of this batch's new
+     * transactions (stand-in.ts): their real rows and resolutions, under
+     * this seq. A still-open owner is a dependency.
+     */
+    {
+      const claims = context.standIns.claim(newTransactions);
+      claims.forEach(({ group }) => {
+        if (
+          group.owner !== undefined &&
+          group.owner !== operation &&
+          !group.owner.finished
+        ) {
+          dependencies.add(group.owner);
+        }
+      });
+      followClaims(
+        context.standIns,
+        operation,
+        claims.map(({ group }) => group)
+      );
+      await writeResolutions(context, commit, claims, rowCounts);
+    }
 
     /* 5. Per-node decisions: after every earlier operation of the nodes. */
     await waitForEarlier();

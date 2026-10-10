@@ -148,7 +148,11 @@ it; the ClickHouse sweep does not list it. The settled end state (mempool, histo
   period; a block input after `pendingSpendTimeoutMs`) carries `value_satoshis = 0`, empty bytecode, no token on its
   `input` row (`input` denormalises the spent output; Postgres joins at read time). If the parent arrives later the
   UTXO set is fixed (pending spend resolution) but the `input` row keeps the stand-in. Rare (BCHN does not relay
-  orphans); a later repair could rewrite those input rows.
+  orphans); a later repair could rewrite those input rows. **Fixed for mempool transactions** in
+  [mempool-fill-fix.md](mempool-fill-fix.md): the stand-in rows have their own seq, which the snapshot hides once
+  the commit storing the parent is visible; that commit carries the real rows. Not rare after all: the agent does
+  not fetch the node's mempool when tracking starts, so every child announced after a start whose parents were
+  announced before it gets stand-ins.
 - **Orphan validations merged while parked** count as received at park time for the inherited-archive rule (§4); a
   node whose validation arrives after the parent's archive would, in Postgres, keep the child in its mempool.
 - **`forgetNodeValidation`** (checker fault injection) cancels rows behind the writer's back; the writer's memory still
