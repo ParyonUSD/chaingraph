@@ -219,9 +219,17 @@ surface as `lib/postgres.mjs`, selected in `run.mjs`):
 - **Thresholds** default to `scripts/ingestion-gate/thresholds.clickhouse.json`: wall,
   drain, converge, ratio, catch-up and heap limits are copied from `thresholds.json`
   (G1: no worse than Postgres on the same host); `maxDelayedInserts` and
-  `maxRejectedInserts` are 0; `maxBytesWritten`, `maxPartsCreated` and
-  `maxMergeSeconds` are `null` ("calibrate": not enforced) until three reference runs
-  exist, then set to about 1.5–2× their values.
+  `maxRejectedInserts` are 0. `maxBytesWritten`, `maxPartsCreated` and
+  `maxMergeSeconds` were calibrated in WP6 (`docs/clickhouse-port/wp6-local-measurement.md`
+  §11) from the local 26.8 reference runs: bytes 1.5×, parts 2×, merge time a 2 s floor
+  (the references are milliseconds):
+
+  | Scenario | `maxBytesWritten` | `maxPartsCreated` | `maxMergeSeconds` |
+  |---|---|---|---|
+  | max-block | 245 MB (ref 160.8 MB, 3 identical runs) | 34 (ref 17) | 2 s (ref 0.001 s) |
+  | burst | 800 MB (ref 527.4 MB, 1 run) | 88 (ref 44) | 2 s (ref 0.007 s) |
+
+  The other scenarios have no write-volume limits.
 - **Status (WP5b, 2026-10-09).** The metric queries and the pinned correctness reads
   were verified on local 26.8 against a throwaway database (three 100k-row inserts plus
   an `OPTIMIZE`: 3 parts, 7.5 MB `NewPart`, 5.6 MB `MergeParts`, 0 delayed/rejected).
