@@ -111,6 +111,28 @@ export const dropStaleClickHouseE2eDatabases = async () => {
  * still requires CHAINGRAPH_POSTGRES_CONNECTION_STRING, so the caller keeps
  * passing it (unused on ClickHouse).
  */
+/**
+ * ClickHouse store tuning variables passed through from the test process to
+ * the spawned agent when set (e.g. `CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES=16`
+ * to run the suite under the lab's in-flight cap). A set
+ * CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS replaces the suite's 1 ms.
+ */
+const clickHousePassThroughVariables = [
+  'CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES',
+  'CHAINGRAPH_CLICKHOUSE_MAX_BLOCKS_PER_COMMIT',
+  'CHAINGRAPH_CLICKHOUSE_MAX_BYTES_PER_COMMIT',
+  'CHAINGRAPH_CLICKHOUSE_LEASE_TTL_MS',
+  'CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS',
+] as const;
+
+const clickHousePassThroughEnvironment = (): { [key: string]: string } =>
+  Object.fromEntries(
+    clickHousePassThroughVariables.flatMap((name) => {
+      const value = process.env[name];
+      return value === undefined || value === '' ? [] : [[name, value]];
+    })
+  );
+
 export const e2eStoreEnvironment = (): { [key: string]: string } =>
   isClickHouseE2e
     ? {
@@ -129,6 +151,7 @@ export const e2eStoreEnvironment = (): { [key: string]: string } =>
         CHAINGRAPH_CLICKHOUSE_USER: e2eClickHouseServer.username ?? '',
         CHAINGRAPH_STORE: 'clickhouse',
         /* eslint-enable @typescript-eslint/naming-convention */
+        ...clickHousePassThroughEnvironment(),
       }
     : // eslint-disable-next-line @typescript-eslint/naming-convention
       { CHAINGRAPH_STORE: 'postgres' };
