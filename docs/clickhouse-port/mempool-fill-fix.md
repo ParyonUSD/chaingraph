@@ -190,3 +190,32 @@ unknown parents.
 
 The red run used a frozen export of dda146c with only the new spec and the checker method. The lines asserting the
 in-memory registry were removed, and the race tests were skipped because their fault steps do not exist there.
+
+## 6. Found on the way: a block requested while the node was saturated arrived 5 minutes late
+
+The optional UTXO-on chipnet run of this pass (agent c967a0c with the defaults: unbounded in-flight saves, 64
+blocks per commit, 200 ms linger) left **59 block inputs with stand-ins and 59 extra stored UTXOs**. These are block
+children, not mempool children. `ch1-chipnet-utxo-check.mjs` compares the stored UTXO set with the v1 definition:
+`onlyStored` = 59, `onlyV1` = 0. Sequence:
+
+1. At 20:50:53Z the block buffer had 203 blocks reserved. The agent sends at most `maxPendingDownloads` = 200
+   requests per node. A block that no node can take is retried after `downloadTimeout`, which is 300 s.
+2. Heights 313,822–313,825 waited 5 minutes. The buffer filled with later blocks (976 blocks, 123.5 MB) and stopped
+   moving.
+3. The children of those four blocks waited `pendingSpendTimeoutMs` (60 s). Then (`pending_spend_timeout` ×2) they
+   were committed with stand-in inputs and no UTXO −1 (wp5a-mempool.md §7, the "parent never arrives" rule).
+4. At 20:52:30Z the agent logged "initial sync is complete" with the four blocks missing. At 20:55:57Z they arrived
+   and were saved. By then the children were final: 59 inputs (37 transactions, 36 parents) show value 0, and 59
+   spent outputs stay in `utxo`.
+
+This is a race in the agent's download scheduling, and it is older than this pass. It can hit any ClickHouse sync of
+small blocks. The UTXO-off run of the same build happened not to reserve more than 200 blocks at once. Postgres is
+unaffected (it joins when it reads).
+
+**Fix** (`agent.ts`): a block that no node can take is retried after 1 s (`noNodeRetryMs`), not 300 s. A download
+sent to a node keeps its 300 s timeout.
+
+**Still open.** A block-path stand-in is final. A parent that arrives after `pendingSpendTimeoutMs` does not repair
+its children's `input` rows or their UTXO −1 rows. This would need the stand-in groups of §2 for block commits, plus a
+per-node UTXO −1 when the parent arrives. After the agent fix, the trigger is a node that takes more than 60 s to
+deliver a requested block.

@@ -65,6 +65,23 @@ const chaingraphProtocolVersion = 70012;
 const downloadTimeout = 300_000;
 
 /**
+ * How long to wait before trying again to request a block that no node could
+ * take (every node with the block is disconnected or already has
+ * `maxPendingDownloads` downloads pending). Downloads complete quickly, so a
+ * slot is usually free within a second. (It used to be `downloadTimeout`: a
+ * block requested while the only node was saturated – e.g. the block buffer
+ * reserving 203 small blocks at once – arrived 5 minutes late. Meanwhile the
+ * ClickHouse store gave up waiting for its outputs after
+ * `pendingSpendTimeoutMs` (60 s) and saved the children with stand-in inputs
+ * and no UTXO −1: docs/clickhouse-port/mempool-fill-fix.md §6.)
+ */
+const noNodeRetryMs = 1_000;
+
+/** When a block download requested from `node` (or from no node) is retried. */
+const downloadRetryMs = (node: string | undefined) =>
+  node === undefined ? noNodeRetryMs : downloadTimeout;
+
+/**
  * The maximum number of block downloads to queue from a single node. This is
  * primarily only relevant during Initial Block Download for nodes (when some
  * nodes respond extremely slowly to requests, causing retries) or when
@@ -1502,7 +1519,7 @@ export class Agent {
     if (node === undefined) {
       this.logger.debug(
         `All nodes with block ${height} (${hash}) are either responding slowly and have reached the maximum number of pending downloads (${maxPendingDownloads}) or are disconnected. Will retry download in ${
-          downloadTimeout / msPerSecond
+          noNodeRetryMs / msPerSecond
         } seconds.`
       );
     } else {
@@ -1527,7 +1544,7 @@ export class Agent {
         }
         this.clearDownload(download);
         this.requestBlock(download.hash, download.height);
-      }, downloadTimeout),
+      }, downloadRetryMs(node)),
     };
     this.blockDownloads.push(download);
     if (node !== undefined) {
