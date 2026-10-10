@@ -1633,3 +1633,86 @@ e2e(
     t.deepEqual(await badUtxoSums(client), []);
   }
 );
+
+/*
+ * WP6b: the agent hung after "initial sync is complete" with
+ * CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES=16: finishInitialSync drains
+ * every operation, and parked children re-armed their pending-spend timeout
+ * while ANY call was queued for a slot, including children that had only
+ * given their slot up for the wait, so they completed one at a time.
+ */
+for (const [cap, maxBlocksPerCommit] of [
+  [2, 1],
+  [16, 1],
+  [16, 64],
+] as const) {
+  e2e(
+    `[e2e] ClickHouseStore: initial sync of blocks spending unknown outputs completes with in-flight cap ${cap} (max ${maxBlocksPerCommit} blocks per commit)`,
+    async (t) => {
+      t.timeout(120_000);
+      const { client, openStore } = await scratch(t, `sync_cap${cap}`, {
+        maxBlocksPerCommit,
+        maxInFlightSaves: cap,
+        pendingSpendTimeoutMs: 1,
+        // per-block commits all working at once, as the agent's buffer feeds them
+        runningBatchesPerNodeSet: maxBlocksPerCommit === 1 ? 64 : undefined,
+      });
+      const store = await openStore();
+      const { node1, node2 } = await registerNodes(store);
+      await store.prepareForInitialSync();
+      // every non-coinbase input spends an outpoint that never exists (the e2e mockchain)
+      const blocks: ChaingraphBlock[] = [];
+      let previous = zeroHash;
+      for (let height = 0; height < 300; height += 1) {
+        const block = makeBlock(
+          height,
+          previous,
+          [
+            makeTx({
+              coinbase: true,
+              label: `sync-${cap}-${maxBlocksPerCommit}-c${height}`,
+              outputs: [{ lockingBytecode: p2pkh('m'), valueSatoshis: 1n }],
+            }),
+            makeTx({
+              label: `sync-${cap}-${maxBlocksPerCommit}-t${height}`,
+              outputs: [{ lockingBytecode: p2pkh('x'), valueSatoshis: 1n }],
+              spends: [[sha(`nowhere-${height}`), 0]],
+            }),
+          ],
+          `sync-${cap}-${maxBlocksPerCommit}-b${height}`
+        );
+        blocks.push(block);
+        previous = block.hash;
+      }
+      const started = Date.now();
+      await Promise.all(
+        blocks.map(async (block) =>
+          store.saveBlock({
+            block,
+            isSavedTransaction: notSaved,
+            nodeAcceptances: [acceptance(node1), acceptance(node2)],
+          })
+        )
+      );
+      const outcome = await Promise.race([
+        store
+          .finishInitialSync({
+            onIndexProgress: () => undefined,
+            onNonFatalError: () => undefined,
+          } as unknown as Parameters<ClickHouseStore['finishInitialSync']>[0])
+          .then(async () => store.enableMempoolTracking())
+          .then(() => 'enabled mempool tracking'),
+        new Promise<string>((resolve) => {
+          setTimeout(() => {
+            resolve('hung');
+          }, 30_000);
+        }),
+      ]);
+      t.log(`${outcome} after ${Date.now() - started} ms`);
+      t.is(outcome, 'enabled mempool tracking');
+      t.is(store.storeMode, 'tip');
+      await store.publishWatermarks();
+      t.is((await nodeView(client, node2)).blocks.length, blocks.length);
+    }
+  );
+}

@@ -228,8 +228,6 @@ export interface WriterContext {
   mempoolHooks?: () => MempoolCommitter | undefined;
   /** Shutdown: abandon waits and uncommitted work. */
   abandon?: AbandonSignal;
-  /** Saves queued for an in-flight slot (0 when unbounded). */
-  savesQueued?: () => number;
 }
 
 /** Postgres's saveBlock result semantics. */
@@ -1754,27 +1752,29 @@ export class BlockCommitter {
        * parent that never arrives): their inputs are written with a
        * coinbase-like stand-in (value 0, no token, empty bytecode) and no
        * UTXO row, as Postgres stores such inputs (no output to join).
-       * While saves are queued for an in-flight slot (one may be the
-       * parent: it registers its outputs only once it holds a slot), the
-       * timeout is re-armed, so the cap never turns a late parent into a
-       * stand-in. Unbounded stores never queue: one timeout, as before.
+       * There is no re-arm: saves register their outputs when they are
+       * called (WP6b), before any slot or batch-lane wait, and a save that
+       * waits for another save of the same block registers nothing new (that
+       * save registered the block's outputs). So a parent queued for a slot
+       * or behind a running batch is already visible here. (WP5c re-armed
+       * the timeout while ANY call was queued for a slot, which includes
+       * children resuming after their own wait: under a cap they completed
+       * one at a time and the agent's initial sync did not finish; re-arming
+       * on waits that themselves wait behind this child is a deadlock.)
        */
-      for (;;) {
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const timeout = new Promise<boolean>((resolve) => {
-          timer = setTimeout(() => {
-            resolve(false);
-          }, context.pendingSpendTimeoutMs);
-        });
-        const done = await Promise.race([
-          all,
-          timeout,
-          ...(context.abandon === undefined ? [] : [context.abandon.promise]),
-        ]).finally(() => {
-          clearTimeout(timer);
-        });
-        if (done || (context.savesQueued?.() ?? 0) === 0) break;
-      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => {
+          resolve(false);
+        }, context.pendingSpendTimeoutMs);
+      });
+      await Promise.race([
+        all,
+        timeout,
+        ...(context.abandon === undefined ? [] : [context.abandon.promise]),
+      ]).finally(() => {
+        clearTimeout(timer);
+      });
       return new Map(result);
     } finally {
       waits.forEach(({ cancel }) => {

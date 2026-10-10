@@ -376,7 +376,6 @@ export class ClickHouseStore implements ChaingraphStore {
       outputs: this.outputs,
       pendingSpendTimeoutMs:
         this.options.pendingSpendTimeoutMs ?? defaultPendingSpendTimeoutMs,
-      savesQueued: () => this.slots?.waiting ?? 0,
       transactions: this.transactions,
     });
     this.mempoolCommitter = new MempoolCommitter({
