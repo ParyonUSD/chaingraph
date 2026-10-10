@@ -120,6 +120,24 @@ ClickHouse path (`src/e2e/e2e.spec.store.helper.ts`):
 - Fixed sleeps: the double-spend test's two 1 s sleeps now wait (via `eventually`) for each
   transaction to reach node1's mempool. The remaining `sleep(1000)` in "ignores inbound transactions
   before initial sync is complete" is a negative check (the tx must stay absent) and stays.
+- Timing (WP6b, `wp6b-e2e-stability.md`). Waits scale with the backend:
+
+  | Wait | Postgres | ClickHouse |
+  |---|---|---|
+  | one log line | 10 s | 30 s |
+  | multi-block feeds, shutdown drain | 10 s | 60 s |
+  | initial sync / catch-up | 60 s | 120 s |
+  | read after a save | 3 s | 10 s |
+  | sync-scale read | 10 s | 60 s |
+
+  On ClickHouse each agent-driving test gets a 180 s AVA timeout. A `waitForStdout` timeout is a
+  test failure, not an uncaught exception. Every read after a log line or agent event goes through
+  `eventually` / `eventuallyEqual`. The negative check asserts absence across two reads 1 s apart
+  (`readTwice`). Shutdown is asserted by exit code 0. Startup also drops `cg_e2e_*` databases older
+  than 1 h.
+
+  Run time: Postgres 6–7 s. ClickHouse 23–24 s from `5c5413f` (multi-block commits); it was 57–66 s
+  before, when initial sync alone took 22–29 s.
 
 Run:
 
