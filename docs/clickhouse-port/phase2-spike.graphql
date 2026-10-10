@@ -1,0 +1,276 @@
+"""64-bit integer, serialized as a decimal string."""
+scalar BigInt
+
+input BigIntComparison {
+  _eq: BigInt
+  _gt: BigInt
+  _gte: BigInt
+  _in: [BigInt!]
+  _lt: BigInt
+  _lte: BigInt
+  _neq: BigInt
+}
+
+type Block {
+  hash: Hex!
+  height: Int!
+  internal_id: BigInt!
+  timestamp: BigInt!
+}
+
+"""
+A block that includes the transaction and that the root node accepts (per node).
+"""
+type BlockInclusion {
+  block: Block!
+  transaction_index: Int
+}
+
+"""
+Per node: in a block the root's node accepts with from_height <= height < to_height, or (include_mempool, default true) in its mempool.
+"""
+input BlockWindow {
+  from_height: Int
+  include_mempool: Boolean
+  to_height: Int
+}
+
+"""Bytes as lowercase hexadecimal (no prefix)."""
+scalar Hex
+
+input HexComparison {
+  _eq: Hex
+  _in: [Hex!]
+  _is_null: Boolean
+  _neq: Hex
+  _prefix: Hex
+}
+
+type Input {
+  input_index: Int!
+  outpoint: SpentOutput!
+
+  """BigInt: a coinbase input has 4294967295."""
+  outpoint_index: BigInt!
+  outpoint_transaction_hash: Hex!
+  sequence_number: BigInt!
+
+  """The spending transaction."""
+  transaction: Transaction!
+  transaction_hash: Hex!
+  transaction_internal_id: BigInt!
+  unlocking_bytecode: Hex!
+}
+
+"""
+Predicates on one input row; `outpoint` fields bind to the same row (same-row conjunction).
+"""
+input InputFilter {
+  _and: [InputFilter!]
+  _not: InputFilter
+  _or: [InputFilter!]
+  input_index: IntComparison
+  outpoint: OutputFilter
+  outpoint_transaction_hash: HexComparison
+}
+
+"""
+One page; `has_more` signals truncation (R33). Pass `end_cursor` as `after` (or as `before` for a DESC transaction page) for the next page.
+"""
+type InputPage {
+  end_cursor: String
+  has_more: Boolean!
+  nodes: [Input!]!
+}
+
+input IntComparison {
+  _eq: Int
+  _gt: Int
+  _gte: Int
+  _in: [Int!]
+  _lt: Int
+  _lte: Int
+  _neq: Int
+}
+
+enum Order {
+  ASC
+  DESC
+}
+
+type Output {
+  fungible_token_amount: BigInt
+  locking_bytecode: Hex!
+  nonfungible_token_capability: TokenCapability
+  nonfungible_token_commitment: Hex
+  output_index: Int!
+  token_category: Hex
+
+  """The creating transaction."""
+  transaction: Transaction!
+  transaction_hash: Hex!
+  transaction_internal_id: BigInt!
+  value_satoshis: BigInt!
+}
+
+"""
+Predicates on one output row (or, as `outpoint`, on the spent output of one input row).
+"""
+input OutputFilter {
+  _and: [OutputFilter!]
+  _not: OutputFilter
+  _or: [OutputFilter!]
+  fungible_token_amount: BigIntComparison
+  locking_bytecode: HexComparison
+  nonfungible_token_capability: TokenCapabilityComparison
+  nonfungible_token_commitment: HexComparison
+  output_index: IntComparison
+  token_category: HexComparison
+  value_satoshis: BigIntComparison
+}
+
+type OutputGroup {
+  aggregate: OutputGroupAggregate!
+  key: OutputGroupKey!
+}
+
+type OutputGroupAggregate {
+  count: BigInt!
+  sum: OutputGroupSum!
+}
+
+enum OutputGroupColumn {
+  LOCKING_BYTECODE
+  TOKEN_CATEGORY
+}
+
+type OutputGroupKey {
+  locking_bytecode: Hex
+  token_category: Hex
+}
+
+input OutputGroupOrder {
+  by: OutputGroupOrderField!
+  direction: Order = DESC
+}
+
+enum OutputGroupOrderField {
+  COUNT
+  KEY
+  SUM_FUNGIBLE_TOKEN_AMOUNT
+  SUM_VALUE_SATOSHIS
+}
+
+type OutputGroupSum {
+  fungible_token_amount: BigInt!
+  value_satoshis: BigInt!
+}
+
+"""
+One page; `has_more` signals truncation (R33). Pass `end_cursor` as `after` (or as `before` for a DESC transaction page) for the next page.
+"""
+type OutputPage {
+  end_cursor: String
+  has_more: Boolean!
+  nodes: [Output!]!
+}
+
+type Query {
+  """
+  Inputs of transactions the node accepts, keyset-paginated on (transaction_internal_id, input_index).
+  """
+  inputs(after: String, limit: Int!, node: String!, where: InputFilter): InputPage!
+
+  """
+  The newest transaction internal_id in the request snapshot (node-agnostic).
+  """
+  transaction_watermark: BigInt
+
+  """
+  Transactions the node accepts (in a block it accepts or in its mempool), keyset on internal_id: after < internal_id < before.
+  """
+  transactions(after: BigInt, before: BigInt, limit: Int!, node: String!, order: Order = ASC, where: TransactionFilter): TransactionPage!
+
+  """
+  Group-by aggregate over the node's unspent outputs (computed at query time).
+  """
+  unspent_output_groups(group_by: [OutputGroupColumn!]!, limit: Int!, node: String!, order_by: OutputGroupOrder, where: OutputFilter): [OutputGroup!]!
+
+  """
+  The node's unspent outputs, computed at query time from outputs minus spending inputs (UTXO tables off), keyset on (transaction_internal_id, output_index).
+  """
+  unspent_outputs(after: String, limit: Int!, node: String!, where: OutputFilter): OutputPage!
+}
+
+"""
+The output an input spends (from the input row's copy of its attributes).
+"""
+type SpentOutput {
+  fungible_token_amount: BigInt
+  locking_bytecode: Hex!
+  nonfungible_token_capability: TokenCapability
+  nonfungible_token_commitment: Hex
+  token_category: Hex
+  value_satoshis: BigInt!
+}
+
+"""
+Live queries: the full result, re-delivered when it changes after the node watermark advances.
+"""
+type Subscription {
+  transactions(after: BigInt, before: BigInt, limit: Int!, node: String!, order: Order = ASC, where: TransactionFilter): TransactionPage!
+  unspent_outputs(after: String, limit: Int!, node: String!, where: OutputFilter): OutputPage!
+}
+
+enum TokenCapability {
+  MINTING
+  MUTABLE
+  NONE
+}
+
+input TokenCapabilityComparison {
+  _eq: TokenCapability
+  _in: [TokenCapability!]
+  _is_null: Boolean
+  _neq: TokenCapability
+}
+
+type Transaction {
+  """Blocks that include the transaction and that the root's node accepts."""
+  block_inclusions: [BlockInclusion!]!
+  hash: Hex!
+  input_count: Int!
+  inputs(limit: Int, order: Order = ASC, where: InputFilter): [Input!]!
+  internal_id: BigInt!
+  is_coinbase: Boolean!
+  locktime: BigInt!
+  output_count: Int!
+  output_value_satoshis: BigInt!
+  outputs(limit: Int, order: Order = ASC, where: OutputFilter): [Output!]!
+  size_bytes: Int!
+  version: Int!
+}
+
+input TransactionFilter {
+  _and: [TransactionFilter!]
+  _not: TransactionFilter
+  _or: [TransactionFilter!]
+  block_window: BlockWindow
+
+  """EXISTS an input of the transaction matching the filter."""
+  has_input: InputFilter
+
+  """EXISTS an output of the transaction matching the filter."""
+  has_output: OutputFilter
+  hash: HexComparison
+  internal_id: BigIntComparison
+}
+
+"""
+One page; `has_more` signals truncation (R33). Pass `end_cursor` as `after` (or as `before` for a DESC transaction page) for the next page.
+"""
+type TransactionPage {
+  end_cursor: String
+  has_more: Boolean!
+  nodes: [Transaction!]!
+}

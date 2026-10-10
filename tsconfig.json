@@ -28,7 +28,8 @@
     "pretty": true /* Stylize errors and messages using color and context. */,
 
     "typeRoots": ["node_modules/@types", "src/types"],
-    "types": ["node"]
+    "types": ["node"],
+    "skipLibCheck": true /* graphql-yoga / @whatwg-node typings need lib.esnext + DOM (URLPattern, DisposableStack) */
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules/**"]

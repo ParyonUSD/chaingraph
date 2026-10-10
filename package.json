@@ -107,6 +107,8 @@
     "image:inspect:bchn": "docker save chaingraph/bitcoin-cash-node:dev-build > data/bitcoin-cash-node.tar",
     "build": "tsc",
     "clickhouse:ddl": "node bin/chaingraph-clickhouse-ddl.js",
+    "api:dev": "yarn build && node build/api/main.js",
+    "api:schema": "yarn build >/dev/null && node build/api/print-schema.js",
     "gen:schema-md": "graphql-markdown http://localhost:8080/v1/graphql > docs/generated-schema.md",
     "gen:schemaspy": "docker run --rm -it -v \"$(pwd)/output\":/output --network host schemaspy/schemaspy:latest -t pgsql -db postgres -host host.docker.internal --port 5432 -s public -u chaingraph -p very_insecure_postgres_password -hq -imageformat svg",
     "log": "yarn log:base -c -l -t",
@@ -151,10 +153,15 @@
     "@bitauth/libauth": "^2.0.0-alpha.8",
     "@chaingraph/bitcore-p2p-cash": "^9.0.5",
     "@clickhouse/client": "1.24",
+    "@pothos/core": "4.15.1",
     "dotenv": "^16.0.3",
+    "graphql": "^16.11.0",
+    "graphql-ws": "6.3.0",
+    "graphql-yoga": "5.24.4",
     "lru-cache": "^7.14.1",
     "pg": "^8.22.0",
-    "pino": "^8.8.0"
+    "pino": "^8.8.0",
+    "ws": "8.22.0"
   },
   "devDependencies": {
     "@ava/typescript": "^3.0.1",
@@ -163,6 +170,7 @@
     "@types/lru-cache": "^7.10.10",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.20.0",
+    "@types/ws": "^8.18.2",
     "@typescript-eslint/eslint-plugin": "^5.48.1",
     "@typescript-eslint/parser": "^5.48.1",
     "ava": "^5.1.0",
