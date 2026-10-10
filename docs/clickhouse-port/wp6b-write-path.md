@@ -198,3 +198,29 @@ Test: `[e2e] an event-loop stall past the lease deadline mid-commit …`: a 2.5 
 block 2's per-node phase; the save resolves normally; the store is in epoch + 1; both nodes see exactly blocks 0–2
 and their UTXO sets; the old epoch's commit of block 2 is not committed and the epoch is fenced; no fatal; a further
 block saves in the new epoch.
+
+## 8. Results (local, 2026-10-10)
+
+Same host and harness as WP6 (`scripts/measure/gate-with-poller.sh`, no poller, `--store clickhouse --keep-pg`,
+ports 3499/19733), agent built from a frozen copy of 355da43 (this branch's HEAD for the write path). Medians of 3;
+WP6 and Postgres columns from `wp6-local-measurement.md` §3.
+
+| Scenario | Postgres 14 (WP6) | ClickHouse WP6 (patched) | ClickHouse WP6b | Limit | WP6b verdict |
+|---|---|---|---|---|---|
+| max-block wall (100,001 tx) | 7.58 s | 4.67 s | **4.43 s** (4.36 / 4.43 / 4.45), 22.6k tx/s | ≤ Postgres | pass |
+| re-org converge | 1.51 s | 7.27 s | **3.54 s** (3.49 / 3.54 / 3.63) | ≤ 6 s | pass (target ≤ 3 s missed) |
+| concurrent ratio | 0.79 | 0.55 | **0.57** (0.57 / 0.57 / 0.63); alone 29.0k + 19.2k, together 27.5k tx/s | ≥ 0.6 | **fail** (JS-bound, §6) |
+| catch-up `--quick` (1,000 blocks) | 904 blocks/s | 30.6 blocks/s | **645.6 blocks/s** (639.8 / 645.6 / 646.0) | ≥ 300 | pass |
+| catch-up `--quick` parts / merges | — | 11,332 parts (11.3/block), 1.92 GB merges | **745 parts (0.75/block)**, 116 MB merges | — | — |
+| catch-up 10,000 blocks | 633.8 blocks/s | agent OOM (4.2 GB heap) | **635.9 blocks/s** agent-side (634.5 / 635.9 / 638.3), peak heap 390–431 MB | ≥ 300 | agent pass; the gate itself errors (harness, below) |
+| e2e initial sync | 2.1 s | 28.9 s | 1.3 s (2.5 s with cap 16) | — | — |
+
+Full catch-up: the agent saves all 10,006 blocks, then the harness's final `blockTransactionCount` passes all
+10,000 block hashes as one query parameter and ClickHouse rejects it (`HTML Form Exception: Field value too long`,
+`http_max_field_value_size` 128 KiB). The rate above is from the agent log (first to last "Saved new block"); the
+harness (`scripts/ingestion-gate/lib/clickhouse.mjs`, owned by WP6b-C) needs to chunk that list.
+
+Suites at the end (frozen 355da43): ClickHouse store specs `build/store/clickhouse/*.spec.js` 117/117; e2e
+Postgres 92/92; e2e ClickHouse 45/45 (47 `[postgres]` skipped); e2e ClickHouse with
+`CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES=16` 45/45 (the e2e harness does not pass the cap to the agent; the run
+used a frozen copy whose compiled e2e store helper adds it from `E2E_CAP`).
