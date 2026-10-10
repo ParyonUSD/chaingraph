@@ -1,4 +1,4 @@
-/* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, max-params, @typescript-eslint/parameter-properties, @typescript-eslint/member-ordering, @typescript-eslint/no-invalid-void-type, class-methods-use-this */
+/* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, @typescript-eslint/member-ordering, @typescript-eslint/no-invalid-void-type, class-methods-use-this, functional/no-let, functional/no-loop-statement, no-bitwise, complexity, functional/no-throw-statement, @typescript-eslint/no-use-before-define */
 // cspell:ignore clickhouse seqs
 /**
  * Per-node in-memory state of the ClickHouse writer (WP5a-core):
@@ -41,9 +41,7 @@ export interface Deferred<T> {
 }
 
 export const deferred = <T>(): Deferred<T> => {
-  // eslint-disable-next-line functional/no-let
   let resolve: (value: T) => void = () => undefined;
-  // eslint-disable-next-line functional/no-let
   let reject: (error: unknown) => void = () => undefined;
   const promise = new Promise<T>((res, rej) => {
     resolve = res;
@@ -57,6 +55,7 @@ export type OperationKind =
   | 'header_accept'
   | 'horizon'
   | 'mempool'
+  | 'predecessors'
   | 'reorg';
 
 export type OperationState = 'committed' | 'done' | 'failed' | 'running';
@@ -70,7 +69,19 @@ export type OperationState = 'committed' | 'done' | 'failed' | 'running';
 export class StoreOperation {
   state: OperationState = 'running';
 
-  seq: bigint | undefined;
+  /**
+   * The registry that ordered this operation (`OperationRegistry.begin`);
+   * `undefined` for stand-alone operations (unit tests, barriers).
+   */
+  registry: OperationRegistry | undefined;
+
+  /** Set by `OperationRegistry` when a predecessor of this one fails. */
+  poisoned: unknown;
+
+  /** Set by `OperationRegistry.end`: no longer orders later operations. */
+  ended = false;
+
+  private seqValue: bigint | undefined;
 
   /**
    * The operation's in-flight slot (`InFlightLimiter`), set for block saves
@@ -87,15 +98,40 @@ export class StoreOperation {
   constructor(
     readonly id: number,
     readonly kind: OperationKind,
-    readonly nodes: readonly number[],
-    /**
-     * Live operations registered earlier that share a node with this one
-     * (cleared when this one finishes, so finished chains can be collected).
-     */
-    public predecessors: StoreOperation[]
+    readonly nodes: readonly number[]
   ) {
     // never an unhandled rejection: callers that care await these explicitly
     this.commit.promise.catch(() => undefined);
+  }
+
+  get seq(): bigint | undefined {
+    return this.seqValue;
+  }
+
+  /** The commit seq; the registry indexes live operations by it. */
+  set seq(seq: bigint | undefined) {
+    this.seqValue = seq;
+    if (seq !== undefined) this.registry?.indexSeq(this, seq);
+  }
+
+  /**
+   * The operations registered earlier that share a node with this one and
+   * have not settled (committed, done or failed), as ONE dependency: a
+   * barrier whose `committed` resolves once all of them have settled and
+   * rejects if one of them failed. Empty when there are none, or once this
+   * operation's rows are written (as before: predecessors are only
+   * consulted while an operation decides its rows).
+   */
+  get predecessors(): StoreOperation[] {
+    if (this.rowsDone || this.registry === undefined) return [];
+    return this.registry.hasUnsettledEarlier(this)
+      ? [new PredecessorBarrier(this, this.registry.earlierSettled(this))]
+      : [];
+  }
+
+  /** Whether `markRowsWritten` (or a terminal mark) has run. */
+  get hasWrittenRows() {
+    return this.rowsDone;
   }
 
   get rowsWritten(): Promise<void> {
@@ -111,30 +147,36 @@ export class StoreOperation {
   }
 
   markRowsWritten() {
-    this.predecessors = [];
     if (!this.rowsDone) {
       this.rowsDone = true;
       this.rows.resolve();
+      this.registry?.rowsWrittenBy(this);
     }
   }
 
   markCommitted() {
     this.markRowsWritten();
+    if (this.state !== 'running') return;
     this.state = 'committed';
     this.commit.resolve();
+    this.registry?.settled(this);
   }
 
   /** Finished without a commit (nothing to write). */
   markDone() {
     this.markRowsWritten();
+    if (this.state !== 'running') return;
     this.state = 'done';
     this.commit.resolve();
+    this.registry?.settled(this);
   }
 
   markFailed(error: unknown) {
     this.markRowsWritten();
+    if (this.state !== 'running') return;
     this.state = 'failed';
     this.commit.reject(error);
+    this.registry?.settled(this, error);
   }
 
   /**
@@ -150,6 +192,27 @@ export class StoreOperation {
 }
 
 export class DependencyFailedError extends Error {}
+
+/**
+ * One dependency standing for "every earlier unsettled operation sharing a
+ * node with `owner`" (see `StoreOperation.predecessors`). Its state is
+ * `done`, so it never contributes a `dependsOn` seq: what it waits for is
+ * ordering, and each of those commits is terminal before `owner` commits.
+ */
+class PredecessorBarrier extends StoreOperation {
+  constructor(
+    owner: StoreOperation,
+    private readonly settledAll: Promise<void>
+  ) {
+    super(-owner.id, 'predecessors', owner.nodes);
+    this.state = 'done';
+    this.settledAll.catch(() => undefined);
+  }
+
+  override get committed(): Promise<void> {
+    return this.settledAll;
+  }
+}
 
 /** In-flight work was abandoned (store shutdown): nothing was committed. */
 export class AbandonedError extends Error {}
@@ -182,7 +245,6 @@ export class AbandonSignal {
 
   assertNotAbandoned() {
     if (this.abandoned) {
-      // eslint-disable-next-line functional/no-throw-statement
       throw new AbandonedError('Abandoned: store shutdown.');
     }
   }
@@ -209,7 +271,6 @@ export class InFlightLimiter {
 
   constructor(readonly max: number) {
     if (!Number.isInteger(max) || max < 1) {
-      // eslint-disable-next-line functional/no-throw-statement
       throw new RangeError(
         `In-flight cap must be an integer >= 1 (got ${max}).`
       );
@@ -249,7 +310,6 @@ export class InFlightLimiter {
       } else {
         this.queue.splice(index, 1);
       }
-      // eslint-disable-next-line functional/no-throw-statement
       throw error;
     }
   }
@@ -318,12 +378,150 @@ export class SaveSlot {
   }
 }
 
+/** A min-heap of waiters by threshold (operation id). */
+class WaiterHeap {
+  private readonly items: { threshold: number; wake: () => void }[] = [];
+
+  get size() {
+    return this.items.length;
+  }
+
+  push(threshold: number, wake: () => void) {
+    const { items } = this;
+    items.push({ threshold, wake });
+    let index = items.length - 1;
+    while (index > 0) {
+      const parent = (index - 1) >> 1;
+      if (items[parent]!.threshold <= items[index]!.threshold) break;
+      [items[parent], items[index]] = [items[index]!, items[parent]!];
+      index = parent;
+    }
+  }
+
+  /** Wake (and remove) every waiter whose threshold is at most `upTo`. */
+  wakeUpTo(upTo: number) {
+    const { items } = this;
+    while (items.length > 0 && items[0]!.threshold <= upTo) {
+      const top = items[0]!;
+      const last = items.pop()!;
+      if (items.length > 0) {
+        items[0] = last;
+        let index = 0;
+        for (;;) {
+          const left = 2 * index + 1;
+          const right = left + 1;
+          let smallest = index;
+          if (
+            left < items.length &&
+            items[left]!.threshold < items[smallest]!.threshold
+          ) {
+            smallest = left;
+          }
+          if (
+            right < items.length &&
+            items[right]!.threshold < items[smallest]!.threshold
+          ) {
+            smallest = right;
+          }
+          if (smallest === index) break;
+          [items[smallest], items[index]] = [items[index]!, items[smallest]!];
+          index = smallest;
+        }
+      }
+      top.wake();
+    }
+  }
+}
+
+/**
+ * Operations of one node in registration (= id) order, with a lazily
+ * advanced head: the oldest one for which `isOpen` still holds. Push and
+ * amortised head advance are O(1).
+ */
+class OrderedQueue {
+  private items: StoreOperation[] = [];
+
+  private head = 0;
+
+  readonly waiters = new WaiterHeap();
+
+  constructor(
+    private readonly isOpen: (operation: StoreOperation) => boolean
+  ) {}
+
+  push(operation: StoreOperation) {
+    this.items.push(operation);
+  }
+
+  /** The id of the oldest open operation, or Infinity if none is open. */
+  oldestOpenId(): number {
+    while (
+      this.head < this.items.length &&
+      !this.isOpen(this.items[this.head]!)
+    ) {
+      this.head += 1;
+    }
+    const compactAt = 1_024;
+    if (this.head >= compactAt && this.head * 2 >= this.items.length) {
+      this.items = this.items.slice(this.head);
+      this.head = 0;
+    }
+    return this.head < this.items.length ? this.items[this.head]!.id : Infinity;
+  }
+
+  /** Re-check after an operation closed: wake waiters it was holding. */
+  advance() {
+    if (this.waiters.size === 0) {
+      this.oldestOpenId();
+      return;
+    }
+    this.waiters.wakeUpTo(this.oldestOpenId());
+  }
+
+  get isEmpty() {
+    return this.oldestOpenId() === Infinity;
+  }
+}
+
+/** Per-node ordering state. */
+class NodeLane {
+  /** Registered and not yet ended (for failure propagation). */
+  readonly live = new Set<StoreOperation>();
+
+  /** Operations whose rows are not all written yet. */
+  readonly rows = new OrderedQueue(
+    (operation) => !operation.ended && !operation.hasWrittenRows
+  );
+
+  /** Operations not yet settled (committed, done or failed). */
+  readonly unsettled = new OrderedQueue(
+    (operation) => !operation.ended && !operation.finished
+  );
+}
+
 /**
  * The registry of live operations. Registration is synchronous, so the order
- * of registration is the order of the store calls (the agent's order).
+ * of registration is the order of the store calls (the agent's order), and
+ * operation ids increase in that order.
+ *
+ * Ordering (wp5a-core.md §4, unchanged): an operation's predecessors are the
+ * operations registered earlier that share a node with it and were live at
+ * its registration. Rather than copying them into every operation (O(live)
+ * per operation, quadratic in queued operations: the WP6 catch-up OOM), each
+ * node keeps its operations in id order with a head pointer to the oldest
+ * one whose rows are not written (and one to the oldest unsettled one).
+ * "Every predecessor on node n has written its rows" is then "the oldest
+ * operation of n with unwritten rows is this one or newer"; waiters sit in
+ * a min-heap by id and are woken when the head passes them. A failure marks
+ * every live later operation on its nodes (`poisoned`), which is exactly the
+ * set that had it as a predecessor. Memory: O(1) per operation per node.
  */
 export class OperationRegistry {
   private readonly live = new Set<StoreOperation>();
+
+  private readonly lanes = new Map<number, NodeLane>();
+
+  private readonly bySeq = new Map<bigint, StoreOperation>();
 
   private nextId = 1;
 
@@ -338,28 +536,114 @@ export class OperationRegistry {
   }
 
   begin(kind: OperationKind, nodes: readonly number[]): StoreOperation {
-    const nodeSet = new Set(nodes);
-    const predecessors = [...this.live].filter((operation) =>
-      operation.nodes.some((node) => nodeSet.has(node))
-    );
-    const operation = new StoreOperation(
-      this.nextId,
-      kind,
-      [...nodeSet].sort((a, b) => a - b),
-      predecessors
-    );
+    const sorted = [...new Set(nodes)].sort((a, b) => a - b);
+    const operation = new StoreOperation(this.nextId, kind, sorted);
+    operation.registry = this;
     this.nextId += 1;
     this.live.add(operation);
+    sorted.forEach((node) => {
+      const lane = this.lane(node);
+      lane.live.add(operation);
+      lane.rows.push(operation);
+      lane.unsettled.push(operation);
+    });
     return operation;
   }
 
   /** Remove a finished operation. */
   end(operation: StoreOperation) {
-    this.live.delete(operation);
+    if (!this.live.delete(operation)) return;
+    operation.ended = true;
+    operation.nodes.forEach((node) => {
+      const lane = this.lanes.get(node);
+      lane?.live.delete(operation);
+      lane?.rows.advance();
+      lane?.unsettled.advance();
+    });
+    if (
+      operation.seq !== undefined &&
+      this.bySeq.get(operation.seq) === operation
+    ) {
+      this.bySeq.delete(operation.seq);
+    }
     if (this.live.size === 0) {
       this.idle.splice(0).forEach((resolve) => {
         resolve();
       });
+    }
+  }
+
+  /** The live, unfinished operation that owns `seq`, if any. O(1). */
+  operationOfSeq(seq: bigint): StoreOperation | undefined {
+    const operation = this.bySeq.get(seq);
+    return operation !== undefined && !operation.finished
+      ? operation
+      : undefined;
+  }
+
+  /** @internal called by `StoreOperation` when its seq is assigned. */
+  indexSeq(operation: StoreOperation, seq: bigint) {
+    if (this.live.has(operation)) this.bySeq.set(seq, operation);
+  }
+
+  /** @internal called by `StoreOperation.markRowsWritten`. */
+  rowsWrittenBy(operation: StoreOperation) {
+    operation.nodes.forEach((node) => {
+      this.lanes.get(node)?.rows.advance();
+    });
+  }
+
+  /** @internal called once when an operation settles. */
+  settled(operation: StoreOperation, error?: unknown) {
+    operation.nodes.forEach((node) => {
+      const lane = this.lanes.get(node);
+      if (lane === undefined) return;
+      if (error !== undefined) {
+        // rare (failures only): every live later operation had it as a predecessor
+        lane.live.forEach((other) => {
+          if (other.id > operation.id && other.poisoned === undefined) {
+            other.poisoned = error;
+          }
+        });
+      }
+      lane.unsettled.advance();
+    });
+  }
+
+  /** Whether an earlier operation on a shared node is still unsettled. */
+  hasUnsettledEarlier(operation: StoreOperation): boolean {
+    return operation.nodes.some(
+      (node) =>
+        (this.lanes.get(node)?.unsettled.oldestOpenId() ?? Infinity) <
+        operation.id
+    );
+  }
+
+  /** Whether an earlier operation on a shared node has rows to write. */
+  hasUnwrittenEarlier(operation: StoreOperation): boolean {
+    return operation.nodes.some(
+      (node) =>
+        (this.lanes.get(node)?.rows.oldestOpenId() ?? Infinity) < operation.id
+    );
+  }
+
+  /** Resolves once every earlier operation on a shared node has written its rows. */
+  async earlierRowsWritten(operation: StoreOperation): Promise<void> {
+    await this.waitForHeads(operation, (lane) => lane.rows);
+  }
+
+  /**
+   * Resolves once every earlier operation on a shared node has settled;
+   * rejects (`DependencyFailedError`) if one of them failed.
+   */
+  async earlierSettled(operation: StoreOperation): Promise<void> {
+    await this.waitForHeads(operation, (lane) => lane.unsettled);
+    if (operation.poisoned !== undefined) {
+      throw new DependencyFailedError(
+        `An earlier operation on nodes ${operation.nodes.join(
+          ', '
+        )} failed: ${String(operation.poisoned)}`
+      );
     }
   }
 
@@ -372,6 +656,32 @@ export class OperationRegistry {
       this.idle.push(resolve);
     });
   }
+
+  private lane(node: number): NodeLane {
+    let lane = this.lanes.get(node);
+    if (lane === undefined) {
+      lane = new NodeLane();
+      this.lanes.set(node, lane);
+    }
+    return lane;
+  }
+
+  private async waitForHeads(
+    operation: StoreOperation,
+    queueOf: (lane: NodeLane) => OrderedQueue
+  ): Promise<void> {
+    await Promise.all(
+      operation.nodes.map(async (node) => {
+        const lane = this.lanes.get(node);
+        if (lane === undefined) return;
+        const queue = queueOf(lane);
+        if (queue.oldestOpenId() >= operation.id) return;
+        await new Promise<void>((resolve) => {
+          queue.waiters.push(operation.id, resolve);
+        });
+      })
+    );
+  }
 }
 
 /**
@@ -379,12 +689,11 @@ export class OperationRegistry {
  * (without holding an in-flight slot while waiting).
  */
 export const waitForPredecessorRows = async (operation: StoreOperation) => {
-  const rows = Promise.all(
-    operation.predecessors.map(async (predecessor) => predecessor.rowsWritten)
-  );
-  await (operation.predecessors.length > 0
-    ? operation.whileWaiting(rows)
-    : rows);
+  const { registry } = operation;
+  if (registry === undefined || !registry.hasUnwrittenEarlier(operation)) {
+    return;
+  }
+  await operation.whileWaiting(registry.earlierRowsWritten(operation));
 };
 
 /**
@@ -399,7 +708,6 @@ export const awaitDependencies = async (
   await Promise.all(
     list.map(async (dependency) =>
       dependency.committed.catch((error: unknown) => {
-        // eslint-disable-next-line functional/no-throw-statement
         throw new DependencyFailedError(
           `Operation ${dependency.id} (${
             dependency.kind

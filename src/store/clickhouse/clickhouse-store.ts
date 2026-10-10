@@ -1329,9 +1329,7 @@ export class ClickHouseStore implements ChaingraphStore {
   }
 
   private operationOfSeq(seq: bigint): StoreOperation | undefined {
-    return this.operations.liveOperations.find(
-      (operation) => operation.seq === seq && !operation.finished
-    );
+    return this.operations.operationOfSeq(seq);
   }
 
   private openSeqs(): bigint[] {
