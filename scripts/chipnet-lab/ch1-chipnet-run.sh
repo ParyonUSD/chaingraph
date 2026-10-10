@@ -118,9 +118,13 @@ sample_loop() {
       log_ms=$(grep -m1 'initial sync is complete' "$run_dir/agent.log" | grep -o '"time":[0-9]*' | cut -d: -f2)
       printf 'initial_sync_complete\t%s\t%s\n' "$(date -u -r $((log_ms / 1000)) +%Y-%m-%dT%H:%M:%SZ)" "$(cut -f1 <<<"$store_line")" >>"$run_dir/markers.tsv"
     fi
-    local store_height
+    local store_height store_blocks
     store_height=$(cut -f1 <<<"$store_line")
-    if [[ -z $(marker_time "$run_dir" tip_reached) && $node_height != NA && $store_height -ge $node_height ]]; then
+    store_blocks=$(cut -f2 <<<"$store_line")
+    # Tip = every block 0..node height accepted (blocks are saved out of order during initial sync, so max(height)
+    # alone reaches the tip early) and the agent has logged the end of initial sync (Postgres builds indexes then).
+    if [[ -z $(marker_time "$run_dir" tip_reached) && $node_height != NA && $store_height -ge $node_height &&
+      $store_blocks -gt $node_height && -n $(marker_time "$run_dir" initial_sync_complete) ]]; then
       printf 'tip_reached\t%s\t%s\n' "$now" "$store_height" >>"$run_dir/markers.tsv"
       write_summary "$run_dir" >/dev/null || true
     fi

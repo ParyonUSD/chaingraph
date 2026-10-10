@@ -23,12 +23,14 @@ if ((height < 0)); then echo "no common height (pg tip $pg_tip, ch tip $ch_tip)"
 out_dir=$CHIPNET_RESULTS_DIR/parity-$(date -u +%Y%m%dT%H%M%SZ)-h$height
 mkdir -p "$out_dir"
 echo "node $CHIPNET_NODE_NAME: chain tip $node_tip, pg tip $pg_tip, ch tip $ch_tip -> compare at height $height; out $out_dir"
+# max_parallel_workers_per_gather=0: ch1-pg runs with Docker's default 64 MB /dev/shm, and parallel hash plans of the
+# digest queries fail there with 53100 "could not resize shared memory segment".
 tables=block,block_transaction,transaction,output,input,input_spent,node_block,tx_acceptance,node_block_history,node_transaction_history
 set +e
 (
   cd "$CHIPNET_LAB_DIR"
   node "$CHIPNET_AGENT_DIR/scripts/parity/compare.mjs" \
-    --pg "$(chipnet_pg_url)" --ch "$CHIPNET_CH_URL" --ch-db "$CHIPNET_CH_DB" \
+    --pg "$(chipnet_pg_url)?options=-c%20max_parallel_workers_per_gather%3D0" --ch "$CHIPNET_CH_URL" --ch-db "$CHIPNET_CH_DB" \
     --nodes "$CHIPNET_NODE_NAME" --at-height "$height" --tables "$tables" \
     --timestamps exclude --hash-chunks 16 --parallel "${CHIPNET_PARITY_PARALLEL:-4}" --diff \
     --out "$out_dir" "$@"

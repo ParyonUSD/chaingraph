@@ -4,7 +4,7 @@
 
 CHIPNET_LAB_DIR=${CHIPNET_LAB_DIR:-/Users/rb/.claude/jobs/2d61cf2d/tmp/chipnet-lab}
 # Frozen agent export (git archive of one commit + .yarn, offline install, yarn build).
-CHIPNET_AGENT_DIR=${CHIPNET_AGENT_DIR:-$CHIPNET_LAB_DIR/agent-67ffa00}
+CHIPNET_AGENT_DIR=${CHIPNET_AGENT_DIR:-$CHIPNET_LAB_DIR/agent-50e8d2e}
 # Raw results: never committed.
 CHIPNET_RESULTS_DIR=${CHIPNET_RESULTS_DIR:-/Users/rb/dv/ParyonUSD/chaingraph-performance/2026-10-10-chipnet-local}
 CHIPNET_PID_DIR=${CHIPNET_PID_DIR:-$CHIPNET_LAB_DIR/pids}
