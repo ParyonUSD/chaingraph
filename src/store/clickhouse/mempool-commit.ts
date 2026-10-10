@@ -1254,7 +1254,7 @@ export class MempoolCommitter {
       this.mempool.markStale(operation);
       if (commit !== undefined) {
         await this.context.commitLog
-          .markAborted(commit.seq, `${method} failed: ${String(error)}`)
+          .abortIfOpen(commit.seq, `${method} failed: ${String(error)}`)
           .catch(() => undefined);
       }
     }

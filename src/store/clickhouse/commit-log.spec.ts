@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-magic-numbers, no-bitwise */
-// cspell:ignore clickhouse dedup seqs
+// cspell:ignore clickhouse dedup seqs abortable
 import { readFileSync } from 'node:fs';
 
 import test from 'ava';
@@ -225,6 +225,40 @@ test('CommitLog: a committed (or possibly committed) seq, or one at or below a p
     ]
   );
   t.is(diagnostics[3]!.watermarks, `0:${open.seq - 1n},1:${open.seq - 1n}`);
+});
+
+test('CommitLog: abortIfOpen aborts only a genuinely open commit; committed and committed-row-sent seqs are left alone, with no diagnostic (fix pass 3 item 1)', async (t) => {
+  const { client, inserts } = stubClient();
+  const diagnostics: CommitLogDiagnostic[] = [];
+  const log = new CommitLog(client, fixedLease(2n), () => 1_000, {
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+  });
+  await log.init();
+  const committed = await log.beginCommit({ kind: 'block', nodeScope: [1] });
+  await log.markCommitted(committed.seq, {});
+  t.false(log.isAbortable(committed.seq));
+  t.false(await log.abortIfOpen(committed.seq, 'shutdown'));
+  t.is(log.stateOf(committed.seq), 'committed');
+  const open = await log.beginCommit({ kind: 'block', nodeScope: [1] });
+  t.true(log.isAbortable(open.seq));
+  t.true(await log.abortIfOpen(open.seq, 'shutdown'));
+  t.is(log.stateOf(open.seq), 'aborted');
+  t.false(await log.abortIfOpen(open.seq, 'again'));
+  const sent = await log.beginCommit({ kind: 'block', nodeScope: [1] });
+  client.insertSelect = async (sql, params, options) => {
+    if (options.deduplicationToken.endsWith(':committed')) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error('socket hang up');
+    }
+    inserts.push({ params, sql, token: options.deduplicationToken });
+  };
+  await t.throwsAsync(log.markCommitted(sent.seq, {}));
+  t.false(await log.abortIfOpen(sent.seq, 'shutdown'));
+  t.is(log.stateOf(sent.seq), 'intent', 'left open for recovery');
+  t.deepEqual(
+    diagnostics.map((item) => [item.event, item.seq]),
+    [['commit_void', open.seq.toString()]]
+  );
 });
 
 test('CommitLog: markCommitted refuses until dependencies are committed', async (t) => {

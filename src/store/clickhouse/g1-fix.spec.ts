@@ -28,6 +28,7 @@ import type { FaultInjector } from './block-commit.js';
 import type {
   ClickHouseStore,
   ClickHouseStoreOptions,
+  StoreDiagnostic,
 } from './clickhouse-store.js';
 import type { ClickHouseClient, ClickHouseRequestInfo } from './client.js';
 import {
@@ -285,7 +286,7 @@ const fixScratch = async (
 /** Open a store whose ClickHouse client runs `faultBeforeRequest`. */
 const openWithClientFault = async (
   harness: Awaited<ReturnType<typeof fixScratch>>,
-  faultBeforeRequest: (request: ClickHouseRequestInfo) => void,
+  faultBeforeRequest: (request: ClickHouseRequestInfo) => Promise<void> | void,
   fault?: FaultInjector
 ) =>
   harness.openStore(fault, {
@@ -667,3 +668,119 @@ const labScenario = (utxo: 'off' | 'on') => {
 
 labScenario('on');
 labScenario('off');
+
+/* -------------------------------------------------------------------- */
+/* fix pass 3, item 1: shutdown never voids a committed commit           */
+/* -------------------------------------------------------------------- */
+
+const shutdownScenario = (utxo: 'off' | 'on') => {
+  e2e(
+    `[e2e] fix pass 3: SIGTERM while a batch's committed row is in flight (utxo ${utxo}) aborts only open commits: no void_refused, no abort_failed; a restart resumes exactly`,
+    async (t) => {
+      t.timeout(180_000);
+      const chain = chainOf(40, `sigterm-${utxo}`);
+      const diagnostics: StoreDiagnostic[] = [];
+      const harness = await fixScratch(t, `sigterm_${utxo}`, {
+        maxBlocksPerCommit: 4,
+        maxInFlightSaves: 16,
+        onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+        pendingSpendTimeoutMs: 20_000,
+        utxo,
+      });
+      const control: {
+        rowsWritten: number;
+        armedSeq: bigint | undefined;
+        fired: boolean;
+        store: ClickHouseStore | undefined;
+      } = {
+        armedSeq: undefined,
+        fired: false,
+        rowsWritten: 0,
+        store: undefined,
+      };
+      const store = await openWithClientFault(
+        harness,
+        async (request) => {
+          if (
+            control.fired ||
+            control.armedSeq === undefined ||
+            request.deduplicationToken !==
+              `${control.armedSeq}:commit_log:committed`
+          ) {
+            return;
+          }
+          // SIGTERM (createStore's handler) lands while the committed row is sent
+          control.fired = true;
+          control.store?.abandonInFlightWork('received SIGTERM');
+          await sleep(30);
+        },
+        (step, context) => {
+          if (context.kind !== 'block' || step !== 'rows-written') return;
+          control.rowsWritten += 1;
+          if (control.rowsWritten === 3) control.armedSeq = context.seq;
+        }
+      );
+      control.store = store;
+      const { node1 } = await registerNodes(store);
+      const watch = watchVoids(harness.client);
+      await saveAll(store, chain, [node1]);
+      await store.operations.drain();
+      await store.publishWatermarks().catch(() => undefined);
+      t.true(control.fired, 'the shutdown landed mid-commit');
+      const states = await commitStates(harness.client);
+      const armed = states.find((row) => row.seq === String(control.armedSeq));
+      t.is(
+        armed?.state,
+        'committed',
+        'the batch whose commit was in flight committed'
+      );
+      const events = diagnostics.map((diagnostic) => diagnostic.event);
+      t.log(
+        `diagnostics: ${JSON.stringify(
+          diagnostics.map((d) => ({ event: d.event, seq: d.seq }))
+        )}`
+      );
+      t.false(events.includes('void_refused'), 'no void_refused');
+      t.false(events.includes('abort_failed'), 'no abort_failed');
+      const committedSeqs = new Set(
+        states.filter((row) => row.state === 'committed').map((row) => row.seq)
+      );
+      t.deepEqual(
+        diagnostics
+          .filter((d) => d.event === 'commit_void' && committedSeqs.has(d.seq))
+          .map((d) => d.seq),
+        [],
+        'no committed seq was offered for voiding'
+      );
+      await assertNodeParity(t, harness.client, node1, chain, {
+        minBlocks: 4,
+        utxo: utxo === 'on',
+      });
+      const { violations } = await watch.stop();
+      t.deepEqual(violations, []);
+
+      // restart: the next start resumes from the visible prefix
+      await store.close();
+      const restarted = await harness.openStore();
+      const again = await saveAll(restarted, chain, [node1]);
+      t.true(again.every((o) => o.status === 'fulfilled'));
+      await restarted.operations.drain();
+      await restarted.publishWatermarks();
+      await assertNodeParity(t, harness.client, node1, chain, {
+        exactBlocks: chain.length,
+        utxo: utxo === 'on',
+      });
+      t.deepEqual(
+        diagnostics
+          .filter(
+            (d) => d.event === 'void_refused' || d.event === 'abort_failed'
+          )
+          .map((d) => d.event),
+        []
+      );
+    }
+  );
+};
+
+shutdownScenario('on');
+shutdownScenario('off');

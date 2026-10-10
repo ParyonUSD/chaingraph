@@ -56,6 +56,8 @@ export interface ClickHouseConnectionConfig {
 export interface ClickHouseRequestInfo {
   kind: 'insert' | 'query';
   sql: string;
+  /** An insert's deduplication token (`seq:table:chunk`). */
+  deduplicationToken?: string;
 }
 
 export interface QueryParams {
@@ -300,7 +302,11 @@ export class ClickHouseClient {
       .map(quoteIdentifier)
       .join(', ')}) FORMAT RowBinary`;
     await withRetries(options.retries, async () => {
-      await this.faultBeforeRequest?.({ kind: 'insert', sql });
+      await this.faultBeforeRequest?.({
+        deduplicationToken: options.deduplicationToken,
+        kind: 'insert',
+        sql,
+      });
       const result = await this.raw.exec({
         clickhouse_settings: idempotentSettings(options),
         query: sql,
@@ -320,7 +326,11 @@ export class ClickHouseClient {
     options: IdempotentInsertOptions
   ): Promise<void> {
     await withRetries(options.retries, async () => {
-      await this.faultBeforeRequest?.({ kind: 'insert', sql });
+      await this.faultBeforeRequest?.({
+        deduplicationToken: options.deduplicationToken,
+        kind: 'insert',
+        sql,
+      });
       await this.raw.command({
         clickhouse_settings: idempotentSettings(options),
         query: sql,

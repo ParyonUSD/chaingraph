@@ -706,6 +706,9 @@ export class BlockBatch {
   /** Every call of the batch was answered early as parked (`onParked`). */
   parked = false;
 
+  /** The per-call results, set once the batch's commit is committed. */
+  committedResults: SaveBlockResult[] | undefined;
+
   private phases: Promise<void>[] = [];
 
   private phaseScheduled = false;
@@ -892,6 +895,18 @@ export class BlockCommitter {
         });
         throw error;
       }
+      if (batch.committedResults !== undefined) {
+        /*
+         * The commit is durable (its committed row landed): nothing after it
+         * can undo it, so it is never aborted (fix-pass-3.md §1). A shutdown
+         * that lands now leaves it saved; any other late error still reaches
+         * the caller.
+         */
+        context.outputs.release(operation, true);
+        await context.transactions.release(operation, true);
+        if (error instanceof AbandonedError) return batch.committedResults;
+        throw error;
+      }
       if (
         error instanceof AbandonedError &&
         context.abandon?.retryable === true
@@ -913,7 +928,7 @@ export class BlockCommitter {
          */
         if (commit !== undefined) {
           await context.commitLog
-            .markAborted(commit.seq, String(error))
+            .abortIfOpen(commit.seq, String(error))
             .catch((abortError: unknown) => {
               context.diagnostic?.({
                 error: String(abortError),
@@ -947,7 +962,7 @@ export class BlockCommitter {
       if (commit !== undefined) {
         const reason = `saveBlock failed: ${String(error)}`;
         await context.commitLog
-          .markAborted(commit.seq, reason)
+          .abortIfOpen(commit.seq, reason)
           .catch((abortError: unknown) => {
             // the commit stays open (its watermarks held) until recovery
             context.diagnostic?.({
@@ -1712,6 +1727,7 @@ export class BlockCommitter {
      */
     await awaitCommitOrder(operation, context.abandon);
     await context.commitLog.markCommitted(commit.seq, rowCounts);
+    batch.committedResults = results;
     operation.markCommitted();
     context.onCommitted(operation);
     await context.fault('committed', { kind: 'block', seq: commit.seq });

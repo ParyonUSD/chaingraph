@@ -718,7 +718,9 @@ export class ClickHouseStore implements ChaingraphStore {
    * committed yet (pending-spend waits, dependency waits, later steps). An
    * abandoned block save is aborted and resolves as handled (so the agent's
    * block buffer drains); abandoned mempool saves reject; orphans are
-   * dropped. Nothing abandoned is committed, so the next start restores the
+   * dropped. A commit whose committed row was already sent is never
+   * aborted: it finishes (or, if that write fails, stays open for the next
+   * start's recovery). Nothing abandoned is committed, so the next start restores the
    * chain without it and the agent downloads it again. Wired to SIGINT /
    * SIGTERM by `createStore` (the agent's shutdown drains the block buffer
    * before it closes the store, and a block waiting for a parent that will
@@ -1786,7 +1788,7 @@ export class ClickHouseStore implements ChaingraphStore {
       } catch (error) {
         if (!(error instanceof SimulatedCrash)) {
           await commitLog
-            .markAborted(commit.seq, `utxo build failed: ${String(error)}`)
+            .abortIfOpen(commit.seq, `utxo build failed: ${String(error)}`)
             .catch(() => undefined);
         }
         throw error;
@@ -1873,7 +1875,12 @@ export class ClickHouseStore implements ChaingraphStore {
     if (this.fatal instanceof SimulatedCrash) {
       throw this.fatal;
     }
-    this.abandonSignal.assertNotAbandoned();
+    /*
+     * After `committed` the commit is durable: a shutdown that lands now
+     * abandons nothing of it (abandoning here made the failure path try to
+     * void a committed seq: fix-pass-3.md §1).
+     */
+    if (step !== 'committed') this.abandonSignal.assertNotAbandoned();
     await this.options.fault?.(step, context);
   }
 
@@ -1938,7 +1945,7 @@ export class ClickHouseStore implements ChaingraphStore {
   ) {
     if (!(error instanceof SimulatedCrash) && commit !== undefined) {
       await this.requireCommitLog()
-        .markAborted(commit.seq, `${method} failed: ${String(error)}`)
+        .abortIfOpen(commit.seq, `${method} failed: ${String(error)}`)
         .catch(() => undefined);
     }
     operation.markFailed(error);

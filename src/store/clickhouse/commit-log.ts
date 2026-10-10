@@ -1,5 +1,5 @@
 /* eslint-disable no-bitwise, max-classes-per-file, @typescript-eslint/naming-convention, functional/no-mixed-type, functional/no-try-statement, @typescript-eslint/parameter-properties, @typescript-eslint/no-magic-numbers, complexity, max-params */
-// cspell:ignore clickhouse dedup milli seqs unhex
+// cspell:ignore clickhouse dedup milli seqs unhex abortable
 /**
  * The commit protocol (plan §3.1, WP4): every unit of work is a commit with a
  * `commit_seq`. Its rows are invisible until the commit is `committed` and the
@@ -453,6 +453,33 @@ export class CommitLog {
     this.aborted.add(seq);
     this.open.delete(seq);
     this.emitTerminal(seq);
+  }
+
+  /**
+   * Whether this process may still abort `seq`: it is open here, not
+   * terminal, and its `committed` row was never sent. A committed seq has
+   * nothing to undo; a seq whose committed row was sent may have landed and
+   * stays open until the next start's recovery reads its final state.
+   */
+  isAbortable(seq: bigint): boolean {
+    const tracked = this.open.get(seq);
+    return (
+      tracked !== undefined &&
+      !terminalStates.has(tracked.state) &&
+      tracked.commitSent !== true
+    );
+  }
+
+  /**
+   * The failure and shutdown paths' abort: abort `seq` only if it is
+   * genuinely open (`isAbortable`); otherwise leave it as it is and return
+   * `false`. `markAborted`'s guard stays the invariant check for every
+   * explicit void.
+   */
+  async abortIfOpen(seq: bigint, reason: string): Promise<boolean> {
+    if (!this.isAbortable(seq)) return false;
+    await this.markAborted(seq, reason);
+    return true;
   }
 
   /** Incomplete commits older than `maxAgeMs` (to abort and re-queue). */
