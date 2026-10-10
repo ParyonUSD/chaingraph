@@ -16,6 +16,28 @@ YARN_ENABLE_NETWORK=0 yarn install --immutable --immutable-cache   # offline, li
 plugins, offline cache incl. `@clickhouse/client`). The offline install above is the only
 `yarn install` needed.
 
+### Adding a package (offline cache)
+
+New npm packages must land in the submodule's offline cache, or offline installs break:
+
+```sh
+git -C .yarn checkout clickhouse-store          # the submodule is usually on a detached HEAD
+yarn add <pkg>@<version>                        # with network; writes new zips to .yarn/cache
+git -C .yarn add cache
+git -C .yarn commit -m "Add <pkg> <version> for the ClickHouse store branch"
+git -C .yarn push                               # first time: git -C .yarn push -u origin clickhouse-store
+git add .yarn package.json yarn.lock            # commit the updated gitlink in the fork
+```
+
+Check with `YARN_ENABLE_NETWORK=0 yarn install --immutable --immutable-cache`.
+
+### Toolchain
+
+TypeScript 5.9.3, `@types/node` 22, `module`/`moduleResolution` `nodenext` (TypeScript 5 requires both), and
+`types: ["node"]` (stops stray `@types/*` packages pulled in by dev tools, e.g. `@types/webgl-ext`, from being
+type-checked). Yarn 3.3.1 cannot apply its built-in PnP patch to TypeScript 5.9 (warning `YN0066`); harmless with
+`nodeLinker: node-modules`.
+
 ## Containers
 
 Postgres for the e2e suite and the ingestion gate (same image/env as CI,

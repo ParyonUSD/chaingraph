@@ -29,26 +29,6 @@ import type {
 
 export type { ClickHouseSettings } from '@clickhouse/client';
 
-/*
- * @clickhouse/client 1.24's typings use `Symbol.asyncDispose`/`Symbol.dispose`
- * (lib.esnext.disposable, TS >= 5.2) and `NodeJS.AsyncIterator` (newer
- * @types/node). This repo is on TypeScript 4.9 / @types/node 18, so declare the
- * two symbols and the alias as those libs do. Remove when the toolchain is
- * upgraded.
- */
-declare global {
-  interface SymbolConstructor {
-    readonly asyncDispose: unique symbol;
-    readonly dispose: unique symbol;
-  }
-  // eslint-disable-next-line @typescript-eslint/no-namespace
-  namespace NodeJS {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-empty-interface
-    interface AsyncIterator<T, TReturn = any, TNext = undefined>
-      extends globalThis.AsyncIterator<T, TReturn, TNext> {}
-  }
-}
-
 // eslint-disable-next-line functional/no-mixed-type
 export interface ClickHouseConnectionConfig {
   /** The HTTP(S) endpoint, e.g. `http://localhost:18123`. Credentials in the URL are moved to `username`/`password`. */

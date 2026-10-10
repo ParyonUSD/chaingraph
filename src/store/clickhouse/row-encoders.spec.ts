@@ -477,7 +477,10 @@ const testDatabase = 'ch1_rowbinary_test_encoders';
 const clickhouseQuery = async (query: string, body?: Buffer) => {
   const url = new URL(clickhouseUrl ?? '');
   url.searchParams.set('query', query);
-  const response = await fetch(url, { body: body ?? '', method: 'POST' });
+  const response = await fetch(url, {
+    body: body === undefined ? '' : Uint8Array.from(body),
+    method: 'POST',
+  });
   const text = await response.text();
   if (!response.ok) {
     // eslint-disable-next-line functional/no-throw-statement

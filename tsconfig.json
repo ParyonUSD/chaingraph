@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "es2022",
-    "module": "esnext",
+    "module": "nodenext",
     "moduleResolution": "nodenext",
     "rootDir": "src",
     "outDir": "build",
@@ -27,7 +27,8 @@
     "listFiles": false /* Print names of files part of the compilation. */,
     "pretty": true /* Stylize errors and messages using color and context. */,
 
-    "typeRoots": ["node_modules/@types", "src/types"]
+    "typeRoots": ["node_modules/@types", "src/types"],
+    "types": ["node"]
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules/**"]
