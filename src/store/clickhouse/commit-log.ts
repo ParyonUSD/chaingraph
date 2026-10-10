@@ -142,6 +142,9 @@ interface TrackedCommit {
 }
 
 export class CommitDependencyError extends Error {}
+
+/** The commit log of a lost lease epoch: it never writes again. */
+export class CommitLogRetiredError extends Error {}
 export class CommitStateError extends Error {}
 
 const zeroHash = '';
@@ -212,11 +215,18 @@ export class CommitLog {
 
   private initialized = false;
 
+  private retiredReason: string | undefined;
+
   constructor(
     private readonly client: CommitLogClient,
     private readonly lease: CommitLease,
     private readonly now: () => number = Date.now
   ) {}
+
+  /** Whether `retire` was called. */
+  get isRetired() {
+    return this.retiredReason !== undefined;
+  }
 
   /** The highest seq allocated so far (or, before any, the last recovered seq). */
   get lastAllocatedSeq() {
@@ -233,6 +243,16 @@ export class CommitLog {
     this.nextCounter = 1n;
     this.initialized = true;
     return result;
+  }
+
+  /**
+   * The writer lease of this log's epoch is lost: from now on every write
+   * (begin, incomplete, committed, aborted) throws `CommitLogRetiredError`
+   * without touching ClickHouse. The next holder's `init()` aborts and fences
+   * whatever this epoch left open (wp6b-gate-cost.md §6.2).
+   */
+  retire(reason: string) {
+    this.retiredReason ??= reason;
   }
 
   /** Non-terminal commits, for the watermark publisher. */
@@ -266,6 +286,7 @@ export class CommitLog {
       // eslint-disable-next-line functional/no-throw-statement
       throw new CommitStateError('CommitLog.init() has not run.');
     }
+    this.assertNotRetired();
     this.lease.assertHeld();
     const { epoch } = this.lease;
     const seq = seqForEpoch(epoch, this.nextCounter);
@@ -365,6 +386,7 @@ export class CommitLog {
         startedAtMs: this.now(),
         state: 'intent',
       };
+    this.assertNotRetired();
     await this.client.insertSelect(
       commitVoidInsert,
       { epoch: this.lease.epoch, reason, seq },
@@ -513,12 +535,22 @@ export class CommitLog {
     });
   }
 
+  private assertNotRetired() {
+    if (this.retiredReason !== undefined) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new CommitLogRetiredError(
+        `Commit log of a lost lease epoch: ${this.retiredReason}`
+      );
+    }
+  }
+
   private async writeState(
     tracked: TrackedCommit,
     state: CommitState,
     rowCounts: { [key: string]: bigint | number },
     reason = ''
   ) {
+    this.assertNotRetired();
     const entries = Object.entries(rowCounts);
     const finished = terminalStates.has(state);
     await this.client.insertSelect(

@@ -240,6 +240,13 @@ export class AbandonedError extends Error {}
 export class AbandonSignal {
   abandoned = false;
 
+  /**
+   * Abandoned because the writer lease was lost: the work is re-run under
+   * the next epoch, so an abandoned block save rejects instead of resolving
+   * as handled.
+   */
+  retryable = false;
+
   readonly promise: Promise<never>;
 
   private rejectWith: (error: AbandonedError) => void = () => undefined;
@@ -251,9 +258,10 @@ export class AbandonSignal {
     this.promise.catch(() => undefined);
   }
 
-  abandon(reason = 'store shutdown') {
+  abandon(reason = 'store shutdown', retryable = false) {
     if (this.abandoned) return;
     this.abandoned = true;
+    this.retryable = retryable;
     this.rejectWith(new AbandonedError(`Abandoned: ${reason}.`));
   }
 

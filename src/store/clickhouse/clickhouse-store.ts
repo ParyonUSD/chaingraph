@@ -1,4 +1,4 @@
-/* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, functional/no-mixed-type, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, functional/no-loop-statement, no-await-in-loop, @typescript-eslint/member-ordering, max-params, @typescript-eslint/parameter-properties, functional/no-let, @typescript-eslint/init-declarations, prefer-destructuring, @typescript-eslint/no-invalid-void-type */
+/* eslint-disable max-classes-per-file, camelcase, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, functional/no-loop-statement, no-await-in-loop, @typescript-eslint/member-ordering, max-params, @typescript-eslint/parameter-properties, functional/no-let, @typescript-eslint/init-declarations, prefer-destructuring, @typescript-eslint/no-invalid-void-type */
 // cspell:ignore clickhouse dedup unhex seqs milli varint
 /**
  * The ClickHouse `ChaingraphStore` (WP5a-core): nodes, blocks, header
@@ -128,6 +128,11 @@ export interface ClickHouseStoreOptions {
   fault?: FaultInjector;
   /** Background errors (watermark publishing, lease loss). */
   onError?: (error: unknown) => void;
+  /**
+   * The store cannot continue (the writer lease was lost and not re-acquired
+   * within about one ttl). Default: exit code 1 and SIGTERM to this process.
+   */
+  onFatal?: (error: unknown) => void;
 }
 
 /*
@@ -170,6 +175,27 @@ const positiveIntegerFromEnvironment = (name: string, fallback: number) => {
 };
 
 export class StoreClosedError extends Error {}
+
+/** The writer lease was lost and could not be re-acquired in time. */
+export class LeaseRecoveryFailedError extends Error {}
+
+const leaseRetryInitialMs = 250;
+const sleepMs = async (ms: number) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+const leaseRetryMaxMs = 5_000;
+
+/**
+ * Default `onFatal`: the store cannot write any more, so ask the process to
+ * shut down (the agent's SIGTERM handler drains and exits) with exit code 1.
+ */
+const exitOnFatal = (error: unknown) => {
+  // eslint-disable-next-line no-console
+  console.error(`ClickHouse store: fatal, exiting: ${String(error)}`);
+  process.exitCode = 1;
+  process.kill(process.pid, 'SIGTERM');
+};
 
 /** Postgres's `blockArrayToHashChain`: hashes at their heights, `null` gaps. */
 export const hashChainFromBlocks = (
@@ -248,16 +274,26 @@ export class ClickHouseStore implements ChaingraphStore {
 
   readonly nodes = new NodeRegistry();
 
-  readonly operations = new OperationRegistry();
+  /*
+   * Per-epoch in-memory state: replaced as a whole when the writer lease is
+   * lost and re-acquired (`recoverLease`).
+   */
+  operations = new OperationRegistry();
 
-  readonly mempool = new MempoolState();
+  mempool = new MempoolState();
 
-  /** Shutdown: abandon in-flight work (`abandonInFlightWork`). */
-  private readonly abandonSignal = new AbandonSignal();
+  /** Shutdown or lease loss: abandon in-flight work. */
+  private abandonSignal = new AbandonSignal();
 
-  readonly outputs: OutputRegistry<StoreOperation>;
+  outputs: OutputRegistry<StoreOperation>;
 
-  readonly transactions: TransactionRegistry;
+  transactions: TransactionRegistry;
+
+  /** Incremented when the writer lease is lost (work of older generations is re-run). */
+  private generation = 0;
+
+  /** Set while the store recovers from a lost writer lease. */
+  private recovery: Promise<void> | undefined;
 
   private committerInstance: BlockCommitter | undefined;
 
@@ -309,6 +345,9 @@ export class ClickHouseStore implements ChaingraphStore {
     );
   }
 
+  /** `enableMempoolTracking` was called (kept across lease recovery). */
+  private mempoolTracking = false;
+
   /* ------------------------------------------------------------------ */
   /* lifecycle                                                           */
   /* ------------------------------------------------------------------ */
@@ -331,9 +370,18 @@ export class ClickHouseStore implements ChaingraphStore {
     const lease = new WriterLease(client, this.options.lease);
     await lease.acquire();
     this.lease = lease;
+    await this.startEpoch(client, lease);
+  }
+
+  /**
+   * Everything of `init()` after the lease is held, for its current epoch:
+   * recovery of earlier epochs (`CommitLog.init`), the fence, a new id
+   * allocator, publisher and committers, the node registry, the mode and the
+   * mempools. Also run after the lease was lost and re-acquired.
+   */
+  private async startEpoch(client: ClickHouseClient, lease: WriterLease) {
     lease.startHeartbeat((error) => {
-      this.fatal = error;
-      this.options.onError?.(error);
+      this.onLeaseLost(error);
     });
     const commitLog = new CommitLog(client, lease);
     await commitLog.init();
@@ -420,8 +468,116 @@ export class ClickHouseStore implements ChaingraphStore {
     if (last?.kind === 'horizon_switch') {
       this.mode = 'bulk';
       this.bulkStartSeq = BigInt(last.commit_seq);
+    } else {
+      this.mode = 'tip';
     }
     await this.mempoolCommitter.rebuild();
+  }
+
+  /**
+   * The writer lease was lost (heartbeat: `stalled`, `deadline` or
+   * `taken-over`; wp6b-gate-cost.md §6.2). Synchronously: stop publishing,
+   * retire the epoch's commit log (it never writes again: no commit, no
+   * abort, no watermark from the old state) and abandon every in-flight
+   * operation as retryable. Then recover in the background: drain, claim a
+   * new epoch (whose `CommitLog.init()` aborts and fences everything the old
+   * epoch left open), rebuild all in-memory state and re-run the calls that
+   * were cut off. If that fails within about one lease ttl, the store is
+   * fatal and the process is asked to exit.
+   */
+  private onLeaseLost(error: unknown) {
+    if (this.closed || this.recovery !== undefined) return;
+    this.generation += 1;
+    this.publisher?.stop();
+    this.publisher = undefined;
+    this.commitLogInstance?.retire(String(error));
+    this.abandonSignal.abandon(`writer lease lost: ${String(error)}`, true);
+    this.mempoolCommitter?.dropOrphans(
+      new StoreClosedError(`Orphan dropped: writer lease lost.`)
+    );
+    this.options.onError?.(error);
+    this.recovery = this.recoverLease().then(
+      () => {
+        this.recovery = undefined;
+      },
+      (failure: unknown) => {
+        this.recovery = undefined;
+        this.fatal = new LeaseRecoveryFailedError(
+          `Writer lease lost (${String(error)}) and not recovered: ${String(
+            failure
+          )}`
+        );
+        this.options.onError?.(this.fatal);
+        (this.options.onFatal ?? exitOnFatal)(this.fatal);
+      }
+    );
+  }
+
+  private async recoverLease(): Promise<void> {
+    const lease = this.lease!;
+    const client = this.requireClient();
+    const budgetMs = lease.ttlMs;
+    const started = Date.now();
+    // 1. every operation of the old epoch fails fast (abandoned, retired log)
+    const drained = await Promise.race([
+      this.operations.drain().then(() => true),
+      new Promise<boolean>((resolve) => {
+        setTimeout(() => {
+          resolve(false);
+        }, budgetMs).unref();
+      }),
+    ]);
+    if (!drained) {
+      throw new Error(
+        `${this.operations.activeCount} operations of the lost epoch did not stop within ${budgetMs} ms.`
+      );
+    }
+    // 2. claim a NEW epoch (never the old one), with backoff, for about one ttl
+    let delayMs = leaseRetryInitialMs;
+    for (;;) {
+      if (this.closed) throw new StoreClosedError('Closed during recovery.');
+      try {
+        await lease.reacquire();
+        break;
+      } catch (error) {
+        if (Date.now() - started + delayMs > budgetMs) throw error;
+        await sleepMs(delayMs);
+        delayMs = Math.min(delayMs * 2, leaseRetryMaxMs);
+      }
+    }
+    // 3. drop everything derived from the old epoch, then start the new one
+    this.operations = new OperationRegistry();
+    this.mempool = new MempoolState();
+    this.mempool.tracking = this.mempoolTracking;
+    this.outputs = new OutputRegistry<StoreOperation>(
+      this.options.recentOutputCapacity
+    );
+    this.transactions = new TransactionRegistry(
+      this.options.recentTransactionCapacity
+    );
+    this.batchLanes.clear();
+    this.batchResults.clear();
+    this.abandonSignal = new AbandonSignal();
+    await this.startEpoch(client, lease);
+  }
+
+  /**
+   * Run a call that writes; if the writer lease is lost while it runs (its
+   * generation ends), wait for the recovery and run it again under the new
+   * epoch. Every such call re-reads what it decides from the store, so a
+   * re-run after the old epoch's open commits were aborted is exact.
+   */
+  private async withLease<T>(work: () => Promise<T>): Promise<T> {
+    for (;;) {
+      if (this.recovery !== undefined) await this.recovery;
+      this.assertOpen();
+      const generation = this.generation;
+      try {
+        return await work();
+      } catch (error) {
+        if (generation === this.generation || this.closed) throw error;
+      }
+    }
   }
 
   async close(): Promise<void> {
@@ -482,6 +638,7 @@ export class ClickHouseStore implements ChaingraphStore {
 
   /** Publish watermarks now (tests; the publisher also runs on its own). */
   async publishWatermarks(): Promise<Map<number, bigint>> {
+    if (this.recovery !== undefined) await this.recovery;
     return this.requirePublisher().publishWatermark();
   }
 
@@ -511,6 +668,19 @@ export class ClickHouseStore implements ChaingraphStore {
   /* ------------------------------------------------------------------ */
 
   async registerNode(node: {
+    latestConnectionBeganAt: Date;
+    nodeName: string;
+    protocolVersion: number;
+    userAgent: string;
+  }): Promise<{
+    internalId: number;
+    syncedHeaderHashChain: (string | null)[];
+  }> {
+    this.assertOpen();
+    return this.withLease(async () => this.registerNodeOnce(node));
+  }
+
+  private async registerNodeOnce(node: {
     latestConnectionBeganAt: Date;
     nodeName: string;
     protocolVersion: number;
@@ -600,6 +770,28 @@ export class ClickHouseStore implements ChaingraphStore {
   /* ------------------------------------------------------------------ */
 
   async saveBlock(args: {
+    block: ChaingraphBlock;
+    nodeAcceptances: NodeAcceptance[];
+    isSavedTransaction: (hash: string) => boolean;
+  }): Promise<SaveBlockResult> {
+    this.assertOpen();
+    const result = await this.withLease(async () => this.saveBlockOnce(args));
+    if (result.committed === undefined) return result;
+    /*
+     * Parked: if the lease is lost before it commits, it is saved again
+     * under the next epoch and `committed` follows that save.
+     */
+    const generation = this.generation;
+    const committed = result.committed.catch(async (error: unknown) => {
+      if (generation === this.generation || this.closed) throw error;
+      const again = await this.saveBlock(args);
+      await again.committed;
+    });
+    committed.catch(() => undefined);
+    return { ...result, committed };
+  }
+
+  private async saveBlockOnce(args: {
     block: ChaingraphBlock;
     nodeAcceptances: NodeAcceptance[];
     isSavedTransaction: (hash: string) => boolean;
@@ -733,7 +925,7 @@ export class ClickHouseStore implements ChaingraphStore {
         await this.takeSlot(operation);
       } catch (error) {
         operation.markFailed(error);
-        if (error instanceof AbandonedError) {
+        if (error instanceof AbandonedError && !this.abandonSignal.retryable) {
           // shutdown while queued: nothing written (as an abandoned save)
           batch.pendingIds.forEach((id) => {
             id.reject(error);
@@ -765,6 +957,21 @@ export class ClickHouseStore implements ChaingraphStore {
    * `rowCount`; blocks the node already accepts are skipped).
    */
   async acceptBlocksViaHeaders(
+    nodeInternalId: number,
+    acceptedBlocks: { height: number; hash: string }[],
+    acceptedAt: Date
+  ): Promise<number | null> {
+    this.assertOpen();
+    return this.withLease(async () =>
+      this.acceptBlocksViaHeadersOnce(
+        nodeInternalId,
+        acceptedBlocks,
+        acceptedAt
+      )
+    );
+  }
+
+  private async acceptBlocksViaHeadersOnce(
     nodeInternalId: number,
     acceptedBlocks: { height: number; hash: string }[],
     acceptedAt: Date
@@ -994,6 +1201,17 @@ export class ClickHouseStore implements ChaingraphStore {
    * are untouched. Transactions are not returned to the mempool (Postgres).
    */
   async removeStaleBlocksForNode(
+    nodeInternalId: number,
+    staleChain: string[],
+    removedAt?: Date
+  ): Promise<void> {
+    this.assertOpen();
+    return this.withLease(async () =>
+      this.removeStaleBlocksForNodeOnce(nodeInternalId, staleChain, removedAt)
+    );
+  }
+
+  private async removeStaleBlocksForNodeOnce(
     nodeInternalId: number,
     staleChain: string[],
     removedAt?: Date
@@ -1311,6 +1529,11 @@ export class ClickHouseStore implements ChaingraphStore {
    */
   async prepareForInitialSync(): Promise<boolean> {
     this.assertOpen();
+    return this.withLease(async () => this.prepareForInitialSyncOnce());
+  }
+
+  private async prepareForInitialSyncOnce(): Promise<boolean> {
+    this.assertOpen();
     if (this.mode === 'bulk') {
       return false;
     }
@@ -1337,6 +1560,13 @@ export class ClickHouseStore implements ChaingraphStore {
    * there is nothing to materialize.
    */
   async finishInitialSync(hooks: FinishInitialSyncHooks): Promise<void> {
+    this.assertOpen();
+    return this.withLease(async () => this.finishInitialSyncOnce(hooks));
+  }
+
+  private async finishInitialSyncOnce(
+    hooks: FinishInitialSyncHooks
+  ): Promise<void> {
     this.assertOpen();
     if (this.mode !== 'bulk') {
       return;
@@ -1427,6 +1657,7 @@ export class ClickHouseStore implements ChaingraphStore {
   async enableMempoolTracking(): Promise<{ schemaIsCurrent: boolean }> {
     this.assertOpen();
     this.mempool.tracking = true;
+    this.mempoolTracking = true;
     return Promise.resolve({ schemaIsCurrent: true });
   }
 
@@ -1439,9 +1670,11 @@ export class ClickHouseStore implements ChaingraphStore {
     nodeValidations: NodeValidation[]
   ): Promise<void> {
     this.assertOpen();
-    return this.requireMempoolCommitter().saveTransaction(
-      transaction,
-      nodeValidations
+    return this.withLease(async () =>
+      this.requireMempoolCommitter().saveTransaction(
+        transaction,
+        nodeValidations
+      )
     );
   }
 
@@ -1450,9 +1683,11 @@ export class ClickHouseStore implements ChaingraphStore {
     validation: NodeValidation
   ): Promise<void> {
     this.assertOpen();
-    return this.requireMempoolCommitter().recordValidation(
-      transactionHash,
-      validation
+    return this.withLease(async () =>
+      this.requireMempoolCommitter().recordValidation(
+        transactionHash,
+        validation
+      )
     );
   }
 
@@ -1460,7 +1695,7 @@ export class ClickHouseStore implements ChaingraphStore {
     ArchivedMempoolTransaction[]
   > {
     this.assertOpen();
-    return this.requireMempoolCommitter().sweep();
+    return this.withLease(async () => this.requireMempoolCommitter().sweep());
   }
 
   async getMempoolTransactionsExpiringBefore(args: {
@@ -1477,7 +1712,9 @@ export class ClickHouseStore implements ChaingraphStore {
     transactionInternalId: number;
   }): Promise<number> {
     this.assertOpen();
-    return this.requireMempoolCommitter().expire(args);
+    return this.withLease(async () =>
+      this.requireMempoolCommitter().expire(args)
+    );
   }
 
   /* ------------------------------------------------------------------ */

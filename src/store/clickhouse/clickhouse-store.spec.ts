@@ -9,6 +9,7 @@ import type { ChaingraphStore } from '../types.js';
 import { SimulatedCrash } from './block-commit.js';
 import type { ClickHouseStore } from './clickhouse-store.js';
 import { hashChainFromBlocks, linkedBlockSize } from './clickhouse-store.js';
+import { epochOfSeq } from './commit-log.js';
 import {
   acceptance,
   badUtxoSums,
@@ -1792,5 +1793,99 @@ e2e(
     // per-node rows only after every node-agnostic insert
     t.true(index('output:end') < index('node_block:start'));
     t.true(index('utxo:end') < index('rows-written:start'));
+  }
+);
+
+e2e(
+  '[e2e] ClickHouseStore: an event-loop stall past the lease deadline mid-commit: new epoch, the save re-runs, nothing of the old epoch is visible (WP6b item 7)',
+  async (t) => {
+    t.timeout(120_000);
+    const stall = { armed: false };
+    const errors: unknown[] = [];
+    const fatal: unknown[] = [];
+    const { client, openStore } = await scratch(t, 'lease', {
+      onError: (error) => errors.push(error),
+      onFatal: (error) => fatal.push(error),
+    });
+    const store = await openStore((step, context) => {
+      if (stall.armed && context.kind === 'block' && step === 'node_block') {
+        stall.armed = false;
+        // a synchronous stretch longer than the lease ttl (1.5 s in specs)
+        const until = Date.now() + leaseTtlMs + 1_000;
+        while (Date.now() < until) {
+          // busy: the heartbeat timer cannot run
+        }
+      }
+    });
+    const { node1, node2 } = await registerNodes(store);
+    const chain = threeBlockChain();
+    const both = [acceptance(node1), acceptance(node2)];
+    for (const block of [chain.block0, chain.block1]) {
+      await store.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: both,
+      });
+    }
+    const epochBefore = epochOfSeq(store.commitLog.lastAllocatedSeq);
+    stall.armed = true;
+    await store.saveBlock({
+      block: chain.block2,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: both,
+    });
+    const epochAfter = epochOfSeq(store.commitLog.lastAllocatedSeq);
+    t.is(epochAfter, epochBefore + 1n, 'a new epoch was claimed');
+    t.true(
+      errors.some((error) => String(error).includes('stalled')),
+      errors.map(String).join('; ')
+    );
+    t.deepEqual(fatal, []);
+    await store.publishWatermarks();
+    const blocks = [chain.block0, chain.block1, chain.block2];
+    for (const node of [node1, node2]) {
+      const view = await nodeView(client, node);
+      t.deepEqual(
+        view.blocks,
+        blocks.map((block) => block.hash)
+      );
+      t.deepEqual(view.txs, txHashes(blocks));
+      t.deepEqual(view.utxo, expectedUnspent(blocks));
+      t.deepEqual(view.utxoByScript, view.utxo);
+    }
+    t.deepEqual(await badUtxoSums(client), []);
+    // the old epoch's commit of block 2 never committed; it is fenced (and aborted)
+    const oldCommits = await client.query<{ state: string }>(
+      `SELECT toString(state) AS state FROM commit_log FINAL
+       WHERE kind = 'block' AND bitShiftRight(commit_seq, 40) = {epoch:UInt64}
+         AND block_hash = toFixedString(unhex({hash:String}), 32)`,
+      { epoch: epochBefore, hash: chain.block2.hash }
+    );
+    t.true(oldCommits.length > 0, 'the old epoch had begun the commit');
+    t.true(oldCommits.every((row) => row.state !== 'committed'));
+    const fences = await client.query<{ epoch: string }>(
+      'SELECT toString(epoch) AS epoch FROM epoch_fence'
+    );
+    t.true(fences.some((row) => BigInt(row.epoch) === epochBefore));
+    // the store keeps working in the new epoch
+    const later = makeBlock(
+      3,
+      chain.block2.hash,
+      [
+        makeTx({
+          coinbase: true,
+          label: 'lease-c3',
+          outputs: [{ lockingBytecode: p2pkh('miner'), valueSatoshis: 1n }],
+        }),
+      ],
+      'lease-block-3'
+    );
+    await store.saveBlock({
+      block: later,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: both,
+    });
+    await store.publishWatermarks();
+    t.is((await nodeView(client, node1)).blocks.length, 4);
   }
 );

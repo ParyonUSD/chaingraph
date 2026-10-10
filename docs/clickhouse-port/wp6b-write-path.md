@@ -162,3 +162,40 @@ Result: everything faster (alone 28.0k + 19.2k tx/s, together 26.6–27.2k tx/s;
 ratio stays 0.55–0.58 (limit 0.6, target 0.7 not reached): together is bounded by the agent's JS thread, which both
 networks share. Re-org converge with these changes: 3.73 s. Next step (not done): RowBinary encoding and UTXO row
 derivation in a worker thread, or a cheaper encoder (`row-binary.ts`).
+
+## 7. Lease lost: recover in process (item 7)
+
+Implements option (b) of `wp6b-gate-cost.md` §6.2 against B's lease API (66a1620: `onLost` once per epoch with a
+`LeaseLostError` reason, `reacquire()`, ttl 120 s default, stall-tolerant heartbeat).
+
+**On loss** (`ClickHouseStore.onLeaseLost`, synchronous): the store's generation is bumped; the publisher is
+stopped and dropped (no watermark from the old state); the epoch's `CommitLog` is **retired** (`retire()`: every
+later begin / incomplete / committed / aborted write throws `CommitLogRetiredError` before touching ClickHouse, so
+nothing commits or aborts for the old epoch); the abandon signal fires as *retryable* (waits on pending spends and
+dependencies reject, every commit step throws, an abandoned block save rejects instead of resolving as handled);
+orphans are dropped; `onError` gets the `LeaseLostError`.
+
+**Recovery** (background): wait until every operation of the old epoch has ended (bounded by one ttl); `reacquire()`
+with exponential backoff (250 ms → 5 s) for about one ttl; then drop all per-epoch in-memory state (operation
+registry, mempool state, output and transaction registries, batch lanes, abandon signal) and run `startEpoch`, the
+same code as `init()` after the claim: heartbeat, a **new** `CommitLog` + `init()` (aborts what the old epoch left open
+and fences it at its highest logged seq), fence reload, a new `IdAllocator`, a new publisher (init, start, publish),
+new committers, node registry, mode (bulk or tip) and the mempool rebuild from the store.
+
+**Calls cut off are re-run.** Every writing call (`saveBlock`, `acceptBlocksViaHeaders`, `removeStaleBlocksForNode`,
+mempool saves, validations, sweeps, expiries, `registerNode`, the mode switches) runs through `withLease`: if it
+fails and the generation changed meanwhile, it waits for the recovery and runs again under the new epoch. Each of
+them decides from the store (stored blocks, live acceptances, the rebuilt mempools), and the old epoch's open
+commits are aborted and fenced, so the re-run is exact; a parked save's `committed` follows its re-run. Calls made
+during recovery wait for it. If recovery fails (another agent holds the lease, or the old operations do not stop),
+the store becomes fatal and `onFatal` runs (default: exit code 1 and SIGTERM to the process, which the agent handles
+as a graceful shutdown); it is never wedged.
+
+**Stalls.** Items 1–2 removed the two ~60 s synchronous stretches WP6 found; with B's 120 s ttl a stall must exceed
+~80 s to lose the lease, and if one does the store recovers (or exits) instead of wedging. The profiles of items
+5–6 show no synchronous stretch above ~0.3 s on the gate scenarios.
+
+Test: `[e2e] an event-loop stall past the lease deadline mid-commit …`: a 2.5 s busy loop (spec ttl 1.5 s) inside
+block 2's per-node phase; the save resolves normally; the store is in epoch + 1; both nodes see exactly blocks 0–2
+and their UTXO sets; the old epoch's commit of block 2 is not committed and the epoch is fenced; no fatal; a further
+block saves in the new epoch.

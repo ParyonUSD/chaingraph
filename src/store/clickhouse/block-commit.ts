@@ -770,6 +770,19 @@ export class BlockCommitter {
         });
         throw error;
       }
+      if (
+        error instanceof AbandonedError &&
+        context.abandon?.retryable === true
+      ) {
+        // writer lease lost: nothing more is written for this epoch; re-run later
+        operation.markFailed(error);
+        batch.pendingIds.forEach((id) => {
+          id.reject(error);
+        });
+        context.outputs.release(operation, false);
+        await context.transactions.release(operation, false);
+        throw error;
+      }
       if (error instanceof AbandonedError) {
         /*
          * Shutdown: abort, and report the blocks as handled so the agent's
