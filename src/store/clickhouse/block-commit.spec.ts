@@ -13,6 +13,7 @@ import {
   blockUtxoDelta,
   chunked,
   minMax,
+  pendingSpendRows,
 } from './block-commit.js';
 import type { UtxoOutput } from './utxo.js';
 
@@ -168,4 +169,44 @@ test('appendAll / minMax: 300k elements without a stack overflow (WP6b item 1)',
     range: [0, 299_999],
     spread: 'RangeError',
   });
+});
+
+test('pendingSpendRows: 100k unresolved spends for 2 nodes in well under 1 s of CPU (WP6b item 2)', (t) => {
+  const count = 100_000;
+  const pendingInputs = Array.from({ length: count }, (_, index) => ({
+    input: { outpointIndex: index, outpointTransactionHash: 'parent' },
+    inputIndex: index % 1_000,
+    transaction: { hash: `spender-${Math.floor(index / 1_000)}` },
+  }));
+  // node 1 and node 2 transition every spender; one input is node-agnostic
+  const pendingUtxo = pendingInputs.slice(1).flatMap((item) =>
+    [1, 2].map((node) => ({
+      inputIndex: item.inputIndex,
+      node,
+      spender: item.transaction.hash,
+    }))
+  );
+  const started = process.cpuUsage();
+  const plus = pendingSpendRows(pendingInputs, pendingUtxo, 1);
+  const minus = pendingSpendRows(pendingInputs, pendingUtxo, -1);
+  const used = process.cpuUsage(started);
+  const cpuMs = (used.user + used.system) / 1_000;
+  t.true(cpuMs < 1_000, `took ${cpuMs} ms of CPU`);
+  t.is(plus.length, 1 + 2 * (count - 1));
+  t.is(minus.length, plus.length);
+  t.deepEqual(plus[0], {
+    nodeInternalId: 0,
+    outpointIndex: 0,
+    outpointTransactionHash: 'parent',
+    sign: 1,
+    spenderInputIndex: 0,
+    spenderTransactionHash: 'spender-0',
+  });
+  t.deepEqual(
+    minus.slice(1, 3).map((row) => [row.nodeInternalId, row.sign]),
+    [
+      [1, -1],
+      [2, -1],
+    ]
+  );
 });

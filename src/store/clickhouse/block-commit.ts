@@ -456,6 +456,50 @@ export const blockUtxoDelta = ({
   return { pending, rows, transitions };
 };
 
+/**
+ * Pure: the `pending_spend` rows of a commit's unresolved inputs: one per
+ * node whose UTXO −1 waits on the input (`pendingUtxo`), or one for node 0
+ * when none does (bulk mode, or a tx no accepting node transitions). The
+ * nodes are indexed by `spender:inputIndex`, so this is linear in the
+ * inputs plus the pending UTXO items (it was a scan of `pendingUtxo` per
+ * input: 100k unresolved spends blocked the event loop for about a minute).
+ */
+export const pendingSpendRows = (
+  pendingInputs: readonly {
+    input: { outpointTransactionHash: string; outpointIndex: number };
+    inputIndex: number;
+    transaction: { hash: string };
+  }[],
+  pendingUtxo: readonly { node: number; spender: string; inputIndex: number }[],
+  sign: -1 | 1
+): PendingSpendRow[] => {
+  const nodesBySpend = new Map<string, number[]>();
+  for (const item of pendingUtxo) {
+    const key = `${item.spender}:${item.inputIndex}`;
+    const nodes = nodesBySpend.get(key);
+    if (nodes === undefined) {
+      nodesBySpend.set(key, [item.node]);
+    } else {
+      nodes.push(item.node);
+    }
+  }
+  const rows: PendingSpendRow[] = [];
+  for (const { input, inputIndex, transaction } of pendingInputs) {
+    const nodes = nodesBySpend.get(`${transaction.hash}:${inputIndex}`) ?? [0];
+    for (const node of nodes) {
+      rows.push({
+        nodeInternalId: node,
+        outpointIndex: input.outpointIndex,
+        outpointTransactionHash: input.outpointTransactionHash,
+        sign,
+        spenderInputIndex: inputIndex,
+        spenderTransactionHash: transaction.hash,
+      });
+    }
+  }
+  return rows;
+};
+
 interface ResolvedSpend {
   output: UtxoOutput;
   owner: StoreOperation | undefined;
@@ -1058,23 +1102,7 @@ export class BlockCommitter {
           )
       );
       const pendingRows = (sign: -1 | 1): PendingSpendRow[] =>
-        pendingInputs.flatMap(({ input, inputIndex, transaction }) => {
-          const nodes = pendingUtxo
-            .filter(
-              (item) =>
-                item.spender === transaction.hash &&
-                item.inputIndex === inputIndex
-            )
-            .map((item) => item.node);
-          return (nodes.length === 0 ? [0] : nodes).map((node) => ({
-            nodeInternalId: node,
-            outpointIndex: input.outpointIndex,
-            outpointTransactionHash: input.outpointTransactionHash,
-            sign,
-            spenderInputIndex: inputIndex,
-            spenderTransactionHash: transaction.hash,
-          }));
-        });
+        pendingSpendRows(pendingInputs, pendingUtxo, sign);
       await insert(
         'pending_spend',
         acceptanceColumns.pending_spend,

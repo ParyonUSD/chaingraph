@@ -1257,3 +1257,50 @@ e2e(
     t.deepEqual(await badUtxoSums(client), []);
   }
 );
+
+e2e(
+  '[e2e] ClickHouseStore: a child block with 150k unresolved spends parks, its parent completes it',
+  async (t) => {
+    t.timeout(300_000);
+    const { client, openStore } = await scratch(t, 'wide_child');
+    const store = await openStore();
+    const { node1 } = await registerNodes(store);
+    const { block0, block1, block2 } = wideChain(50, 3_000);
+    await store.saveBlock({
+      block: block0,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    const started = Date.now();
+    // child first: it parks (incomplete) with 150k pending spends
+    await store.saveBlock({
+      block: block2,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    const parkedMs = Date.now() - started;
+    await store.saveBlock({
+      block: block1,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    while (store.operations.activeCount > 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50);
+      });
+    }
+    await store.publishWatermarks();
+    t.log(
+      `parked after ${parkedMs} ms, all committed after ${
+        Date.now() - started
+      } ms`
+    );
+    const unspent = await utxoCountAt(client, node1);
+    t.is(unspent.n, String(150_000 + 2));
+    const pending = await client.query<{ s: string; n: string }>(
+      'SELECT toString(sum(sign)) AS s, toString(count()) AS n FROM pending_spend'
+    );
+    t.deepEqual(pending[0], { n: String(2 * 150_000), s: '0' });
+    t.deepEqual(await badUtxoSums(client), []);
+  }
+);
