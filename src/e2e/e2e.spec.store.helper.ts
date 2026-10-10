@@ -49,9 +49,16 @@ const isRunning = (pid: number) => {
 };
 
 /**
- * Drop `cg_e2e_<pid>` databases of runs that no longer exist (a run that dies
- * on an uncaught exception never reaches `test.after.always`). Returns the
- * dropped names.
+ * A run never lasts this long, so a `cg_e2e_<pid>` database older than this
+ * is stale even if its pid is in use (a pid can be reused).
+ */
+const staleDatabaseAgeSeconds = 3600;
+
+/**
+ * Drop `cg_e2e_<pid>` databases left behind by other runs: the pid no longer
+ * exists (a run killed by an uncaught exception or an AVA timeout never
+ * reaches `test.after.always`), or the database is older than an hour (its
+ * oldest table's `metadata_modification_time`). Returns the dropped names.
  */
 export const dropStaleClickHouseE2eDatabases = async () => {
   const client = new ClickHouseClient({
@@ -63,17 +70,29 @@ export const dropStaleClickHouseE2eDatabases = async () => {
   });
   // eslint-disable-next-line functional/no-try-statement
   try {
-    const stale = (
-      await client.query<{ name: string }>(
-        "SELECT name FROM system.databases WHERE match(name, '^cg_e2e_[0-9]+$')"
-      )
-    )
-      .map((row) => row.name)
+    const candidates = await client.query<{
+      ageSeconds: number | string | null;
+      name: string;
+    }>(
+      `SELECT d.name AS name,
+              if(t.oldest IS NULL, NULL, dateDiff('second', t.oldest, now())) AS ageSeconds
+         FROM system.databases AS d
+         LEFT JOIN (SELECT database, min(metadata_modification_time) AS oldest
+                      FROM system.tables
+                      WHERE match(database, '^cg_e2e_[0-9]+$')
+                      GROUP BY database) AS t
+           ON t.database = d.name
+         WHERE match(d.name, '^cg_e2e_[0-9]+$')
+         SETTINGS join_use_nulls = 1`
+    );
+    const stale = candidates
       .filter(
-        (name) =>
+        ({ ageSeconds, name }) =>
           name !== e2eClickHouseDatabase &&
-          !isRunning(Number(name.slice('cg_e2e_'.length)))
-      );
+          (!isRunning(Number(name.slice('cg_e2e_'.length))) ||
+            Number(ageSeconds ?? 0) > staleDatabaseAgeSeconds)
+      )
+      .map(({ name }) => name);
     await stale.reduce<Promise<void>>(
       async (previous, name) =>
         previous.then(async () =>
