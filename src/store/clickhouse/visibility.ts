@@ -167,21 +167,41 @@ export interface VisibilitySnapshot {
 }
 
 /**
+ * A snapshot pinning several nodes at once (`readSnapshotMulti`): one
+ * `visible(n)` per node, one node-agnostic part (visible(0), tail, void,
+ * fence) shared by all of them, all from one statement. `snapshotForNode`
+ * gives the per-node `VisibilitySnapshot` (the per-node rule is unchanged:
+ * node n's views see `visible(n)`).
+ */
+export interface MultiNodeSnapshot {
+  nodeIds: number[];
+  /** visible(n) per pinned node (0 if the node has no watermark row). */
+  visibleByNode: ReadonlyMap<number, bigint>;
+  visible0: bigint;
+  committedTail: bigint[];
+  fence: bigint[];
+  void: bigint[];
+  voidOverflow: boolean;
+}
+
+/**
  * The snapshot query. One statement; the scalar subqueries run in data
  * dependency order (each references the previous result, so ClickHouse must
  * evaluate it first):
- * 1. visible(n) and visible(0), from one read of `visibility`;
+ * 1. visible(n) of every pinned node and visible(0), from one read of
+ *    `visibility`;
  * 2. the committed tail above visible(0);
- * 3. `bound` = the highest seq any view of this snapshot can show; the void
- *    set up to `bound` (read after 1-2, so every aborted seq at or below a
- *    watermark is in it: abort writes `commit_void` before the commit
- *    becomes terminal, and watermarks only pass terminal commits);
+ * 3. `bound` = the highest seq any view of this snapshot can show (over
+ *    every pinned node); the void set up to `bound` (read after 1-2, so
+ *    every aborted seq at or below a watermark is in it: abort writes
+ *    `commit_void` before the commit becomes terminal, and watermarks only
+ *    pass terminal commits);
  * 4. the fences of epochs up to `bound`'s epoch (read after 1-2: a new
  *    holder writes its fences before its first commit).
  * Any commit up to visible(n) (and every commit it depends on) was committed
  * before visible(n) was read, so it is at most visible(0) or in the tail:
  * node-agnostic rows of a visible node-n fact are always visible in the same
- * snapshot.
+ * snapshot, for every pinned node.
  */
 export const snapshotSql = (tables: {
   visibility: string;
@@ -189,13 +209,15 @@ export const snapshotSql = (tables: {
   commitVoid: string;
   epochFence: string;
 }) => `WITH
-  (SELECT (maxIf(visible_seq, node_internal_id = {node:UInt32}), maxIf(visible_seq, node_internal_id = 0))
-   FROM ${
-     tables.visibility
-   } WHERE node_internal_id IN (0, {node:UInt32})) AS marks,
+  (SELECT maxMap([node_internal_id], [visible_seq]) FROM ${tables.visibility}
+   WHERE node_internal_id = 0 OR has({nodes:Array(UInt32)}, node_internal_id)) AS max_by_node,
+  (arrayMap(n -> if(indexOf(max_by_node.1, n) = 0, toUInt64(0), max_by_node.2[indexOf(max_by_node.1, n)]),
+            {nodes:Array(UInt32)}),
+   if(indexOf(max_by_node.1, 0) = 0, toUInt64(0), max_by_node.2[indexOf(max_by_node.1, 0)])) AS marks,
   (SELECT arraySort(groupArray(commit_seq)) FROM ${tables.commitLog}
    WHERE state = 'committed' AND commit_seq > marks.2) AS tail_seqs,
-  greatest(marks.1, marks.2, arrayMax(arrayPushBack(tail_seqs, toUInt64(0)))) AS bound,
+  greatest(arrayMax(arrayPushBack(marks.1, marks.2)),
+           arrayMax(arrayPushBack(tail_seqs, toUInt64(0)))) AS bound,
   (SELECT groupArray(commit_seq) FROM
      (SELECT DISTINCT commit_seq FROM ${
        tables.commitVoid
@@ -207,7 +229,7 @@ export const snapshotSql = (tables: {
      }
       WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences
 SELECT
-  toString(marks.1) AS visible,
+  arrayMap(x -> toString(x), marks.1) AS visible,
   toString(marks.2) AS visible0,
   arrayMap(x -> toString(x), tail_seqs) AS tail,
   arrayMap(x -> toString(x), void_seqs) AS void,
@@ -227,21 +249,22 @@ const encodedLength = (values: readonly bigint[]) =>
   values.reduce((total, value) => total + value.toString().length + 1, 1);
 
 /**
- * Read a snapshot in one query (see `snapshotSql` for the order argument).
- * Throws `GateParameterOverflowError` if the fence would not fit in one HTTP
- * parameter.
+ * Read one snapshot pinning every node of `nodeIds` (see `snapshotSql` for
+ * the order argument). Throws `GateParameterOverflowError` if the fence
+ * would not fit in one HTTP parameter.
  */
-export const readSnapshot = async (
+export const readSnapshotMulti = async (
   client: Pick<ClickHouseClient, 'query'>,
-  nodeId: number
-): Promise<VisibilitySnapshot> => {
+  nodeIds: readonly number[]
+): Promise<MultiNodeSnapshot> => {
+  const nodes = [...new Set(nodeIds)].sort((a, b) => a - b);
   const rows = await client.query<{
-    visible: string;
+    visible: string[];
     visible0: string;
     tail: string[];
     void: string[];
     fence: string[];
-  }>(snapshotQuery, { node: nodeId, voidLimit: voidInlineLimit + 1 });
+  }>(snapshotQuery, { nodes, voidLimit: voidInlineLimit + 1 });
   const [row] = rows;
   const voidSeqs = (row?.void ?? []).map(BigInt);
   const voidOverflow = voidSeqs.length > voidInlineLimit;
@@ -254,16 +277,114 @@ export const readSnapshot = async (
       )} bytes as a parameter, limit ${fenceParamMaxBytes}); see docs/clickhouse-port/wp6b-gate-cost.md.`
     );
   }
+  const visible = row?.visible ?? [];
   return {
     committedTail: (row?.tail ?? []).map(BigInt),
     fence,
-    nodeId,
-    visible: BigInt(row?.visible ?? '0'),
+    nodeIds: nodes,
     visible0: BigInt(row?.visible0 ?? '0'),
+    visibleByNode: new Map(
+      nodes.map((node, index) => [node, BigInt(visible[index] ?? '0')])
+    ),
     void: voidOverflow ? [voidOverflowSentinel] : voidSeqs,
     voidOverflow,
   };
 };
+
+/** The per-node snapshot of one node pinned by `snapshot`. */
+export const snapshotForNode = (
+  snapshot: MultiNodeSnapshot,
+  nodeId: number
+): VisibilitySnapshot => {
+  const visible =
+    nodeId === nodeAgnosticId
+      ? snapshot.visible0
+      : snapshot.visibleByNode.get(nodeId);
+  if (visible === undefined) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new RangeError(`Node ${nodeId} is not pinned by this snapshot.`);
+  }
+  return {
+    committedTail: snapshot.committedTail,
+    fence: snapshot.fence,
+    nodeId,
+    visible,
+    visible0: snapshot.visible0,
+    void: snapshot.void,
+    voidOverflow: snapshot.voidOverflow,
+  };
+};
+
+/** Read a snapshot of one node in one query (`readSnapshotMulti` of `[nodeId]`). */
+export const readSnapshot = async (
+  client: Pick<ClickHouseClient, 'query'>,
+  nodeId: number
+): Promise<VisibilitySnapshot> =>
+  snapshotForNode(await readSnapshotMulti(client, [nodeId]), nodeId);
+
+/** The cheap watermark read of `SnapshotCache`: visibility only, no subquery. */
+export const watermarksSql = `SELECT node_internal_id AS node, toString(max(visible_seq)) AS visible
+  FROM visibility WHERE node_internal_id IN {nodes:Array(UInt32)} GROUP BY node_internal_id`;
+
+/**
+ * Snapshots reused while the watermarks stand still (fix-pass-3.md §4).
+ * `read(nodes)` first reads only the published watermarks of the nodes and
+ * node 0 (one small query without subqueries). If they equal those of the
+ * cached snapshot of the same node set, that snapshot is returned: it is
+ * exactly what `readSnapshotMulti` returned when these watermarks were
+ * current, and it is still a consistent snapshot of them (a seq at or below
+ * a watermark is terminal, so its void row was already read; fences never
+ * cover a seq a watermark passed; the tail only lacks commits above every
+ * watermark). Its watermarks equal the ones read after the request started,
+ * so it is never staler than the published watermarks at request start.
+ * Otherwise a full `readSnapshotMulti` replaces the entry.
+ */
+const defaultSnapshotCacheEntries = 256;
+
+export class SnapshotCache {
+  hits = 0;
+
+  misses = 0;
+
+  private readonly entries = new Map<string, MultiNodeSnapshot>();
+
+  constructor(
+    private readonly client: Pick<ClickHouseClient, 'query'>,
+    private readonly maxEntries = defaultSnapshotCacheEntries
+  ) {}
+
+  async read(nodeIds: readonly number[]): Promise<MultiNodeSnapshot> {
+    const nodes = [...new Set(nodeIds)].sort((a, b) => a - b);
+    const key = nodes.join(',');
+    const cached = this.entries.get(key);
+    if (cached !== undefined) {
+      const rows = await this.client.query<{ node: number; visible: string }>(
+        watermarksSql,
+        { nodes: [nodeAgnosticId, ...nodes] }
+      );
+      const marks = new Map(
+        rows.map((row) => [Number(row.node), BigInt(row.visible)])
+      );
+      const same =
+        (marks.get(nodeAgnosticId) ?? 0n) === cached.visible0 &&
+        nodes.every(
+          (node) => (marks.get(node) ?? 0n) === cached.visibleByNode.get(node)
+        );
+      if (same) {
+        this.hits += 1;
+        return cached;
+      }
+    }
+    this.misses += 1;
+    const fresh = await readSnapshotMulti(this.client, nodes);
+    this.entries.delete(key);
+    this.entries.set(key, fresh);
+    if (this.entries.size > this.maxEntries) {
+      this.entries.delete(this.entries.keys().next().value!);
+    }
+    return fresh;
+  }
+}
 
 /** `node = …, visible = …, fence = …, void = …` for a node-scoped `*_at` view. */
 export const nodeViewArgs =

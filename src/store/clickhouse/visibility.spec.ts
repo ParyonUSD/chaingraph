@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-magic-numbers, camelcase, @typescript-eslint/naming-convention, complexity */
+/* eslint-disable @typescript-eslint/no-magic-numbers, camelcase, @typescript-eslint/naming-convention, complexity, functional/no-try-statement */
 // cspell:ignore randomised seqs unhex
 import test from 'ava';
 
@@ -23,7 +23,10 @@ import {
   nodeViewParams,
   pinnedView,
   readSnapshot,
+  readSnapshotMulti,
   readWatermark,
+  SnapshotCache,
+  snapshotForNode,
   snapshotParams,
   VisibilityPublisher,
   voidInlineLimit,
@@ -626,5 +629,82 @@ e2e(
       `utxo_at PK granules ${granulesRead}/${granulesTotal}; output_at uses p_script`
     );
     t.is(snapshot.visible, seqForEpoch(1n, 1n));
+  }
+);
+
+e2e(
+  '[e2e] fix pass 3: readSnapshotMulti pins several nodes in one read (void up to the highest bound of all); SnapshotCache reuses it while the watermarks stand still',
+  async (t) => {
+    const scratch = await createScratchDatabase('fix3_multi');
+    try {
+      const { client } = scratch;
+      const seq = (counter: number) => seqForEpoch(1n, BigInt(counter));
+      const row = (counter: number, state: string, scope: number[]) =>
+        `(${seq(counter)}, '${state}', [${scope.join(
+          ','
+        )}], 'block', toFixedString('', 32), map(), 1, now64(3), NULL, '')`;
+      /*
+       * 1-3 committed (both nodes), 4 committed (node 2), 5 open (node 1),
+       * 6 aborted (node 2): visible(0) = 4, visible(1) = 4, visible(2) = 6
+       */
+      await client.command(
+        `INSERT INTO commit_log (commit_seq, state, node_scope, kind, block_hash, row_counts, writer_epoch, started_at, finished_at, abort_reason) VALUES ${[
+          row(1, 'committed', [1, 2]),
+          row(2, 'committed', [1, 2]),
+          row(3, 'committed', [1, 2]),
+          row(4, 'committed', [2]),
+          row(5, 'intent', [1]),
+          row(6, 'aborted', [2]),
+        ].join(', ')}`
+      );
+      await client.command(
+        `INSERT INTO commit_void (commit_seq, reason, writer_epoch, voided_at) VALUES (${seq(
+          6
+        )}, 'test', 1, now64(3))`
+      );
+      const publish = async (marks: [number, number][]) =>
+        client.command(
+          `INSERT INTO visibility (node_internal_id, visible_seq, updated_at) VALUES ${marks
+            .map(([node, counter]) => `(${node}, ${seq(counter)}, now64(3))`)
+            .join(', ')}`
+        );
+      await publish([
+        [0, 4],
+        [1, 4],
+        [2, 6],
+      ]);
+      const multi = await readSnapshotMulti(client, [2, 1]);
+      t.deepEqual(multi.nodeIds, [1, 2]);
+      t.deepEqual(
+        [...multi.visibleByNode],
+        [
+          [1, seq(4)],
+          [2, seq(6)],
+        ]
+      );
+      t.is(multi.visible0, seq(4));
+      t.deepEqual(multi.void, [seq(6)], 'void up to visible(2)');
+      const one = await readSnapshot(client, 1);
+      const two = await readSnapshot(client, 2);
+      t.deepEqual(one.void, [], 'node 1 alone: bound 4, no void needed');
+      t.deepEqual(snapshotForNode(multi, 2), two);
+      t.deepEqual(
+        { ...snapshotForNode(multi, 1), void: [] },
+        { ...one, void: [] }
+      );
+      t.throws(() => snapshotForNode(multi, 3), { instanceOf: RangeError });
+
+      const cache = new SnapshotCache(client);
+      const first = await cache.read([1, 2]);
+      t.is(await cache.read([2, 1]), first, 'hit: same snapshot');
+      t.deepEqual([cache.hits, cache.misses], [1, 1]);
+      await publish([[2, 7]]);
+      const fresh = await cache.read([1, 2]);
+      t.not(fresh, first, 'a watermark moved: re-read');
+      t.is(fresh.visibleByNode.get(2), seq(7));
+      t.deepEqual([cache.hits, cache.misses], [1, 2]);
+    } finally {
+      await scratch.drop();
+    }
   }
 );

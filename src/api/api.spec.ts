@@ -1,5 +1,5 @@
 /* eslint-disable max-lines, @typescript-eslint/no-magic-numbers, functional/no-loop-statement, functional/no-let, no-await-in-loop, camelcase, @typescript-eslint/naming-convention, functional/no-throw-statement, @typescript-eslint/require-array-sort-compare, complexity, @typescript-eslint/no-loop-func, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/restrict-template-expressions, functional/no-mixed-type, max-params, no-bitwise, require-atomic-updates */
-// cspell:ignore clickhouse paryon unhex pothos
+// cspell:ignore clickhouse paryon unhex pothos seqs
 /**
  * Phase 2 spike proofs (docs/clickhouse-port/phase2-spike.md §3): S1–S6
  * over a two-node dataset written through the ClickHouse store, each result
@@ -24,6 +24,7 @@ import { e2eClickHouseUrl } from '../store/clickhouse/test-support.js';
 import {
   nodeAgnosticId,
   pinnedView,
+  readWatermark,
   snapshotParams,
 } from '../store/clickhouse/visibility.js';
 
@@ -861,7 +862,7 @@ e2e(
       )
     );
     const pinned = recorder.events.find((event) => event.kind === 'snapshot')!;
-    t.is(pinned.params.node, env.nodes.node1);
+    t.true((pinned.params.nodes as number[]).includes(env.nodes.node1));
 
     // independent: the model's activity set, the watermark by direct SQL at the same parameters
     const expected = model
@@ -945,15 +946,64 @@ e2e(
     });
     t.true(ids.size > 0);
 
-    // several per-node roots in one operation must name one node (one snapshot)
-    const mixed = await fetch(env.server.url, {
-      body: JSON.stringify({
-        query: `{ a: unspent_outputs(node: "node-one", limit: 1) { has_more } b: unspent_outputs(node: "node-two", limit: 1) { has_more } }`,
-      }),
-      headers: { 'content-type': 'application/json' },
-      method: 'POST',
-    });
-    t.regex(JSON.stringify(await mixed.json()), /must name the same node/u);
+    /*
+     * fix pass 3: an operation naming two nodes pins both in ONE snapshot;
+     * each root reads at its own node's watermark, every root shares the
+     * node-agnostic part (visible0, tail, fence, void)
+     */
+    const twoNodes = `query($paryon: Hex!) {
+      a: unspent_outputs(node: "node-one", limit: 1000, where: { token_category: { _eq: $paryon } }) { nodes { transaction_hash output_index } }
+      b: unspent_outputs(node: "node-two", limit: 1000, where: { token_category: { _eq: $paryon } }) { nodes { transaction_hash output_index } }
+    }`;
+    interface Keys {
+      nodes: { transaction_hash: string; output_index: number }[];
+    }
+    const keysOf = (page: Keys) =>
+      sorted(
+        page.nodes.map((row) => `${row.transaction_hash}:${row.output_index}`)
+      );
+    const pair = recordQueries(env.api);
+    const snapshotsBeforePair = env.api.db.stats.snapshots;
+    const both = await env.gql<{ a: Keys; b: Keys }>(twoNodes, { paryon });
+    pair.stop();
+    t.is(
+      env.api.db.stats.snapshots - snapshotsBeforePair,
+      1,
+      'two nodes, one snapshot'
+    );
+    const single = async (node: string) =>
+      (
+        await env.gql<{ unspent_outputs: Keys }>(
+          `query($node: String!, $paryon: Hex!) { unspent_outputs(node: $node, limit: 1000, where: { token_category: { _eq: $paryon } }) { nodes { transaction_hash output_index } } }`,
+          { node, paryon }
+        )
+      ).unspent_outputs;
+    t.deepEqual(keysOf(both.a), keysOf(await single(one)));
+    t.deepEqual(keysOf(both.b), keysOf(await single(two)));
+    t.notDeepEqual(keysOf(both.a), keysOf(both.b), 'the nodes differ');
+    const pairData = pair.events.filter((event) => event.kind === 'data');
+    t.is(pairData.length, 2);
+    const byNode = new Map(
+      pairData.map((event) => [Number(event.params.node), event.params])
+    );
+    t.deepEqual(
+      [...byNode.keys()].sort(),
+      [env.nodes.node1, env.nodes.node2].sort()
+    );
+    for (const nodeId of [env.nodes.node1, env.nodes.node2]) {
+      t.is(
+        String(byNode.get(nodeId)!.visible),
+        String((await env.api.db.readSnapshot(nodeId)).visible),
+        `node ${nodeId} reads at its own watermark`
+      );
+    }
+    (['visible0', 'tail', 'fence', 'void'] as const).forEach((name) =>
+      t.is(
+        String(pairData[0]!.params[name]),
+        String(pairData[1]!.params[name]),
+        `shared ${name}`
+      )
+    );
 
     /*
      * no argument or input field anywhere in the schema can carry a snapshot parameter
@@ -1341,6 +1391,40 @@ e2e(
   }
 );
 
+e2e(
+  '[e2e] fix pass 3: request snapshots are reused while the watermarks stand still and never trail the watermark at request start',
+  async (t) => {
+    const env = await setup(t, 'cache');
+    const variables = { limit: 5000, node: one, paryon };
+    const first = await env.gql(allHolders, variables);
+    const hits = env.api.db.stats.snapshotCacheHits;
+    const recorder = recordQueries(env.api);
+    const second = await env.gql(allHolders, variables);
+    recorder.stop();
+    t.is(env.api.db.stats.snapshotCacheHits, hits + 1, 'served by the cache');
+    t.deepEqual(second, first);
+    t.deepEqual(
+      recorder.events
+        .filter((event) => event.kind === 'snapshot')
+        .map((event) => event.sql.includes('void_seqs')),
+      [false],
+      'one cheap watermark query, no full snapshot read'
+    );
+    // a commit advances node-one's watermark: the next request reads a new snapshot
+    await env.extendNodeOne([]);
+    const published = await readWatermark(env.client, env.nodes.node1);
+    const after = recordQueries(env.api);
+    await env.gql(allHolders, variables);
+    after.stop();
+    t.is(env.api.db.stats.snapshotCacheHits, hits + 1, 'a miss');
+    const data = after.events.find((event) => event.kind === 'data')!;
+    t.true(
+      BigInt(String(data.params.visible)) >= published,
+      'not staler than the watermark published before the request'
+    );
+  }
+);
+
 /* ------------------------------------------------------------------ */
 /* overhead                                                             */
 /* ------------------------------------------------------------------ */
@@ -1377,6 +1461,9 @@ e2e(
       const api: number[] = [];
       const sql: number[] = [];
       const snapshotAndSql: number[] = [];
+      const cachedAndSql: number[] = [];
+      const snapshotOnly: number[] = [];
+      const cachedOnly: number[] = [];
       for (let index = 0; index < runs; index += 1) {
         let start = performance.now();
         await env.gql(query, variables);
@@ -1386,12 +1473,21 @@ e2e(
         sql.push(performance.now() - start);
         start = performance.now();
         await env.api.db.readSnapshot(env.nodes.node1);
+        snapshotOnly.push(performance.now() - start);
         await env.client.query(statement.sql, statement.params);
         snapshotAndSql.push(performance.now() - start);
+        start = performance.now();
+        await env.api.db.pinnedSnapshot([env.nodes.node1]);
+        cachedOnly.push(performance.now() - start);
+        await env.client.query(statement.sql, statement.params);
+        cachedAndSql.push(performance.now() - start);
       }
       const p50 = {
         api: percentile(api, 0.5),
+        cachedAndSql: percentile(cachedAndSql, 0.5),
+        cachedOnly: percentile(cachedOnly, 0.5),
         snapshotAndSql: percentile(snapshotAndSql, 0.5),
+        snapshotOnly: percentile(snapshotOnly, 0.5),
         sql: percentile(sql, 0.5),
       };
       const overhead = p50.api - p50.snapshotAndSql;
@@ -1406,7 +1502,13 @@ e2e(
           2
         )} ms, vs SQL alone ${(p50.api - p50.sql).toFixed(
           2
-        )} ms; p95 API ${percentile(api, 0.95).toFixed(2)} ms`
+        )} ms; p95 API ${percentile(api, 0.95).toFixed(
+          2
+        )} ms; full readSnapshot ${p50.snapshotOnly.toFixed(
+          2
+        )} ms, cached request snapshot ${p50.cachedOnly.toFixed(
+          2
+        )} ms, cached snapshot + SQL ${p50.cachedAndSql.toFixed(2)} ms`
       );
       t.true(
         overhead <= 5,

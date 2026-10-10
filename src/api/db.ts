@@ -12,10 +12,15 @@ import type {
   ClickHouseSettings,
   QueryParams,
 } from '../store/clickhouse/client.js';
-import type { VisibilitySnapshot } from '../store/clickhouse/visibility.js';
+import type {
+  MultiNodeSnapshot,
+  VisibilitySnapshot,
+} from '../store/clickhouse/visibility.js';
 import {
   nodeAgnosticId,
   readSnapshot,
+  SnapshotCache,
+  snapshotForNode,
 } from '../store/clickhouse/visibility.js';
 
 /**
@@ -27,8 +32,10 @@ export const dataQuerySettings = {
 } as unknown as ClickHouseSettings;
 
 export interface ApiStats {
-  /** `readSnapshot` calls. */
+  /** Snapshot reads: one per request (`pinnedSnapshot`) and per live re-run (`readSnapshot`). */
   snapshots: number;
+  /** Request snapshots served by the cache (watermarks unchanged: one cheap query). */
+  snapshotCacheHits: number;
   /** Data queries (everything except snapshot reads, node lookups and watermark polls). */
   dataQueries: number;
   /** Node-name lookups (cached per process). */
@@ -48,6 +55,7 @@ export class ApiDb {
   readonly stats: ApiStats = {
     dataQueries: 0,
     nodeLookups: 0,
+    snapshotCacheHits: 0,
     snapshots: 0,
     watermarkPolls: 0,
   };
@@ -57,26 +65,41 @@ export class ApiDb {
 
   private readonly nodeIds = new Map<string, number>();
 
+  /** The snapshot client: every query is reported as a `snapshot` event. */
+  private readonly snapshotClient = {
+    query: async <T>(sql: string, params?: QueryParams) => {
+      const rows = await this.client.query<T>(sql, params);
+      this.onQuery?.({
+        kind: 'snapshot',
+        label: 'readSnapshot',
+        params: params ?? {},
+        sql,
+      });
+      return rows;
+    },
+  };
+
+  private readonly snapshotCache = new SnapshotCache(this.snapshotClient);
+
   constructor(readonly client: ClickHouseClient) {}
 
-  /** Exactly one ClickHouse query: the visibility snapshot of `nodeId`. */
+  /** Exactly one ClickHouse query: a fresh visibility snapshot of `nodeId`. */
   async readSnapshot(nodeId: number): Promise<VisibilitySnapshot> {
     this.stats.snapshots += 1;
-    return readSnapshot(
-      {
-        query: async <T>(sql: string, params?: QueryParams) => {
-          const rows = await this.client.query<T>(sql, params);
-          this.onQuery?.({
-            kind: 'snapshot',
-            label: 'readSnapshot',
-            params: params ?? {},
-            sql,
-          });
-          return rows;
-        },
-      },
-      nodeId
-    );
+    return readSnapshot(this.snapshotClient, nodeId);
+  }
+
+  /**
+   * The snapshot of one request, pinning every node it names
+   * (`SnapshotCache`): one cheap watermark query while the watermarks stand
+   * still, else that plus one full snapshot read.
+   */
+  async pinnedSnapshot(nodeIds: readonly number[]): Promise<MultiNodeSnapshot> {
+    this.stats.snapshots += 1;
+    const { hits } = this.snapshotCache;
+    const snapshot = await this.snapshotCache.read(nodeIds);
+    if (this.snapshotCache.hits > hits) this.stats.snapshotCacheHits += 1;
+    return snapshot;
   }
 
   async query<T>(label: string, sql: string, params: QueryParams) {
@@ -125,14 +148,18 @@ export class ApiDb {
 }
 
 /**
- * The one snapshot of a request (or of one subscription re-run). The node
- * is fixed when the request starts (from the operation's root `node`
- * arguments); the snapshot is read once, on first use, and shared by every
- * resolver. Node-agnostic roots ride on the same snapshot (its `visible0`,
- * `tail`), so a multi-root operation reads one consistent state.
+ * The one snapshot of a request (or of one subscription re-run). The nodes
+ * are fixed when the request starts (from the operation's root `node`
+ * arguments); the snapshot is read once, on first use, pinning all of them
+ * in one consistent read, and shared by every resolver: each per-node root
+ * reads at its own node's `visible(n)`, and every root shares visible(0),
+ * the tail, void and fence. Node-agnostic roots ride on the same snapshot,
+ * so a multi-root operation reads one consistent state.
  */
 export class PinnedSnapshot {
-  private pending: Promise<VisibilitySnapshot> | undefined;
+  private pending: Promise<MultiNodeSnapshot> | undefined;
+
+  private readonly ids = new Map<string, number>();
 
   constructor(
     private readonly db: ApiDb,
@@ -147,23 +174,33 @@ export class PinnedSnapshot {
         `Node ${node} is not a root node argument of this operation.`
       );
     }
-    if (this.nodeNames.length > 1) {
-      throw new GraphQLError(
-        'All per-node roots of one operation must name the same node (one snapshot per request; spike limit).',
-        { extensions: { code: 'BAD_USER_INPUT' } }
-      );
+    if (this.preset !== undefined) {
+      if (this.nodeNames.length > 1) {
+        throw new GraphQLError(
+          'A subscription pins one node: its roots must name the same node.',
+          { extensions: { code: 'BAD_USER_INPUT' } }
+        );
+      }
+      return this.preset;
     }
-    if (this.pending === undefined) {
-      this.pending =
-        this.preset === undefined ? this.read() : Promise.resolve(this.preset);
-    }
-    return this.pending;
+    this.pending ??= this.read();
+    const snapshot = await this.pending;
+    return snapshotForNode(
+      snapshot,
+      node === undefined
+        ? snapshot.nodeIds[0] ?? nodeAgnosticId
+        : this.ids.get(node)!
+    );
   }
 
   private async read() {
-    const [name] = this.nodeNames;
-    const nodeId =
-      name === undefined ? nodeAgnosticId : await this.db.nodeId(name);
-    return this.db.readSnapshot(nodeId);
+    const ids = await Promise.all(
+      this.nodeNames.map(async (name) => {
+        const id = await this.db.nodeId(name);
+        this.ids.set(name, id);
+        return id;
+      })
+    );
+    return this.db.pinnedSnapshot(ids.length === 0 ? [nodeAgnosticId] : ids);
   }
 }
