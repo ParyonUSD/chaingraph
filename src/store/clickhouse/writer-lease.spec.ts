@@ -2,7 +2,7 @@
 // cspell:ignore initialise
 import test from 'ava';
 
-import { CommitLog } from './commit-log.js';
+import { CommitLog, counterOfSeq } from './commit-log.js';
 import {
   createScratchDatabase,
   e2eClickHouseUrl,
@@ -12,11 +12,13 @@ import {
   testSaveSteps,
   visibleOfSave,
 } from './test-support.js';
-import { VisibilityPublisher } from './visibility.js';
+import { readSnapshot, VisibilityPublisher } from './visibility.js';
 import {
+  defaultTtlMs,
   LeaseHeldError,
   leaseHolder,
   LeaseLostError,
+  leaseTtlFromEnv,
   WriterLease,
 } from './writer-lease.js';
 
@@ -101,6 +103,257 @@ test('WriterLease: the local deadline fences the holder without any I/O', async 
   await t.throwsAsync(echo.acquire(), { instanceOf: LeaseLostError });
   now = 0;
 });
+
+/** A client whose claims are whatever `claims` holds (server time = `serverNow`). */
+const fakeLeaseStore = () => {
+  const state = {
+    claims: [] as { epoch: bigint; agent: string; at: number }[],
+    failQueries: false,
+    serverNow: 1000,
+  };
+  const client = {
+    command: async (_sql: string, params?: { [key: string]: unknown }) => {
+      const epoch = BigInt(String(params?.epoch));
+      const agent = String(params?.agent);
+      if (!state.claims.some((c) => c.epoch === epoch && c.agent === agent)) {
+        state.claims.push({ agent, at: state.serverNow, epoch });
+      }
+      return undefined;
+    },
+    insertSelect: async () => undefined,
+    query: async (sql: string) => {
+      if (state.failQueries) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw new Error('ECONNRESET (simulated)');
+      }
+      if (!sql.includes('FROM writer_lease')) {
+        return [{ server_now: String(state.serverNow) }] as never[];
+      }
+      return state.claims.map((c) => ({
+        agent_id: c.agent,
+        claimed_ms: String(c.at),
+        epoch: c.epoch.toString(),
+        expires_ms: String(state.serverNow + 1_000_000),
+        heartbeat_ms: String(c.at),
+        server_now: String(state.serverNow),
+      })) as never[];
+    },
+  };
+  return { client, state };
+};
+
+test('leaseTtlFromEnv: default 120 s, env override, invalid values refused', (t) => {
+  t.is(defaultTtlMs, 120_000);
+  t.is(leaseTtlFromEnv({}), undefined);
+  t.is(
+    leaseTtlFromEnv({ CHAINGRAPH_CLICKHOUSE_LEASE_TTL_MS: '45000' }),
+    45_000
+  );
+  t.throws(
+    () => leaseTtlFromEnv({ CHAINGRAPH_CLICKHOUSE_LEASE_TTL_MS: '5.5' }),
+    {
+      instanceOf: RangeError,
+    }
+  );
+  t.throws(
+    () => leaseTtlFromEnv({ CHAINGRAPH_CLICKHOUSE_LEASE_TTL_MS: '10' }),
+    {
+      instanceOf: RangeError,
+    }
+  );
+  const lease = new WriterLease(fakeLeaseStore().client, { settleMs: 0 });
+  t.is(lease.ttlMs, leaseTtlFromEnv() ?? defaultTtlMs);
+});
+
+test('WriterLease: a stalled heartbeat reports lost once, never renews late; reacquire takes a new epoch', async (t) => {
+  // eslint-disable-next-line functional/no-let
+  let now = 0;
+  const { client, state } = fakeLeaseStore();
+  const lease = new WriterLease(client, {
+    agentId: 'me',
+    monotonicNow: () => now,
+    renewIntervalMs: 20_000,
+    safetyMarginMs: 20_000,
+    settleMs: 0,
+    ttlMs: 120_000,
+  });
+  t.is(await lease.acquire(), 1n);
+  const losses: LeaseLostError[] = [];
+  lease.startHeartbeat((error) => {
+    losses.push(error);
+  });
+  // an on-time tick renews
+  now = 20_000;
+  t.is(await lease.tick(), undefined);
+  // the loop stalls 85 s: the deadline (renewal start 20 s + 120 s - 20 s = 120 s) has passed
+  now = 125_000;
+  const claimsBefore = state.claims.length;
+  const lost = await lease.tick();
+  t.is(lost?.reason, 'stalled');
+  t.is(lost?.epoch, 1n);
+  t.is(state.claims.length, claimsBefore, 'no late heartbeat row was written');
+  t.is(losses.length, 1);
+  t.is(losses[0], lost);
+  t.false(lease.isHeld);
+  t.throws(
+    () => {
+      lease.assertHeld();
+    },
+    { instanceOf: LeaseLostError }
+  );
+  // the heartbeat stopped itself: onLost is not called again
+  t.is((await lease.tick())?.reason, 'not-held');
+  t.is(losses.length, 1);
+  // recovery: a new epoch, never the old one
+  t.is(await lease.reacquire(), 2n);
+  t.true(lease.isHeld);
+  t.is(lease.epoch, 2n);
+  lease.stopHeartbeat();
+});
+
+test('WriterLease: renewal I/O errors are retried until the deadline, then lost', async (t) => {
+  // eslint-disable-next-line functional/no-let
+  let now = 0;
+  const { client, state } = fakeLeaseStore();
+  const lease = new WriterLease(client, {
+    agentId: 'me',
+    monotonicNow: () => now,
+    safetyMarginMs: 20_000,
+    settleMs: 0,
+    ttlMs: 120_000,
+  });
+  await lease.acquire();
+  const losses: LeaseLostError[] = [];
+  lease.startHeartbeat((error) => {
+    losses.push(error);
+  });
+  state.failQueries = true;
+  now = 20_000;
+  t.is(await lease.tick(), undefined);
+  now = 60_000;
+  t.is(await lease.tick(), undefined);
+  t.true(lease.isHeld);
+  // the failing renewal crosses the deadline (100 s)
+  now = 99_000;
+  const original = client.query;
+  client.query = async (sql: string) => {
+    now = 101_000;
+    return original(sql);
+  };
+  const lost = await lease.tick();
+  t.is(lost?.reason, 'deadline');
+  t.is(losses.length, 1);
+  t.false(lease.isHeld);
+});
+
+test('WriterLease: a takeover seen by a renewal is reported as taken-over', async (t) => {
+  // eslint-disable-next-line functional/no-let
+  let now = 0;
+  const { client, state } = fakeLeaseStore();
+  const lease = new WriterLease(client, {
+    agentId: 'me',
+    monotonicNow: () => now,
+    settleMs: 0,
+    ttlMs: 120_000,
+  });
+  await lease.acquire();
+  const losses: LeaseLostError[] = [];
+  lease.startHeartbeat((error) => {
+    losses.push(error);
+  });
+  state.claims.push({ agent: 'other', at: 2000, epoch: 2n });
+  now = 20_000;
+  t.is((await lease.tick())?.reason, 'taken-over');
+  t.is(losses.length, 1);
+  // the other agent's claim is unexpired: reacquiring is refused
+  await t.throwsAsync(lease.reacquire(), { instanceOf: LeaseHeldError });
+});
+
+e2e(
+  '[e2e] WriterLease: stall -> lost -> reacquire -> the old epoch is fenced; a racing claimant leaves one holder',
+  async (t) => {
+    const scratch = await createScratchDatabase('lease_reacquire');
+    t.teardown(scratch.drop);
+    // eslint-disable-next-line functional/no-let
+    let skewMs = 0;
+    const monotonicNow = () =>
+      Number(process.hrtime.bigint() / 1_000_000n) + skewMs;
+    const options = { safetyMarginMs: 300, settleMs: 200, ttlMs: 2000 };
+    const lease = new WriterLease(scratch.client, {
+      ...options,
+      agentId: 'agent',
+      monotonicNow,
+    });
+    t.is(await lease.acquire(), 1n);
+    const log = new CommitLog(scratch.client, lease);
+    await log.init();
+    const publisher = new VisibilityPublisher(scratch.client, log);
+    await publisher.init();
+    publisher.registerNode(1);
+    const save = {
+      category: hashOf(0xfeed),
+      nodeId: 1,
+      outputs: 2,
+      transactionId: 1,
+    };
+    const commit = await log.beginCommit({
+      kind: 'mempool_batch',
+      nodeScope: [1],
+    });
+    // eslint-disable-next-line functional/no-loop-statement
+    for (const step of testSaveSteps(scratch.client, commit, save)) {
+      // eslint-disable-next-line no-await-in-loop
+      await step();
+    }
+    await log.markCommitted(commit.seq, testSaveRowCounts(save));
+    await publisher.publishWatermark();
+    const losses: LeaseLostError[] = [];
+    lease.startHeartbeat((error) => {
+      losses.push(error);
+    });
+    // simulate a stall: the clock jumps past the local deadline before the next tick
+    skewMs = options.ttlMs;
+    const lost = await lease.tick();
+    t.is(lost?.reason, 'stalled');
+    t.is(losses.length, 1);
+    await t.throwsAsync(
+      log.beginCommit({ kind: 'mempool_batch', nodeScope: [1] }),
+      { instanceOf: LeaseLostError }
+    );
+    // wait out the real ttl so a racing claimant may also try
+    await sleep(options.ttlMs + 100);
+    skewMs = 0;
+    const rival = new WriterLease(scratch.newClient(), {
+      ...options,
+      agentId: 'rival',
+    });
+    const [mine, theirs] = await Promise.allSettled([
+      lease.reacquire(),
+      rival.acquire(),
+    ]);
+    const winners = [mine, theirs].filter((r) => r.status === 'fulfilled');
+    t.is(winners.length, 1, JSON.stringify([mine.status, theirs.status]));
+    const holder = mine.status === 'fulfilled' ? lease : rival;
+    t.true(holder.epoch >= 2n);
+    // recovery under the new epoch: a new CommitLog fences every older epoch
+    const recovered = new CommitLog(scratch.client, holder);
+    const recovery = await recovered.init();
+    t.true(
+      recovery.fences.some(
+        (fence) => fence.epoch === 1n && fence.maxValidSeq === commit.seq
+      )
+    );
+    const snapshot = await readSnapshot(scratch.client, 1);
+    t.is(snapshot.fence[0], counterOfSeq(commit.seq));
+    // the committed save of the old epoch is still visible; nothing of it is torn
+    t.is(
+      nodeFactsVisibility(await visibleOfSave(scratch.client, save), save),
+      'all'
+    );
+    await lease.release();
+    await rival.release();
+  }
+);
 
 e2e(
   '[e2e] WriterLease: acquire, refuse a second writer, renew, release',
