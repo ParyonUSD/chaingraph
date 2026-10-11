@@ -1243,6 +1243,32 @@ const utxoCountAt = async (
 };
 
 e2e(
+  '[e2e] ClickHouseStore: blocks of 5,000 transactions in tip mode (UTXO on): no transaction list in a query parameter, exact UTXO set',
+  async (t) => {
+    t.timeout(300_000);
+    const { client, openStore } = await scratch(t, 'many_txs', { utxo: 'on' });
+    const store = await openStore();
+    const { node1, node2 } = await registerNodes(store);
+    // 5,000 hashes are ~335 KB as an array parameter: over the server's 128 KiB field limit
+    const { block0, block1, block2 } = wideChain(5_000, 2);
+    for (const block of [block0, block1, block2]) {
+      await store.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: [acceptance(node1), acceptance(node2)],
+      });
+    }
+    await store.publishWatermarks();
+    for (const node of [node1, node2]) {
+      const unspent = await utxoCountAt(client, node);
+      // block 2's 10,000 outputs and the two 1-sat coinbase outputs
+      t.is(unspent.n, String(10_000 + 2));
+    }
+    t.deepEqual(await badUtxoSums(client), []);
+  }
+);
+
+e2e(
   '[e2e] ClickHouseStore: a block with 150k inputs and 150k outputs (300k UTXO rows) commits in tip mode',
   async (t) => {
     t.timeout(300_000);

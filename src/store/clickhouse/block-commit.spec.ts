@@ -1,17 +1,15 @@
-/* eslint-disable @typescript-eslint/no-magic-numbers, max-params, @typescript-eslint/require-array-sort-compare */
+/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/require-array-sort-compare */
 // cspell:ignore clickhouse
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 import test from 'ava';
 
-import type { ChaingraphTransaction } from '../../types/chaingraph.js';
 import type { Outpoint } from '../mempool-graph.js';
 
 import {
   appendAll,
   assignTransactionIds,
-  blockTransitions,
   chunked,
   minMax,
 } from './block-commit.js';
@@ -42,56 +40,12 @@ test('assignTransactionIds: stored ids win, new ids in block order, duplicates s
   t.throws(() => assignTransactionIds(['a'], new Map(), [1n, 2n]));
 });
 
-const tx = (
-  hash: string,
-  spends: [string, number][],
-  outputs: number,
-  isCoinbase = false
-): ChaingraphTransaction => ({
-  hash,
-  inputs: spends.map(([outpointTransactionHash, outpointIndex]) => ({
-    outpointIndex,
-    outpointTransactionHash,
-    sequenceNumber: 0,
-    unlockingBytecode: '',
-  })),
-  isCoinbase,
-  locktime: 0,
-  outputs: Array.from({ length: outputs }, (_, index) => ({
-    lockingBytecode: `5${index}`,
-    valueSatoshis: BigInt(index + 1),
-  })),
-  sizeBytes: 100,
-  version: 2,
-});
-
 const stored = (hash: string, index: number): UtxoOutput => ({
   lockingBytecode: 'aa',
   outputIndex: index,
   transactionHash: hash,
   transactionInternalId: 9n,
   valueSatoshis: 10n,
-});
-
-test('blockTransitions: per node, only transactions not already accepted transition, once', (t) => {
-  const transactions = [
-    { transaction: tx('cb', [['00'.repeat(32), 0xffffffff]], 1, true) },
-    { transaction: tx('t1', [['old', 0]], 2) },
-    { transaction: tx('t2', [['t1', 0]], 1) },
-    { transaction: tx('mempool', [['old', 1]], 1) },
-    // a transaction in two blocks of the batch counts once
-    { transaction: tx('t1', [['old', 0]], 2) },
-  ];
-  t.deepEqual(
-    blockTransitions({ acceptedBefore: new Set(['mempool']), transactions }),
-    ['cb', 't1', 't2']
-  );
-  t.deepEqual(blockTransitions({ acceptedBefore: new Set(), transactions }), [
-    'cb',
-    't1',
-    't2',
-    'mempool',
-  ]);
 });
 
 test('utxo off: changeRows produces no utxo rows; the other rows are unchanged; no pending-spend rows exist', (t) => {

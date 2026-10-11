@@ -472,36 +472,27 @@ export const assignTransactionIds = (
 };
 
 /**
- * Pure: the transactions of one node's blocks that become accepted by the
- * node in this commit (plan §2.3): every transaction not already accepted by
- * it, once. Above the bulk horizon with UTXO on, each gets +1 per output and
- * −1 per spent output, written server-side (`utxoDeltaInsertSql`).
+ * The deltas CTE of `utxoDeltaInsertSql` for a block commit `{seq}` and node
+ * `{node}`: every transaction its blocks make accepted by the node (a block
+ * acceptance row of this commit), unless a live acceptance of the node by
+ * another commit (a block or its mempool) already exists, once (`d = +1`).
+ * The same rule as header acceptance; read server-side, so no transaction
+ * list travels in a query parameter (a 100k-transaction block's hashes do
+ * not fit in a URL).
  */
-export const blockTransitions = ({
-  transactions,
-  acceptedBefore,
-}: {
-  transactions: readonly { transaction: ChaingraphTransaction }[];
-  acceptedBefore: ReadonlySet<string>;
-}): string[] => {
-  const transitions: string[] = [];
-  const seen = new Set<string>();
-  transactions.forEach(({ transaction }) => {
-    if (acceptedBefore.has(transaction.hash) || seen.has(transaction.hash)) {
-      return;
-    }
-    seen.add(transaction.hash);
-    transitions.push(transaction.hash);
-  });
-  return transitions;
-};
-
-/**
- * The deltas CTE of `utxoDeltaInsertSql` for a list of transactions that
- * all become accepted (`d = +1`): `{hashes:Array(String)}`.
- */
-export const acceptedDeltasSql = `SELECT toFixedString(unhex(h), 32) AS transaction_hash, toInt8(1) AS d
-  FROM (SELECT arrayJoin({hashes:Array(String)}) AS h)`;
+export const blockDeltasSql = `SELECT transaction_hash, toInt8(1) AS d
+  FROM (SELECT DISTINCT transaction_hash FROM tx_acceptance
+        WHERE node_internal_id = {node:UInt32} AND commit_seq = {seq:UInt64}
+          AND block_internal_id != 0 AND sign = 1)
+  WHERE transaction_hash NOT IN (
+    SELECT transaction_hash FROM tx_acceptance
+    WHERE node_internal_id = {node:UInt32} AND commit_seq != {seq:UInt64}
+      AND transaction_hash IN (
+        SELECT transaction_hash FROM tx_acceptance
+        WHERE node_internal_id = {node:UInt32} AND commit_seq = {seq:UInt64} AND block_internal_id != 0)
+      AND ${validCommitSql()}
+    GROUP BY transaction_hash, block_internal_id
+    HAVING sum(sign) > 0)`;
 
 const inclusionsOf = (
   block: ChaingraphBlock,
@@ -1344,13 +1335,12 @@ export class BlockCommitter {
         encodeNodeBlockRows(nodeBlockRows, commit.seq)
       )
     );
-    nodeWrites.push(
-      insert(
-        'tx_acceptance',
-        acceptanceColumns.tx_acceptance,
-        encodeTxAcceptanceRows(txAcceptanceRows, commit.seq)
-      )
+    const txAcceptanceWritten = insert(
+      'tx_acceptance',
+      acceptanceColumns.tx_acceptance,
+      encodeTxAcceptanceRows(txAcceptanceRows, commit.seq)
     );
+    nodeWrites.push(txAcceptanceWritten);
 
     const utxoRows: UtxoRow[] = [];
     if (hooks !== undefined && mempoolChanges.length > 0) {
@@ -1388,34 +1378,24 @@ export class BlockCommitter {
     if (tipMode && utxoEnabled) {
       /*
        * One transition per (node, tx) over all the node's blocks in the
-       * batch: a tx in two of them (or accepted before) counts once. Its
-       * +1 (outputs) and −1 (spent outputs) rows are joined server-side from
-       * `output` and `input` (this commit's rows, written above, and the
-       * earlier commits' rows: every earlier operation of the node has
-       * written its rows, `waitForEarlier`). A spent output that is not
-       * stored gets no −1 row (as Postgres has no output to join).
+       * batch (`blockDeltasSql`: a tx in two of them, or accepted before,
+       * counts once). Its +1 (outputs) and −1 (spent outputs) rows are
+       * joined server-side from `output` and `input` (this commit's rows,
+       * written above, and the earlier commits' rows: every earlier operation
+       * of the node has written its rows, `waitForEarlier`). A spent output
+       * that is not stored gets no −1 row (as Postgres has no output to
+       * join); its creator's transition writes it (late parent).
        */
       acceptingNodes.forEach((node) => {
-        const hashes = blockTransitions({
-          acceptedBefore: acceptedBefore.get(node)!,
-          transactions: plansOfNode
-            .get(node)!
-            .flatMap((plan) =>
-              plan.block.transactions.map((transaction) => ({ transaction }))
-            ),
-        });
-        if (hashes.length === 0) return;
+        if (!plansOfNode.has(node)) return;
         (['utxo', 'utxo_by_script'] as const).forEach((table) => {
           nodeWrites.push(
             (async () => {
+              // the deltas are read from this commit's tx_acceptance rows
+              await txAcceptanceWritten;
               await context.client.insertSelect(
-                utxoDeltaInsertSql(table, acceptedDeltasSql),
-                {
-                  fence: context.fence(),
-                  hashes,
-                  node,
-                  seq: commit.seq,
-                },
+                utxoDeltaInsertSql(table, blockDeltasSql),
+                { fence: context.fence(), node, seq: commit.seq },
                 { deduplicationToken: commit.token(table, `j${node}`) }
               );
               await context.fault(table, { kind: 'block', seq: commit.seq });

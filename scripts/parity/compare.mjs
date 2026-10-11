@@ -323,7 +323,14 @@ const main = async () => {
     });
     const snapshot =
       clickhouse === undefined
-        ? { fence: [], tail: [], visible: new Map(), visible0: '0', void: [] }
+        ? {
+            fence: [],
+            spend: '0',
+            tail: [],
+            visible: new Map(),
+            visible0: '0',
+            void: [],
+          }
         : await readClickHouseSnapshot(
             clickhouse,
             nodes.map((node) => node.chId)
@@ -333,6 +340,7 @@ const main = async () => {
       atHeight,
       ch: {
         fence: snapshot.fence,
+        spend: snapshot.spend,
         tail: snapshot.tail,
         visible0: snapshot.visible0,
         void: snapshot.void,

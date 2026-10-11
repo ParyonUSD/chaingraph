@@ -351,9 +351,21 @@ const joinedSpendColumns = `i.transaction_hash AS transaction_hash, i.input_inde
 export const spendRelationSql = (sql: Sql, predicate: string) => {
   const input = sql.view('input_at');
   const output = sql.view('output_at');
-  return `(SELECT ${spendRelationColumns} FROM ${sql.view(
+  const index = `SELECT ${spendRelationColumns} FROM ${sql.view(
     'spend_at'
-  )} WHERE ${predicate}
+  )} WHERE ${predicate}`;
+  /*
+   * Caught up (spend watermark = visible(0), no committed tail): no visible
+   * input or output has a seq above W, so both tail parts are empty and are
+   * left out (they cost ~15 ms of planning on chipnet).
+   */
+  if (
+    sql.snapshot.spend >= sql.snapshot.visible0 &&
+    sql.snapshot.committedTail.length === 0
+  ) {
+    return `(${index})`;
+  }
+  return `(${index}
     UNION ALL
     SELECT ${spendRelationColumns} FROM (
       SELECT ${joinedSpendColumns}

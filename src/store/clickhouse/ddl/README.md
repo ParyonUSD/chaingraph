@@ -16,9 +16,10 @@ Files run in order; every statement is `IF NOT EXISTS`, so re-running is safe.
 | `010_core.sql` | block, transaction, block_transaction, output, input, node |
 | `020_acceptance.sql` | node_block, node_transaction, tx_acceptance, node_block_history, node_transaction_history |
 | `030_utxo.sql` | utxo, utxo_by_script |
-| `040_bookkeeping.sql` | commit_log, commit_void, epoch_fence, visibility, id_reservation, writer_lease, pending_spend, input_stand_in, input_stand_in_resolution |
+| `040_bookkeeping.sql` | commit_log, commit_void, epoch_fence, visibility, id_reservation, writer_lease |
 | `050_views.sql` | visibility gate views: `*_v` (live, subqueries; ad-hoc use) and `*_at` (pinned, pure parameters; the API path, WP4/WP6b); `CREATE OR REPLACE` |
 | `060_projections.sql` | the §2.1/§2.4 projections as `ALTER TABLE … ADD PROJECTION IF NOT EXISTS` |
+| `070_spend.sql` | the asynchronous spend index: spend (+ p_category), spend_orphan, spend_watermark, view `spend_at` (item 28) |
 
 Server-fact checks are in `../checks/` (`run.sh <url> <file>`); results below.
 
@@ -35,7 +36,7 @@ engine as written. VersionedCollapsingMergeTree appends `version` to the sorting
 | transaction | MergeTree / SharedMergeTree | `hash` | `intDiv(commit_seq, 2^20)` | 1024 | node-agnostic (7) |
 | block_transaction | MergeTree / SharedMergeTree | `block_internal_id, transaction_index` | `intDiv(commit_seq, 2^20)` | 1024 | node-agnostic (7) |
 | output | MergeTree / SharedMergeTree | `transaction_hash, output_index` | `intDiv(commit_seq, 2^20)` | 128, 4 KiB blocks (projections: 1024, default blocks) | node-agnostic (7) |
-| input | MergeTree / SharedMergeTree | `transaction_hash, input_index` | `intDiv(commit_seq, 2^20)` | 1024 | node-agnostic (7) |
+| input | MergeTree / SharedMergeTree | `transaction_hash, input_index` | `intDiv(commit_seq, 2^20)` | 1024 (p_outpoint: 128, 4 KiB blocks) | node-agnostic (7); the input's own fields only (item 28) |
 | node | ReplacingMergeTree(updated_at) / SharedReplacingMergeTree | `internal_id` | none | 8192 | registry; resolves name → id (7) |
 | node_block | VersionedCollapsingMergeTree(sign, version) / SharedVersionedCollapsingMergeTree | `node_internal_id, block_internal_id, version` | none | 8192 | 1, 2, 4 |
 | node_transaction | VCMT / SharedVCMT | `node_internal_id, transaction_internal_id, version` | none | 8192 | 1, 2, 4 |
@@ -50,17 +51,20 @@ engine as written. VersionedCollapsingMergeTree appends `version` to the sorting
 | commit_void (WP4) | MergeTree / SharedMergeTree | `commit_seq` | none | 8192 | 4 (aborted seqs; read by the gate) |
 | epoch_fence (WP4) | MergeTree / SharedMergeTree | `epoch` | none | 8192 | 4 (stale-writer fencing) |
 | writer_lease | ReplacingMergeTree(heartbeat_at) / SharedReplacingMergeTree | `lease_name, epoch, agent_id` (WP4) | none | 8192 | single writer (precondition of 4) |
-| pending_spend | VCMT / SharedVCMT | `outpoint_transaction_hash, outpoint_index, node_internal_id, spender_transaction_hash, spender_input_index, version` | none | 8192 | 1, 2, 4 (child-before-parent) |
-| input_stand_in | MergeTree / SharedMergeTree | `stand_in_seq, transaction_hash, input_index` | none | 8192 | 4, 5 (stand-in `input` rows; read by the gate) |
-| input_stand_in_resolution | MergeTree / SharedMergeTree | `stand_in_seq, commit_seq` | none | 8192 | 4, 5 (resolved stand-ins; read by the gate) |
+| spend (item 28) | MergeTree / SharedMergeTree | `locking_bytecode_prefix, transaction_hash, input_index` (p_category: `token_category, nonfungible_token_commitment_key, transaction_hash, input_index`) | `intDiv(batch, 2^20)` | 1024 | node-agnostic (7); filled behind `spend_watermark`, never on the commit path |
+| spend_orphan (item 28) | MergeTree / SharedMergeTree | `outpoint_transaction_hash, outpoint_index` | `intDiv(batch, 2^20)` | 8192 | inputs a spend batch found no stored output for |
+| spend_watermark (item 28) | ReplacingMergeTree(watermark) / SharedReplacingMergeTree | `watermark` | none | 8192 | one row per finished spend batch; readers take `max` |
+
+`pending_spend`, `input_stand_in` and `input_stand_in_resolution` were removed on 2026-10-11 (item 28).
 
 Projections (060): `block.p_height (height)`, `transaction.p_id (internal_id)`,
 `block_transaction.p_tx (transaction_hash)`, `output.p_script (locking_bytecode_prefix, transaction_hash, output_index)`,
 `output.p_category (token_category, nonfungible_token_commitment_key, transaction_hash, output_index)`,
-`input.p_outpoint (outpoint_transaction_hash, outpoint_index)`, `input.p_spent_script (locking_bytecode_prefix, transaction_hash, input_index)`,
-`input.p_spent_category (token_category, nonfungible_token_commitment_key, transaction_hash, input_index)`,
-`tx_acceptance.p_node_height (node_internal_id, height, transaction_internal_id)`. All full-column; the three
-`input` ones omit `unlocking_bytecode` (plan). All accepted by both servers. Skip indexes: `bloom_filter` on
+`input.p_outpoint (outpoint_transaction_hash, outpoint_index)`, `tx_acceptance.p_node_height (node_internal_id, height,
+transaction_internal_id)`, and in 070 `spend.p_category (token_category, nonfungible_token_commitment_key, transaction_hash,
+input_index)`. All full-column except `input.p_outpoint`, which is slim (outpoint, input key, `commit_seq`) at
+granularity 128 with 4 KiB blocks (item 28). `input.p_spent_script` / `p_spent_category` were removed (their
+job is the spend index's). All accepted by both servers. Skip indexes: `bloom_filter` on
 `output.locking_bytecode` and `input.outpoint_transaction_hash` (plan §2.4 fallbacks).
 
 ## Views (050)
@@ -78,6 +82,7 @@ Projections (060): `block.p_height (height)`, `transaction.p_id (internal_id)`,
 | every node-scoped `*_at` (WP4, WP6b) | `node`, `visible`, `fence`, `void` | `seq <= visible`, `seq & 0xFFFFFFFFFF <= fence[seq >> 40]`, `seq` not in `void` (all parameters; no subqueries) | as `*_v` | pins one snapshot across views (no torn reads) |
 | `block_at`, `transaction_at`, `block_transaction_at`, `output_at`, `input_at` (WP4, WP6b) | `visible0`, `tail`, `fence`, `void` | (`seq <= visible0` or `seq` in `tail`), fence and void as above | none | pinned node-agnostic snapshot |
 | `node_v` | none | `FINAL` | Replacing | 7 (name → id) |
+| `spend_at` (070) | `spend` | `batch <= spend` (the snapshot's spend watermark, at most visible(0)); the pairs above it come from the join (read rule, item 28) | none | node-agnostic |
 
 Querying a node-scoped view without `node` is an error, so no acceptance answer can be had without naming
 a node. Verified on both servers: every view executes; the outer `WHERE` on a key column is pushed into the
@@ -167,12 +172,12 @@ Both servers default `async_insert = 1`, `insert_deduplicate = 1`, `deduplicate_
    `ALTER TABLE cg.commit_log MODIFY COLUMN kind Enum8(…, 'horizon_switch' = 8, 'backfill' = 9)` in
    `040_bookkeeping.sql`; existing values keep their numbers.
 10. `writer_lease` is `ReplacingMergeTree(heartbeat_at)`, not KeeperMap (the local server has no Keeper).
-11. `pending_spend` is keyed by outpoint first (probed when a parent's outputs arrive), then node, then spender.
+11. ~~`pending_spend` is keyed by outpoint first …~~ **Removed (item 28).**
 12. `id_reservation` ranges are half-open `[range_start, range_end)`, with `writer_epoch`.
 13. Node-scoped views take the node's internal id (`{node:UInt32}`); the API resolves the name via `node_v`.
     A missing `visibility` row means watermark 0 (nothing visible).
 14. The aborted-set subquery is not bounded by `visible(n)` (the set is tiny).
-15. Input rows whose outpoint is not yet stored: proposed for WP5 that the `fill_pending` commit writes the
+15. **Superseded by item 28** (inputs carry no spent output). Input rows whose outpoint is not yet stored: proposed for WP5 that the `fill_pending` commit writes the
     complete `input` row (the child's commit writes only `pending_spend`), because `input` is immutable
     MergeTree and its spent-output attributes cannot be filled in later without a mutation.
 16. `node.internal_id` is UInt32 (Postgres `integer`); `node` gains `updated_at` (the Replacing version) and
@@ -194,7 +199,7 @@ WP4 amendments (design: `docs/clickhouse-port/wp4-commit-and-visibility.md`):
 
 WP5a-core amendments (design: `docs/clickhouse-port/wp5a-core.md`):
 
-23. `input.fungible_token_amount Nullable(Int64)` (after `token_category`): the spent output's FT amount,
+23. **Superseded by item 28.** `input.fungible_token_amount Nullable(Int64)` (after `token_category`): the spent output's FT amount,
     the plan gap WP2 found. `010_core.sql` creates it and also runs `ALTER TABLE … ADD COLUMN IF NOT EXISTS`
     for older databases. The three `input` projections list it. **Databases created before WP5a** keep their
     old projections (`ADD PROJECTION IF NOT EXISTS`): on an empty table run
@@ -222,7 +227,7 @@ WP5a-core amendments (design: `docs/clickhouse-port/wp5a-core.md`):
 
 Mempool fill fix (design: `docs/clickhouse-port/mempool-fill-fix.md`):
 
-27. `input_stand_in` / `input_stand_in_resolution`. Item 15 is replaced: a mempool transaction saved with an
+27. **Removed by item 28.** `input_stand_in` / `input_stand_in_resolution`. Item 15 is replaced: a mempool transaction saved with an
     unknown spent output writes that input's `input` row with a stand-in spent output (value 0, empty bytecode,
     no token) under its own `fill_pending` commit P (one per unknown parent transaction), never under the
     transaction's seq C. `input_stand_in` lists P's inputs and its owner C; `input_stand_in_resolution` names the
@@ -230,6 +235,24 @@ Mempool fill fix (design: `docs/clickhouse-port/mempool-fill-fix.md`):
     `void` parameter while C is not visible and once R is visible, so a reader sees the stand-in exactly while C
     is visible and R is not, and never both rows. `input_v` applies the same rule with subqueries. **Apply the
     DDL before starting an agent of this version**: the snapshot reads both tables.
+
+Input denormalisation drop + spend index (owner decision 2026-10-11; design: `docs/clickhouse-port/spend-index.md`):
+
+28. **`input` stores the input's own fields only** (outpoint, sequence number, unlocking bytecode, ids,
+    `commit_seq`). The spent output's value, locking bytecode (+ MATERIALIZED prefix), token category, FT
+    amount and NFT capability/commitment (+ key) are gone, with `p_spent_script` / `p_spent_category`,
+    `pending_spend`, the stand-in tables and `block.generated_value_satoshis` (computed at read time, as
+    Postgres's `block_generated_value_satoshis`). `p_outpoint` is slim. Every row a commit writes comes from its
+    own transactions. Spent-output attributes are a join on the outpoint (output's primary key), or the
+    **spend index** (`070_spend.sql`): `spend` rows (input key, outpoint, spent attributes, input and output
+    `commit_seq`, `batch`) written server-side by `INSERT … SELECT` from `input ⋈ output` in commit-seq batches up
+    to visible(0), behind `spend_watermark`, off the commit path. Readers see `spend` up to their snapshot's
+    spend watermark W and take every pair with a seq above W from the join (exact at the snapshot). `commit_log`
+    keeps the enum values `incomplete` / `fill_pending` (never written now) so older databases still apply.
+29. **Upgrade path:** none in place. A database created before item 28 (input with spent-output columns,
+    `pending_spend`, the stand-in tables or `p_spent_*`) is refused by the DDL CLI (`legacySchemaFindings`);
+    re-sync into a new database. `CREATE TABLE IF NOT EXISTS` / `ADD PROJECTION IF NOT EXISTS` would leave the
+    old objects in place, and an agent of this version would write fewer columns into the old `input`.
 
 ## Differences: Cloud 26.6 vs local 26.8
 
@@ -245,7 +268,7 @@ Mempool fill fix (design: `docs/clickhouse-port/mempool-fill-fix.md`):
 
 **Satisfied by the schema.**
 - **1 Keys.** `node_internal_id` is in the key of node_block, node_transaction, tx_acceptance, utxo,
-  utxo_by_script, both histories, visibility and pending_spend.
+  utxo_by_script, both histories and visibility.
 - **2 Isolation.** VCMT only collapses rows with equal keys, which include the node, so a −1 for node A can
   never cancel node B's +1. Watermarks are per node. Check d shows a node-1 spend not leaking into node 2.
 - **3 No any-node shortcuts.** There is no summarised marker (no E15-B column). `utxo` rows are per node.
@@ -287,8 +310,7 @@ safety), wp5a-core.md §6 (checklist review).*
 - `visibility` row 0 (the node-agnostic watermark): used only by the node-agnostic views, never by a
   node-scoped answer.
 - `commit_log.node_scope` (an array, not a key): bookkeeping for the watermark, not an answer.
-- `input`'s denormalised spent-output attributes are immutable output facts, not acceptance facts.
-- Plan gap: `input` did not denormalise `fungible_token_amount` (the plan's list omits it). *Fixed in WP5a (item 23).*
+- `spend` (the spend index) holds immutable output facts per input, not acceptance facts (item 28).
 
 ## UTXO growth and compaction (WP5c, design only, not built)
 
