@@ -228,7 +228,19 @@ node build/api/catalogue-run.js [--latency 9] [--update-headers] [L1 X6 …]
 
 The v1 side is Hasura (`chaingraph/hasura:dev-build`, container `ch1-api-hasura`, `HASURA_GRAPHQL_STRINGIFY_NUMERIC_TYPES`)
 over `chipnet_pg` through a read-only connection (`default_transaction_read_only=on`; metadata in the scratch database
-`ch1_api_hasura_meta`). The runner walks every page on both sides (v1 as the library does: keyset, composite keyset,
+`ch1_api_hasura_meta`). Recreate it (it was removed after the run):
+
+```sh
+psql … -c "CREATE DATABASE ch1_api_hasura_meta"
+docker run -d --name ch1-api-hasura -p 18080:8080 --entrypoint graphql-engine \
+  -e HASURA_GRAPHQL_METADATA_DATABASE_URL=postgres://chaingraph:…@host.docker.internal:15432/ch1_api_hasura_meta \
+  -e 'HASURA_GRAPHQL_DATABASE_URL=postgres://chaingraph:…@host.docker.internal:15432/chipnet_pg?options=-c%20default_transaction_read_only%3Don' \
+  -e HASURA_GRAPHQL_ADMIN_SECRET=… -e WEBHOOK_HANDLER_BASE_URL=http://127.0.0.1:1 -e HASURA_GRAPHQL_STRINGIFY_NUMERIC_TYPES=true \
+  chaingraph/hasura:dev-build serve
+docker exec ch1-api-hasura hasura-cli metadata apply --endpoint http://localhost:8080 --admin-secret … --project /hasura-data --skip-update-check
+```
+
+The runner walks every page on both sides (v1 as the library does: keyset, composite keyset,
 offset), normalises (no `\x`; integers as strings; internal ids and per-sync timestamps dropped; nested lists as sets;
 v1's single-row lists unwrapped) and compares.
 
