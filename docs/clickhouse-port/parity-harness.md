@@ -34,7 +34,8 @@ dependency. The self-test applies the DDL with `src/store/clickhouse/ddl/apply.s
 | `transaction` | node-agnostic | tx-hash prefixes | `transaction` in scope | `transaction_at` in scope |
 | `output` | node-agnostic | tx-hash prefixes | `output` of in-scope txs | `output_at` |
 | `input` | node-agnostic | tx-hash prefixes | `input` of in-scope txs | `input_at` |
-| `input_spent` *(opt-in)* | node-agnostic | tx-hash prefixes | `input ⋈ output` on the outpoint | ClickHouse's denormalised spent-output columns on `input_at` |
+| `spend` *(opt-in)* | node-agnostic | tx-hash prefixes | `input ⋈ output` on the outpoint | the spend index, `spend_at` up to the snapshot's spend watermark (exact once the index has caught up; [spend-index.md](spend-index.md)) |
+| `spend_join` *(opt-in)* | node-agnostic | tx-hash prefixes | `input ⋈ output` on the outpoint | `input_at ⋈ output_at` on the outpoint |
 | `node_block` | per node | height ranges | `node_block ⋈ block` | `node_block_at` (its `block_hash`, `height`) |
 | `tx_acceptance` | per node | tx-hash prefixes (+ `mempool`) | **ACC predicate** (below) | `tx_acceptance_at ⋈ block_at` |
 | `node_transaction` | per node | `mempool` (only with `--include-mempool`) | `node_transaction` | `node_transaction_at` |
@@ -83,7 +84,7 @@ One text value `s` per row on both engines: fields joined with `|`.
 | `transaction` | `hash\|version\|locktime\|size_bytes\|is_coinbase` |
 | `output`, `utxo` | `transaction_hash\|output_index\|value_satoshis\|locking_bytecode\|token_category\|fungible_token_amount\|nonfungible_token_capability\|nonfungible_token_commitment` |
 | `input` | `transaction_hash\|input_index\|outpoint_transaction_hash\|outpoint_index\|sequence_number\|unlocking_bytecode` |
-| `input_spent` | `transaction_hash\|input_index\|value_satoshis\|locking_bytecode\|token_category\|fungible_token_amount\|nonfungible_token_capability\|nonfungible_token_commitment` (coinbase and unresolved outpoints excluded) |
+| `spend`, `spend_join` | `transaction_hash\|input_index\|outpoint_transaction_hash\|outpoint_index\|value_satoshis\|locking_bytecode\|token_category\|fungible_token_amount\|nonfungible_token_capability\|nonfungible_token_commitment` (inputs whose spent output is stored) |
 | `node_block` | `block_hash\|height\|accepted_at?` |
 | `tx_acceptance` | `transaction_hash\|block_hash\|height`; mempool rows `transaction_hash\|mempool\|-` |
 | `node_transaction` | `transaction_hash\|validated_at?` |
@@ -95,12 +96,13 @@ NULL = confirmed), so it is always compared exactly.
 
 **Columns not compared:**
 - ClickHouse-only derived columns: `block.transaction_count`, `block.output_value_satoshis`,
-  `block.generated_value_satoshis`, `transaction.input_count`, `transaction.output_count`,
+  `transaction.input_count`, `transaction.output_count`,
   `transaction.output_value_satoshis`, `utxo.created_height` (always 0, WP5a §3).
 - History rows' own `internal_id`.
 
-Postgres computes the derived columns through functions. Comparing them belongs to the plan's API row (§5.2). The
-spent-output copies on `input` are covered by the opt-in `input_spent`.
+Postgres computes the derived columns through functions. Comparing them belongs to the plan's API row (§5.2).
+`input` carries no spent-output copies since 2026-10-11 (`input_spent` is retired); the spend index is compared by
+the opt-in `spend` / `spend_join`.
 
 ### Timestamps
 

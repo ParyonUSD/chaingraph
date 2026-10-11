@@ -1,5 +1,7 @@
 # `CHAINGRAPH_CLICKHOUSE_UTXO=off`: no stored UTXO tables
 
+> **2026-10-11** ([spend-index.md](spend-index.md)): with UTXO off nothing resolves a spent output any more (no lookup, no output cache, no pending spends); spent-output filters use the spend index.
+
 `CHAINGRAPH_CLICKHOUSE_UTXO=on|off` (default `on`, validated in `src/config.ts`) picks whether the ClickHouse store
 keeps the per-node UTXO set in `utxo` / `utxo_by_script`. With `off` the store offers what upstream Chaingraph v1
 offers: no stored unspent root. Unspent outputs are worked out at query time from `output`, `input` and acceptance.

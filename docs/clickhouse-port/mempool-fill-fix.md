@@ -2,6 +2,8 @@
 
 # Mempool fill fix: stand-in input rows resolved exactly
 
+> **Superseded 2026-10-11** ([spend-index.md](spend-index.md)): `input` no longer carries the spent output, so stand-in rows, `input_stand_in(_resolution)`, `fill_pending` commits and the mempool orphan pool are gone. Kept as the record of the fix.
+
 Date 2026-10-10. Local only (ch1-local ClickHouse 26.8, ch1-pg). Found by the chipnet lab
 ([chipnet-lab.md](chipnet-lab.md), first run). Inputs: [wp4-commit-and-visibility.md](wp4-commit-and-visibility.md),
 [wp5a-core.md](wp5a-core.md), [wp5a-mempool.md](wp5a-mempool.md), [g1-fix-pass.md](g1-fix-pass.md),

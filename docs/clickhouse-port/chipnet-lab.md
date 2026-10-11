@@ -82,8 +82,11 @@ follow-the-tip phase.
 `ch1-chipnet-parity.sh`:
 
 - compares at `--at-height H`, `H = min(both tips)` (or `--height H`);
-- tables: `block, block_transaction, transaction, output, input, input_spent, node_block, tx_acceptance,
-  node_block_history, node_transaction_history`;
+- tables: `block, block_transaction, transaction, output, input, spend, spend_join, node_block, tx_acceptance,
+  node_block_history, node_transaction_history` (`CHIPNET_PARITY_TABLES` overrides; `input_spent` was retired on
+  2026-10-11 with input's spent-output columns, [spend-index.md](spend-index.md));
+- `ch1-chipnet-spend-check.mjs <agent dir> <url> <db>`: the spend index against the join on one snapshot (missing,
+  extra, duplicated, mismatched rows; the lag);
 - options: `--timestamps exclude`, `--hash-chunks 16`, `--diff`;
 - mempool is excluded (the compare.mjs default).
 
