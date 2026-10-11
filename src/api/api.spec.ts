@@ -29,6 +29,7 @@ import {
 } from '../store/clickhouse/visibility.js';
 
 import type { QueryEvent } from './db.js';
+import { dataQuerySettings } from './db.js';
 import { schema } from './schema.js';
 import type { Api, RunningServer } from './server.js';
 import { createApi, listen } from './server.js';
@@ -1456,7 +1457,11 @@ e2e(
       // warm up
       for (let index = 0; index < 20; index += 1) {
         await env.gql(query, variables);
-        await env.client.query(statement.sql, statement.params);
+        await env.client.query(
+          statement.sql,
+          statement.params,
+          dataQuerySettings
+        );
       }
       const api: number[] = [];
       const sql: number[] = [];
@@ -1469,17 +1474,29 @@ e2e(
         await env.gql(query, variables);
         api.push(performance.now() - start);
         start = performance.now();
-        await env.client.query(statement.sql, statement.params);
+        await env.client.query(
+          statement.sql,
+          statement.params,
+          dataQuerySettings
+        );
         sql.push(performance.now() - start);
         start = performance.now();
         await env.api.db.readSnapshot(env.nodes.node1);
         snapshotOnly.push(performance.now() - start);
-        await env.client.query(statement.sql, statement.params);
+        await env.client.query(
+          statement.sql,
+          statement.params,
+          dataQuerySettings
+        );
         snapshotAndSql.push(performance.now() - start);
         start = performance.now();
         await env.api.db.pinnedSnapshot([env.nodes.node1]);
         cachedOnly.push(performance.now() - start);
-        await env.client.query(statement.sql, statement.params);
+        await env.client.query(
+          statement.sql,
+          statement.params,
+          dataQuerySettings
+        );
         cachedAndSql.push(performance.now() - start);
       }
       const p50 = {

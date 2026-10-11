@@ -1,23 +1,31 @@
-/* eslint-disable camelcase, @typescript-eslint/naming-convention, complexity, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, max-params, no-underscore-dangle */
-// cspell:ignore clickhouse unhex seqs
+/* eslint-disable camelcase, @typescript-eslint/naming-convention, complexity, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, max-params, no-underscore-dangle, max-lines, @typescript-eslint/no-use-before-define, functional/no-let, functional/no-loop-statement, @typescript-eslint/member-ordering */
+// cspell:ignore clickhouse unhex seqs nfts
 /**
- * SQL building blocks of the v2 API spike (Phase 2): a parameter binder and
- * the filter compilers for the typed `where` inputs.
+ * SQL building blocks of the v2 API (Phase 2): a parameter binder and the
+ * filter compilers for the typed `where` inputs.
  *
- * Rules (docs/clickhouse-port/phase2-spike.md §2):
+ * Rules (docs/clickhouse-port/phase2-api.md §2):
  * - Every client value is bound as a `{pN:Type}` query parameter; nothing a
  *   client sends is ever interpolated into SQL text. Identifiers come from
  *   fixed tables in this file, never from a request.
  * - The snapshot parameters (`node`, `visible`, `visible0`, `tail`, `fence`,
- *   `void`, `spend`) are set only from `readSnapshot` (`Sql` constructor). Client
- *   values are always bound under `p0`, `p1`, …, so they cannot collide with
- *   or override a snapshot parameter.
- * - Every read goes through a pinned `*_at` view (`Sql.view`).
+ *   `void`, `spend`, and `node_<id>` / `visible_<id>` for further pinned
+ *   nodes) are set only from `readSnapshot(Multi)` (`Sql` constructor).
+ *   Client values are always bound under `p0`, `p1`, …, so they cannot
+ *   collide with or override a snapshot parameter.
+ * - Every read goes through a pinned `*_at` view (`Sql.view`,
+ *   `Sql.nodeView`).
+ * - Per-node predicates (acceptance, mempool, blocks, spends) name their node
+ *   explicitly; a filter without a node is node-agnostic.
  */
 import { GraphQLError } from 'graphql';
 
 import type { VisibilitySnapshot } from '../store/clickhouse/visibility.js';
-import { pinnedView, snapshotParams } from '../store/clickhouse/visibility.js';
+import {
+  nodeAgnosticId,
+  pinnedView,
+  snapshotParams,
+} from '../store/clickhouse/visibility.js';
 
 /** Names of the snapshot parameters; a client can never set them. */
 export const snapshotParameterNames = [
@@ -31,18 +39,75 @@ export const snapshotParameterNames = [
 ] as const;
 
 const clientParamPattern = /^p\d+$/u;
+const extraNodeParamPattern = /^(?:node|visible)_\d+$/u;
 
 /** True for a parameter name the binder hands out for client values. */
 export const isClientParamName = (name: string) =>
   clientParamPattern.test(name);
+
+/** True for a snapshot parameter of a further pinned node (`node_<id>`, `visible_<id>`). */
+export const isExtraNodeParamName = (name: string) =>
+  extraNodeParamPattern.test(name);
+
+export const invalid = (message: string) =>
+  new GraphQLError(message, { extensions: { code: 'BAD_USER_INPUT' } });
+
+/** Maximum list elements bound in one query parameter (ClickHouse's 128 KiB field limit). */
+export const maxListChunk = 1_000;
+
+const chunks = <T>(values: readonly T[], size = maxListChunk): T[][] => {
+  const out: T[][] = [];
+  for (let start = 0; start < values.length; start += size) {
+    out.push(values.slice(start, start + size));
+  }
+  return out.length === 0 ? [[]] : out;
+};
 
 export class Sql {
   readonly params: { [name: string]: unknown };
 
   private next = 0;
 
-  constructor(readonly snapshot: VisibilitySnapshot) {
+  /**
+   * `snapshot`: the request snapshot at the statement's primary node (its
+   * `node`/`visible` parameters; node 0 for a node-agnostic statement).
+   * `others`: visible(n) of every further node the request pinned (one
+   * multi-node snapshot: they share visible0, tail, fence and void).
+   */
+  constructor(
+    readonly snapshot: VisibilitySnapshot,
+    readonly others: ReadonlyMap<number, bigint> = new Map()
+  ) {
     this.params = { ...snapshotParams(snapshot) };
+  }
+
+  /** The statement's primary node (undefined for a node-agnostic statement). */
+  get primaryNode(): number | undefined {
+    return this.snapshot.nodeId === nodeAgnosticId
+      ? undefined
+      : this.snapshot.nodeId;
+  }
+
+  private names = 0;
+
+  /** A name for a statement-local CTE (unique within the statement). */
+  uniqueName(prefix: string) {
+    this.names += 1;
+    return `${prefix}_${this.names}`;
+  }
+
+  /**
+   * Rows of `rows` (a subquery with a `transaction_hash` column) whose
+   * transaction the node accepts, with `columns` selected: the rows are
+   * computed once (a statement-local MATERIALIZED CTE) and the acceptance
+   * check reads only their transactions' acceptance rows.
+   */
+  acceptedRows(rows: string, columns: string, node?: number) {
+    const name = this.uniqueName('acc');
+    return `WITH ${name} AS MATERIALIZED (${rows}) SELECT ${columns} FROM ${name} WHERE transaction_hash IN (${this.accepted(
+      node,
+      `SELECT transaction_hash FROM ${name}`
+    )})`;
   }
 
   /** Bind a value; returns its `{pN:Type}` placeholder. */
@@ -53,48 +118,88 @@ export class Sql {
     return `{${name}:${type}}`;
   }
 
-  /** A pinned view call bound to this request's snapshot. */
+  /** A node-agnostic pinned view (or the primary node's) bound to the snapshot. */
   // eslint-disable-next-line class-methods-use-this
   view(name: string) {
     return pinnedView(name);
   }
 
-  /** `SELECT transaction_hash FROM tx_acceptance_at(...)`: ACC for the snapshot's node. */
-  accepted() {
-    return `SELECT transaction_hash FROM ${this.view('tx_acceptance_at')}`;
+  /**
+   * A node-scoped pinned view of `node` (default: the primary node). A node
+   * other than the primary one must be pinned by the request snapshot; its
+   * `node_<id>` / `visible_<id>` parameters come from that snapshot.
+   */
+  nodeView(name: string, node?: number) {
+    const id = node ?? this.primaryNode;
+    if (id === undefined || id === nodeAgnosticId) {
+      throw invalid(
+        'This field reads per-node data: name the node (`node:` argument).'
+      );
+    }
+    if (id === this.snapshot.nodeId) return pinnedView(name);
+    const visible = this.others.get(id);
+    if (visible === undefined) {
+      throw new GraphQLError(`Node ${id} is not pinned by this request.`);
+    }
+    this.params[`node_${id}`] = id;
+    this.params[`visible_${id}`] = visible;
+    return `${name}(node = {node_${id}:UInt32}, visible = {visible_${id}:UInt64}, fence = {fence:Array(UInt64)}, void = {void:Array(UInt64)})`;
+  }
+
+  /**
+   * ACC: `SELECT transaction_hash` of transactions the node accepts (a block
+   * it accepts or its mempool). With `among` (a subquery of transaction
+   * hashes), only those are checked: the acceptance view is then read by its
+   * primary key, not in full.
+   */
+  accepted(node?: number, among?: string) {
+    return `SELECT transaction_hash FROM ${this.nodeView(
+      'tx_acceptance_at',
+      node
+    )}${among === undefined ? '' : ` WHERE transaction_hash IN (${among})`}`;
   }
 }
 
 /* ------------------------------------------------------------------ */
-/* filter input shapes (as coerced by the schema)                       */
+/* comparison input shapes (as coerced by the schema)                   */
 /* ------------------------------------------------------------------ */
 
 export interface IntComparison {
   _eq?: number | null;
   _neq?: number | null;
   _in?: readonly number[] | null;
+  _nin?: readonly number[] | null;
   _gt?: number | null;
   _gte?: number | null;
   _lt?: number | null;
   _lte?: number | null;
+  _is_null?: boolean | null;
 }
 
 export interface BigIntComparison {
   _eq?: bigint | null;
   _neq?: bigint | null;
   _in?: readonly bigint[] | null;
+  _nin?: readonly bigint[] | null;
   _gt?: bigint | null;
   _gte?: bigint | null;
   _lt?: bigint | null;
   _lte?: bigint | null;
+  _is_null?: boolean | null;
 }
 
 export interface HexComparison {
   _eq?: string | null;
   _neq?: string | null;
   _in?: readonly string[] | null;
+  _nin?: readonly string[] | null;
+  _gt?: string | null;
+  _gte?: string | null;
+  _lt?: string | null;
+  _lte?: string | null;
   _is_null?: boolean | null;
   _prefix?: string | null;
+  _prefix_in?: readonly string[] | null;
 }
 
 export type Capability = 'minting' | 'mutable' | 'none';
@@ -103,14 +208,37 @@ export interface CapabilityComparison {
   _eq?: Capability | null;
   _neq?: Capability | null;
   _in?: readonly Capability[] | null;
+  _nin?: readonly Capability[] | null;
   _is_null?: boolean | null;
 }
+
+export interface BooleanComparison {
+  _eq?: boolean | null;
+  _neq?: boolean | null;
+}
+
+/** ISO-8601 timestamps (UTC unless the string has an offset). */
+export interface TimestampComparison {
+  _eq?: string | null;
+  _neq?: string | null;
+  _gt?: string | null;
+  _gte?: string | null;
+  _lt?: string | null;
+  _lte?: string | null;
+  _is_null?: boolean | null;
+}
+
+/* ------------------------------------------------------------------ */
+/* filter input shapes                                                  */
+/* ------------------------------------------------------------------ */
 
 /** Filters on output attributes; also used for a spent output (`outpoint`). */
 export interface OutputFilter {
   _and?: readonly OutputFilter[] | null;
   _or?: readonly OutputFilter[] | null;
   _not?: OutputFilter | null;
+  transaction_hash?: HexComparison | null;
+  transaction_internal_id?: BigIntComparison | null;
   output_index?: IntComparison | null;
   value_satoshis?: BigIntComparison | null;
   locking_bytecode?: HexComparison | null;
@@ -118,20 +246,30 @@ export interface OutputFilter {
   fungible_token_amount?: BigIntComparison | null;
   nonfungible_token_capability?: CapabilityComparison | null;
   nonfungible_token_commitment?: HexComparison | null;
+  /** The creating transaction matches (same output row). */
+  transaction?: TransactionFilter | null;
+  /** EXISTS an input spending the output, in a transaction the node accepts, matching. */
+  spent_by?: InputFilter | null;
 }
 
 export interface InputFilter {
   _and?: readonly InputFilter[] | null;
   _or?: readonly InputFilter[] | null;
   _not?: InputFilter | null;
+  transaction_hash?: HexComparison | null;
+  transaction_internal_id?: BigIntComparison | null;
   input_index?: IntComparison | null;
   outpoint_transaction_hash?: HexComparison | null;
+  outpoint_index?: BigIntComparison | null;
+  sequence_number?: BigIntComparison | null;
   /**
    * The spent output: the input row's outpoint is the key of an output
    * matching it (still a predicate on the same input row, so same-row
    * conjunction holds).
    */
   outpoint?: OutputFilter | null;
+  /** The spending transaction matches. */
+  transaction?: TransactionFilter | null;
 }
 
 export interface BlockWindow {
@@ -149,12 +287,82 @@ export interface TransactionFilter {
   _not?: TransactionFilter | null;
   internal_id?: BigIntComparison | null;
   hash?: HexComparison | null;
+  version?: IntComparison | null;
+  locktime?: BigIntComparison | null;
+  size_bytes?: IntComparison | null;
+  is_coinbase?: BooleanComparison | null;
+  input_count?: IntComparison | null;
+  output_count?: IntComparison | null;
+  output_value_satoshis?: BigIntComparison | null;
   /** EXISTS an output of this transaction matching all of the filter (one row). */
   has_output?: OutputFilter | null;
   /** EXISTS an input of this transaction matching all of the filter (one row). */
   has_input?: InputFilter | null;
   /** WIN, per node: in a block the node accepts with height in the window, or in its mempool. */
   block_window?: BlockWindow | null;
+  /** Per node: in a block the node accepts that matches. */
+  in_block?: BlockFilter | null;
+  /** Per node: in (true) or not in (false) the node's mempool. */
+  in_mempool?: boolean | null;
+}
+
+export interface BlockFilter {
+  _and?: readonly BlockFilter[] | null;
+  _or?: readonly BlockFilter[] | null;
+  _not?: BlockFilter | null;
+  hash?: HexComparison | null;
+  internal_id?: BigIntComparison | null;
+  height?: IntComparison | null;
+  version?: IntComparison | null;
+  timestamp?: BigIntComparison | null;
+  previous_block_hash?: HexComparison | null;
+  merkle_root?: HexComparison | null;
+  bits?: BigIntComparison | null;
+  nonce?: BigIntComparison | null;
+  size_bytes?: IntComparison | null;
+  transaction_count?: IntComparison | null;
+  /** EXISTS a transaction in the block matching. */
+  has_transaction?: TransactionFilter | null;
+}
+
+/** A mempool entry (node_transaction): the node's validation of a transaction. */
+export interface NodeTransactionFilter {
+  _and?: readonly NodeTransactionFilter[] | null;
+  _or?: readonly NodeTransactionFilter[] | null;
+  _not?: NodeTransactionFilter | null;
+  transaction_internal_id?: BigIntComparison | null;
+  transaction_hash?: HexComparison | null;
+  validated_at?: TimestampComparison | null;
+  transaction?: TransactionFilter | null;
+}
+
+/** An accepted block (node_block). */
+export interface NodeBlockFilter {
+  _and?: readonly NodeBlockFilter[] | null;
+  _or?: readonly NodeBlockFilter[] | null;
+  _not?: NodeBlockFilter | null;
+  block_internal_id?: BigIntComparison | null;
+  height?: IntComparison | null;
+  accepted_at?: TimestampComparison | null;
+  block?: BlockFilter | null;
+}
+
+/** A block inclusion of a transaction (per node). */
+export interface BlockInclusionFilter {
+  _and?: readonly BlockInclusionFilter[] | null;
+  _or?: readonly BlockInclusionFilter[] | null;
+  _not?: BlockInclusionFilter | null;
+  transaction_index?: IntComparison | null;
+  block?: BlockFilter | null;
+}
+
+/** A transaction of a block. */
+export interface BlockTransactionFilter {
+  _and?: readonly BlockTransactionFilter[] | null;
+  _or?: readonly BlockTransactionFilter[] | null;
+  _not?: BlockTransactionFilter | null;
+  transaction_index?: IntComparison | null;
+  transaction?: TransactionFilter | null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -164,10 +372,9 @@ export interface TransactionFilter {
 type HexColumnKind = 'bytes' | 'hash' | 'nullableBytes' | 'tokenCategory';
 
 const hashBytes = 32;
-const zeroCategory = `toFixedString(unhex('${'00'.repeat(hashBytes)}'), 32)`;
-
-const invalid = (message: string) =>
-  new GraphQLError(message, { extensions: { code: 'BAD_USER_INPUT' } });
+export const zeroCategory = `toFixedString(unhex('${'00'.repeat(
+  hashBytes
+)}'), 32)`;
 
 const assertHashLength = (hex: string, column: string) => {
   if (hex.length !== hashBytes * 2) {
@@ -175,38 +382,108 @@ const assertHashLength = (hex: string, column: string) => {
   }
 };
 
-const all = (parts: readonly string[]) =>
+export const all = (parts: readonly string[]) =>
   parts.length === 0 ? '1' : parts.map((part) => `(${part})`).join(' AND ');
 
-const any = (parts: readonly string[]) =>
+export const any = (parts: readonly string[]) =>
   parts.length === 0 ? '0' : parts.map((part) => `(${part})`).join(' OR ');
 
-const numericComparison = (
+const given = <T>(value: T | null | undefined): value is T =>
+  value !== undefined && value !== null;
+
+/** ClickHouse integer column types and their ranges. */
+const integerRanges: { [type: string]: readonly [bigint, bigint] } = {
+  Int32: [-(2n ** 31n), 2n ** 31n - 1n],
+  Int64: [-(2n ** 63n), 2n ** 63n - 1n],
+  UInt32: [0n, 2n ** 32n - 1n],
+  UInt64: [0n, 2n ** 64n - 1n],
+  UInt8: [0n, 255n],
+};
+
+/**
+ * Numeric comparisons on a non-null integer column of ClickHouse type
+ * `type`. A value outside the column's range is resolved here (e.g.
+ * `internal_id > -1` is always true), so binding never fails and the key
+ * condition stays on the column's own type.
+ */
+export const numericComparison = (
   sql: Sql,
   column: string,
   type: string,
-  comparison: BigIntComparison | IntComparison
+  comparison: BigIntComparison | IntComparison,
+  nullable = false
 ) => {
+  const [min, max] = integerRanges[type] ?? [-(2n ** 127n), 2n ** 127n - 1n];
   const parts: string[] = [];
-  const operators: [keyof IntComparison, string][] = [
-    ['_eq', '='],
-    ['_neq', '!='],
-    ['_gt', '>'],
-    ['_gte', '>='],
-    ['_lt', '<'],
-    ['_lte', '<='],
-  ];
-  operators.forEach(([key, operator]) => {
-    const value = comparison[key];
-    if (value !== undefined && value !== null) {
-      parts.push(`${column} ${operator} ${sql.bind(value, type)}`);
+  const value = (raw: bigint | number) => BigInt(raw);
+  const bindValue = (raw: bigint) => sql.bind(raw, type);
+  if (given(comparison._eq)) {
+    const v = value(comparison._eq);
+    parts.push(v < min || v > max ? '0' : `${column} = ${bindValue(v)}`);
+  }
+  if (given(comparison._neq)) {
+    const v = value(comparison._neq);
+    parts.push(v < min || v > max ? '1' : `${column} != ${bindValue(v)}`);
+  }
+  const range = (
+    key: '_gt' | '_gte' | '_lt' | '_lte',
+    operator: string,
+    belowMin: '0' | '1',
+    aboveMax: '0' | '1'
+  ) => {
+    const raw = comparison[key];
+    if (!given(raw)) return;
+    const v = value(raw);
+    if (v < min) parts.push(belowMin);
+    else if (v > max) parts.push(aboveMax);
+    else parts.push(`${column} ${operator} ${bindValue(v)}`);
+  };
+  range('_gt', '>', '1', '0');
+  range('_gte', '>=', '1', '0');
+  range('_lt', '<', '0', '1');
+  range('_lte', '<=', '0', '1');
+  const inRange = (values: readonly (bigint | number)[]) =>
+    values.map(value).filter((v) => v >= min && v <= max);
+  if (given(comparison._in)) {
+    const values = inRange(comparison._in);
+    parts.push(
+      values.length === 0
+        ? '0'
+        : any(
+            chunks(values).map(
+              (chunk) => `${column} IN ${sql.bind(chunk, `Array(${type})`)}`
+            )
+          )
+    );
+  }
+  if (given(comparison._nin)) {
+    const values = inRange(comparison._nin);
+    if (values.length > 0) {
+      parts.push(
+        all(
+          chunks(values).map(
+            (chunk) => `${column} NOT IN ${sql.bind(chunk, `Array(${type})`)}`
+          )
+        )
+      );
     }
-  });
-  if (comparison._in !== undefined && comparison._in !== null) {
-    parts.push(`${column} IN ${sql.bind(comparison._in, `Array(${type})`)}`);
+  }
+  if (given(comparison._is_null)) {
+    parts.push(
+      nullable
+        ? comparison._is_null
+          ? `isNull(${column})`
+          : `isNotNull(${column})`
+        : comparison._is_null
+        ? '0'
+        : '1'
+    );
   }
   return parts;
 };
+
+const isFixed = (kind: HexColumnKind) =>
+  kind === 'hash' || kind === 'tokenCategory';
 
 const hexValue = (
   sql: Sql,
@@ -214,14 +491,45 @@ const hexValue = (
   hex: string,
   label: string
 ) => {
-  if (kind === 'hash' || kind === 'tokenCategory') {
+  if (isFixed(kind)) {
     assertHashLength(hex, label);
     return `toFixedString(unhex(${sql.bind(hex, 'String')}), 32)`;
   }
   return `unhex(${sql.bind(hex, 'String')})`;
 };
 
-const hexComparison = (
+/** A hex list bound in chunks of at most `maxListChunk` values, as bytes. */
+const hexList = (
+  sql: Sql,
+  kind: HexColumnKind,
+  values: readonly string[],
+  label: string
+) => {
+  const fixed = isFixed(kind);
+  if (fixed)
+    values.forEach((hex) => {
+      assertHashLength(hex, label);
+    });
+  const bound = chunks(values).map((chunk) => sql.bind(chunk, 'Array(String)'));
+  return `arrayMap(x -> ${
+    fixed ? 'toFixedString(unhex(x), 32)' : 'unhex(x)'
+  }, ${bound.length === 1 ? bound[0]! : `arrayConcat(${bound.join(', ')})`})`;
+};
+
+/** Byte prefix: `startsWith` on a String column (`column` may be nullable). */
+const prefixCondition = (
+  sql: Sql,
+  kind: HexColumnKind,
+  column: string,
+  prefix: string
+) =>
+  `startsWith(${
+    kind === 'bytes' ? column : `toString(assumeNotNull(${column}))`
+  }, unhex(${sql.bind(prefix, 'String')}))${
+    kind === 'nullableBytes' ? ` AND isNotNull(${column})` : ''
+  }`;
+
+export const hexComparison = (
   sql: Sql,
   column: string,
   kind: HexColumnKind,
@@ -229,25 +537,31 @@ const hexComparison = (
   label: string
 ) => {
   const parts: string[] = [];
-  if (comparison._eq !== undefined && comparison._eq !== null) {
-    parts.push(`${column} = ${hexValue(sql, kind, comparison._eq, label)}`);
-  }
-  if (comparison._neq !== undefined && comparison._neq !== null) {
-    parts.push(`${column} != ${hexValue(sql, kind, comparison._neq, label)}`);
-  }
-  if (comparison._in !== undefined && comparison._in !== null) {
-    const fixed = kind === 'hash' || kind === 'tokenCategory';
-    if (fixed)
-      comparison._in.forEach((hex) => {
-        assertHashLength(hex, label);
-      });
+  const binary = (key: keyof HexComparison, operator: string) => {
+    const value = comparison[key];
+    if (typeof value === 'string') {
+      parts.push(`${column} ${operator} ${hexValue(sql, kind, value, label)}`);
+    }
+  };
+  binary('_eq', '=');
+  binary('_neq', '!=');
+  binary('_gt', '>');
+  binary('_gte', '>=');
+  binary('_lt', '<');
+  binary('_lte', '<=');
+  if (given(comparison._in)) {
     parts.push(
-      `${column} IN arrayMap(x -> ${
-        fixed ? 'toFixedString(unhex(x), 32)' : 'unhex(x)'
-      }, ${sql.bind(comparison._in, 'Array(String)')})`
+      comparison._in.length === 0
+        ? '0'
+        : `${column} IN ${hexList(sql, kind, comparison._in, label)}`
     );
   }
-  if (comparison._is_null !== undefined && comparison._is_null !== null) {
+  if (given(comparison._nin) && comparison._nin.length > 0) {
+    parts.push(
+      `${column} NOT IN ${hexList(sql, kind, comparison._nin, label)}`
+    );
+  }
+  if (given(comparison._is_null)) {
     if (kind === 'tokenCategory') {
       parts.push(
         `${column} ${comparison._is_null ? '=' : '!='} ${zeroCategory}`
@@ -260,34 +574,108 @@ const hexComparison = (
       parts.push(comparison._is_null ? '0' : '1');
     }
   }
-  if (comparison._prefix !== undefined && comparison._prefix !== null) {
+  if (given(comparison._prefix)) {
+    parts.push(prefixCondition(sql, kind, column, comparison._prefix));
+  }
+  if (given(comparison._prefix_in)) {
     parts.push(
-      `startsWith(${
-        kind === 'bytes' ? column : `toString(assumeNotNull(${column}))`
-      }, unhex(${sql.bind(comparison._prefix, 'String')}))`
+      any(
+        comparison._prefix_in.map((prefix) =>
+          prefixCondition(sql, kind, column, prefix)
+        )
+      )
     );
   }
   return parts;
 };
 
-const capabilityComparison = (
+export const capabilityComparison = (
   sql: Sql,
   column: string,
   comparison: CapabilityComparison
 ) => {
   const parts: string[] = [];
-  if (comparison._eq !== undefined && comparison._eq !== null) {
+  if (given(comparison._eq)) {
     parts.push(`${column} = ${sql.bind(comparison._eq, 'String')}`);
   }
-  if (comparison._neq !== undefined && comparison._neq !== null) {
-    parts.push(`${column} != ${sql.bind(comparison._neq, 'String')}`);
+  if (given(comparison._neq)) {
+    /* v1 (SQL): NULL != 'x' is not true; an output without an NFT never matches */
+    parts.push(
+      `isNotNull(${column}) AND ${column} != ${sql.bind(
+        comparison._neq,
+        'String'
+      )}`
+    );
   }
-  if (comparison._in !== undefined && comparison._in !== null) {
+  if (given(comparison._in)) {
     parts.push(
       `toString(${column}) IN ${sql.bind(comparison._in, 'Array(String)')}`
     );
   }
-  if (comparison._is_null !== undefined && comparison._is_null !== null) {
+  if (given(comparison._nin)) {
+    parts.push(
+      `isNotNull(${column}) AND toString(${column}) NOT IN ${sql.bind(
+        comparison._nin,
+        'Array(String)'
+      )}`
+    );
+  }
+  if (given(comparison._is_null)) {
+    parts.push(
+      comparison._is_null ? `isNull(${column})` : `isNotNull(${column})`
+    );
+  }
+  return parts;
+};
+
+export const booleanComparison = (
+  sql: Sql,
+  column: string,
+  comparison: BooleanComparison
+) => {
+  const parts: string[] = [];
+  if (given(comparison._eq)) {
+    parts.push(`${column} = ${sql.bind(comparison._eq ? 1 : 0, 'UInt8')}`);
+  }
+  if (given(comparison._neq)) {
+    parts.push(`${column} != ${sql.bind(comparison._neq ? 1 : 0, 'UInt8')}`);
+  }
+  return parts;
+};
+
+const parseTimestamp = (value: string, label: string) => {
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) throw invalid(`${label}: not an ISO-8601 timestamp.`);
+  return BigInt(ms);
+};
+
+export const timestampComparison = (
+  sql: Sql,
+  column: string,
+  comparison: TimestampComparison,
+  label: string
+) => {
+  const parts: string[] = [];
+  const operators: [keyof TimestampComparison, string][] = [
+    ['_eq', '='],
+    ['_neq', '!='],
+    ['_gt', '>'],
+    ['_gte', '>='],
+    ['_lt', '<'],
+    ['_lte', '<='],
+  ];
+  operators.forEach(([key, operator]) => {
+    const value = comparison[key];
+    if (typeof value === 'string') {
+      parts.push(
+        `${column} ${operator} fromUnixTimestamp64Milli(${sql.bind(
+          parseTimestamp(value, label),
+          'Int64'
+        )}, 'UTC')`
+      );
+    }
+  });
+  if (given(comparison._is_null)) {
     parts.push(
       comparison._is_null ? `isNull(${column})` : `isNotNull(${column})`
     );
@@ -296,29 +684,39 @@ const capabilityComparison = (
 };
 
 /* ------------------------------------------------------------------ */
-/* row filters                                                          */
+/* spend relation (spend-index.md, read rule)                           */
 /* ------------------------------------------------------------------ */
 
 /**
- * Columns of an output-like row (`output_at`, or a spend-index row, whose
- * outpoint index is `outpoint_index`).
+ * Columns of an output-like row: an `output_at` row, or a spend-relation row
+ * (whose spent output's key is the outpoint; its own `transaction_hash` is
+ * the spending transaction's).
  */
 export interface OutputColumns {
+  transaction_hash: string;
   output_index: string;
+  /** Undefined: the row has no spent-output transaction id (spend relation). */
+  transaction_internal_id: string | undefined;
 }
 
-export const outputRowColumns: OutputColumns = { output_index: 'output_index' };
+export const outputRowColumns: OutputColumns = {
+  output_index: 'output_index',
+  transaction_hash: 'transaction_hash',
+  transaction_internal_id: 'transaction_internal_id',
+};
 
-/** A spend-relation row: the spent output's index is `outpoint_index`. */
+/** A spend-relation row: the spent output's key is the outpoint. */
 export const spentOutputColumns: OutputColumns = {
   output_index: 'outpoint_index',
+  transaction_hash: 'outpoint_transaction_hash',
+  transaction_internal_id: undefined,
 };
 
 const zeroHashSql = `toFixedString(unhex(repeat('00', 32)), 32)`;
 
 const spendRelationColumns =
-  'transaction_hash, input_index, outpoint_transaction_hash, outpoint_index, value_satoshis, locking_bytecode, ' +
-  'locking_bytecode_prefix, token_category, fungible_token_amount, nonfungible_token_capability, ' +
+  'transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index, value_satoshis, ' +
+  'locking_bytecode, locking_bytecode_prefix, token_category, fungible_token_amount, nonfungible_token_capability, ' +
   'nonfungible_token_commitment, nonfungible_token_commitment_key';
 
 const spentOutputSelect =
@@ -326,6 +724,7 @@ const spentOutputSelect =
   'fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment, nonfungible_token_commitment_key';
 
 const joinedSpendColumns = `i.transaction_hash AS transaction_hash, i.input_index AS input_index,
+      i.transaction_internal_id AS transaction_internal_id,
       i.outpoint_transaction_hash AS outpoint_transaction_hash, i.outpoint_index AS outpoint_index,
       o.value_satoshis AS value_satoshis, o.locking_bytecode AS locking_bytecode,
       o.locking_bytecode_prefix AS locking_bytecode_prefix, o.token_category AS token_category,
@@ -369,7 +768,7 @@ export const spendRelationSql = (sql: Sql, predicate: string) => {
     UNION ALL
     SELECT ${spendRelationColumns} FROM (
       SELECT ${joinedSpendColumns}
-      FROM (SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index FROM ${input}
+      FROM (SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index FROM ${input}
             WHERE commit_seq > {spend:UInt64} AND outpoint_transaction_hash != ${zeroHashSql}) AS i
       INNER JOIN (SELECT ${spentOutputSelect} FROM ${output}
                   WHERE (transaction_hash, output_index) IN (
@@ -380,7 +779,7 @@ export const spendRelationSql = (sql: Sql, predicate: string) => {
     UNION ALL
     SELECT ${spendRelationColumns} FROM (
       SELECT ${joinedSpendColumns}
-      FROM (SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index FROM ${input}
+      FROM (SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index FROM ${input}
             WHERE commit_seq <= {spend:UInt64}
               AND (outpoint_transaction_hash, outpoint_index) IN (
                 SELECT transaction_hash, output_index FROM ${output} WHERE commit_seq > {spend:UInt64})) AS i
@@ -389,51 +788,119 @@ export const spendRelationSql = (sql: Sql, predicate: string) => {
     WHERE ${predicate})`;
 };
 
+/* ------------------------------------------------------------------ */
+/* row filters                                                          */
+/* ------------------------------------------------------------------ */
+
 /**
- * Redundant key conditions next to a locking bytecode equality: the same
+ * Redundant key conditions next to a locking bytecode filter: the same
  * filter on the 25-byte prefix the sort keys use (`output`'s p_script,
  * `spend`'s primary key), so a range of the key is read, not a scan.
  */
 const lockingBytecodePrefixKey = (sql: Sql, comparison: HexComparison) => {
-  if (comparison._eq !== undefined && comparison._eq !== null) {
-    return [
+  const parts: string[] = [];
+  if (given(comparison._eq)) {
+    parts.push(
       `locking_bytecode_prefix = substring(unhex(${sql.bind(
         comparison._eq,
         'String'
-      )}), 1, 25)`,
-    ];
+      )}), 1, 25)`
+    );
   }
-  if (comparison._in !== undefined && comparison._in !== null) {
-    return [
-      `locking_bytecode_prefix IN arrayMap(x -> substring(unhex(x), 1, 25), ${sql.bind(
-        comparison._in,
-        'Array(String)'
-      )})`,
-    ];
+  if (given(comparison._in) && comparison._in.length > 0) {
+    const bound = chunks(comparison._in).map((chunk) =>
+      sql.bind(chunk, 'Array(String)')
+    );
+    parts.push(
+      `locking_bytecode_prefix IN arrayMap(x -> substring(unhex(x), 1, 25), ${
+        bound.length === 1 ? bound[0]! : `arrayConcat(${bound.join(', ')})`
+      })`
+    );
   }
-  return [];
+  const prefixKey = (prefix: string) =>
+    `startsWith(locking_bytecode_prefix, substring(unhex(${sql.bind(
+      prefix,
+      'String'
+    )}), 1, 25))`;
+  if (given(comparison._prefix)) parts.push(prefixKey(comparison._prefix));
+  if (given(comparison._prefix_in) && comparison._prefix_in.length > 0) {
+    parts.push(any(comparison._prefix_in.map(prefixKey)));
+  }
+  return parts;
 };
 
 /** The same for an NFT commitment prefix: `nonfungible_token_commitment_key` (p_category). */
-const commitmentKeyCondition = (sql: Sql, comparison: HexComparison) =>
-  comparison._prefix === undefined || comparison._prefix === null
-    ? []
-    : [
-        `startsWith(nonfungible_token_commitment_key, unhex(${sql.bind(
-          comparison._prefix,
-          'String'
-        )}))`,
-      ];
+const commitmentKeyCondition = (sql: Sql, comparison: HexComparison) => {
+  const key = (prefix: string) =>
+    `startsWith(nonfungible_token_commitment_key, unhex(${sql.bind(
+      prefix,
+      'String'
+    )}))`;
+  return [
+    ...(given(comparison._prefix) ? [key(comparison._prefix)] : []),
+    ...(given(comparison._prefix_in) && comparison._prefix_in.length > 0
+      ? [any(comparison._prefix_in.map(key))]
+      : []),
+  ];
+};
 
-/** An `OutputFilter` as a predicate on one output_at row. */
+/** Whether an output filter can be evaluated on a spend-relation row. */
+export const spendRowEvaluable = (
+  filter: OutputFilter | null | undefined
+): boolean => {
+  if (!given(filter)) return true;
+  if (
+    given(filter.transaction_internal_id) ||
+    given(filter.transaction) ||
+    given(filter.spent_by)
+  ) {
+    return false;
+  }
+  return (
+    (filter._and ?? []).every(spendRowEvaluable) &&
+    (filter._or ?? []).every(spendRowEvaluable) &&
+    spendRowEvaluable(filter._not)
+  );
+};
+
+/**
+ * An `OutputFilter` as a predicate on one output-like row (`output_at`, or a
+ * spend-relation row with `spentOutputColumns`). `node`: the node of per-node
+ * sub-filters (`spent_by`, the transaction's `in_block` …).
+ */
 export const outputPredicate = (
   sql: Sql,
   filter: OutputFilter | null | undefined,
-  columns: OutputColumns = outputRowColumns
+  columns: OutputColumns = outputRowColumns,
+  node?: number
 ): string => {
-  if (filter === undefined || filter === null) return '1';
+  if (!given(filter)) return '1';
   const parts: string[] = [];
-  if (filter.output_index) {
+  if (given(filter.transaction_hash)) {
+    parts.push(
+      ...hexComparison(
+        sql,
+        columns.transaction_hash,
+        'hash',
+        filter.transaction_hash,
+        'transaction_hash'
+      )
+    );
+  }
+  if (given(filter.transaction_internal_id)) {
+    if (columns.transaction_internal_id === undefined) {
+      throw new Error('transaction_internal_id is not on this row.');
+    }
+    parts.push(
+      ...numericComparison(
+        sql,
+        columns.transaction_internal_id,
+        'UInt64',
+        filter.transaction_internal_id
+      )
+    );
+  }
+  if (given(filter.output_index)) {
     parts.push(
       ...numericComparison(
         sql,
@@ -443,7 +910,7 @@ export const outputPredicate = (
       )
     );
   }
-  if (filter.value_satoshis) {
+  if (given(filter.value_satoshis)) {
     parts.push(
       ...numericComparison(
         sql,
@@ -453,17 +920,18 @@ export const outputPredicate = (
       )
     );
   }
-  if (filter.fungible_token_amount) {
+  if (given(filter.fungible_token_amount)) {
     parts.push(
       ...numericComparison(
         sql,
         'fungible_token_amount',
         'Int64',
-        filter.fungible_token_amount
+        filter.fungible_token_amount,
+        true
       )
     );
   }
-  if (filter.locking_bytecode) {
+  if (given(filter.locking_bytecode)) {
     parts.push(
       ...hexComparison(
         sql,
@@ -475,7 +943,7 @@ export const outputPredicate = (
       ...lockingBytecodePrefixKey(sql, filter.locking_bytecode)
     );
   }
-  if (filter.token_category) {
+  if (given(filter.token_category)) {
     parts.push(
       ...hexComparison(
         sql,
@@ -486,7 +954,7 @@ export const outputPredicate = (
       )
     );
   }
-  if (filter.nonfungible_token_capability) {
+  if (given(filter.nonfungible_token_capability)) {
     parts.push(
       ...capabilityComparison(
         sql,
@@ -495,7 +963,7 @@ export const outputPredicate = (
       )
     );
   }
-  if (filter.nonfungible_token_commitment) {
+  if (given(filter.nonfungible_token_commitment)) {
     parts.push(
       ...hexComparison(
         sql,
@@ -507,50 +975,96 @@ export const outputPredicate = (
       ...commitmentKeyCondition(sql, filter.nonfungible_token_commitment)
     );
   }
-  if (filter._and) {
-    parts.push(...filter._and.map((f) => outputPredicate(sql, f, columns)));
+  if (given(filter.transaction)) {
+    parts.push(
+      `${columns.transaction_hash} IN (SELECT hash FROM ${sql.view(
+        'transaction_at'
+      )} WHERE ${transactionPredicate(sql, filter.transaction, node)})`
+    );
   }
-  if (filter._or) {
-    parts.push(any(filter._or.map((f) => outputPredicate(sql, f, columns))));
+  if (given(filter.spent_by)) {
+    parts.push(
+      `(${columns.transaction_hash}, ${
+        columns.output_index
+      }) IN (${sql.acceptedRows(
+        inputRowsSql(sql, filter.spent_by, node),
+        'outpoint_transaction_hash, outpoint_index',
+        node
+      )})`
+    );
   }
-  if (filter._not) {
-    parts.push(`NOT (${outputPredicate(sql, filter._not, columns)})`);
+  if (given(filter._and)) {
+    parts.push(
+      ...filter._and.map((f) => outputPredicate(sql, f, columns, node))
+    );
+  }
+  if (given(filter._or)) {
+    parts.push(
+      any(filter._or.map((f) => outputPredicate(sql, f, columns, node)))
+    );
+  }
+  if (given(filter._not)) {
+    parts.push(`NOT (${outputPredicate(sql, filter._not, columns, node)})`);
   }
   return all(parts);
 };
 
+/** Whether an input filter can be evaluated on a spend-relation row. */
+const inputSpendEvaluable = (filter: InputFilter | null | undefined): boolean =>
+  !given(filter) ||
+  (!given(filter.sequence_number) &&
+    spendRowEvaluable(filter.outpoint) &&
+    (filter._and ?? []).every(inputSpendEvaluable) &&
+    (filter._or ?? []).every(inputSpendEvaluable) &&
+    inputSpendEvaluable(filter._not));
+
 /**
  * Whether every input matching `filter` has a stored spent output (the filter
  * requires an `outpoint` match: positively, in a conjunction, or in every
- * branch of a disjunction). Such a filter is answered from the spend relation
- * alone (index + tail); any other one that mentions `outpoint` (under `_not`,
- * or in some `_or` branches) is evaluated on input rows with the outpoint
- * semi-join.
+ * branch of a disjunction) and the whole filter can be evaluated on a
+ * spend-relation row. Such a filter is answered from the spend relation alone
+ * (index + tail); any other one that mentions `outpoint` (under `_not`, in
+ * some `_or` branches, or with sub-filters the spend row lacks) is evaluated
+ * on input rows with the outpoint semi-join.
  */
-export const requiresOutpoint = (filter: InputFilter): boolean =>
-  (filter.outpoint !== undefined && filter.outpoint !== null) ||
-  (filter._and ?? []).some(requiresOutpoint) ||
-  (filter._or !== undefined &&
-    filter._or !== null &&
-    filter._or.length > 0 &&
-    filter._or.every(requiresOutpoint));
+export const requiresOutpoint = (filter: InputFilter): boolean => {
+  const requires = (f: InputFilter): boolean =>
+    given(f.outpoint) ||
+    (f._and ?? []).some(requires) ||
+    (given(f._or) && f._or.length > 0 && f._or.every(requires));
+  return requires(filter) && inputSpendEvaluable(filter);
+};
 
-/**
- * An `InputFilter` as a predicate on one spend-relation row (the input's own
- * fields and the spent output's attributes on the same row).
- */
-export const spendRowPredicate = (
-  sql: Sql,
-  filter: InputFilter | null | undefined
-): string => {
-  if (filter === undefined || filter === null) return '1';
+/** Predicates on an input's own columns (common to input rows and spend rows). */
+const inputOwnColumns = (sql: Sql, filter: InputFilter, node?: number) => {
   const parts: string[] = [];
-  if (filter.input_index) {
+  if (given(filter.transaction_hash)) {
+    parts.push(
+      ...hexComparison(
+        sql,
+        'transaction_hash',
+        'hash',
+        filter.transaction_hash,
+        'transaction_hash'
+      )
+    );
+  }
+  if (given(filter.transaction_internal_id)) {
+    parts.push(
+      ...numericComparison(
+        sql,
+        'transaction_internal_id',
+        'UInt64',
+        filter.transaction_internal_id
+      )
+    );
+  }
+  if (given(filter.input_index)) {
     parts.push(
       ...numericComparison(sql, 'input_index', 'UInt32', filter.input_index)
     );
   }
-  if (filter.outpoint_transaction_hash) {
+  if (given(filter.outpoint_transaction_hash)) {
     parts.push(
       ...hexComparison(
         sql,
@@ -561,17 +1075,48 @@ export const spendRowPredicate = (
       )
     );
   }
-  if (filter.outpoint) {
-    parts.push(outputPredicate(sql, filter.outpoint, spentOutputColumns));
+  if (given(filter.outpoint_index)) {
+    parts.push(
+      ...numericComparison(
+        sql,
+        'outpoint_index',
+        'UInt32',
+        filter.outpoint_index
+      )
+    );
   }
-  if (filter._and) {
-    parts.push(...filter._and.map((f) => spendRowPredicate(sql, f)));
+  if (given(filter.transaction)) {
+    parts.push(
+      `transaction_hash IN (SELECT hash FROM ${sql.view(
+        'transaction_at'
+      )} WHERE ${transactionPredicate(sql, filter.transaction, node)})`
+    );
   }
-  if (filter._or) {
-    parts.push(any(filter._or.map((f) => spendRowPredicate(sql, f))));
+  return parts;
+};
+
+/**
+ * An `InputFilter` as a predicate on one spend-relation row (the input's own
+ * fields and the spent output's attributes on the same row).
+ */
+export const spendRowPredicate = (
+  sql: Sql,
+  filter: InputFilter | null | undefined,
+  node?: number
+): string => {
+  if (!given(filter)) return '1';
+  const parts = inputOwnColumns(sql, filter, node);
+  if (given(filter.outpoint)) {
+    parts.push(outputPredicate(sql, filter.outpoint, spentOutputColumns, node));
   }
-  if (filter._not) {
-    parts.push(`NOT (${spendRowPredicate(sql, filter._not)})`);
+  if (given(filter._and)) {
+    parts.push(...filter._and.map((f) => spendRowPredicate(sql, f, node)));
+  }
+  if (given(filter._or)) {
+    parts.push(any(filter._or.map((f) => spendRowPredicate(sql, f, node))));
+  }
+  if (given(filter._not)) {
+    parts.push(`NOT (${spendRowPredicate(sql, filter._not, node)})`);
   }
   return all(parts);
 };
@@ -588,83 +1133,242 @@ export const spendRowPredicate = (
  */
 export const inputPredicate = (
   sql: Sql,
-  filter: InputFilter | null | undefined
+  filter: InputFilter | null | undefined,
+  node?: number
 ): string => {
-  if (filter === undefined || filter === null) return '1';
+  if (!given(filter)) return '1';
   if (requiresOutpoint(filter)) {
     return `(transaction_hash, input_index) IN (SELECT transaction_hash, input_index FROM ${spendRelationSql(
       sql,
-      spendRowPredicate(sql, filter)
+      spendRowPredicate(sql, filter, node)
     )})`;
   }
-  // eslint-disable-next-line @typescript-eslint/no-use-before-define
-  return inputRowPredicate(sql, filter);
+  return inputRowPredicate(sql, filter, node);
 };
 
-const inputRowPredicate = (sql: Sql, filter: InputFilter): string => {
-  const parts: string[] = [];
-  if (filter.input_index) {
+const inputRowPredicate = (
+  sql: Sql,
+  filter: InputFilter,
+  node?: number
+): string => {
+  const parts = inputOwnColumns(sql, filter, node);
+  if (given(filter.sequence_number)) {
     parts.push(
-      ...numericComparison(sql, 'input_index', 'UInt32', filter.input_index)
-    );
-  }
-  if (filter.outpoint_transaction_hash) {
-    parts.push(
-      ...hexComparison(
+      ...numericComparison(
         sql,
-        'outpoint_transaction_hash',
-        'hash',
-        filter.outpoint_transaction_hash,
-        'outpoint_transaction_hash'
+        'sequence_number',
+        'UInt32',
+        filter.sequence_number
       )
     );
   }
-  if (filter.outpoint) {
+  if (given(filter.outpoint)) {
     parts.push(
       `(outpoint_transaction_hash, outpoint_index) IN (SELECT transaction_hash, output_index FROM ${sql.view(
         'output_at'
-      )} WHERE ${outputPredicate(sql, filter.outpoint)})`
+      )} WHERE ${outputPredicate(
+        sql,
+        filter.outpoint,
+        outputRowColumns,
+        node
+      )})`
     );
   }
-  if (filter._and) {
-    parts.push(...filter._and.map((f) => inputPredicate(sql, f)));
+  if (given(filter._and)) {
+    parts.push(...filter._and.map((f) => inputPredicate(sql, f, node)));
   }
-  if (filter._or) {
-    parts.push(any(filter._or.map((f) => inputPredicate(sql, f))));
+  if (given(filter._or)) {
+    parts.push(any(filter._or.map((f) => inputPredicate(sql, f, node))));
   }
-  if (filter._not) {
-    parts.push(`NOT (${inputPredicate(sql, filter._not)})`);
+  if (given(filter._not)) {
+    parts.push(`NOT (${inputPredicate(sql, filter._not, node)})`);
   }
   return all(parts);
 };
 
 /**
+ * Input rows matching `filter` (columns transaction_hash, input_index,
+ * outpoint_transaction_hash, outpoint_index): from the spend relation when
+ * the filter requires a spent output, else from `input_at`.
+ */
+export const inputRowsSql = (
+  sql: Sql,
+  filter: InputFilter | null | undefined,
+  node?: number
+) =>
+  given(filter) && requiresOutpoint(filter)
+    ? `SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index FROM ${spendRelationSql(
+        sql,
+        spendRowPredicate(sql, filter, node)
+      )}`
+    : `SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index FROM ${sql.view(
+        'input_at'
+      )} WHERE ${inputPredicate(sql, filter, node)}`;
+
+/** Block columns of a `BlockFilter` on a block_at row. */
+export const blockPredicate = (
+  sql: Sql,
+  filter: BlockFilter | null | undefined,
+  node?: number
+): string => {
+  if (!given(filter)) return '1';
+  const parts: string[] = [];
+  if (given(filter.hash)) {
+    parts.push(...hexComparison(sql, 'hash', 'hash', filter.hash, 'hash'));
+  }
+  if (given(filter.previous_block_hash)) {
+    parts.push(
+      ...hexComparison(
+        sql,
+        'previous_block_hash',
+        'hash',
+        filter.previous_block_hash,
+        'previous_block_hash'
+      )
+    );
+  }
+  if (given(filter.merkle_root)) {
+    parts.push(
+      ...hexComparison(
+        sql,
+        'merkle_root',
+        'hash',
+        filter.merkle_root,
+        'merkle_root'
+      )
+    );
+  }
+  const numeric: [keyof BlockFilter, string][] = [
+    ['internal_id', 'UInt64'],
+    ['height', 'UInt32'],
+    ['version', 'Int32'],
+    ['timestamp', 'UInt32'],
+    ['bits', 'UInt32'],
+    ['nonce', 'UInt32'],
+    ['size_bytes', 'UInt32'],
+    ['transaction_count', 'UInt32'],
+  ];
+  numeric.forEach(([key, type]) => {
+    const comparison = filter[key] as IntComparison | null | undefined;
+    if (given(comparison)) {
+      parts.push(...numericComparison(sql, key, type, comparison));
+    }
+  });
+  if (given(filter.has_transaction)) {
+    parts.push(
+      `internal_id IN (SELECT block_internal_id FROM ${sql.view(
+        'block_transaction_at'
+      )} WHERE transaction_hash IN (SELECT hash FROM ${sql.view(
+        'transaction_at'
+      )} WHERE ${transactionPredicate(sql, filter.has_transaction, node)}))`
+    );
+  }
+  if (given(filter._and)) {
+    parts.push(...filter._and.map((f) => blockPredicate(sql, f, node)));
+  }
+  if (given(filter._or)) {
+    parts.push(any(filter._or.map((f) => blockPredicate(sql, f, node))));
+  }
+  if (given(filter._not)) {
+    parts.push(`NOT (${blockPredicate(sql, filter._not, node)})`);
+  }
+  return all(parts);
+};
+
+/** True when a block filter only constrains `height` (served by tx_acceptance's height column). */
+const heightOnly = (filter: BlockFilter): boolean =>
+  Object.entries(filter).every(
+    ([key, value]) =>
+      !given(value) ||
+      key === 'height' ||
+      (key === '_and' && (value as BlockFilter[]).every(heightOnly)) ||
+      (key === '_or' && (value as BlockFilter[]).every(heightOnly)) ||
+      (key === '_not' && heightOnly(value as BlockFilter))
+  );
+
+/** A height-only block filter as a predicate on tx_acceptance / node_block rows (`height`). */
+const heightPredicate = (sql: Sql, filter: BlockFilter): string =>
+  all([
+    ...(given(filter.height)
+      ? numericComparison(sql, 'height', 'UInt32', filter.height)
+      : []),
+    ...(filter._and ?? []).map((f) => heightPredicate(sql, f)),
+    ...(given(filter._or)
+      ? [any(filter._or.map((f) => heightPredicate(sql, f)))]
+      : []),
+    ...(given(filter._not)
+      ? [`NOT (${heightPredicate(sql, filter._not)})`]
+      : []),
+  ]);
+
+/**
+ * `block_internal_id` of blocks the node accepts that match `filter`, as a
+ * predicate on a row with `block_internal_id` and `height` (tx_acceptance or
+ * node_block): a height-only filter reads the row's own height.
+ */
+export const acceptedBlockCondition = (
+  sql: Sql,
+  filter: BlockFilter,
+  node?: number
+) =>
+  heightOnly(filter)
+    ? heightPredicate(sql, filter)
+    : `block_internal_id IN (SELECT internal_id FROM ${sql.view(
+        'block_at'
+      )} WHERE ${blockPredicate(sql, filter, node)})`;
+
+/**
  * A `TransactionFilter` as a predicate on a transaction_at row (`hash`,
- * `internal_id`). Relationship filters are semi-joins on the pinned views
- * (EXISTS = `hash IN (…)`, NOT EXISTS = `NOT (hash IN (…))`).
+ * `internal_id`, …). Relationship filters are semi-joins on the pinned views
+ * (EXISTS = `hash IN (…)`, NOT EXISTS = `NOT (hash IN (…))`). `node`: the
+ * node of the per-node parts (`block_window`, `in_block`, `in_mempool`, and
+ * acceptance inside `spent_by`); default the statement's primary node.
  */
 export const transactionPredicate = (
   sql: Sql,
-  filter: TransactionFilter | null | undefined
+  filter: TransactionFilter | null | undefined,
+  node?: number
 ): string => {
-  if (filter === undefined || filter === null) return '1';
+  if (!given(filter)) return '1';
   const parts: string[] = [];
-  if (filter.internal_id) {
+  if (given(filter.internal_id)) {
     parts.push(
       ...numericComparison(sql, 'internal_id', 'UInt64', filter.internal_id)
     );
   }
-  if (filter.hash) {
+  if (given(filter.hash)) {
     parts.push(...hexComparison(sql, 'hash', 'hash', filter.hash, 'hash'));
   }
-  if (filter.has_output) {
+  const numeric: [keyof TransactionFilter, string][] = [
+    ['version', 'Int32'],
+    ['locktime', 'UInt32'],
+    ['size_bytes', 'UInt32'],
+    ['input_count', 'UInt32'],
+    ['output_count', 'UInt32'],
+    ['output_value_satoshis', 'Int64'],
+  ];
+  numeric.forEach(([key, type]) => {
+    const comparison = filter[key] as IntComparison | null | undefined;
+    if (given(comparison)) {
+      parts.push(...numericComparison(sql, key, type, comparison));
+    }
+  });
+  if (given(filter.is_coinbase)) {
+    parts.push(...booleanComparison(sql, 'is_coinbase', filter.is_coinbase));
+  }
+  if (given(filter.has_output)) {
     parts.push(
       `hash IN (SELECT transaction_hash FROM ${sql.view(
         'output_at'
-      )} WHERE ${outputPredicate(sql, filter.has_output)})`
+      )} WHERE ${outputPredicate(
+        sql,
+        filter.has_output,
+        outputRowColumns,
+        node
+      )})`
     );
   }
-  if (filter.has_input) {
+  if (given(filter.has_input)) {
     /*
      * A filter requiring a spent output reads the spend relation alone (no
      * `input` rows): an address's or a category's spending transactions.
@@ -673,41 +1377,332 @@ export const transactionPredicate = (
       requiresOutpoint(filter.has_input)
         ? `hash IN (SELECT transaction_hash FROM ${spendRelationSql(
             sql,
-            spendRowPredicate(sql, filter.has_input)
+            spendRowPredicate(sql, filter.has_input, node)
           )})`
         : `hash IN (SELECT transaction_hash FROM ${sql.view(
             'input_at'
-          )} WHERE ${inputPredicate(sql, filter.has_input)})`
+          )} WHERE ${inputPredicate(sql, filter.has_input, node)})`
     );
   }
-  if (filter.block_window) {
+  if (given(filter.block_window)) {
     const window = filter.block_window;
     const heights: string[] = ['block_internal_id != 0'];
-    if (window.from_height !== undefined && window.from_height !== null) {
-      heights.push(`height >= ${sql.bind(window.from_height, 'UInt32')}`);
+    if (given(window.from_height)) {
+      heights.push(
+        ...numericComparison(sql, 'height', 'UInt32', {
+          _gte: window.from_height,
+        })
+      );
     }
-    if (window.to_height !== undefined && window.to_height !== null) {
-      heights.push(`height < ${sql.bind(window.to_height, 'UInt32')}`);
+    if (given(window.to_height)) {
+      heights.push(
+        ...numericComparison(sql, 'height', 'UInt32', {
+          _lt: window.to_height,
+        })
+      );
     }
     const mempool = window.include_mempool !== false;
     parts.push(
-      `hash IN (SELECT transaction_hash FROM ${sql.view(
-        'tx_acceptance_at'
+      `hash IN (SELECT transaction_hash FROM ${sql.nodeView(
+        'tx_acceptance_at',
+        node
       )} WHERE ${
         mempool ? any([all(heights), 'block_internal_id = 0']) : all(heights)
       })`
     );
   }
-  if (filter._and) {
-    parts.push(...filter._and.map((f) => transactionPredicate(sql, f)));
+  if (given(filter.in_block)) {
+    parts.push(
+      `hash IN (SELECT transaction_hash FROM ${sql.nodeView(
+        'tx_acceptance_at',
+        node
+      )} WHERE block_internal_id != 0 AND (${acceptedBlockCondition(
+        sql,
+        filter.in_block,
+        node
+      )}))`
+    );
   }
-  if (filter._or) {
-    parts.push(any(filter._or.map((f) => transactionPredicate(sql, f))));
+  if (given(filter.in_mempool)) {
+    const inMempool = `hash IN (SELECT transaction_hash FROM ${sql.nodeView(
+      'node_transaction_at',
+      node
+    )})`;
+    parts.push(filter.in_mempool ? inMempool : `NOT (${inMempool})`);
   }
-  if (filter._not) {
-    parts.push(`NOT (${transactionPredicate(sql, filter._not)})`);
+  if (given(filter._and)) {
+    parts.push(...filter._and.map((f) => transactionPredicate(sql, f, node)));
+  }
+  if (given(filter._or)) {
+    parts.push(any(filter._or.map((f) => transactionPredicate(sql, f, node))));
+  }
+  if (given(filter._not)) {
+    parts.push(`NOT (${transactionPredicate(sql, filter._not, node)})`);
   }
   return all(parts);
+};
+
+/** A `NodeTransactionFilter` on a node_transaction_at row. */
+export const nodeTransactionPredicate = (
+  sql: Sql,
+  filter: NodeTransactionFilter | null | undefined,
+  node?: number
+): string => {
+  if (!given(filter)) return '1';
+  const parts: string[] = [];
+  if (given(filter.transaction_internal_id)) {
+    parts.push(
+      ...numericComparison(
+        sql,
+        'transaction_internal_id',
+        'UInt64',
+        filter.transaction_internal_id
+      )
+    );
+  }
+  if (given(filter.transaction_hash)) {
+    parts.push(
+      ...hexComparison(
+        sql,
+        'transaction_hash',
+        'hash',
+        filter.transaction_hash,
+        'transaction_hash'
+      )
+    );
+  }
+  if (given(filter.validated_at)) {
+    parts.push(
+      ...timestampComparison(
+        sql,
+        'validated_at',
+        filter.validated_at,
+        'validated_at'
+      )
+    );
+  }
+  if (given(filter.transaction)) {
+    parts.push(
+      `transaction_hash IN (SELECT hash FROM ${sql.view(
+        'transaction_at'
+      )} WHERE hash IN (SELECT transaction_hash FROM ${sql.nodeView(
+        'node_transaction_at',
+        node
+      )}) AND ${transactionPredicate(sql, filter.transaction, node)})`
+    );
+  }
+  if (given(filter._and)) {
+    parts.push(
+      ...filter._and.map((f) => nodeTransactionPredicate(sql, f, node))
+    );
+  }
+  if (given(filter._or)) {
+    parts.push(
+      any(filter._or.map((f) => nodeTransactionPredicate(sql, f, node)))
+    );
+  }
+  if (given(filter._not)) {
+    parts.push(`NOT (${nodeTransactionPredicate(sql, filter._not, node)})`);
+  }
+  return all(parts);
+};
+
+/** A `NodeBlockFilter` on a node_block_at row. */
+export const nodeBlockPredicate = (
+  sql: Sql,
+  filter: NodeBlockFilter | null | undefined,
+  node?: number
+): string => {
+  if (!given(filter)) return '1';
+  const parts: string[] = [];
+  if (given(filter.block_internal_id)) {
+    parts.push(
+      ...numericComparison(
+        sql,
+        'block_internal_id',
+        'UInt64',
+        filter.block_internal_id
+      )
+    );
+  }
+  if (given(filter.height)) {
+    parts.push(...numericComparison(sql, 'height', 'UInt32', filter.height));
+  }
+  if (given(filter.accepted_at)) {
+    parts.push(
+      ...timestampComparison(
+        sql,
+        'accepted_at',
+        filter.accepted_at,
+        'accepted_at'
+      )
+    );
+  }
+  if (given(filter.block)) {
+    parts.push(acceptedBlockCondition(sql, filter.block, node));
+  }
+  if (given(filter._and)) {
+    parts.push(...filter._and.map((f) => nodeBlockPredicate(sql, f, node)));
+  }
+  if (given(filter._or)) {
+    parts.push(any(filter._or.map((f) => nodeBlockPredicate(sql, f, node))));
+  }
+  if (given(filter._not)) {
+    parts.push(`NOT (${nodeBlockPredicate(sql, filter._not, node)})`);
+  }
+  return all(parts);
+};
+
+/** A `BlockInclusionFilter` on a block-inclusion row (block_internal_id, height, transaction_index). */
+export const blockInclusionPredicate = (
+  sql: Sql,
+  filter: BlockInclusionFilter | null | undefined,
+  node?: number
+): string => {
+  if (!given(filter)) return '1';
+  const parts: string[] = [];
+  if (given(filter.transaction_index)) {
+    parts.push(
+      ...numericComparison(
+        sql,
+        'transaction_index',
+        'UInt32',
+        filter.transaction_index
+      )
+    );
+  }
+  if (given(filter.block)) {
+    parts.push(acceptedBlockCondition(sql, filter.block, node));
+  }
+  if (given(filter._and)) {
+    parts.push(
+      ...filter._and.map((f) => blockInclusionPredicate(sql, f, node))
+    );
+  }
+  if (given(filter._or)) {
+    parts.push(
+      any(filter._or.map((f) => blockInclusionPredicate(sql, f, node)))
+    );
+  }
+  if (given(filter._not)) {
+    parts.push(`NOT (${blockInclusionPredicate(sql, filter._not, node)})`);
+  }
+  return all(parts);
+};
+
+/** A `BlockTransactionFilter` on a block_transaction_at row. */
+export const blockTransactionPredicate = (
+  sql: Sql,
+  filter: BlockTransactionFilter | null | undefined,
+  node?: number
+): string => {
+  if (!given(filter)) return '1';
+  const parts: string[] = [];
+  if (given(filter.transaction_index)) {
+    parts.push(
+      ...numericComparison(
+        sql,
+        'transaction_index',
+        'UInt32',
+        filter.transaction_index
+      )
+    );
+  }
+  if (given(filter.transaction)) {
+    parts.push(
+      `transaction_hash IN (SELECT hash FROM ${sql.view(
+        'transaction_at'
+      )} WHERE ${transactionPredicate(sql, filter.transaction, node)})`
+    );
+  }
+  if (given(filter._and)) {
+    parts.push(
+      ...filter._and.map((f) => blockTransactionPredicate(sql, f, node))
+    );
+  }
+  if (given(filter._or)) {
+    parts.push(
+      any(filter._or.map((f) => blockTransactionPredicate(sql, f, node)))
+    );
+  }
+  if (given(filter._not)) {
+    parts.push(`NOT (${blockTransactionPredicate(sql, filter._not, node)})`);
+  }
+  return all(parts);
+};
+
+/* ------------------------------------------------------------------ */
+/* candidates: restricting acceptance checks                            */
+/* ------------------------------------------------------------------ */
+
+const hasSelectiveHex = (comparison: HexComparison | null | undefined) =>
+  given(comparison) &&
+  (given(comparison._eq) ||
+    given(comparison._in) ||
+    given(comparison._prefix) ||
+    given(comparison._prefix_in));
+
+/** Whether an output filter narrows the outputs by an indexed column (script, category, transaction). */
+export const outputFilterIsSelective = (
+  filter: OutputFilter | null | undefined
+): boolean =>
+  given(filter) &&
+  (hasSelectiveHex(filter.locking_bytecode) ||
+    hasSelectiveHex(filter.token_category) ||
+    hasSelectiveHex(filter.transaction_hash) ||
+    (filter._and ?? []).some(outputFilterIsSelective) ||
+    (given(filter._or) &&
+      filter._or.length > 0 &&
+      filter._or.every(outputFilterIsSelective)));
+
+/**
+ * A subquery of candidate transaction hashes that every transaction matching
+ * `filter` is among (a positive, selective conjunct), or undefined when the
+ * filter has none. Used to restrict the acceptance check: reading the node's
+ * acceptance rows of a few thousand candidates by key costs a fraction of
+ * reading all of them (chipnet: 95 ms vs 420 ms for a busy category).
+ */
+export const transactionCandidates = (
+  sql: Sql,
+  filter: TransactionFilter | null | undefined,
+  node?: number
+): string | undefined => {
+  if (!given(filter)) return undefined;
+  if (hasSelectiveHex(filter.hash) && !given(filter.hash?._prefix)) {
+    return `SELECT hash FROM ${sql.view('transaction_at')} WHERE ${all(
+      hexComparison(sql, 'hash', 'hash', filter.hash!, 'hash')
+    )}`;
+  }
+  if (outputFilterIsSelective(filter.has_output)) {
+    return `SELECT transaction_hash FROM ${sql.view(
+      'output_at'
+    )} WHERE ${outputPredicate(
+      sql,
+      filter.has_output,
+      outputRowColumns,
+      node
+    )}`;
+  }
+  if (given(filter.has_input) && requiresOutpoint(filter.has_input)) {
+    return `SELECT transaction_hash FROM ${spendRelationSql(
+      sql,
+      spendRowPredicate(sql, filter.has_input, node)
+    )}`;
+  }
+
+  for (const part of filter._and ?? []) {
+    const candidates = transactionCandidates(sql, part, node);
+    if (candidates !== undefined) return candidates;
+  }
+  if (given(filter._or) && filter._or.length > 0) {
+    const branches = filter._or.map((part) =>
+      transactionCandidates(sql, part, node)
+    );
+    if (branches.every((branch) => branch !== undefined)) {
+      return branches.join(' UNION ALL ');
+    }
+  }
+  return undefined;
 };
 
 /**
@@ -715,28 +1710,56 @@ export const transactionPredicate = (
  * definition): outputs of transactions the node accepts, minus outpoints
  * spent by an input of a transaction the node accepts. With a filter, the
  * spends of matching outputs come from the spend relation (spend index up to
- * the snapshot's spend watermark, the join above it).
+ * the snapshot's spend watermark, the join above it), and the acceptance
+ * checks read only the candidates' acceptance rows.
  */
 export const unspentOutputPredicate = (
   sql: Sql,
-  filter: OutputFilter | null | undefined
+  filter: OutputFilter | null | undefined,
+  node?: number
 ) => {
-  const matching = outputPredicate(sql, filter);
+  const matching = outputPredicate(sql, filter, outputRowColumns, node);
+  if (matching === '1') {
+    const spent = `SELECT outpoint_transaction_hash, outpoint_index FROM ${sql.view(
+      'input_at'
+    )} WHERE transaction_hash IN (${sql.accepted(node)})`;
+    return `transaction_hash IN (${sql.accepted(node)})
+  AND (transaction_hash, output_index) NOT IN (${spent})`;
+  }
+  const selective = outputFilterIsSelective(filter);
   /*
    * The spends of matching outputs: from the spend relation when the filter
-   * narrows the outputs (index + tail, by script or category), else every
-   * input of an accepted transaction.
+   * can be evaluated on spend rows (index + tail, by script or category),
+   * else the inputs spending a matching output.
    */
-  const spent =
-    matching === '1'
-      ? `SELECT outpoint_transaction_hash, outpoint_index FROM ${sql.view(
-          'input_at'
-        )} WHERE transaction_hash IN (${sql.accepted()})`
-      : `SELECT outpoint_transaction_hash, outpoint_index FROM ${spendRelationSql(
-          sql,
-          outputPredicate(sql, filter, spentOutputColumns)
-        )} WHERE transaction_hash IN (${sql.accepted()})`;
-  return `transaction_hash IN (${sql.accepted()})
+  const spends = spendRowEvaluable(filter)
+    ? `SELECT transaction_hash, outpoint_transaction_hash, outpoint_index FROM ${spendRelationSql(
+        sql,
+        outputPredicate(sql, filter, spentOutputColumns, node)
+      )}`
+    : `SELECT transaction_hash, outpoint_transaction_hash, outpoint_index FROM ${sql.view(
+        'input_at'
+      )} WHERE (outpoint_transaction_hash, outpoint_index) IN (SELECT transaction_hash, output_index FROM ${sql.view(
+        'output_at'
+      )} WHERE ${outputPredicate(sql, filter, outputRowColumns, node)})`;
+  const created = selective
+    ? sql.accepted(
+        node,
+        `SELECT transaction_hash FROM ${sql.view(
+          'output_at'
+        )} WHERE ${outputPredicate(sql, filter, outputRowColumns, node)}`
+      )
+    : sql.accepted(node);
+  const spent = selective
+    ? sql.acceptedRows(
+        spends,
+        'outpoint_transaction_hash, outpoint_index',
+        node
+      )
+    : `SELECT outpoint_transaction_hash, outpoint_index FROM (${spends}) WHERE transaction_hash IN (${sql.accepted(
+        node
+      )})`;
+  return `transaction_hash IN (${created})
   AND (transaction_hash, output_index) NOT IN (${spent})
   AND (${matching})`;
 };

@@ -42,8 +42,9 @@ const argumentValue = (
 };
 
 /**
- * The node names of an operation's root fields (`node:` arguments), with
- * fragments on the root type flattened.
+ * The node names of an operation: every `node:` argument of every field at
+ * any depth (root fields and per-node relationships), with fragments
+ * flattened. The request snapshot pins exactly these nodes.
  */
 export const operationNodeNames = (
   document: DocumentNode,
@@ -64,16 +65,17 @@ export const operationNodeNames = (
       ])
   );
   const visit = (
-    selectionSet: OperationDefinitionNode['selectionSet'],
+    selectionSet: OperationDefinitionNode['selectionSet'] | undefined,
     seen: Set<string>
   ) => {
-    selectionSet.selections.forEach((selection) => {
+    selectionSet?.selections.forEach((selection) => {
       if (selection.kind === Kind.FIELD) {
         selection.arguments?.forEach((argument) => {
           if (argument.name.value !== 'node') return;
           const value = argumentValue(argument.value, variables);
           if (typeof value === 'string') names.add(value);
         });
+        visit(selection.selectionSet, seen);
       } else if (selection.kind === Kind.INLINE_FRAGMENT) {
         visit(selection.selectionSet, seen);
       } else if (!seen.has(selection.name.value)) {

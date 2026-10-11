@@ -23,6 +23,9 @@ import {
   snapshotForNode,
 } from '../store/clickhouse/visibility.js';
 
+import type { Ctx } from './compile.js';
+import { Sql } from './sql.js';
+
 /**
  * Settings of every data query. `enable_materialized_cte`: a root page with
  * relationships is a `WITH page AS MATERIALIZED (…)` CTE (compile.ts).
@@ -147,14 +150,55 @@ export class ApiDb {
   }
 }
 
+/** The SQL binder and compile context of one root statement. */
+export interface StatementEnv {
+  sql: Sql;
+  ctx: Ctx;
+}
+
+const unknownNode = (name: string) =>
+  new GraphQLError(
+    `Node ${name} is not named by this operation (every node a request reads must appear as a \`node:\` argument).`,
+    { extensions: { code: 'BAD_USER_INPUT' } }
+  );
+
+/**
+ * A statement environment from a single-node snapshot (a live re-run, which
+ * pins exactly its subscription's node).
+ */
+export const singleNodeEnv = (
+  snapshot: VisibilitySnapshot,
+  nodeName: string | undefined
+): StatementEnv => {
+  const sql = new Sql(snapshot);
+  return {
+    ctx: {
+      node: snapshot.nodeId === nodeAgnosticId ? undefined : snapshot.nodeId,
+      nodeId: (name) => {
+        if (name !== nodeName) {
+          throw new GraphQLError(
+            'A subscription pins one node: every `node:` argument of it must name the same node.',
+            { extensions: { code: 'BAD_USER_INPUT' } }
+          );
+        }
+        return snapshot.nodeId;
+      },
+      sql,
+    },
+    sql,
+  };
+};
+
 /**
  * The one snapshot of a request (or of one subscription re-run). The nodes
- * are fixed when the request starts (from the operation's root `node`
- * arguments); the snapshot is read once, on first use, pinning all of them
- * in one consistent read, and shared by every resolver: each per-node root
- * reads at its own node's `visible(n)`, and every root shares visible(0),
- * the tail, void and fence. Node-agnostic roots ride on the same snapshot,
- * so a multi-root operation reads one consistent state.
+ * are fixed when the request starts (every `node:` argument of the
+ * operation, at any depth); the snapshot is read once, on first use, pinning
+ * all of them in one consistent read, and shared by every resolver: each
+ * per-node root reads at its own node's `visible(n)`, every root shares
+ * visible(0), the tail, void and fence, and a per-node relationship naming
+ * another node reads that node's `visible(n)` from the same snapshot.
+ * Node-agnostic roots ride on the same snapshot, so a multi-root operation
+ * reads one consistent state.
  */
 export class PinnedSnapshot {
   private pending: Promise<MultiNodeSnapshot> | undefined;
@@ -170,9 +214,7 @@ export class PinnedSnapshot {
   /** For a root that names `node` (undefined: a node-agnostic root). */
   async get(node?: string): Promise<VisibilitySnapshot> {
     if (node !== undefined && !this.nodeNames.includes(node)) {
-      throw new GraphQLError(
-        `Node ${node} is not a root node argument of this operation.`
-      );
+      throw unknownNode(node);
     }
     if (this.preset !== undefined) {
       if (this.nodeNames.length > 1) {
@@ -187,10 +229,38 @@ export class PinnedSnapshot {
     const snapshot = await this.pending;
     return snapshotForNode(
       snapshot,
-      node === undefined
-        ? snapshot.nodeIds[0] ?? nodeAgnosticId
-        : this.ids.get(node)!
+      node === undefined ? nodeAgnosticId : this.ids.get(node)!
     );
+  }
+
+  /**
+   * The statement environment of a root naming `node` (undefined: a
+   * node-agnostic root): its primary node's view parameters, and every other
+   * pinned node for per-node relationships that name one.
+   */
+  async statement(node?: string): Promise<StatementEnv> {
+    if (this.preset !== undefined) {
+      await this.get(node);
+      return singleNodeEnv(this.preset, this.nodeNames[0]);
+    }
+    const snapshot = await this.get(node);
+    const multi = await this.pending!;
+    const others = new Map(
+      [...multi.visibleByNode].filter(([id]) => id !== snapshot.nodeId)
+    );
+    const sql = new Sql(snapshot, others);
+    return {
+      ctx: {
+        node: snapshot.nodeId === nodeAgnosticId ? undefined : snapshot.nodeId,
+        nodeId: (name) => {
+          const id = this.ids.get(name);
+          if (id === undefined) throw unknownNode(name);
+          return id;
+        },
+        sql,
+      },
+      sql,
+    };
   }
 
   private async read() {
