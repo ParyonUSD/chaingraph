@@ -53,6 +53,8 @@ import {
   encodeTransactionRows,
   rowBinaryTableColumns,
 } from './row-encoders.js';
+import type { NewTransactionProof, TransactionLookup } from './tx-lookup.js';
+import { uniqueToItsBlock } from './tx-lookup.js';
 import type { OutputRegistry, UtxoOutput, UtxoRow } from './utxo.js';
 import {
   encodeUtxoRows,
@@ -252,6 +254,10 @@ export interface WriterContext {
    */
   outputs: OutputRegistry<StoreOperation> | undefined;
   transactions: TransactionRegistry;
+  /** The coalesced transaction-hash lookup (tx-lookup.ts). */
+  transactionLookup?: TransactionLookup;
+  /** Blocks whose transactions need no lookup (tx-lookup.ts). */
+  newTransactions?: NewTransactionProof;
   operations: OperationRegistry;
   mempool: MempoolState;
   mode: () => StoreMode;
@@ -388,11 +394,19 @@ export const lookupStoredOutputs = async (
   return results;
 };
 
-/** Stored (valid-commit) transactions by hash: id and the commit that wrote it. */
+/**
+ * Stored (valid-commit) transactions by hash: id and the commit that wrote
+ * it. Through the context's coalesced `transactionLookup` when there is one.
+ */
 export const lookupStoredTransactions = async (
-  context: Pick<WriterContext, 'client' | 'fence' | 'lookupChunkSize'>,
+  context: Pick<WriterContext, 'client' | 'fence' | 'lookupChunkSize'> & {
+    transactionLookup?: TransactionLookup;
+  },
   hashes: readonly string[]
 ): Promise<Map<string, { internalId: bigint; seq: bigint }>> => {
+  if (context.transactionLookup !== undefined) {
+    return context.transactionLookup.lookup(hashes);
+  }
   const found = new Map<string, { internalId: bigint; seq: bigint }>();
   const chunkRows = await mapChunksConcurrently(
     [...new Set(hashes)].sort(compareText),
@@ -554,6 +568,9 @@ export class BlockBatch {
   /** Owned hashes waiting for an id phase. */
   unresolved: string[] = [];
 
+  /** Owned hashes proven new (no lookup: `NewTransactionProof`). */
+  readonly provenNew = new Set<string>();
+
   /** The per-call results, set once the batch's commit is committed. */
   committedResults: SaveBlockResult[] | undefined;
 
@@ -608,6 +625,11 @@ export class BlockCommitter {
 
   constructor(private readonly context: WriterContext) {}
 
+  /** Set once the epoch has read the stored chain (tx-lookup.ts). */
+  setNewTransactionProof(proof: NewTransactionProof) {
+    this.context.newTransactions = proof;
+  }
+
   /** Whether another live operation is saving `hash` now. */
   isInFlight(hash: string) {
     const other = this.inFlight.get(hash);
@@ -630,6 +652,7 @@ export class BlockCommitter {
     const { context } = this;
     const { operation } = batch;
     this.inFlight.set(block.hash, operation);
+    const blockIsNew = context.newTransactions?.note(block) ?? false;
     const owned: ChaingraphTransaction[] = [];
     block.transactions.forEach((transaction) => {
       if (batch.idOf.has(transaction.hash)) return;
@@ -647,6 +670,9 @@ export class BlockCommitter {
       batch.idOf.set(transaction.hash, id.promise);
       context.transactions.pin(transaction.hash, operation, id.promise);
       batch.unresolved.push(transaction.hash);
+      if (blockIsNew && uniqueToItsBlock(transaction, block.height)) {
+        batch.provenNew.add(transaction.hash);
+      }
       owned.push(transaction);
     });
     context.outputs?.register(
@@ -668,7 +694,12 @@ export class BlockCommitter {
   private async idPhase(batch: BlockBatch, hashes: readonly string[]) {
     const { context } = this;
     try {
-      const stored = await lookupStoredTransactions(context, hashes);
+      const lookedUp = hashes.filter((hash) => !batch.provenNew.has(hash));
+      if (context.newTransactions !== undefined) {
+        context.newTransactions.stats.skipped +=
+          hashes.length - lookedUp.length;
+      }
+      const stored = await lookupStoredTransactions(context, lookedUp);
       const newHashes = hashes.filter((hash) => !stored.has(hash));
       const newIds: bigint[] = [];
       if (newHashes.length > 0) {

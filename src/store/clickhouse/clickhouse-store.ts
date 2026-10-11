@@ -39,6 +39,7 @@ import {
   BlockCommitter,
   chunked,
   freshen,
+  lookupConcurrency,
   minMax,
   SimulatedCrash,
   TransactionRegistry,
@@ -76,6 +77,11 @@ import {
 import { RowBinaryWriter } from './row-binary.js';
 import type { SpendIndexProgress, SpendIndexStatus } from './spend-index.js';
 import { SpendIndexFiller } from './spend-index.js';
+import {
+  NewTransactionProof,
+  readStoredChainFacts,
+  TransactionLookup,
+} from './tx-lookup.js';
 import {
   committedSql,
   heightBatches,
@@ -375,6 +381,12 @@ export class ClickHouseStore implements ChaingraphStore {
 
   private committerInstance: BlockCommitter | undefined;
 
+  /** The coalesced transaction-hash lookup of the current epoch. */
+  transactionLookup: TransactionLookup | undefined;
+
+  /** Which new blocks' transactions need no lookup (current epoch). */
+  newTransactions: NewTransactionProof | undefined;
+
   /** The spend index filler of the current epoch (`undefined` when off). */
   private spendFiller: SpendIndexFiller | undefined;
 
@@ -556,6 +568,12 @@ export class ClickHouseStore implements ChaingraphStore {
     await publisher.publishWatermark();
     this.publisher = publisher;
     const { ids } = this;
+    const transactionLookup = new TransactionLookup(
+      client,
+      () => this.fenceArray,
+      { chunkSize: this.lookupChunkSize, concurrency: lookupConcurrency }
+    );
+    this.transactionLookup = transactionLookup;
     this.committerInstance = new BlockCommitter({
       abandon: this.abandonSignal,
       client,
@@ -571,6 +589,7 @@ export class ClickHouseStore implements ChaingraphStore {
       operationOfSeq: (seq) => this.operationOfSeq(seq),
       operations: this.operations,
       outputs: this.outputs,
+      transactionLookup,
       transactions: this.transactions,
       utxo: this.utxoEnabled,
       // eslint-disable-next-line sort-keys
@@ -627,6 +646,7 @@ export class ClickHouseStore implements ChaingraphStore {
       operationOfSeq: (seq) => this.operationOfSeq(seq),
       operations: this.operations,
       outputs: this.outputs,
+      transactionLookup,
       transactions: this.transactions,
       utxo: this.utxoEnabled,
     });
@@ -658,6 +678,16 @@ export class ClickHouseStore implements ChaingraphStore {
       this.mode = 'tip';
     }
     await this.mempoolCommitter.rebuild();
+    /*
+     * Which blocks of this epoch need no transaction-hash lookup: proven from
+     * the stored chain now (tx-lookup.ts). Off once mempool tracking is on.
+     */
+    const proof = new NewTransactionProof(
+      await readStoredChainFacts(client, this.fenceArray, this.nodes.ids.length)
+    );
+    if (this.mempoolTracking) proof.disable('mempool tracking');
+    this.newTransactions = proof;
+    this.committerInstance.setNewTransactionProof(proof);
     if (this.spendIndexEnabled) {
       const filler = new SpendIndexFiller(
         {
@@ -953,6 +983,9 @@ export class ClickHouseStore implements ChaingraphStore {
       deduplicationToken: `node:${internalId}:${updatedMs}`,
     });
     this.nodes.set(node.nodeName, internalId);
+    if (this.nodes.ids.length > 1) {
+      this.newTransactions?.disable('more than one node');
+    }
     this.requirePublisher().registerNode(internalId);
     const accepted = await client.query<{ hash: string; block_height: number }>(
       `SELECT lower(hex(any(block_hash))) AS hash, any(height) AS block_height
@@ -1478,6 +1511,7 @@ export class ClickHouseStore implements ChaingraphStore {
     removedAt?: Date
   ): Promise<void> {
     this.assertOpen();
+    this.newTransactions?.disable('re-org');
     const operation = await this.beginOperation('reorg', [nodeInternalId]);
     let commit: OpenCommit | undefined;
     try {
@@ -1945,6 +1979,7 @@ export class ClickHouseStore implements ChaingraphStore {
 
   async enableMempoolTracking(): Promise<{ schemaIsCurrent: boolean }> {
     this.assertOpen();
+    this.newTransactions?.disable('mempool tracking');
     this.mempool.tracking = true;
     this.mempoolTracking = true;
     return Promise.resolve({ schemaIsCurrent: true });
@@ -1959,6 +1994,7 @@ export class ClickHouseStore implements ChaingraphStore {
     nodeValidations: NodeValidation[]
   ): Promise<void> {
     this.assertOpen();
+    this.newTransactions?.disable('mempool transaction');
     return this.withLease(async () =>
       this.requireMempoolCommitter().saveTransaction(
         transaction,
@@ -1972,6 +2008,7 @@ export class ClickHouseStore implements ChaingraphStore {
     validation: NodeValidation
   ): Promise<void> {
     this.assertOpen();
+    this.newTransactions?.disable('mempool transaction');
     return this.withLease(async () =>
       this.requireMempoolCommitter().recordValidation(
         transactionHash,
