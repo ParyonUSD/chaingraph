@@ -1,6 +1,7 @@
 # L20 InterestManager (v1: v1/L20-InterestManager.graphql)
 # status: works
 # chipnet equality: equal (v1 2 rows in 1 pages, v2 2 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 59.8 ms; v1 Hasura/Postgres 3.0 ms
 query InterestManager($loanTokenId: Hex, $interestManagerCommitment: Hex, $node: String!, $limit: Int!, $after: String) {
   output: unspent_outputs(node: $node, limit: $limit, after: $after,
     where: { token_category: { _eq: $loanTokenId }, nonfungible_token_commitment: { _eq: $interestManagerCommitment } }) {

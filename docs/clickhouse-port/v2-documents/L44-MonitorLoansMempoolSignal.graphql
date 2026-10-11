@@ -1,6 +1,7 @@
 # L44 MonitorLoansMempoolSignal (v1: v1/L44-MonitorLoansMempoolSignal.graphql)
 # status: works
 # chipnet equality: equal (v1 0 rows in 1 pages, v2 0 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 27.6 ms; v1 Hasura/Postgres 1.3 ms
 subscription MonitorLoansMempoolSignal($paryonTokenId: Hex!, $loanContractLockingBytecode: Hex!, $node: String!) {
   node_transaction: mempool(node: $node, limit: 100, order_by: [{ validated_at: DESC }, { transaction_internal_id: DESC }],
     where: { transaction: { has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $loanContractLockingBytecode } } } } }) {

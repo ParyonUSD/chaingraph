@@ -1,6 +1,7 @@
 # X9 SearchOutputsByLockingBytecodePrefix (v1: v1/X09-SearchOutputsByLockingBytecodePrefix.graphql)
 # status: works
 # chipnet equality: equal (v1 3548 rows in 1 pages, v2 3548 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 333.1 ms; v1 Hasura/Postgres 54.4 ms
 query SearchOutputsByLockingBytecodePrefix($node: String!, $prefix: Hex!, $limit: Int!, $after: String) {
   search_output_prefix: outputs(node: $node, limit: $limit, after: $after, where: { locking_bytecode: { _prefix: $prefix } }, order_by: { locking_bytecode: ASC }) {
     has_more

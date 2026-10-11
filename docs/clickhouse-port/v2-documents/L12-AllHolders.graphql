@@ -1,6 +1,7 @@
 # L12 AllHolders (v1: v1/L12-AllHolders.graphql)
 # status: works
 # chipnet equality: equal-unordered (root order: by store-local ids, not selected) (v1 1536 rows in 1 pages, v2 1536 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 136.4 ms; v1 Hasura/Postgres 368.0 ms
 query AllHolders($paryonTokenId: Hex, $node: String!, $limit: Int!, $after: String) {
   output: unspent_outputs(node: $node, limit: $limit, after: $after,
     order_by: [{ transaction: { internal_id: ASC } }, { output_index: ASC }],

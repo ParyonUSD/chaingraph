@@ -1,6 +1,7 @@
 # L47 MonitorContractUtxosMempoolSignalPoll (v1: v1/L47-MonitorContractUtxosMempoolSignalPoll.graphql)
 # status: works
 # chipnet equality: equal (v1 5 rows in 1 pages, v2 5 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 35.3 ms; v1 Hasura/Postgres 39.8 ms
 query MonitorContractUtxosMempoolSignalPoll($tokenId: Hex!, $lockingBytecode: Hex!, $node: String!) {
   node_transaction: mempool(node: $node, limit: 100, order_by: [{ validated_at: DESC }, { transaction_internal_id: DESC }],
     where: { transaction: { _or: [{ has_output: { token_category: { _eq: $tokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecode } } }, { has_input: { outpoint: { token_category: { _eq: $tokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecode } } } }] } }) {

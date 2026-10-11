@@ -1,6 +1,7 @@
 # X16 TransactionStats2021Q1 (v1: v1/X16-TransactionStats2021Q1.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 556.8 ms; v1 Hasura/Postgres 590.9 ms
 query TransactionStats2021Q1($node: String!, $from: BigInt!, $to: BigInt!) {
   transaction_aggregate: transactions_aggregate(node: $node, where: { in_block: { timestamp: { _gt: $from, _lt: $to } } }) {
     aggregate {

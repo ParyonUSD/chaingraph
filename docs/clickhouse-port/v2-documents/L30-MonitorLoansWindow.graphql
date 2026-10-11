@@ -1,6 +1,7 @@
 # L30 MonitorLoansWindow (v1: v1/L30-MonitorLoansWindow.graphql)
 # status: works
 # chipnet equality: equal-unordered (v2 rows descending by v2 internal ids) (v1 1000 rows in 1 pages, v2 1000 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 316.9 ms; v1 Hasura/Postgres 2372.5 ms
 query MonitorLoansWindow($paryonTokenId: Hex!, $loanContractLockingBytecode: Hex!, $after: BigInt, $before: BigInt, $order: Order!, $node: String!, $limit: Int!) {
   transaction: transactions(node: $node, after: $after, before: $before, order: $order, limit: $limit, where: {
     has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $loanContractLockingBytecode } } }

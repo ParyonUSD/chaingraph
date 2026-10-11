@@ -1,6 +1,7 @@
 # X14 BlockchainSize (v1: v1/X14-BlockchainSize.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 34.0 ms; v1 Hasura/Postgres 342.4 ms
 query BlockchainSize($node: String!) {
   bchn_blocks: blocks_aggregate(node: $node) {
     aggregate { sum { size_bytes } }

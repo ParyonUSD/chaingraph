@@ -1,6 +1,7 @@
 # L39 newPeriodPool (v1: v1/L39-newPeriodPool.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 142.9 ms; v1 Hasura/Postgres 5.1 ms
 subscription newPeriodPool($poolTokenId: Hex!, $poolLockingBytecode: Hex!, $node: String!) {
   transaction: transactions(node: $node, limit: 1, order_by: [{ locktime: DESC }], where: {
     has_input: { outpoint: { token_category: { _eq: $poolTokenId }, nonfungible_token_capability: { _eq: MINTING }, locking_bytecode: { _eq: $poolLockingBytecode } } }

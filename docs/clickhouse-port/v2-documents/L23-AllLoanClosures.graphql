@@ -1,6 +1,7 @@
 # L23 AllLoanClosures (v1: v1/L23-AllLoanClosures.graphql)
 # status: works
 # chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 20 rows in 1 pages, v2 20 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 183.5 ms; v1 Hasura/Postgres 109.1 ms
 query AllLoanClosures($paryonTokenId: Hex, $lockingBytecodeLoan: Hex, $node: String!, $limit: Int!, $after: BigInt) {
   transaction: transactions(node: $node, limit: $limit, after: $after, where: {
     has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecodeLoan } } }

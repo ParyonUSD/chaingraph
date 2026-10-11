@@ -1,6 +1,7 @@
 # X15 BlockSizeStatsSince2021 (v1: v1/X15-BlockSizeStatsSince2021.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 33.3 ms; v1 Hasura/Postgres 343.2 ms
 query BlockSizeStatsSince2021($node: String!, $since: BigInt!) {
   block_aggregate: blocks_aggregate(node: $node, where: { timestamp: { _gt: $since } }) {
     aggregate {

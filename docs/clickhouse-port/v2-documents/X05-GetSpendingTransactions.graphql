@@ -1,6 +1,7 @@
 # X5 GetSpendingTransactions (v1: v1/X05-GetSpendingTransactions.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 258.9 ms; v1 Hasura/Postgres 8.8 ms
 query GetSpendingTransactions($hash: Hex!, $node: String!) {
   output: outputs_by_transaction_hash(transaction_hashes: [$hash], where: { output_index: { _eq: 0 } }) {
     transaction_hash

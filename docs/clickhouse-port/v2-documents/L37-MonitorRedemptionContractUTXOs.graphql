@@ -1,6 +1,7 @@
 # L37 MonitorRedemptionContractUTXOs (v1: v1/L37-MonitorRedemptionContractUTXOs.graphql)
 # status: works
 # chipnet equality: equal (v1 0 rows in 1 pages, v2 0 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 118.0 ms; v1 Hasura/Postgres 3.1 ms
 subscription MonitorRedemptionContractUTXOs($redemptionTokenId: Hex!, $redemptionContractLockingBytecode: Hex!, $node: String!, $limit: Int!) {
   output: unspent_outputs(node: $node, limit: $limit, where: {
     token_category: { _eq: $redemptionTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $redemptionContractLockingBytecode }

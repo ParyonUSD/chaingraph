@@ -1,6 +1,7 @@
 # L25 LoanKeyOwner (v1: v1/L25-LoanKeyOwner.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 33.7 ms; v1 Hasura/Postgres 2.2 ms
 query LoanKeyOwner($loanKey: Hex, $node: String!, $limit: Int!, $after: String) {
   output: unspent_outputs(node: $node, limit: $limit, after: $after,
     where: { token_category: { _eq: $loanKey }, nonfungible_token_capability: { _eq: MINTING } }) {

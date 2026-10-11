@@ -1,6 +1,7 @@
 # L29 LoanBorrowingSummaries (v1: v1/L29-LoanBorrowingSummaries.graphql)
 # status: works
 # chipnet equality: equal (v1 7 rows in 1 pages, v2 7 rows in 1 pages)
+# latency (chipnet_ch_pp2, p50 warm, first page): v2 172.9 ms; v1 Hasura/Postgres 8.5 ms
 query LoanBorrowingSummaries($userLoanKeys: [Hex!], $paryonTokenId: Hex, $node: String!, $limit: Int!, $after: BigInt) {
   transaction: transactions(node: $node, limit: $limit, after: $after, where: {
     has_output: { token_category: { _in: $userLoanKeys }, nonfungible_token_capability: { _eq: NONE } }
