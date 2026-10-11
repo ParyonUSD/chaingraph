@@ -383,6 +383,14 @@ export class Agent {
   successfullyInitialized = false;
 
   /**
+   * Set while the post-registration initialization (synchronous_commit,
+   * unspent tracking configuration) runs: `scheduleBlockBufferFill` keeps
+   * calling `checkInitialization` until `successfullyInitialized`, and a
+   * second concurrent run would repeat the configuration DDL.
+   */
+  initializationInProgress = false;
+
+  /**
    * Chaingraph does not currently support live transaction saving during
    * the initial sync and index building steps, as retaining this
    * information would require more complex logic, heavier memory usage,
@@ -856,6 +864,14 @@ export class Agent {
         this.scheduleBlockBufferFill();
       }, second);
     } else {
+      if (this.initializationInProgress) {
+        return;
+      }
+      this.initializationInProgress = true;
+      // eslint-disable-next-line functional/no-let
+      let fatalInitializationError = false;
+      // eslint-disable-next-line functional/no-let
+      let configuringUnspentNodeIds = false;
       optionallyDisableSynchronousCommit()
         .then((disabled) => {
           if (disabled) {
@@ -871,6 +887,7 @@ export class Agent {
               this.logger.warn(message);
             },
           });
+          configuringUnspentNodeIds = true;
           return configureUnspentNodeIds();
         })
         .then((statements) => {
@@ -882,10 +899,29 @@ export class Agent {
             );
           }
         })
-        .catch((err) => {
+        .catch((err: unknown) => {
+          if (unspentNodeIds.enabled && configuringUnspentNodeIds) {
+            /*
+             * Tracking on but not configured (release-event triggers possibly
+             * off): syncing would leave the stored set stale.
+             */
+            fatalInitializationError = true;
+            this.logger.fatal(
+              err,
+              'Agent: failed to configure unspent tracking (CHAINGRAPH_UNSPENT_NODE_IDS=true); shutting down.'
+            );
+            this.shutdown().catch((shutdownErr) => {
+              this.logger.error(shutdownErr);
+            });
+            return;
+          }
           this.logger.error(err);
         })
         .finally(() => {
+          this.initializationInProgress = false;
+          if (fatalInitializationError) {
+            return;
+          }
           this.successfullyInitialized = true;
           this.scheduleBlockBufferFill();
         });

@@ -73,6 +73,13 @@ export const configureTrackingTriggersSql = (
 export const readSettingsSql = /* sql */ `SELECT hash_max_transactions::text AS "hashMaxTransactions", fallback_transactions::text AS "fallbackTransactions", fallback_events::text AS "fallbackEvents" FROM unspent_tracking_settings;`;
 export const writeSettingsSql = /* sql */ `UPDATE unspent_tracking_settings SET hash_max_transactions = $1::bigint, fallback_transactions = $2::bigint, fallback_events = $3::bigint;`;
 export const buildRootSql = /* sql */ `SELECT unspent_node_ids_build_root();`;
+export const stopTrackingSql = /* sql */ `SELECT unspent_node_ids_stop() AS stopped;`;
+/**
+ * Advisory lock key serializing the agent's unspent tracking DDL (trigger
+ * configuration, root builds, per-node index creation) across agents and
+ * concurrent callers; `unspent_node_ids_build_root()` takes the same key.
+ */
+export const configurationLockKey = 1970172787;
 
 /**
  * Settling the watermark limits. The sequences are read first; after a short
@@ -83,16 +90,19 @@ export const buildRootSql = /* sql */ `SELECT unspent_node_ids_build_root();`;
  * either committed or will never commit. (The grace covers the gap between a
  * statement's `nextval` and the assignment of its transaction id.) A
  * snapshot's in-progress list is not enough: it omits running transactions
- * whose xid is at or above the snapshot's xmax.
+ * whose xid is at or above the snapshot's xmax. Event ids are settled the same
+ * way: an event id is allocated when its row is inserted, so a later id can
+ * commit first, and a batch consuming past an uncommitted id would skip it.
  */
 export const readSequencesSql = /* sql */ `
 SELECT
   (SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM transaction_internal_id_seq)::text AS "transactionLimit",
-  (SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM block_internal_id_seq)::text AS "blockLimit";`;
+  (SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM block_internal_id_seq)::text AS "blockLimit",
+  (SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM unspent_tracking_events_id_seq)::text AS "eventLimit";`;
 export const nextTransactionIdSql = /* sql */ `SELECT pg_current_xact_id()::text AS "nextXid";`;
 export const snapshotSettledSql = /* sql */ `SELECT pg_snapshot_xmin(pg_current_snapshot()) > $1::xid8 AS settled;`;
 
-export const initializeSql = /* sql */ `SELECT unspent_node_ids_initialize($1::integer, $2::bigint, $3::bigint) AS initialized;`;
+export const initializeSql = /* sql */ `SELECT unspent_node_ids_initialize($1::integer, $2::bigint, $3::bigint, $4::bigint) AS initialized;`;
 export const repartitionSql = /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`;
 export const progressSql = /* sql */ `
 SELECT count(*)::text AS partitions,
@@ -104,7 +114,33 @@ SELECT count(*)::text AS partitions,
        min(backfill_transaction_internal_id)::text AS "backfillWatermark",
        (SELECT backfill_complete FROM unspent_tracking_settings) AS "backfillComplete"
   FROM unspent_tracking_progress;`;
-export const runBatchSql = /* sql */ `SELECT unspent_node_ids_run_batch($1::integer, $2::integer, $3::bigint, $4::bigint, $5::integer, $6::integer, $7::integer, $8::bigint, $9::boolean) AS result;`;
+export const runBatchSql = /* sql */ `SELECT unspent_node_ids_run_batch($1::integer, $2::integer, $3::bigint, $4::bigint, $5::bigint, $6::integer, $7::integer, $8::integer, $9::bigint) AS result;`;
+export const watchPassSql = /* sql */ `SELECT unspent_node_ids_watch_pass($1::bigint) AS result;`;
+
+/**
+ * Result of the once-per-pass watch-set check (`unspent_node_ids_watch_pass`):
+ * released transactions added, transactions watched, "accepted" events
+ * written for re-acceptances, entries expired.
+ */
+export interface WatchPassResult {
+  added: number;
+  busy?: boolean;
+  expired: number;
+  reaccepted: number;
+  uninitialized?: boolean;
+  watched: number;
+}
+// eslint-disable-next-line complexity
+export const parseWatchPassResult = (raw: {
+  [key: string]: unknown;
+}): WatchPassResult => ({
+  added: Number(raw.added ?? 0),
+  ...(raw.busy === true ? { busy: true } : {}),
+  expired: Number(raw.expired ?? 0),
+  reaccepted: Number(raw.reaccepted ?? 0),
+  ...(raw.uninitialized === true ? { uninitialized: true } : {}),
+  watched: Number(raw.watched ?? 0),
+});
 export const backfillBatchSql = /* sql */ `SELECT unspent_node_ids_backfill_batch($1::integer, $2::integer, $3::integer) AS result;`;
 export const deleteConsumedEventsSql = /* sql */ `SELECT unspent_node_ids_delete_consumed_events()::text AS deleted;`;
 /**
@@ -185,9 +221,6 @@ export interface BatchResult {
   skippedInputs: number;
   stalledAt: number | null;
   uninitialized?: boolean;
-  watchAdded: number;
-  watchChanged: number;
-  watchExpired: number;
 }
 
 // eslint-disable-next-line complexity
@@ -216,9 +249,6 @@ export const parseBatchResult = (raw: {
         ? null
         : Number(raw.stalledAt),
     ...(raw.uninitialized === true ? { uninitialized: true } : {}),
-    watchAdded: num('watchAdded'),
-    watchChanged: num('watchChanged'),
-    watchExpired: num('watchExpired'),
   };
 };
 
@@ -228,8 +258,7 @@ export const parseBatchResult = (raw: {
 export const batchDidWork = (result: BatchResult) =>
   result.inputWatermark !== result.previousInputWatermark ||
   result.blockWatermark !== result.previousBlockWatermark ||
-  result.events > 0 ||
-  result.watchChanged > 0;
+  result.events > 0;
 
 /**
  * Whether a partition reached the settled limits (nothing left but events
@@ -282,11 +311,22 @@ export const nextSkipThrough = (
     : previousSkipThrough;
 
 /**
+ * Sequence values whose allocating transactions have all finished: the job
+ * walks transactions and blocks and consumes events up to them.
+ */
+export interface SettledLimits {
+  blockLimit: number;
+  eventLimit: number;
+  transactionLimit: number;
+}
+
+/**
  * Settling candidate: sequence values read at `readAt`, then (after the
  * grace) the next xid; usable once every xid up to it has finished.
  */
 export interface SettleCandidate {
   blockLimit: number;
+  eventLimit: number;
   nextXid?: string;
   readAt: number;
   transactionLimit: number;
@@ -312,11 +352,7 @@ export const formatBatchLog = (
     result.blocks
   } (+${result.blockTransactions.toLocaleString()} earlier txs), events ${
     result.events
-  } (${result.eventTransactions.toLocaleString()} txs), watch +${
-    result.watchAdded
-  }/~${result.watchChanged}/-${
-    result.watchExpired
-  }; ${result.affected.toLocaleString()} outputs checked (${result.fresh.toLocaleString()} first seen, no probe), ${result.changed.toLocaleString()} changed${
+  } (${result.eventTransactions.toLocaleString()} txs); ${result.affected.toLocaleString()} outputs checked (${result.fresh.toLocaleString()} first seen, no probe), ${result.changed.toLocaleString()} changed${
     result.stalledAt === null
       ? ''
       : `; stalled before tx ${result.stalledAt} (output not saved yet)`
