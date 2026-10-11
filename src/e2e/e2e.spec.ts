@@ -3364,6 +3364,72 @@ INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
 );
 
 test.serial(
+  '[e2e] [sql] node_block_height migration backfills existing rows and can be re-applied',
+  async (t) => {
+    const migrationDirectory = 'default/1791600000000_node_block_height';
+    const downMigration = readFileSync(
+      migration(`${migrationDirectory}/down.sql`),
+      'utf8'
+    );
+    const upMigration = readFileSync(
+      migration(`${migrationDirectory}/up.sql`),
+      'utf8'
+    );
+    const describeNodeBlockHeight = async () =>
+      (
+        await client.query<{
+          indexExists: boolean;
+          mismatched: string;
+          notNull: boolean;
+          total: string;
+          triggerExists: boolean;
+        }>(/* sql */ `
+SELECT COUNT(*)::bigint AS total,
+       COUNT(*) FILTER (WHERE node_block.block_height IS DISTINCT FROM block.height)::bigint AS mismatched,
+       (SELECT is_nullable = 'NO' FROM information_schema.columns
+          WHERE table_name = 'node_block' AND column_name = 'block_height') AS "notNull",
+       to_regclass('node_block_node_height_index') IS NOT NULL AS "indexExists",
+       EXISTS (SELECT 1 FROM pg_trigger
+          WHERE tgname = 'trigger_public_node_block_fill_height') AS "triggerExists"
+  FROM node_block
+  JOIN block ON block.internal_id = node_block.block_internal_id;
+`)
+      ).rows[0]!;
+    await client.query('BEGIN;');
+    const reapply = async () => {
+      await client.query(downMigration);
+      const columnAfterDown = (
+        await client.query(/* sql */ `
+SELECT 1 FROM information_schema.columns
+  WHERE table_name = 'node_block' AND column_name = 'block_height';
+`)
+      ).rowCount;
+      await client.query(upMigration);
+      const afterBackfill = await describeNodeBlockHeight();
+      await client.query(upMigration);
+      const afterReapply = await describeNodeBlockHeight();
+      return { afterBackfill, afterReapply, columnAfterDown };
+    };
+    const rollback = async () => client.query('ROLLBACK;');
+    const { afterBackfill, afterReapply, columnAfterDown } =
+      await reapply().then(
+        async (result) => rollback().then(() => result),
+        async (error: unknown) =>
+          // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+          rollback().then(async () => Promise.reject(error))
+      );
+    t.deepEqual(columnAfterDown, 0);
+    t.true(Number(afterBackfill.total) > 0);
+    [afterBackfill, afterReapply].forEach((state) => {
+      t.deepEqual(state.mismatched, '0');
+      t.true(state.notNull);
+      t.true(state.indexExists);
+      t.true(state.triggerExists);
+    });
+  }
+);
+
+test.serial(
   '[e2e] [sql] per-node tip query uses node_block_node_height_index',
   async (t) => {
     /*
