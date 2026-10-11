@@ -2025,15 +2025,13 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   t.pass();
 });
 
-test.serial(
-  '[e2e] new block saved after reorg',
-  async (t) => {
-    const acceptedBlocks = (
-      await client.query<{
-        hash: string;
-        nodeName: string;
-      }>(
-        /* sql */ `
+test.serial('[e2e] new block saved after reorg', async (t) => {
+  const acceptedBlocks = (
+    await client.query<{
+      hash: string;
+      nodeName: string;
+    }>(
+      /* sql */ `
       SELECT node.name AS "nodeName", encode(block.hash, 'hex') AS hash
         FROM node_block
         INNER JOIN node
@@ -2044,14 +2042,13 @@ test.serial(
           AND block.height = $1
         ORDER BY block.hash;
     `,
-        [splitHeight + 1]
-      )
-    ).rows;
-    t.deepEqual(acceptedBlocks, [
-      { hash: tipA[0]!.header.hash, nodeName: 'node3' },
-    ]);
-  }
-);
+      [splitHeight + 1]
+    )
+  ).rows;
+  t.deepEqual(acceptedBlocks, [
+    { hash: tipA[0]!.header.hash, nodeName: 'node3' },
+  ]);
+});
 
 test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
   const tipStartIndex = 2;
@@ -3408,10 +3405,22 @@ SELECT 1 FROM information_schema.columns
       const afterBackfill = await describeNodeBlockHeight();
       await client.query(upMigration);
       const afterReapply = await describeNodeBlockHeight();
-      return { afterBackfill, afterReapply, columnAfterDown };
+      /*
+       * A nullable, partly filled column (e.g. an interrupted manual apply) is
+       * backfilled again.
+       */
+      await client.query(downMigration);
+      await client.query(/* sql */ `
+ALTER TABLE node_block ADD COLUMN block_height bigint;
+UPDATE node_block SET block_height = -1
+  WHERE block_internal_id = (SELECT min(block_internal_id) FROM node_block);
+`);
+      await client.query(upMigration);
+      const afterPartial = await describeNodeBlockHeight();
+      return { afterBackfill, afterPartial, afterReapply, columnAfterDown };
     };
     const rollback = async () => client.query('ROLLBACK;');
-    const { afterBackfill, afterReapply, columnAfterDown } =
+    const { afterBackfill, afterPartial, afterReapply, columnAfterDown } =
       await reapply().then(
         async (result) => rollback().then(() => result),
         async (error: unknown) =>
@@ -3420,7 +3429,7 @@ SELECT 1 FROM information_schema.columns
       );
     t.deepEqual(columnAfterDown, 0);
     t.true(Number(afterBackfill.total) > 0);
-    [afterBackfill, afterReapply].forEach((state) => {
+    [afterBackfill, afterReapply, afterPartial].forEach((state) => {
       t.deepEqual(state.mismatched, '0');
       t.true(state.notNull);
       t.true(state.indexExists);
