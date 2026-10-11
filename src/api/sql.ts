@@ -100,14 +100,38 @@ export class Sql {
   }
 
   /**
+   * Items of the statement's top-level `WITH` clause, in definition order:
+   * `MATERIALIZED` CTEs (`cte`) and, for a root with relationships, the
+   * level subqueries of compile.ts. A statement builder emits them with
+   * `withClause()`. CTEs are never nested inside a subquery: a scalar
+   * subquery containing a `MATERIALIZED` CTE is evaluated again at every
+   * reference on ClickHouse 26.8 (chipnet L31: 9 evaluations, 0.7 s).
+   */
+  readonly withItems: string[] = [];
+
+  /** A statement-level `MATERIALIZED` CTE of `body`; returns its name. */
+  cte(prefix: string, body: string) {
+    const name = this.uniqueName(prefix);
+    this.withItems.push(`${name} AS MATERIALIZED (${body})`);
+    return name;
+  }
+
+  /** `WITH …` of the statement's items (empty when there are none). */
+  withClause() {
+    return this.withItems.length === 0
+      ? ''
+      : `WITH ${this.withItems.join(',\n')}\n`;
+  }
+
+  /**
    * Rows of `rows` (a subquery with a `transaction_hash` column) whose
    * transaction the node accepts, with `columns` selected: the rows are
-   * computed once (a statement-local MATERIALIZED CTE) and the acceptance
+   * computed once (a statement-level MATERIALIZED CTE) and the acceptance
    * check reads only their transactions' acceptance rows.
    */
   acceptedRows(rows: string, columns: string, node?: number) {
-    const name = this.uniqueName('acc');
-    return `WITH ${name} AS MATERIALIZED (${rows}) SELECT ${columns} FROM ${name} WHERE transaction_hash IN (${this.accepted(
+    const name = this.cte('acc', rows);
+    return `SELECT ${columns} FROM ${name} WHERE transaction_hash IN (${this.accepted(
       node,
       `SELECT transaction_hash FROM ${name}`
     )})`;

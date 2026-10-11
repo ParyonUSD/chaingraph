@@ -133,8 +133,7 @@ const pageOf = async (
   args: PageArgs,
   sels: readonly Sel[],
   max: number,
-  cursorOf?: (row: Row, values: string[]) => string,
-  ctes?: readonly string[]
+  cursorOf?: (row: Row, values: string[]) => string
 ): Promise<Page> => {
   checkLimit(args.limit, max);
   const offset = checkOffset(args.offset);
@@ -142,7 +141,6 @@ const pageOf = async (
     env.sql,
     env.ctx,
     {
-      ...(ctes === undefined ? {} : { ctes }),
       entity,
       limit: args.limit + 1,
       offset,
@@ -191,8 +189,10 @@ export const runTransactions = async (
    * materialized once: the transaction rows, the acceptance check and every
    * per-transaction semi-join of the filter read only them, by key.
    */
-  const name = sql.uniqueName('candidates');
-  const among = candidates === undefined ? undefined : `SELECT * FROM ${name}`;
+  const among =
+    candidates === undefined
+      ? undefined
+      : `SELECT * FROM ${sql.cte('candidates', candidates)}`;
   const bounds = numericComparison(sql, 'internal_id', 'UInt64', {
     _gt: args.after_internal_id ?? undefined,
     _lt: args.before ?? undefined,
@@ -213,10 +213,7 @@ export const runTransactions = async (
     sels,
     maxLimits.transactions,
     /* the spike's cursor: the last internal_id (pass as `after`/`before`) */
-    explicit === undefined ? (_row, values) => values[0]! : undefined,
-    candidates === undefined
-      ? undefined
-      : [`${name} AS MATERIALIZED (${candidates})`]
+    explicit === undefined ? (_row, values) => values[0]! : undefined
   );
 };
 

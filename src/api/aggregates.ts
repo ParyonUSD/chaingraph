@@ -266,9 +266,10 @@ export const runAggregate = async (
   rows: RowSet,
   requested: Requested
 ): Promise<AggregateRow> => {
-  const statement = `SELECT ${aggregateColumns(spec, requested).join(
-    ', '
-  )} FROM (${rows.source}) WHERE ${whereOf(rows)}`;
+  const statement = `${env.sql.withClause()}SELECT ${aggregateColumns(
+    spec,
+    requested
+  ).join(', ')} FROM (${rows.source}) WHERE ${whereOf(rows)}`;
   const [row] = await env.db.query<{ [column: string]: unknown }>(
     label,
     statement,
@@ -337,7 +338,7 @@ export const runGroups = async (
   });
   const keyOrder = keySql.map((key) => `\`key.${key.field}\` ASC`);
   const join = spec.joins?.(env, keys);
-  const statement = `SELECT ${keySql
+  const statement = `${env.sql.withClause()}SELECT ${keySql
     .map((key) => `${key.sql} AS \`key.${key.field}\``)
     .join(', ')}, ${aggregateColumns(spec, requested).join(', ')}
   FROM (${rows.source}) AS rows ${join ?? ''}

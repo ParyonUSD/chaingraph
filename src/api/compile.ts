@@ -1,5 +1,5 @@
 /* eslint-disable camelcase, @typescript-eslint/naming-convention, complexity, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, functional/no-mixed-type, max-params, functional/no-let, no-underscore-dangle, functional/no-loop-statement, functional/no-try-statement, @typescript-eslint/init-declarations, @typescript-eslint/parameter-properties, @typescript-eslint/strict-boolean-expressions */
-// cspell:ignore clickhouse unhex subquery
+// cspell:ignore clickhouse unhex subquery analysed
 /**
  * Selection-driven SQL for the v2 API: one root field = ONE ClickHouse
  * statement, at any depth.
@@ -303,36 +303,54 @@ const referencedColumns = (expr: string, columns: readonly string[]) =>
 /** Response-row cap per statement (R33): a bigger result is an error, never silently cut. */
 export const maxRowsPerStatement = 500_000;
 
+/**
+ * The levels of one statement. Each level (the root page included) is a
+ * scalar subquery of the statement's `WITH` clause returning ALL its rows as
+ * one array of tuples (`groupArray(tuple(…))`); a relationship's rows are read
+ * by the keys of its parent level's array (`IN (SELECT tupleElement(__r, i)
+ * FROM (SELECT arrayJoin(parent) AS __r))`), and the statement returns the
+ * arrays (one row). The rows are nested in TypeScript (`decode`).
+ *
+ * Why not one `MATERIALIZED` CTE per level joined back in SQL (the stage-1
+ * shape): ClickHouse 26.8's analyzer re-analyses a materialized CTE's whole
+ * definition, recursively, at every reference, so a 5-level document spent
+ * 40-80 ms in query analysis before reading a row. A scalar subquery is
+ * analysed and evaluated once and its references are constants
+ * (phase2-api.md §6.1).
+ */
 class Statement {
-  readonly ctes: string[] = [];
-
-  private names = 0;
-
-  private joins = 0;
+  /** Key width (child key columns) of each level, by name. */
+  readonly keyWidths = new Map<string, number>();
 
   constructor(readonly sql: Sql) {}
 
-  cteName() {
-    this.names += 1;
-    return `l${this.names}`;
-  }
-
-  joinName() {
-    this.joins += 1;
-    return `j${this.joins}`;
+  levelName(keyWidth: number) {
+    const name = `__l${this.keyWidths.size + 1}`;
+    this.keyWidths.set(name, keyWidth);
+    return name;
   }
 }
+
+/** Rows of every level by name: child rows grouped by their parent key, sorted. */
+type LevelData = Map<string, Map<string, unknown[][]>>;
 
 interface LevelPlan {
-  /** Tuple element expressions (after the row number). */
-  exprs: string[];
-  /** LEFT JOINs of child aggregates. */
-  joins: string[];
+  /** Tuple elements (SQL over the level row's raw columns), after the level's prefix. */
+  elements: string[];
   /** Raw columns the level row must carry. */
   needs: Set<string>;
-  /** Tuple (without the leading row number) → decoded row. */
-  decode: (values: unknown[], count: { rows: number }) => Row;
+  /** Tuple elements (after the prefix) → decoded row. */
+  decode: (values: unknown[], data: LevelData, count: { rows: number }) => Row;
 }
+
+/** A key column as text, for matching parent and child rows in TypeScript (lossless for bytes). */
+const keyText = (column: string) => `hex(toString(${column}))`;
+
+/** Values of a tuple → the matching key (null: matches nothing, like SQL). */
+const keyOf = (values: readonly unknown[]) =>
+  values.some((value) => value === null || value === undefined)
+    ? undefined
+    : values.map(String).join('\u0000');
 
 const nestedLimitCap = 100_000;
 
@@ -377,30 +395,37 @@ const resolveNode = (c: Ctx, args: { [name: string]: unknown }) =>
   typeof args.node === 'string' ? c.nodeId(args.node) : c.node;
 
 /**
- * Plan one level: `cte` is the level's CTE (or subquery) name; its rows carry
- * the entity's raw columns in `needs`.
+ * Plan one level: `level` is the name of its array (a `WITH` scalar), whose
+ * tuples hold `prefix` fixed elements followed by `elements`.
  */
 const planLevel = (
   st: Statement,
   entity: Entity,
   sels: readonly Sel[],
-  cte: string,
+  level: string,
+  prefix: number,
   c: Ctx
 ): LevelPlan => {
-  const exprs: string[] = [];
-  const joins: string[] = [];
+  const elements: string[] = [];
   const needs = new Set<string>();
+  const element = (sql: string) => {
+    const existing = elements.indexOf(sql);
+    if (existing !== -1) return existing;
+    elements.push(sql);
+    return elements.length - 1;
+  };
   const decoders: ((
     values: unknown[],
     record: { [key: string]: unknown },
     related: { [key: string]: unknown },
+    data: LevelData,
     count: { rows: number }
   ) => void)[] = [];
+  const { sql } = st;
   expandComputed(entity, sels).forEach((sel) => {
     const field = entity.fields[sel.name]!;
     if (field.kind === 'scalar') {
-      const position = exprs.length;
-      exprs.push(field.sql);
+      const position = element(field.sql);
       referencedColumns(field.sql, entity.columns).forEach((column) =>
         needs.add(column)
       );
@@ -413,17 +438,36 @@ const planLevel = (
     const target = field.target();
     const childNode = field.perNode ? resolveNode(c, sel.args) : c.node;
     const childCtx: Ctx = { ...c, node: childNode };
-    const childCte = st.cteName();
-    const reserved = st.ctes.length;
-    st.ctes.push('');
-    const child = planLevel(st, target, sel.sels ?? [], childCte, childCtx);
-    (field.linkColumns ?? field.parentKeys).forEach((column) =>
+    const child = st.levelName(field.childKeys.length);
+    /* the child's WITH items go here: after this level's, before its own children's */
+    const reserved = sql.withItems.length;
+    sql.withItems.push('');
+    const childPrefix = 1 + field.childKeys.length;
+    const plan = planLevel(
+      st,
+      target,
+      sel.sels ?? [],
+      child,
+      childPrefix,
+      childCtx
+    );
+    const linkColumns = field.linkColumns ?? field.parentKeys;
+    [...linkColumns, ...field.parentKeys].forEach((column) =>
       needs.add(column)
     );
-    field.parentKeys.forEach((column) => needs.add(column));
-    const link = `SELECT ${(field.linkColumns ?? field.parentKeys).join(
-      ', '
-    )} FROM ${cte}`;
+    const linkPositions = linkColumns.map(element);
+    const parentKeyPositions = field.parentKeys.map((column) =>
+      element(keyText(column))
+    );
+    const link = `SELECT ${linkColumns
+      .map(
+        (column, index) =>
+          `tupleElement(__r, ${
+            prefix + linkPositions[index]! + 1
+          }) AS ${column}`
+      )
+      .join(', ')} FROM (SELECT arrayJoin(${level}) AS __r)`;
+    const mark = sql.withItems.length;
     const source = field.source(childCtx, link, sel.args);
     const where =
       field.where === undefined ||
@@ -434,68 +478,58 @@ const planLevel = (
     const order = field.order?.(sel.args) ?? field.defaultOrder;
     order.forEach((term) => {
       referencedColumns(term.expr, target.columns).forEach((column) =>
-        child.needs.add(column)
+        plan.needs.add(column)
       );
     });
     const limit = toLimit(sel.args.limit, `${sel.key}.limit`);
     const offset = toLimit(sel.args.offset, `${sel.key}.offset`);
+    const added = sql.withItems.splice(mark);
     const pk = field.childKeys
       .map((key, index) => `${key} AS __pk${index}`)
       .join(', ');
-    const childNeeds = [...child.needs];
+    const childNeeds = [...plan.needs];
     const rowNumber = `row_number() OVER (PARTITION BY ${field.childKeys.join(
       ', '
     )}${order.length === 0 ? '' : ` ORDER BY ${orderSql(order)}`}) AS __rn`;
     const bounds = [
       ...(limit === undefined
         ? []
-        : [`__rn <= ${st.sql.bind(limit + (offset ?? 0), 'UInt64')}`]),
-      ...(offset === undefined
-        ? []
-        : [`__rn > ${st.sql.bind(offset, 'UInt64')}`]),
+        : [`__rn <= ${sql.bind(limit + (offset ?? 0), 'UInt64')}`]),
+      ...(offset === undefined ? [] : [`__rn > ${sql.bind(offset, 'UInt64')}`]),
     ];
-    st.ctes[
-      reserved
-    ] = `${childCte} AS MATERIALIZED (SELECT * FROM (SELECT ${pk}${
-      childNeeds.length === 0 ? '' : `, ${childNeeds.join(', ')}`
-    }, ${rowNumber} FROM (${source}) WHERE ${where})${
-      bounds.length === 0 ? '' : ` WHERE ${bounds.join(' AND ')}`
-    })`;
-    const join = st.joinName();
-    const keys = field.childKeys.map((_, index) => `__pk${index}`);
-    joins.push(
-      `LEFT JOIN (SELECT ${keys
-        .map((key, index) => `${key} AS __k${index}`)
-        .join(', ')}, arraySort(x -> x.1, groupArray(tuple(__rn${
-        child.exprs.length === 0 ? '' : `, ${child.exprs.join(', ')}`
-      }))) AS __v FROM ${childCte} ${child.joins.join(
-        ' '
-      )} GROUP BY ${keys.join(', ')}) AS ${join} ON ${field.parentKeys
-        .map((key, index) => `${join}.__k${index} = ${key}`)
-        .join(' AND ')}`
-    );
-    const position = exprs.length;
-    exprs.push(`${join}.__v`);
-    decoders.push((values, _record, related, count) => {
-      const items = tupleValues(values[position]).map((item) => {
-        const tuple = tupleValues(item);
+    const childTuple = [
+      '__rn',
+      ...field.childKeys.map((_, index) => keyText(`__pk${index}`)),
+      ...plan.elements,
+    ];
+    sql.withItems[reserved] = [
+      ...added,
+      `(SELECT groupArray(tuple(${childTuple.join(', ')})) FROM (SELECT ${pk}${
+        childNeeds.length === 0 ? '' : `, ${childNeeds.join(', ')}`
+      }, ${rowNumber} FROM (${source}) WHERE ${where})${
+        bounds.length === 0 ? '' : ` WHERE ${bounds.join(' AND ')}`
+      }) AS ${child}`,
+    ].join(',\n');
+    decoders.push((values, _record, related, data, count) => {
+      const key = keyOf(parentKeyPositions.map((position) => values[position]));
+      const tuples = key === undefined ? [] : data.get(child)?.get(key) ?? [];
+      const items = tuples.map((tuple) => {
         count.rows += 1;
-        return child.decode(tuple.slice(1), count);
+        return plan.decode(tuple.slice(childPrefix), data, count);
       });
       related[sel.key] = field.many ? items : items[0] ?? null;
     });
   });
   return {
-    decode: (values, count) => {
+    decode: (values, data, count) => {
       const record: { [key: string]: unknown } = {};
       const related: { [key: string]: unknown } = {};
       decoders.forEach((decode) => {
-        decode(values, record, related, count);
+        decode(values, record, related, data, count);
       });
       return withRelations(record, related);
     },
-    exprs,
-    joins,
+    elements,
     needs,
   };
 };
@@ -514,8 +548,6 @@ export interface RootQuery {
   /** Rows to fetch (page size + 1 for `has_more`); undefined: all. */
   limit?: number;
   offset?: number;
-  /** Statement-level CTEs the source/where refer to (e.g. materialized candidates). */
-  ctes?: readonly string[];
 }
 
 export interface CompiledRoot {
@@ -539,6 +571,33 @@ const cursorExpr = (term: OrderTerm) => {
   }
 };
 
+/** `__lN` arrays of a result row → child tuples grouped by parent key, in row-number order. */
+const levelData = (
+  row: { [column: string]: unknown },
+  keyWidths: ReadonlyMap<string, number>
+): LevelData => {
+  const data: LevelData = new Map();
+  Object.entries(row).forEach(([name, value]) => {
+    if (!name.startsWith('__l')) return;
+    const groups = new Map<string, unknown[][]>();
+    (Array.isArray(value) ? value : []).forEach((item) => {
+      const tuple = tupleValues(item);
+      /* [__rn, key texts…, elements…] */
+      const keyLength = keyWidths.get(name) ?? 0;
+      const key = keyOf(tuple.slice(1, 1 + keyLength));
+      if (key === undefined) return;
+      const group = groups.get(key);
+      if (group === undefined) groups.set(key, [tuple]);
+      else group.push(tuple);
+    });
+    groups.forEach((group) =>
+      group.sort((a, b) => Number(a[0]) - Number(b[0]))
+    );
+    data.set(name, groups);
+  });
+  return data;
+};
+
 /** Compile one root field: root rows from `root`, every selected relationship nested. One statement. */
 export const compileRoot = (
   sql: Sql,
@@ -547,7 +606,10 @@ export const compileRoot = (
   sels: readonly Sel[]
 ): CompiledRoot => {
   const st = new Statement(sql);
-  const plan = planLevel(st, root.entity, sels, 'page', c);
+  /* the page's WITH item: after the root's own (candidates …), before the levels' */
+  const reserved = sql.withItems.length;
+  sql.withItems.push('');
+  const plan = planLevel(st, root.entity, sels, '__page', 1, c);
   root.order.forEach((term) => {
     referencedColumns(term.expr, root.entity.columns).forEach((column) =>
       plan.needs.add(column)
@@ -570,48 +632,72 @@ export const compileRoot = (
             : ` OFFSET ${sql.bind(root.offset, 'UInt64')}`
         }`
   }`;
-  const cursorColumns = root.order.map(
-    (term, index) => `${cursorExpr(term)} AS __c${index}`
-  );
-  const select = `SELECT tuple(0${
-    plan.exprs.length === 0 ? '' : `, ${plan.exprs.join(', ')}`
-  }) AS __row${
-    cursorColumns.length === 0 ? '' : `, ${cursorColumns.join(', ')}`
-  }`;
-  const rootCtes = root.ctes ?? [];
-  const statement =
-    st.ctes.length === 0
-      ? `${
-          rootCtes.length === 0 ? '' : `WITH ${rootCtes.join(',\n')}\n`
-        }${select} FROM (${page}) AS page${
-          order === '' ? '' : ` ORDER BY ${order}`
-        }`
-      : `WITH ${[...rootCtes, `page AS MATERIALIZED (${page})`].join(',\n')},
-${st.ctes.join(',\n')}
-${select} FROM page ${plan.joins.join('\n')}${
-          order === '' ? '' : `\nORDER BY ${order}`
-        }`;
+  const cap = c.maxRows ?? maxRowsPerStatement;
+  const checkCap = (rows: number) => {
+    if (rows > cap) {
+      throw new GraphQLError(
+        `The result has ${rows} rows (limit ${cap}): page it with limit/after, or limit the nested lists.`,
+        { extensions: { code: 'RESULT_TOO_LARGE' } }
+      );
+    }
+  };
+  if (st.keyWidths.size === 0) {
+    /* no relationship: the page itself, one row per root row */
+    sql.withItems.splice(reserved, 1);
+    const cursorColumns = root.order.map(
+      (term, index) => `${cursorExpr(term)} AS __c${index}`
+    );
+    return {
+      decode: (rows) => {
+        checkCap(rows.length);
+        const none: LevelData = new Map();
+        const count = { rows: rows.length };
+        return {
+          cursors: rows.map((row) =>
+            root.order.map((_, index) => String(row[`__c${index}`]))
+          ),
+          rows: rows.map((row) =>
+            plan.decode(tupleValues(row.__row).slice(1), none, count)
+          ),
+        };
+      },
+      sql: `${sql.withClause()}SELECT tuple(0${
+        plan.elements.length === 0 ? '' : `, ${plan.elements.join(', ')}`
+      }) AS __row${
+        cursorColumns.length === 0 ? '' : `, ${cursorColumns.join(', ')}`
+      } FROM (${page}) AS page${order === '' ? '' : ` ORDER BY ${order}`}`,
+    };
+  }
+  /* the page's tuples: [__pos, elements…, cursor values…] */
+  const cursorStart = plan.elements.length;
+  const elements = [...plan.elements, ...root.order.map(cursorExpr)];
+  sql.withItems[reserved] = `(SELECT groupArray(tuple(__pos, ${elements.join(
+    ', '
+  )})) FROM (SELECT *, row_number() OVER (${
+    order === '' ? '' : `ORDER BY ${order}`
+  }) AS __pos FROM (${page}))) AS __page`;
   return {
     decode: (rows) => {
-      const count = { rows: rows.length };
-      const decoded = rows.map((row) =>
-        plan.decode(tupleValues(row.__row).slice(1), count)
+      const [row] = rows;
+      const tuples = (Array.isArray(row?.__page) ? row.__page : [])
+        .map(tupleValues)
+        .sort((a, b) => Number(a[0]) - Number(b[0]));
+      const data = levelData(row ?? {}, st.keyWidths);
+      const count = { rows: tuples.length };
+      const decoded = tuples.map((tuple) =>
+        plan.decode(tuple.slice(1), data, count)
       );
-      const cap = c.maxRows ?? maxRowsPerStatement;
-      if (count.rows > cap) {
-        throw new GraphQLError(
-          `The result has ${count.rows} rows (limit ${cap}): page it with limit/after, or limit the nested lists.`,
-          { extensions: { code: 'RESULT_TOO_LARGE' } }
-        );
-      }
+      checkCap(count.rows);
       return {
-        cursors: rows.map((row) =>
-          root.order.map((_, index) => String(row[`__c${index}`]))
+        cursors: tuples.map((tuple) =>
+          root.order.map((_, index) => String(tuple[1 + cursorStart + index]))
         ),
         rows: decoded,
       };
     },
-    sql: statement,
+    sql: `${sql.withClause()}SELECT __page, ${[...st.keyWidths.keys()].join(
+      ', '
+    )}`,
   };
 };
 
