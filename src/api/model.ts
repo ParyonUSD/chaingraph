@@ -526,19 +526,22 @@ export const TransactionEntity: Entity = {
       order: listOrder(blockInclusionOrder, [term('block_internal_id')]),
       parentKeys: ['hash'],
       perNode: true,
-      source: (
-        c,
-        link
-      ) => `SELECT a.transaction_hash AS transaction_hash, a.block_internal_id AS block_internal_id,
-          a.height AS height, a.accepted_at AS accepted_at, bt.transaction_index AS transaction_index
-        FROM (SELECT transaction_hash, block_internal_id, height, accepted_at FROM ${c.sql.nodeView(
+      /* transaction_index comes from block_transaction: joined only when read (the join costs ~5 ms) */
+      source: (c, link, _args, needs) => {
+        const acceptance = `SELECT transaction_hash, block_internal_id, height, accepted_at FROM ${c.sql.nodeView(
           'tx_acceptance_at',
           c.node
-        )} WHERE block_internal_id != 0 AND transaction_hash IN (${link})) AS a
+        )} WHERE block_internal_id != 0 AND transaction_hash IN (${link})`;
+        return needs.has('transaction_index')
+          ? `SELECT a.transaction_hash AS transaction_hash, a.block_internal_id AS block_internal_id,
+          a.height AS height, a.accepted_at AS accepted_at, bt.transaction_index AS transaction_index
+        FROM (${acceptance}) AS a
         LEFT JOIN (SELECT block_internal_id, transaction_hash, transaction_index FROM ${c.sql.view(
           'block_transaction_at'
         )} WHERE transaction_hash IN (${link})) AS bt
-          ON bt.block_internal_id = a.block_internal_id AND bt.transaction_hash = a.transaction_hash`,
+          ON bt.block_internal_id = a.block_internal_id AND bt.transaction_hash = a.transaction_hash`
+          : acceptance;
+      },
       target: () => BlockInclusionEntity,
       where: (c, where) =>
         blockInclusionPredicate(c.sql, where as BlockInclusionFilter, c.node),

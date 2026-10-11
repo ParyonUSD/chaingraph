@@ -231,8 +231,15 @@ export interface RelationField {
   /**
    * The child rows (raw columns of the target entity), restricted to the
    * parent level: `link` is a subquery returning the parent's `linkColumns`.
+   * `needs`: the raw columns the level reads (its selection, order and
+   * filter), so a source may leave out a join no selected field needs.
    */
-  source: (c: Ctx, link: string, args: { [name: string]: unknown }) => string;
+  source: (
+    c: Ctx,
+    link: string,
+    args: { [name: string]: unknown },
+    needs: ReadonlySet<string>
+  ) => string;
   /** The `where` argument as a predicate on child rows. */
   /** The `where` argument as a predicate on child rows (`source`: the level's restricted rows). */
   where?: (c: Ctx, where: unknown, source: string) => string;
@@ -467,20 +474,27 @@ const planLevel = (
           }) AS ${column}`
       )
       .join(', ')} FROM (SELECT arrayJoin(${level}) AS __r)`;
-    const mark = sql.withItems.length;
-    const source = field.source(childCtx, link, sel.args);
-    const where =
-      field.where === undefined ||
-      sel.args.where === undefined ||
-      sel.args.where === null
-        ? '1'
-        : field.where(childCtx, sel.args.where, source);
     const order = field.order?.(sel.args) ?? field.defaultOrder;
     order.forEach((term) => {
       referencedColumns(term.expr, target.columns).forEach((column) =>
         plan.needs.add(column)
       );
     });
+    const filtered =
+      field.where !== undefined &&
+      sel.args.where !== undefined &&
+      sel.args.where !== null;
+    const mark = sql.withItems.length;
+    const source = field.source(
+      childCtx,
+      link,
+      sel.args,
+      /* a filter may read any column */
+      filtered ? new Set(target.columns) : plan.needs
+    );
+    const where = filtered
+      ? field.where!(childCtx, sel.args.where, source)
+      : '1';
     const limit = toLimit(sel.args.limit, `${sel.key}.limit`);
     const offset = toLimit(sel.args.offset, `${sel.key}.offset`);
     const added = sql.withItems.splice(mark);
