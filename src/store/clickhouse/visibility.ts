@@ -15,6 +15,13 @@ import type { ClickHouseClient } from './client.js';
 /** Node id 0 is the node-agnostic data watermark. */
 export const nodeAgnosticId = 0;
 
+/**
+ * The spend index's watermark travels with the visibility watermarks under
+ * this pseudo node id in the snapshot reads (it is stored in
+ * `spend_watermark`, not in `visibility`).
+ */
+export const spendWatermarkId = 4_294_967_295;
+
 export interface OpenCommitScope {
   seq: bigint;
   nodeScope: readonly number[];
@@ -138,14 +145,6 @@ export const voidOverflowSentinel = 18_446_744_073_709_551_615n;
  */
 export const fenceParamMaxBytes = 120_000;
 
-/**
- * Budget for the hidden stand-in seqs appended to `void` (about 5,000 seqs).
- * Each resolved stand-in seq stays hidden until its rows are removed, so
- * the set grows with every stand-in ever resolved (rare: mempool orphans
- * released without their parents); see docs/clickhouse-port/mempool-fill-fix.md.
- */
-export const hiddenParamMaxBytes = 100_000;
-
 export class GateParameterOverflowError extends Error {}
 
 /**
@@ -168,13 +167,16 @@ export interface VisibilitySnapshot {
    * fenced.
    */
   fence: bigint[];
-  /**
-   * Aborted seqs up to the snapshot's highest seq (or `[voidOverflowSentinel]`),
-   * then the hidden stand-in seqs (`snapshotSql` step 5).
-   */
+  /** Aborted seqs up to the snapshot's highest seq (or `[voidOverflowSentinel]`). */
   void: bigint[];
   /** True when `void` starts with the overflow sentinel. */
   voidOverflow: boolean;
+  /**
+   * The spend index's watermark at snapshot time, at most `visible0`:
+   * `spend_at` shows the index rows up to it; readers take every pair above
+   * it from the join (docs/clickhouse-port/spend-index.md).
+   */
+  spend: bigint;
 }
 
 /**
@@ -193,6 +195,8 @@ export interface MultiNodeSnapshot {
   fence: bigint[];
   void: bigint[];
   voidOverflow: boolean;
+  /** The spend watermark (at most visible0). */
+  spend: bigint;
 }
 
 /**
@@ -200,7 +204,8 @@ export interface MultiNodeSnapshot {
  * dependency order (each references the previous result, so ClickHouse must
  * evaluate it first):
  * 1. visible(n) of every pinned node and visible(0), from one read of
- *    `visibility`;
+ *    `visibility`, and the spend watermark (`spend_watermark`, pseudo node
+ *    `spendWatermarkId`) in the same scalar subquery, capped at visible(0);
  * 2. the committed tail above visible(0);
  * 3. `bound` = the highest seq any view of this snapshot can show (over
  *    every pinned node); the void set up to `bound` (read after 1-2, so
@@ -208,15 +213,7 @@ export interface MultiNodeSnapshot {
  *    `commit_void` before the commit becomes terminal, and watermarks only
  *    pass terminal commits);
  * 4. the fences of epochs up to `bound`'s epoch (read after 1-2: a new
- *    holder writes its fences before its first commit);
- * 5. the hidden stand-in seqs (read after 1-4): a stand-in seq P
- *    (`input_stand_in`, docs/clickhouse-port/mempool-fill-fix.md) is hidden
- *    while its owner C is not visible in this snapshot, and once a commit R
- *    resolving it (`input_stand_in_resolution`) is. "Visible" is the
- *    node-agnostic rule of the views: at most visible(0) and not void, or in
- *    the tail; and not fenced. P's and R's rows in these tables are written
- *    before P / R commit, so a P or R this snapshot shows has its rows read
- *    here. The caller appends the hidden seqs to `void`.
+ *    holder writes its fences before its first commit).
  * Any commit up to visible(n) (and every commit it depends on) was committed
  * before visible(n) was read, so it is at most visible(0) or in the tail:
  * node-agnostic rows of a visible node-n fact are always visible in the same
@@ -227,11 +224,15 @@ export const snapshotSql = (tables: {
   commitLog: string;
   commitVoid: string;
   epochFence: string;
-  standIn?: string;
-  standInResolution?: string;
+  spendWatermark: string;
 }) => `WITH
-  (SELECT maxMap([node_internal_id], [visible_seq]) FROM ${tables.visibility}
-   WHERE node_internal_id = 0 OR has({nodes:Array(UInt32)}, node_internal_id)) AS max_by_node,
+  (SELECT maxMap([n], [v]) FROM
+     (SELECT node_internal_id AS n, visible_seq AS v FROM ${tables.visibility}
+      WHERE node_internal_id = 0 OR has({nodes:Array(UInt32)}, node_internal_id)
+      UNION ALL
+      SELECT toUInt32(${spendWatermarkId}), watermark FROM ${
+  tables.spendWatermark
+})) AS max_by_node,
   (arrayMap(n -> if(indexOf(max_by_node.1, n) = 0, toUInt64(0), max_by_node.2[indexOf(max_by_node.1, n)]),
             {nodes:Array(UInt32)}),
    if(indexOf(max_by_node.1, 0) = 0, toUInt64(0), max_by_node.2[indexOf(max_by_node.1, 0)])) AS marks,
@@ -248,27 +249,14 @@ export const snapshotSql = (tables: {
      (SELECT epoch, min(max_valid_seq) AS max_valid_seq FROM ${
        tables.epochFence
      }
-      WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences,
-  (SELECT groupUniqArray(seq) FROM
-     (SELECT stand_in_seq AS seq, owner_seq AS by_seq, toUInt8(0) AS resolves
-      FROM ${tables.standIn ?? 'input_stand_in'} WHERE stand_in_seq <= bound
-      UNION ALL
-      SELECT stand_in_seq, commit_seq, toUInt8(1)
-      FROM ${
-        tables.standInResolution ?? 'input_stand_in_resolution'
-      } WHERE stand_in_seq <= bound)
-   WHERE resolves = toUInt8(
-     ((by_seq <= marks.2 AND by_seq NOT IN (SELECT commit_seq FROM ${
-       tables.commitVoid
-     })) OR has(tail_seqs, by_seq))
-     AND (indexOf(fences.1, bitShiftRight(by_seq, 40)) = 0
-          OR by_seq <= fences.2[indexOf(fences.1, bitShiftRight(by_seq, 40))]))) AS stand_in_hidden
+      WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences
 SELECT
   arrayMap(x -> toString(x), marks.1) AS visible,
   toString(marks.2) AS visible0,
+  toString(least(marks.2, if(indexOf(max_by_node.1, ${spendWatermarkId}) = 0, toUInt64(0),
+                             max_by_node.2[indexOf(max_by_node.1, ${spendWatermarkId})]))) AS spend,
   arrayMap(x -> toString(x), tail_seqs) AS tail,
   arrayMap(x -> toString(x), void_seqs) AS void,
-  arrayMap(x -> toString(x), arraySort(stand_in_hidden)) AS hidden,
   arrayMap(e -> toString(if(indexOf(fences.1, e) = 0, ${counterMaskSeq.toString()},
                             bitAnd(fences.2[indexOf(fences.1, e)], ${counterMaskSeq.toString()}))),
            range(1, toUInt64(bitShiftRight(bound, 40)) + 1)) AS fence`;
@@ -277,6 +265,7 @@ const snapshotQuery = snapshotSql({
   commitLog: 'commit_log',
   commitVoid: 'commit_void',
   epochFence: 'epoch_fence',
+  spendWatermark: 'spend_watermark',
   visibility: 'visibility',
 });
 
@@ -297,15 +286,14 @@ export const readSnapshotMulti = async (
   const rows = await client.query<{
     visible: string[];
     visible0: string;
+    spend: string;
     tail: string[];
     void: string[];
-    hidden: string[];
     fence: string[];
   }>(snapshotQuery, { nodes, voidLimit: voidInlineLimit + 1 });
   const [row] = rows;
   const voidSeqs = (row?.void ?? []).map(BigInt);
   const voidOverflow = voidSeqs.length > voidInlineLimit;
-  const hidden = (row?.hidden ?? []).map(BigInt);
   const fence = (row?.fence ?? []).map(BigInt);
   if (encodedLength(fence) > fenceParamMaxBytes) {
     // eslint-disable-next-line functional/no-throw-statement
@@ -315,24 +303,17 @@ export const readSnapshotMulti = async (
       )} bytes as a parameter, limit ${fenceParamMaxBytes}); see docs/clickhouse-port/wp6b-gate-cost.md.`
     );
   }
-  if (encodedLength(hidden) > hiddenParamMaxBytes) {
-    // eslint-disable-next-line functional/no-throw-statement
-    throw new GateParameterOverflowError(
-      `${hidden.length} hidden stand-in seqs (${encodedLength(
-        hidden
-      )} bytes as a parameter, limit ${hiddenParamMaxBytes}); see docs/clickhouse-port/mempool-fill-fix.md.`
-    );
-  }
   const visible = row?.visible ?? [];
   return {
     committedTail: (row?.tail ?? []).map(BigInt),
     fence,
     nodeIds: nodes,
+    spend: BigInt(row?.spend ?? '0'),
     visible0: BigInt(row?.visible0 ?? '0'),
     visibleByNode: new Map(
       nodes.map((node, index) => [node, BigInt(visible[index] ?? '0')])
     ),
-    void: [...(voidOverflow ? [voidOverflowSentinel] : voidSeqs), ...hidden],
+    void: voidOverflow ? [voidOverflowSentinel] : voidSeqs,
     voidOverflow,
   };
 };
@@ -354,6 +335,7 @@ export const snapshotForNode = (
     committedTail: snapshot.committedTail,
     fence: snapshot.fence,
     nodeId,
+    spend: snapshot.spend,
     visible,
     visible0: snapshot.visible0,
     void: snapshot.void,
@@ -411,6 +393,10 @@ export class SnapshotCache {
       const marks = new Map(
         rows.map((row) => [Number(row.node), BigInt(row.visible)])
       );
+      /*
+       * The spend watermark is not compared: a cached (lower) one is still
+       * exact, the tail join just covers more (spend-index.md, read rule).
+       */
       const same =
         (marks.get(nodeAgnosticId) ?? 0n) === cached.visible0 &&
         nodes.every(
@@ -436,6 +422,9 @@ export class SnapshotCache {
 export const nodeViewArgs =
   'node = {node:UInt32}, visible = {visible:UInt64}, fence = {fence:Array(UInt64)}, void = {void:Array(UInt64)}';
 
+/** `spend = …` for the spend index's pinned view (`spend_at`). */
+export const spendViewArgs = 'spend = {spend:UInt64}';
+
 /** `visible0 = …, tail = …, fence = …, void = …` for a node-agnostic `*_at` view. */
 export const agnosticViewArgs =
   'visible0 = {visible0:UInt64}, tail = {tail:Array(UInt64)}, fence = {fence:Array(UInt64)}, void = {void:Array(UInt64)}';
@@ -456,7 +445,11 @@ export const agnosticPinnedViews: readonly string[] = [
  */
 export const pinnedView = (name: string, qualifier = '') =>
   `${qualifier === '' ? '' : `${qualifier}.`}${name}(${
-    agnosticPinnedViews.includes(name) ? agnosticViewArgs : nodeViewArgs
+    name === 'spend_at'
+      ? spendViewArgs
+      : agnosticPinnedViews.includes(name)
+      ? agnosticViewArgs
+      : nodeViewArgs
   })`;
 
 /** Parameters for node-scoped pinned views: `utxo_at(${nodeViewArgs})`. */
@@ -475,10 +468,11 @@ export const agnosticViewParams = (snapshot: VisibilitySnapshot) => ({
   void: snapshot.void,
 });
 
-/** Every parameter of one snapshot (for requests that use both view kinds). */
+/** Every parameter of one snapshot (for requests that use both view kinds and `spend_at`). */
 export const snapshotParams = (snapshot: VisibilitySnapshot) => ({
   ...agnosticViewParams(snapshot),
   ...nodeViewParams(snapshot),
+  spend: snapshot.spend,
 });
 
 /**

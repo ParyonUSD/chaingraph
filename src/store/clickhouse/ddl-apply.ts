@@ -173,6 +173,50 @@ export const listClickHouseTables = async (
 };
 
 /**
+ * Schema of a database created before 2026-10-11 that the current DDL cannot
+ * bring up to date in place (CREATE TABLE IF NOT EXISTS and ADD PROJECTION IF
+ * NOT EXISTS leave the old objects as they are): `input` with the spent
+ * output's columns, its `p_spent_*` projections, `pending_spend` or the
+ * stand-in tables. Such a database must be re-synced into a new one
+ * (docs/clickhouse-port/spend-index.md, "Upgrade"). Empty when the database
+ * is new or current.
+ */
+export const legacySchemaFindings = async (
+  server: ClickHouseServer,
+  database: string
+) => {
+  ddlStatements('', database);
+  const client = adminClient(server);
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const [columns, tables, projections] = await Promise.all([
+      client.query<{ name: string }>(
+        `SELECT name FROM system.columns WHERE database = {database:String} AND table = 'input'
+           AND name IN ('value_satoshis', 'locking_bytecode', 'token_category')`,
+        { database }
+      ),
+      client.query<{ name: string }>(
+        `SELECT name FROM system.tables WHERE database = {database:String}
+           AND name IN ('pending_spend', 'input_stand_in', 'input_stand_in_resolution')`,
+        { database }
+      ),
+      client.query<{ name: string }>(
+        `SELECT DISTINCT name FROM system.projection_parts WHERE database = {database:String}
+           AND table = 'input' AND name IN ('p_spent_script', 'p_spent_category') AND active`,
+        { database }
+      ),
+    ]);
+    return [
+      ...columns.map((row) => `input.${row.name}`),
+      ...tables.map((row) => `table ${row.name}`),
+      ...projections.map((row) => `projection input.${row.name}`),
+    ];
+  } finally {
+    await client.close();
+  }
+};
+
+/**
  * Part cleanup settings: how long merged-away parts stay on disk. The
  * server defaults (480 s, cleanup every 30-300 s) let a sync of small blocks
  * fill a disk with inactive parts (fix-pass-3.md §3). They can change on a

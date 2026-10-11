@@ -1,11 +1,13 @@
-/* eslint-disable max-classes-per-file, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, @typescript-eslint/parameter-properties, no-await-in-loop, functional/no-loop-statement, max-params, functional/no-let, @typescript-eslint/init-declarations, class-methods-use-this, @typescript-eslint/no-loop-func, prefer-destructuring, require-atomic-updates, functional/no-mixed-type, no-continue, @typescript-eslint/member-ordering, max-depth, camelcase */
+/* eslint-disable max-classes-per-file, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, complexity, max-lines, functional/no-try-statement, functional/no-throw-statement, @typescript-eslint/parameter-properties, no-await-in-loop, functional/no-loop-statement, max-params, functional/no-let, @typescript-eslint/init-declarations, @typescript-eslint/no-loop-func, prefer-destructuring, require-atomic-updates, functional/no-mixed-type, no-continue, @typescript-eslint/member-ordering, max-depth, camelcase */
 // cspell:ignore clickhouse dedup unhex seqs varint retryable
 /**
  * `saveBlock` for the ClickHouse store (WP5a-core): one block = one commit
  * (plan §3.1), written in dependency order, per accepting node:
- * `node_block` +1, `tx_acceptance` +1 and (above the bulk horizon) the UTXO
- * transition rows. Child-before-parent spends go through the pending-spend
- * path of WP4 (`incomplete`, fill rows under the child's seq).
+ * `node_block` +1, `tx_acceptance` +1 and (above the bulk horizon, UTXO on)
+ * the UTXO transition rows. Every row comes from the batch's own blocks: no
+ * spent output is looked up and a commit never waits for a parent's outputs
+ * (docs/clickhouse-port/spend-index.md). UTXO −1 rows are a server-side join
+ * of the commit's inputs to `output` (`utxoDeltaInsertSql`).
  * Design and invariants: docs/clickhouse-port/wp5a-core.md.
  */
 import type {
@@ -28,7 +30,6 @@ import type {
   Deferred,
   NodeBlockRow,
   OperationRegistry,
-  PendingSpendRow,
   StoreMode,
   StoreOperation,
   TxAcceptanceRow,
@@ -40,62 +41,41 @@ import {
   awaitDependencies,
   deferred,
   encodeNodeBlockRows,
-  encodePendingSpendRows,
   encodeTxAcceptanceRows,
   waitForPredecessorRows,
 } from './node-state.js';
 import { RecentCache } from './recent-cache.js';
 import { RowBinaryWriter } from './row-binary.js';
-import type { ResolvedInput, SpentOutput } from './row-encoders.js';
 import {
   encodeBlockRows,
   encodeInputRows,
   encodeOutputRows,
-  encodeResolvedInputRows,
   encodeTransactionRows,
   rowBinaryTableColumns,
 } from './row-encoders.js';
-import type { StandInRegistry } from './stand-in.js';
-import { followClaims, writeResolutions } from './stand-in.js';
-import type {
-  OutputRegistry,
-  RegisteredOutput,
-  UtxoOutput,
-  UtxoRow,
-} from './utxo.js';
+import type { OutputRegistry, UtxoOutput, UtxoRow } from './utxo.js';
 import {
   encodeUtxoRows,
-  outpointKey,
   utxoByScriptColumns,
   utxoColumns,
+  utxoDeltaInsertSql,
   utxoFromChaingraphOutput,
-  utxoRowsForTransition,
   validCommitSql,
 } from './utxo.js';
 
 /** A test-only crash: the store stops as if the process died (no abort). */
 export class SimulatedCrash extends Error {}
 
-export class PendingSpendTimeoutError extends Error {}
-
 /**
  * Called between the steps of a commit (tests inject crashes here). Step
  * names: `begin` (block commits: before the seq is allocated), `intent`,
- * then the table just written (`output`, `input`, …), then `incomplete`,
- * `fill`, `rows-written`, `committed`.
+ * then the table just written (`output`, `input`, …), then
+ * `rows-written`, `committed`.
  */
 export type FaultInjector = (
   step: string,
   context: { kind: string; seq: bigint | undefined }
 ) => Promise<void> | void;
-
-const coinbaseHash = '00'.repeat(32);
-
-/** Written on `input` rows whose spent output never became known. */
-const unknownSpentOutput: SpentOutput = {
-  lockingBytecode: '',
-  valueSatoshis: 0n,
-};
 
 /**
  * `target.push(...items)` without spreading into a call: a spread passes
@@ -134,7 +114,7 @@ export const chunked = <T>(items: readonly T[], size: number): T[][] => {
 /**
  * Store lookups of one call run at most this many chunk queries at once
  * (g1-fix-pass-2.md §2: the lab's per-batch lookups ran their chunks one
- * after another).
+ * after another; the transaction-hash lookup uses the same bound).
  */
 export const lookupConcurrency = 4;
 
@@ -265,7 +245,12 @@ export interface WriterContext {
   client: ClickHouseClient;
   commitLog: CommitLog;
   ids: IdAllocator;
-  outputs: OutputRegistry<StoreOperation>;
+  /**
+   * Recent and in-flight outputs, for the UTXO add-on's mempool path only
+   * (spent outputs of mempool transactions). `undefined` with UTXO off: then
+   * nothing anywhere resolves a spent output.
+   */
+  outputs: OutputRegistry<StoreOperation> | undefined;
   transactions: TransactionRegistry;
   operations: OperationRegistry;
   mempool: MempoolState;
@@ -277,9 +262,6 @@ export interface WriterContext {
   onCommitted: (operation: StoreOperation) => void;
   fault: FaultInjector;
   lookupChunkSize: number;
-  pendingSpendTimeoutMs: number;
-  /** Unresolved stand-in `input` rows (stand-in.ts). */
-  standIns: StandInRegistry;
   /** The mempool committer (block acceptance cleans the node's mempool). */
   mempoolHooks?: () => MempoolCommitter | undefined;
   /** Shutdown: abandon waits and uncommitted work. */
@@ -295,7 +277,7 @@ export interface WriterContext {
    * (the store abandons its in-flight work; docs/clickhouse-port/g1-fix-pass.md).
    */
   onBatchFailure?: (failure: BatchFailure) => void;
-  /** Structured diagnostics (pending-spend timeouts, failed aborts). */
+  /** Structured diagnostics (failed aborts). */
   diagnostic?: (diagnostic: WriterDiagnostic) => void;
 }
 
@@ -308,20 +290,12 @@ export interface BatchFailure {
 }
 
 /** Writer-side structured diagnostics. */
-export type WriterDiagnostic =
-  | {
-      event: 'abort_failed';
-      seq: string;
-      reason: string;
-      error: string;
-    }
-  | {
-      event: 'pending_spend_timeout';
-      seq: string;
-      unresolved: number;
-      sample: string[];
-      waitedMs: number;
-    };
+export interface WriterDiagnostic {
+  event: 'abort_failed';
+  seq: string;
+  reason: string;
+  error: string;
+}
 
 /** The stored UTXO tables (skipped entirely when the context's `utxo` is false). */
 export const utxoTables: ReadonlySet<string> = new Set([
@@ -333,12 +307,6 @@ export const utxoTables: ReadonlySet<string> = new Set([
 export interface SaveBlockResult {
   attemptedSavedTransactions: ChaingraphTransaction[];
   transactionCacheMisses: number;
-  /**
-   * Only on a parked save (child-before-parent: answered while its commit is
-   * `incomplete`): resolves once the block is committed, rejects if the
-   * commit fails.
-   */
-  committed?: Promise<void>;
 }
 
 interface StoredOutputRow {
@@ -490,155 +458,36 @@ export const assignTransactionIds = (
 };
 
 /**
- * Pure: the UTXO rows of one block for one accepting node (plan §2.3): every
- * transaction not already accepted by the node becomes accepted (+1 outputs,
- * −1 spent outputs). Spends whose output is not yet known are returned in
- * `pending` (their −1 rows are written by the fill step). With
- * `utxo: false` (`CHAINGRAPH_CLICKHOUSE_UTXO=off`) no rows are produced;
- * `pending` and `transitions` are unchanged (pending spends still resolve).
+ * Pure: the transactions of one node's blocks that become accepted by the
+ * node in this commit (plan §2.3): every transaction not already accepted by
+ * it, once. Above the bulk horizon with UTXO on, each gets +1 per output and
+ * −1 per spent output, written server-side (`utxoDeltaInsertSql`).
  */
-export const blockUtxoDelta = ({
-  nodeInternalId,
+export const blockTransitions = ({
   transactions,
   acceptedBefore,
-  resolveSpent,
-  utxo = true,
 }: {
-  nodeInternalId: number;
-  utxo?: boolean;
-  transactions: readonly {
-    transaction: ChaingraphTransaction;
-    internalId: bigint;
-  }[];
+  transactions: readonly { transaction: ChaingraphTransaction }[];
   acceptedBefore: ReadonlySet<string>;
-  resolveSpent: (hash: string, index: number) => UtxoOutput | undefined;
-}): {
-  rows: UtxoRow[];
-  pending: {
-    spender: string;
-    inputIndex: number;
-    hash: string;
-    index: number;
-  }[];
-  transitions: string[];
-} => {
-  const rows: UtxoRow[] = [];
-  const pending: {
-    spender: string;
-    inputIndex: number;
-    hash: string;
-    index: number;
-  }[] = [];
+}): string[] => {
   const transitions: string[] = [];
   const seen = new Set<string>();
-  transactions.forEach(({ transaction, internalId }) => {
+  transactions.forEach(({ transaction }) => {
     if (acceptedBefore.has(transaction.hash) || seen.has(transaction.hash)) {
       return;
     }
     seen.add(transaction.hash);
     transitions.push(transaction.hash);
-    const spentOutputs: UtxoOutput[] = [];
-    if (!transaction.isCoinbase) {
-      transaction.inputs.forEach((input, inputIndex) => {
-        const spent = resolveSpent(
-          input.outpointTransactionHash,
-          input.outpointIndex
-        );
-        if (spent === undefined) {
-          pending.push({
-            hash: input.outpointTransactionHash,
-            index: input.outpointIndex,
-            inputIndex,
-            spender: transaction.hash,
-          });
-        } else {
-          spentOutputs.push(spent);
-        }
-      });
-    }
-    if (!utxo) {
-      return;
-    }
-    appendAll(
-      rows,
-      utxoRowsForTransition({
-        delta: 1,
-        nodeInternalId,
-        outputs: transaction.outputs.map((output, outputIndex) => ({
-          fungibleTokenAmount: output.fungibleTokenAmount,
-          lockingBytecode: output.lockingBytecode,
-          nonfungibleTokenCapability: output.nonfungibleTokenCapability,
-          nonfungibleTokenCommitment: output.nonfungibleTokenCommitment,
-          outputIndex,
-          tokenCategory: output.tokenCategory,
-          transactionHash: transaction.hash,
-          transactionInternalId: internalId,
-          valueSatoshis: output.valueSatoshis,
-        })),
-        spentOutputs,
-      })
-    );
   });
-  return { pending, rows, transitions };
+  return transitions;
 };
 
 /**
- * Pure: the `pending_spend` rows of a commit's unresolved inputs: one per
- * node whose UTXO −1 waits on the input (`pendingUtxo`), or one for node 0
- * when none does (bulk mode, or a tx no accepting node transitions). The
- * nodes are indexed by `spender:inputIndex`, so this is linear in the
- * inputs plus the pending UTXO items (it was a scan of `pendingUtxo` per
- * input: 100k unresolved spends blocked the event loop for about a minute).
+ * The deltas CTE of `utxoDeltaInsertSql` for a list of transactions that
+ * all become accepted (`d = +1`): `{hashes:Array(String)}`.
  */
-export const pendingSpendRows = (
-  pendingInputs: readonly {
-    input: { outpointTransactionHash: string; outpointIndex: number };
-    inputIndex: number;
-    transaction: { hash: string };
-  }[],
-  pendingUtxo: readonly { node: number; spender: string; inputIndex: number }[],
-  sign: -1 | 1
-): PendingSpendRow[] => {
-  const nodesBySpend = new Map<string, number[]>();
-  for (const item of pendingUtxo) {
-    const key = `${item.spender}:${item.inputIndex}`;
-    const nodes = nodesBySpend.get(key);
-    if (nodes === undefined) {
-      nodesBySpend.set(key, [item.node]);
-    } else {
-      nodes.push(item.node);
-    }
-  }
-  const rows: PendingSpendRow[] = [];
-  for (const { input, inputIndex, transaction } of pendingInputs) {
-    const nodes = nodesBySpend.get(`${transaction.hash}:${inputIndex}`) ?? [0];
-    for (const node of nodes) {
-      rows.push({
-        nodeInternalId: node,
-        outpointIndex: input.outpointIndex,
-        outpointTransactionHash: input.outpointTransactionHash,
-        sign,
-        spenderInputIndex: inputIndex,
-        spenderTransactionHash: transaction.hash,
-      });
-    }
-  }
-  return rows;
-};
-
-interface ResolvedSpend {
-  output: UtxoOutput;
-  owner: StoreOperation | undefined;
-}
-
-const spentOutputOf = (output: UtxoOutput): SpentOutput => ({
-  fungibleTokenAmount: output.fungibleTokenAmount,
-  lockingBytecode: output.lockingBytecode,
-  nonfungibleTokenCapability: output.nonfungibleTokenCapability,
-  nonfungibleTokenCommitment: output.nonfungibleTokenCommitment,
-  tokenCategory: output.tokenCategory,
-  valueSatoshis: output.valueSatoshis,
-});
+export const acceptedDeltasSql = `SELECT toFixedString(unhex(h), 32) AS transaction_hash, toInt8(1) AS d
+  FROM (SELECT arrayJoin({hashes:Array(String)}) AS h)`;
 
 const inclusionsOf = (
   block: ChaingraphBlock,
@@ -659,11 +508,9 @@ export interface BlockSaveRequest {
   isSavedTransaction: (hash: string) => boolean;
 }
 
-/** One request of a batch and how its call is answered. */
+/** One request of a batch. */
 interface BatchItem {
   request: BlockSaveRequest;
-  /** Resolves the call early when the batch parks (`incomplete`). */
-  onParked: (result: SaveBlockResult) => void;
 }
 
 /**
@@ -706,9 +553,6 @@ export class BlockBatch {
 
   /** Owned hashes waiting for an id phase. */
   unresolved: string[] = [];
-
-  /** Every call of the batch was answered early as parked (`onParked`). */
-  parked = false;
 
   /** The per-call results, set once the batch's commit is committed. */
   committedResults: SaveBlockResult[] | undefined;
@@ -805,7 +649,7 @@ export class BlockCommitter {
       batch.unresolved.push(transaction.hash);
       owned.push(transaction);
     });
-    context.outputs.register(
+    context.outputs?.register(
       operation,
       owned.map((transaction) => ({
         hash: transaction.hash,
@@ -858,8 +702,7 @@ export class BlockCommitter {
 
   /**
    * Save every request of `batch` as one commit; resolves the per-request
-   * results in request order. If the commit parks (child-before-parent),
-   * every request is answered early through its `onParked`.
+   * results in request order.
    */
   async save(batch: BlockBatch): Promise<SaveBlockResult[]> {
     const { context } = this;
@@ -888,7 +731,7 @@ export class BlockCommitter {
       const results = await this.run(batch, (opened) => {
         commit = opened;
       });
-      context.outputs.release(operation, true);
+      context.outputs?.release(operation, true);
       await context.transactions.release(operation, true);
       return results;
     } catch (error) {
@@ -906,7 +749,7 @@ export class BlockCommitter {
          * that lands now leaves it saved; any other late error still reaches
          * the caller.
          */
-        context.outputs.release(operation, true);
+        context.outputs?.release(operation, true);
         await context.transactions.release(operation, true);
         if (error instanceof AbandonedError) return batch.committedResults;
         throw error;
@@ -920,7 +763,7 @@ export class BlockCommitter {
         batch.pendingIds.forEach((id) => {
           id.reject(error);
         });
-        context.outputs.release(operation, false);
+        context.outputs?.release(operation, false);
         await context.transactions.release(operation, false);
         throw error;
       }
@@ -946,13 +789,8 @@ export class BlockCommitter {
         batch.pendingIds.forEach((id) => {
           id.reject(error);
         });
-        context.outputs.release(operation, false);
+        context.outputs?.release(operation, false);
         await context.transactions.release(operation, false);
-        /*
-         * A parked batch's calls were answered already: their `committed`
-         * must reject (the blocks were not saved), not resolve as saved.
-         */
-        if (batch.parked) throw error;
         return empty();
       }
       context.mempool.markStale(operation);
@@ -981,7 +819,7 @@ export class BlockCommitter {
       batch.pendingIds.forEach((id) => {
         id.reject(error);
       });
-      context.outputs.release(operation, false);
+      context.outputs?.release(operation, false);
       await context.transactions.release(operation, false);
       throw error;
     } finally {
@@ -1084,6 +922,17 @@ export class BlockCommitter {
     const waitForEarlier = async () => {
       if (waitedForEarlier || !needsEarlierRows) return;
       waitedForEarlier = true;
+      /*
+       * Waiting for earlier operations' rows: give the batch lane up, so a
+       * later batch can write its node-agnostic rows meanwhile. An earlier
+       * child may be waiting for exactly those rows (it spends this lane's
+       * later outputs); holding the lane here was a deadlock (child waits
+       * for parent, parent queued behind this batch, this batch waits for
+       * the child).
+       */
+      if (operation.registry?.hasUnwrittenEarlier(operation) === true) {
+        operation.yieldLane();
+      }
       await waitForPredecessorRows(operation);
       if (hooks !== undefined) {
         await freshen(hooks, context.mempool, operation, requestedNodes);
@@ -1100,7 +949,15 @@ export class BlockCommitter {
      * it waits first, as before.
      */
     const writeAgnosticFirst = !anyBlockExists;
-    if (!writeAgnosticFirst) await waitForEarlier();
+    if (!writeAgnosticFirst) {
+      /*
+       * Its transactions' outputs are (mostly) stored already: a child that
+       * waits for this batch's node-agnostic rows must not wait for a batch
+       * that waits for the child's rows.
+       */
+      operation.markAgnosticRowsWritten();
+      await waitForEarlier();
+    }
     const newBlockCount = blocks.filter(
       (block) => !storedBlocks.has(block.hash)
     ).length;
@@ -1193,71 +1050,7 @@ export class BlockCommitter {
       ])
     );
 
-    /*
-     * 3. Resolve spent outputs the node-agnostic rows need: every input of a
-     * new transaction (input rows) and of a new block (generated value).
-     */
-    const resolved = new Map<string, ResolvedSpend>();
-    const wanted = new Map<string, { hash: string; index: number }>();
-    /** Per block: outpoints its block row needs (generated value). */
-    const wantedOfPlan = new Map<BlockPlan, string[]>();
-    const want = (
-      transaction: ChaingraphTransaction,
-      keys: string[] | undefined
-    ) => {
-      if (transaction.isCoinbase) return;
-      transaction.inputs.forEach((input) => {
-        if (input.outpointTransactionHash === coinbaseHash) return;
-        const key = outpointKey(
-          input.outpointTransactionHash,
-          input.outpointIndex
-        );
-        keys?.push(key);
-        if (!wanted.has(key)) {
-          wanted.set(key, {
-            hash: input.outpointTransactionHash,
-            index: input.outpointIndex,
-          });
-        }
-      });
-    };
-    plans.forEach((plan) => {
-      const keys: string[] = [];
-      plan.block.transactions.forEach((transaction) => {
-        if (!plan.blockExists) want(transaction, keys);
-        else if (insertedBy.has(transaction.hash)) want(transaction, undefined);
-      });
-      wantedOfPlan.set(plan, keys);
-    });
-    /*
-     * Outpoints already looked up (round 1) are not looked up again in round
-     * 2: a still-unknown spend stays pending (100k of them cost ~2 s of
-     * sequential lookups per extra round).
-     */
-    const attempted = new Set<string>();
-    /** Commits committed before the last store lookup of spent outputs. */
-    let committedAtLookup = context.commitLog.committedCount;
-    const resolveWanted = async () => {
-      committedAtLookup = context.commitLog.committedCount;
-      const missing = new Map(
-        [...wanted].filter(([key]) => !attempted.has(key))
-      );
-      missing.forEach((_, key) => attempted.add(key));
-      (await this.resolveSpends(missing, operation)).forEach((spend, key) => {
-        resolved.set(key, spend);
-        if (spend.owner !== undefined && spend.owner !== operation) {
-          dependencies.add(spend.owner);
-        }
-      });
-    };
-    await resolveWanted();
-    const resolveSpent = (hash: string, index: number) =>
-      resolved.get(outpointKey(hash, index))?.output;
-    const agnosticUnresolved = new Set(
-      [...wanted.keys()].filter((key) => !resolved.has(key))
-    );
-
-    /* 4. The commit. */
+    /* 3. The commit. */
     await context.fault('begin', { kind: 'block', seq: undefined });
     const nodeScope = acceptingNodes;
     const dependsOn = [...dependencies]
@@ -1306,7 +1099,8 @@ export class BlockCommitter {
      * Inserts of one phase go out concurrently: independent rows of the same
      * open commit (none is visible before it commits), so their order does
      * not matter to readers or to recovery; only the phases are ordered
-     * (intent, node-agnostic rows, per-node rows, fill, committed).
+     * (intent, node-agnostic rows, per-node rows, committed). Every row comes
+     * from the batch's own blocks.
      */
     const agnosticWrites: Promise<void>[] = [];
     agnosticWrites.push(
@@ -1320,7 +1114,7 @@ export class BlockCommitter {
       insert(
         'input',
         columnsOf('input'),
-        encodeInputRows(newTransactions, newContext, resolveSpent)
+        encodeInputRows(newTransactions, newContext)
       )
     );
     agnosticWrites.push(
@@ -1330,22 +1124,17 @@ export class BlockCommitter {
         encodeTransactionRows(newTransactions, newContext)
       )
     );
-    const blockRowNow = (plan: BlockPlan) =>
-      !plan.blockExists &&
-      !wantedOfPlan.get(plan)!.some((key) => agnosticUnresolved.has(key));
     agnosticWrites.push(
       insert(
         'block',
         columnsOf('block'),
         encodeBlockRows(
-          plans.filter(blockRowNow).map((plan) => ({
-            block: plan.block,
-            generatedValueSatoshis: this.generatedValue(
-              plan.block,
-              resolveSpent
-            ),
-            internalId: plan.blockInternalId,
-          })),
+          plans
+            .filter((plan) => !plan.blockExists)
+            .map((plan) => ({
+              block: plan.block,
+              internalId: plan.blockInternalId,
+            })),
           commit.seq
         )
       )
@@ -1376,32 +1165,53 @@ export class BlockCommitter {
     }
 
     await Promise.all(agnosticWrites);
-    /*
-     * 4b. Stand-in `input` rows of mempool children of this batch's new
-     * transactions (stand-in.ts): their real rows and resolutions, under
-     * this seq. A still-open owner is a dependency.
-     */
-    {
-      const claims = context.standIns.claim(newTransactions);
-      claims.forEach(({ group }) => {
-        if (
-          group.owner !== undefined &&
-          group.owner !== operation &&
-          !group.owner.finished
-        ) {
-          dependencies.add(group.owner);
-        }
-      });
-      followClaims(
-        context.standIns,
-        operation,
-        claims.map(({ group }) => group)
-      );
-      await writeResolutions(context, commit, claims, rowCounts);
-    }
+    operation.markAgnosticRowsWritten();
 
-    /* 5. Per-node decisions: after every earlier operation of the nodes. */
+    /* 4. Per-node decisions: after every earlier operation of the nodes. */
     await waitForEarlier();
+    if (tipMode && utxoEnabled) {
+      /*
+       * A later block save (called after this one, so committed after it by
+       * commit order) creating outputs this batch spends (child before
+       * parent): wait for its node-agnostic rows, so the join below finds
+       * them, and commit after it (it then skips this batch in its commit
+       * order). The lane is given up first: the parent may be queued behind
+       * this batch. A parent not called yet is not waited for; its own
+       * transition writes the −1 rows this batch could not
+       * (`utxoDeltaInsertSql`, late parents).
+       */
+      const parents = new Set<StoreOperation>();
+      blocks.forEach((block) => {
+        block.transactions.forEach((transaction) => {
+          if (transaction.isCoinbase) return;
+          transaction.inputs.forEach((input) => {
+            const owner = context.transactions.lookup(
+              input.outpointTransactionHash
+            )?.owner;
+            if (
+              owner !== undefined &&
+              owner !== operation &&
+              !owner.finished &&
+              owner.kind === 'block' &&
+              owner.id > operation.id
+            ) {
+              parents.add(owner);
+            }
+          });
+        });
+      });
+      if (parents.size > 0) {
+        parents.forEach((parent) => {
+          dependencies.add(parent);
+        });
+        operation.noteWaitsOn(parents);
+        operation.yieldLane();
+        const written = Promise.all(
+          [...parents].map(async (parent) => parent.agnosticRowsWritten)
+        ).then(() => undefined);
+        await operation.whileWaiting(context.abandon?.race(written) ?? written);
+      }
+    }
     const acceptedBefore = new Map<number, Set<string>>(
       acceptingNodes.map((node) => [node, new Set<string>()])
     );
@@ -1416,9 +1226,9 @@ export class BlockCommitter {
       );
     }
     /*
-     * 2b. Each accepting node's mempool cleanup, in this commit: confirmed,
-     * conflicting and cascading entries, and outstanding spends of entries
-     * whose creator this batch makes accepted (wp5a-mempool.md).
+     * 4b. Each accepting node's mempool cleanup, in this commit: confirmed,
+     * conflicting and cascading entries, and (UTXO on) outstanding spends of
+     * entries whose creator this batch makes accepted (wp5a-mempool.md).
      */
     const batchTxByHash = new Map<string, ChaingraphTransaction>();
     blocks.forEach((block) => {
@@ -1466,31 +1276,6 @@ export class BlockCommitter {
     hooks?.applyChanges(operation, mempoolChanges);
     const historyIds =
       hooks === undefined ? [] : await hooks.historyIds(mempoolChanges);
-
-    /*
-     * In tip mode every transaction that becomes accepted needs its spent
-     * outputs (UTXO −1 rows), also in stored blocks.
-     */
-    if (tipMode) {
-      const transitionTxs = new Set<string>();
-      acceptingNodes.forEach((node) => {
-        plansOfNode.get(node)!.forEach((plan) => {
-          plan.block.transactions.forEach((transaction) => {
-            if (!acceptedBefore.get(node)!.has(transaction.hash)) {
-              transitionTxs.add(transaction.hash);
-            }
-          });
-        });
-      });
-      plans.forEach((plan) => {
-        if (!plan.blockExists) return;
-        plan.block.transactions.forEach((transaction) => {
-          if (transitionTxs.has(transaction.hash)) want(transaction, undefined);
-        });
-      });
-      await resolveWanted();
-    }
-    const unresolved = [...wanted.keys()].filter((key) => !resolved.has(key));
 
     const nodeBlockRows: NodeBlockRow[] = [];
     const txAcceptanceRows: TxAcceptanceRow[] = [];
@@ -1556,48 +1341,6 @@ export class BlockCommitter {
         )
       );
     }
-    const pendingUtxo: {
-      node: number;
-      spender: string;
-      inputIndex: number;
-      key: string;
-    }[] = [];
-    if (tipMode) {
-      acceptingNodes.forEach((node) => {
-        /*
-         * One transition per (node, tx) over all the node's blocks in the
-         * batch: a tx in two of them (or stored before) counts once.
-         */
-        const transactions: {
-          transaction: ChaingraphTransaction;
-          internalId: bigint;
-        }[] = [];
-        plansOfNode.get(node)!.forEach((plan) => {
-          plan.block.transactions.forEach((transaction) => {
-            transactions.push({
-              internalId: idByHash.get(transaction.hash)!,
-              transaction,
-            });
-          });
-        });
-        const delta = blockUtxoDelta({
-          acceptedBefore: acceptedBefore.get(node)!,
-          nodeInternalId: node,
-          resolveSpent,
-          transactions,
-          utxo: utxoEnabled,
-        });
-        appendAll(utxoRows, delta.rows);
-        delta.pending.forEach((item) => {
-          pendingUtxo.push({
-            inputIndex: item.inputIndex,
-            key: outpointKey(item.hash, item.index),
-            node,
-            spender: item.spender,
-          });
-        });
-      });
-    }
     const encodedUtxo = encodeUtxoRows(utxoRows, commit.seq);
     nodeWrites.push(
       insert('utxo', utxoColumns, {
@@ -1611,139 +1354,51 @@ export class BlockCommitter {
         rowCount: encodedUtxo.rowCount,
       })
     );
+    if (tipMode && utxoEnabled) {
+      /*
+       * One transition per (node, tx) over all the node's blocks in the
+       * batch: a tx in two of them (or accepted before) counts once. Its
+       * +1 (outputs) and −1 (spent outputs) rows are joined server-side from
+       * `output` and `input` (this commit's rows, written above, and the
+       * earlier commits' rows: every earlier operation of the node has
+       * written its rows, `waitForEarlier`). A spent output that is not
+       * stored gets no −1 row (as Postgres has no output to join).
+       */
+      acceptingNodes.forEach((node) => {
+        const hashes = blockTransitions({
+          acceptedBefore: acceptedBefore.get(node)!,
+          transactions: plansOfNode
+            .get(node)!
+            .flatMap((plan) =>
+              plan.block.transactions.map((transaction) => ({ transaction }))
+            ),
+        });
+        if (hashes.length === 0) return;
+        (['utxo', 'utxo_by_script'] as const).forEach((table) => {
+          nodeWrites.push(
+            (async () => {
+              await context.client.insertSelect(
+                utxoDeltaInsertSql(table, acceptedDeltasSql),
+                {
+                  fence: context.fence(),
+                  hashes,
+                  node,
+                  seq: commit.seq,
+                },
+                { deduplicationToken: commit.token(table, `j${node}`) }
+              );
+              await context.fault(table, { kind: 'block', seq: commit.seq });
+            })()
+          );
+        });
+      });
+    }
 
     await Promise.all(nodeWrites);
-
-    /* 6. Child-before-parent: pending spends, filled under this seq. */
-    if (unresolved.length > 0) {
-      const pendingInputs = newTransactions.flatMap((transaction) =>
-        transaction.isCoinbase
-          ? []
-          : transaction.inputs
-              .map((input, inputIndex) => ({ input, inputIndex, transaction }))
-              .filter(
-                ({ input }) =>
-                  !resolved.has(
-                    outpointKey(
-                      input.outpointTransactionHash,
-                      input.outpointIndex
-                    )
-                  )
-              )
-      );
-      const pendingRows = (sign: -1 | 1): PendingSpendRow[] =>
-        pendingSpendRows(pendingInputs, pendingUtxo, sign);
-      await insert(
-        'pending_spend',
-        acceptanceColumns.pending_spend,
-        encodePendingSpendRows(pendingRows(1), commit.seq)
-      );
-      await context.commitLog.markIncomplete(commit.seq);
-      await context.fault('incomplete', { kind: 'block', seq: commit.seq });
-      /*
-       * Every row but the fill is written and the commit is `incomplete`
-       * (it holds its nodes' watermarks): the callers may report the blocks
-       * as parked now, so the agent's bounded block buffer keeps downloading
-       * (the parent may still be queued behind them). The commit completes
-       * in the background; if the process stops first, recovery aborts it
-       * and the next start downloads the blocks again.
-       */
-      operation.yieldLane();
-      batch.parked = true;
-      batch.items.forEach((item, index) => {
-        item.onParked(results[index]!);
-      });
-      const filled = await operation.whileWaiting(
-        this.waitForPending(
-          unresolved,
-          wanted,
-          commit.seq,
-          context.commitLog.committedCount !== committedAtLookup
-        )
-      );
-      filled.forEach((spend, key) => {
-        resolved.set(key, spend);
-        if (spend.owner !== undefined && spend.owner !== operation) {
-          dependencies.add(spend.owner);
-        }
-      });
-      // a parent found now is waited for: the commit-order barrier must know
-      operation.noteWaitsOn(dependencies);
-      const fillInputs: ResolvedInput[] = pendingInputs.map(
-        ({ input, inputIndex, transaction }) => {
-          const spent = resolveSpent(
-            input.outpointTransactionHash,
-            input.outpointIndex
-          );
-          return {
-            input,
-            inputIndex,
-            spent:
-              spent === undefined ? unknownSpentOutput : spentOutputOf(spent),
-            transactionHash: transaction.hash,
-            transactionInternalId: idByHash.get(transaction.hash)!,
-          };
-        }
-      );
-      await insert(
-        'input',
-        columnsOf('input'),
-        encodeResolvedInputRows(fillInputs, commit.seq),
-        'f0'
-      );
-      const fillUtxo = pendingUtxo
-        .filter((item) => utxoEnabled && resolved.has(item.key))
-        .map(
-          (item): UtxoRow => ({
-            nodeInternalId: item.node,
-            output: resolved.get(item.key)!.output,
-            sign: -1,
-          })
-        );
-      const encodedFill = encodeUtxoRows(fillUtxo, commit.seq);
-      await insert(
-        'utxo',
-        utxoColumns,
-        { data: encodedFill.utxo, rowCount: encodedFill.rowCount },
-        'f0'
-      );
-      await insert(
-        'utxo_by_script',
-        utxoByScriptColumns,
-        { data: encodedFill.utxoByScript, rowCount: encodedFill.rowCount },
-        'f0'
-      );
-      await insert(
-        'block',
-        columnsOf('block'),
-        encodeBlockRows(
-          plans
-            .filter((plan) => !plan.blockExists && !blockRowNow(plan))
-            .map((plan) => ({
-              block: plan.block,
-              generatedValueSatoshis: this.generatedValue(
-                plan.block,
-                resolveSpent,
-                true
-              ),
-              internalId: plan.blockInternalId,
-            })),
-          commit.seq
-        ),
-        'f0'
-      );
-      await insert(
-        'pending_spend',
-        acceptanceColumns.pending_spend,
-        encodePendingSpendRows(pendingRows(-1), commit.seq),
-        'f0'
-      );
-      await context.fault('fill', { kind: 'block', seq: commit.seq });
-    }
     operation.markRowsWritten();
     await context.fault('rows-written', { kind: 'block', seq: commit.seq });
 
-    /* 6. Commit once every commit this one read from is committed. */
+    /* 5. Commit once every commit this one read from is committed. */
     const settled =
       context.abandon?.race(awaitDependencies(dependencies, operation)) ??
       awaitDependencies(dependencies, operation);
@@ -1794,38 +1449,6 @@ export class BlockCommitter {
       });
     }
     return found;
-  }
-
-  /** Σ outputs − Σ spent outputs (coinbase inputs spend nothing). */
-  private generatedValue(
-    block: ChaingraphBlock,
-    resolveSpent: (hash: string, index: number) => UtxoOutput | undefined,
-    unknownAsZero = false
-  ) {
-    return block.transactions.reduce((total, transaction) => {
-      const outputs = transaction.outputs.reduce(
-        (sum, output) => sum + output.valueSatoshis,
-        0n
-      );
-      const spent = transaction.isCoinbase
-        ? 0n
-        : transaction.inputs.reduce((sum, input) => {
-            const output = resolveSpent(
-              input.outpointTransactionHash,
-              input.outpointIndex
-            );
-            if (output === undefined && unknownAsZero) {
-              return sum;
-            }
-            if (output === undefined) {
-              throw new Error(
-                `Spent output ${input.outpointTransactionHash}:${input.outpointIndex} is unknown.`
-              );
-            }
-            return sum + output.valueSatoshis;
-          }, 0n);
-      return total + outputs - spent;
-    }, 0n);
   }
 
   /** Indexes of `block`'s transactions with no valid `block_transaction` link. */
@@ -1919,197 +1542,6 @@ export class BlockCommitter {
             dependencies.add(owner);
           }
         });
-      });
-    }
-  }
-
-  /**
-   * Resolve spent outputs: (a) the registry (recent and in-flight outputs),
-   * (b) the store, (c) the registry again (a save may have registered while
-   * the query ran). Unresolved outpoints are pending.
-   */
-  private async resolveSpends(
-    wanted: ReadonlyMap<string, { hash: string; index: number }>,
-    operation: StoreOperation
-  ): Promise<Map<string, ResolvedSpend>> {
-    const { context } = this;
-    const resolved = new Map<string, ResolvedSpend>();
-    const fromRegistry = async (keys: Iterable<string>) => {
-      const misses: string[] = [];
-      for (const key of keys) {
-        const entry = context.outputs.lookup(key);
-        if (entry === undefined) {
-          misses.push(key);
-        } else {
-          resolved.set(key, await this.toResolved(entry, operation));
-        }
-      }
-      return misses;
-    };
-    const misses = await fromRegistry(wanted.keys());
-    if (misses.length > 0) {
-      const stored = await lookupStoredOutputs(
-        context,
-        misses.map((key) => wanted.get(key)!)
-      );
-      stored.forEach(({ output, seq }) => {
-        const key = outpointKey(output.transactionHash, output.outputIndex);
-        if (resolved.has(key)) {
-          return;
-        }
-        const owner = context.operationOfSeq(seq);
-        resolved.set(key, { output, owner });
-        if (owner === undefined) {
-          context.outputs.remember(key, {
-            internalId: Promise.resolve(output.transactionInternalId),
-            output,
-            owner: undefined,
-          });
-        }
-      });
-      await fromRegistry(misses.filter((key) => !resolved.has(key)));
-    }
-    return resolved;
-  }
-
-  private async toResolved(
-    entry: RegisteredOutput<StoreOperation>,
-    operation: StoreOperation
-  ): Promise<ResolvedSpend> {
-    const owner =
-      entry.owner !== undefined &&
-      entry.owner !== operation &&
-      !entry.owner.finished
-        ? entry.owner
-        : undefined;
-    return {
-      output: {
-        ...entry.output,
-        transactionInternalId: await entry.internalId,
-      },
-      owner,
-    };
-  }
-
-  /**
-   * Wait (bounded) until every pending outpoint is known: registered by a
-   * save, or stored by a valid commit. The registry only remembers recent
-   * outputs (`recentOutputCapacity`), so a parent that registered, committed
-   * and was evicted between this commit's lookup and this wait (e.g. saved
-   * by another node's lane) is found by one store lookup after subscribing
-   * (G1 bug 2, docs/clickhouse-port/g1-fix-pass.md); later registrations
-   * wake the wait.
-   */
-  private async waitForPending(
-    keys: readonly string[],
-    wanted: ReadonlyMap<string, { hash: string; index: number }>,
-    seq: bigint,
-    /** Some commit was committed since the last lookup: look up again. */
-    recheckStore: boolean
-  ): Promise<Map<string, ResolvedSpend>> {
-    const { context } = this;
-    const started = Date.now();
-    /*
-     * check and subscribe in one synchronous pass: a save that registered
-     * the outpoint since `resolveSpends` is found here, a later one wakes us
-     */
-    const result = new Map<string, ResolvedSpend>();
-    const fromStore = new Map<
-      string,
-      Deferred<RegisteredOutput<StoreOperation>>
-    >();
-    const waits = keys.map((key) => {
-      const known = context.outputs.lookup(key);
-      const stored = deferred<RegisteredOutput<StoreOperation>>();
-      if (known === undefined) fromStore.set(key, stored);
-      const wait =
-        known === undefined
-          ? { key, ...context.outputs.waitFor(key) }
-          : { cancel: () => undefined, key, promise: Promise.resolve(known) };
-      return {
-        ...wait,
-        promise: Promise.race([wait.promise, stored.promise]).then(
-          async (entry) => {
-            result.set(key, {
-              output: {
-                ...entry.output,
-                transactionInternalId: await entry.internalId,
-              },
-              owner: entry.owner?.finished === true ? undefined : entry.owner,
-            });
-          }
-        ),
-      };
-    });
-    if (recheckStore && fromStore.size > 0) {
-      lookupStoredOutputs(
-        context,
-        [...fromStore.keys()].map((key) => wanted.get(key)!)
-      ).then(
-        (rows) => {
-          rows.forEach(({ output, seq: outputSeq }) => {
-            const key = outpointKey(output.transactionHash, output.outputIndex);
-            const owner = context.operationOfSeq(outputSeq);
-            const entry: RegisteredOutput<StoreOperation> = {
-              internalId: Promise.resolve(output.transactionInternalId),
-              output,
-              owner,
-            };
-            if (owner === undefined) context.outputs.remember(key, entry);
-            fromStore.get(key)?.resolve(entry);
-          });
-        },
-        // the registration wait (or the timeout) decides
-        () => undefined
-      );
-    }
-    const all = Promise.all(waits.map(async ({ promise }) => promise)).then(
-      () => true
-    );
-    try {
-      /*
-       * After the timeout the outputs still missing are taken as unknown
-       * (a block spending outputs Chaingraph never sees: test chains, or a
-       * parent that never arrives): their inputs are written with a
-       * coinbase-like stand-in (value 0, no token, empty bytecode) and no
-       * UTXO row, as Postgres stores such inputs (no output to join).
-       * There is no re-arm: saves register their outputs when they are
-       * called (WP6b), before any slot or batch-lane wait, and a save that
-       * waits for another save of the same block registers nothing new (that
-       * save registered the block's outputs). So a parent queued for a slot
-       * or behind a running batch is already visible here. (WP5c re-armed
-       * the timeout while ANY call was queued for a slot, which includes
-       * children resuming after their own wait: under a cap they completed
-       * one at a time and the agent's initial sync did not finish; re-arming
-       * on waits that themselves wait behind this child is a deadlock.)
-       */
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timeout = new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => {
-          resolve(false);
-        }, context.pendingSpendTimeoutMs);
-      });
-      const complete = await Promise.race([
-        all,
-        timeout,
-        ...(context.abandon === undefined ? [] : [context.abandon.promise]),
-      ]).finally(() => {
-        clearTimeout(timer);
-      });
-      if (!complete) {
-        const missing = keys.filter((key) => !result.has(key));
-        context.diagnostic?.({
-          event: 'pending_spend_timeout',
-          sample: missing.slice(0, 5),
-          seq: seq.toString(),
-          unresolved: missing.length,
-          waitedMs: Date.now() - started,
-        });
-      }
-      return new Map(result);
-    } finally {
-      waits.forEach(({ cancel }) => {
-        cancel();
       });
     }
   }

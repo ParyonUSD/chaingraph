@@ -107,7 +107,12 @@ const setup = async (
     });
   }
   const checker = createClickHouseChecker(env.client);
-  return { ...env, checker, fx, nodes, store };
+  /** Close the store and open a new one on the same database (a restart). */
+  const reopen = async () => {
+    await store.close();
+    return env.openStore();
+  };
+  return { ...env, checker, fx, nodes, reopen, store };
 };
 
 const outpoints = (
@@ -482,36 +487,36 @@ e2e(
 );
 
 e2e(
-  '[e2e] mempool: an orphan waits for its parent (mempool or block) without a commit',
+  '[e2e] mempool: a child before its parent (mempool or block) is saved at once; the parent resolves its spend',
   async (t) => {
-    const { checker, client, fx, nodes, store } = await setup(t, 'orphan', {
-      orphanGraceMs: 30_000,
-    });
-    // q before its parent p: parked, no commit
+    const { checker, client, fx, nodes, store } = await setup(t, 'orphan');
+    // q before its parent p: saved at once (Postgres), its own rows only
     const commitsBefore = (await store.commitLog.listCommits()).length;
-    const qSaved = store.saveMempoolTransaction(fx.q, [
+    await store.saveMempoolTransaction(fx.q, [
       { nodeInternalId: nodes.node1, validatedAt: at(20) },
     ]);
-    await new Promise((resolve) => {
-      setTimeout(resolve, 200);
-    });
-    t.true(store.mempool.orphans.has(fx.q.hash), 'q is parked');
     t.is(
       (await store.commitLog.listCommits()).length,
-      commitsBefore,
-      'parking writes no commit'
+      commitsBefore + 1,
+      'one commit for q'
     );
-    t.false(await checker.transactionExists(fx.q.hash));
-    // a second node's validation of the parked q merges into the orphan
-    const q2Saved = store.saveMempoolTransaction(fx.q, [
+    t.true(await checker.transactionExists(fx.q.hash));
+    t.deepEqual(
+      (await checker.inputsOfTx(fx.q.hash)).map(
+        (input) => `${input.outpointTransactionHash}:${input.outpointIndex}`
+      ),
+      fx.q.inputs.map(
+        (input) => `${input.outpointTransactionHash}:${input.outpointIndex}`
+      ),
+      "q's input rows, although its parent is not stored"
+    );
+    await store.saveMempoolTransaction(fx.q, [
       { nodeInternalId: nodes.node2, validatedAt: at(22) },
     ]);
     await store.saveMempoolTransaction(fx.p, [
       { nodeInternalId: nodes.node1, validatedAt: at(10) },
       { nodeInternalId: nodes.node2, validatedAt: at(11) },
     ]);
-    await Promise.all([qSaved, q2Saved]);
-    t.false(store.mempool.orphans.has(fx.q.hash));
     await settle(store);
     for (const [node, qAt] of [
       [nodeOne, at(20)],
@@ -523,39 +528,31 @@ e2e(
       t.false(view.unspent.includes(`${fx.p.hash}:0`));
     }
 
-    // x spends u:0, u is first seen in a block: x waits; the block releases it
-    const xSaved = store.saveMempoolTransaction(fx.x, [
+    // x spends u:0, u is first seen in a block: x is saved at once; the block resolves its spend
+    await store.saveMempoolTransaction(fx.x, [
       { nodeInternalId: nodes.node1, validatedAt: at(30) },
     ]);
-    await new Promise((resolve) => {
-      setTimeout(resolve, 200);
-    });
-    t.true(store.mempool.orphans.has(fx.x.hash));
     await store.saveBlock({
       block: fx.blockU,
       isSavedTransaction: notSaved,
       nodeAcceptances: [acceptance(nodes.node1, at(31))],
     });
-    await xSaved;
     await settle(store);
     const node1 = await mempoolView(checker, nodeOne);
     t.true(node1.mempool.includes(`${fx.x.hash}@${at(30).toISOString()}`));
     t.true(node1.unspent.includes(`${fx.x.hash}:0`));
     t.false(node1.unspent.includes(`${fx.u.hash}:0`));
     t.deepEqual(await badUtxoSums(client), []);
-    await assertMemoryMatchesStore(t, store, checker, 'after orphans');
+    await assertMemoryMatchesStore(t, store, checker, 'after children');
   }
 );
 
 e2e(
-  '[e2e] mempool: an orphan whose parent arrives conflicting with an accepted block ends archived as its descendant (Postgres arrival order)',
+  '[e2e] mempool: a child saved before its parent, which conflicts with an accepted block, is archived as its descendant',
   async (t) => {
     const { checker, client, fx, nodes, store } = await setup(
       t,
-      'orphan_conflict',
-      {
-        orphanGraceMs: 30_000,
-      }
+      'orphan_conflict'
     );
     const name = short(fx);
     await store.saveBlock({
@@ -568,32 +565,29 @@ e2e(
       outputs: [{ lockingBytecode: p2pkh('s'), valueSatoshis: 900n }],
       spends: [[fx.r.hash, 0]],
     });
-    const sSaved = store.saveMempoolTransaction(s, [
+    await store.saveMempoolTransaction(s, [
       { nodeInternalId: nodes.node1, validatedAt: at(50) },
       { nodeInternalId: nodes.node2, validatedAt: at(50) },
     ]);
-    await new Promise((resolve) => {
-      setTimeout(resolve, 200);
-    });
-    t.true(store.mempool.orphans.has(s.hash));
     // r conflicts with p (in block P, accepted by node 1 only)
     await store.saveMempoolTransaction(fx.r, [
       { nodeInternalId: nodes.node1, validatedAt: at(60) },
       { nodeInternalId: nodes.node2, validatedAt: at(60) },
     ]);
-    await sSaved;
     await settle(store);
     const node1 = await mempoolView(checker, nodeOne);
     t.deepEqual(node1.mempool, []);
     t.deepEqual(
-      node1.history.map((row) => [
-        name(row.hash) === row.hash.slice(0, 8) ? 's' : name(row.hash),
-        row.validatedAt,
-        row.replacedAt,
-      ]),
+      node1.history
+        .map((row) => [
+          name(row.hash) === row.hash.slice(0, 8) ? 's' : name(row.hash),
+          row.validatedAt,
+          row.replacedAt,
+        ])
+        .sort(),
       [
-        ['s', at(50).toISOString(), at(40).toISOString()],
         ['r', at(60).toISOString(), at(40).toISOString()],
+        ['s', at(50).toISOString(), at(40).toISOString()],
       ]
     );
     const node2 = await mempoolView(checker, nodeTwo);
@@ -607,42 +601,43 @@ e2e(
     t.deepEqual(node2.history, []);
     t.deepEqual(await checker.orphanMempoolDescendants(nodeOne), []);
     t.deepEqual(await badUtxoSums(client), []);
-    await assertMemoryMatchesStore(t, store, checker, 'after orphan conflict');
+    await assertMemoryMatchesStore(t, store, checker, 'after child conflict');
   }
 );
 
 e2e(
-  '[e2e] mempool: an orphan whose parent never arrives is saved after the grace period; a later block resolves its spend',
+  '[e2e] mempool: a child whose parent never arrives as a mempool tx is saved at once; a later block resolves its spend, also across a restart',
   async (t) => {
-    const { checker, client, fx, nodes, store } = await setup(t, 'grace', {
-      orphanGraceMs: 300,
-    });
+    const { checker, client, fx, nodes, store, reopen } = await setup(
+      t,
+      'grace'
+    );
     const started = Date.now();
     await store.saveMempoolTransaction(fx.x, [
       { nodeInternalId: nodes.node1, validatedAt: at(30) },
     ]);
-    t.true(Date.now() - started >= 250, 'x waited for the grace period');
+    t.true(Date.now() - started < 5_000, 'x did not wait for its parent');
     await settle(store);
     let node1 = await mempoolView(checker, nodeOne);
     t.true(node1.mempool.includes(`${fx.x.hash}@${at(30).toISOString()}`));
     t.true(node1.unspent.includes(`${fx.x.hash}:0`));
-    const pending = async () =>
-      client.query<{ node: number; live: string }>(
-        `SELECT node_internal_id AS node, toString(sum(sign)) AS live FROM pending_spend
-         WHERE spender_transaction_hash = toFixedString(unhex({hash:String}), 32)
-         GROUP BY node`,
-        { hash: fx.x.hash }
-      );
-    t.deepEqual(await pending(), [{ live: '1', node: nodes.node1 }]);
     await logCommit(
       t,
       client,
       fx,
       await latestSeq(store, 'mempool_batch'),
-      'addition x with unknown parent (after grace)'
+      'addition x with unknown parent'
     );
+    // a restart rebuilds x's outstanding spend from the store (u:0 not stored)
+    const restarted = await reopen();
+    if (restarted.mempool.trackSpends) {
+      t.deepEqual(
+        [...restarted.mempool.node(nodes.node1).txs.get(fx.x.hash)!.unresolved],
+        [`${fx.u.hash}:0`]
+      );
+    }
     // the parent arrives in a block node 1 accepts: x's −1 for u:0 is written then
-    await store.saveBlock({
+    await restarted.saveBlock({
       block: fx.blockU,
       isSavedTransaction: notSaved,
       nodeAcceptances: [acceptance(nodes.node1, at(40))],
@@ -651,14 +646,13 @@ e2e(
       t,
       client,
       fx,
-      await latestSeq(store, 'block'),
+      await latestSeq(restarted, 'block'),
       'block creating u ⇒ x spend resolved'
     );
-    await settle(store);
+    await settle(restarted);
     node1 = await mempoolView(checker, nodeOne);
     t.false(node1.unspent.includes(`${fx.u.hash}:0`));
     t.true(node1.unspent.includes(`${fx.x.hash}:0`));
-    t.deepEqual(await pending(), [{ live: '0', node: nodes.node1 }]);
     t.deepEqual(await badUtxoSums(client), []);
   }
 );

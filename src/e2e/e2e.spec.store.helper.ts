@@ -114,15 +114,14 @@ export const dropStaleClickHouseE2eDatabases = async () => {
 /**
  * ClickHouse store tuning variables passed through from the test process to
  * the spawned agent when set (e.g. `CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES=16`
- * to run the suite under the lab's in-flight cap). A set
- * CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS replaces the suite's 1 ms.
+ * to run the suite under the lab's in-flight cap).
  */
 const clickHousePassThroughVariables = [
   'CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES',
   'CHAINGRAPH_CLICKHOUSE_MAX_BLOCKS_PER_COMMIT',
   'CHAINGRAPH_CLICKHOUSE_MAX_BYTES_PER_COMMIT',
   'CHAINGRAPH_CLICKHOUSE_LEASE_TTL_MS',
-  'CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS',
+  'CHAINGRAPH_CLICKHOUSE_SPEND_INDEX',
   'CHAINGRAPH_CLICKHOUSE_UTXO',
 ] as const;
 
@@ -147,14 +146,6 @@ export const e2eStoreEnvironment = (): { [key: string]: string } =>
         /* eslint-disable @typescript-eslint/naming-convention */
         CHAINGRAPH_CLICKHOUSE_DATABASE: e2eClickHouseDatabase,
         CHAINGRAPH_CLICKHOUSE_PASSWORD: e2eClickHouseServer.password ?? '',
-        /*
-         * The mockchain's non-coinbase inputs spend random outpoints that
-         * never exist ("inputs do not spend prior outputs"); a ClickHouse
-         * block save waits this long for a spent output before taking it as
-         * unknown (Postgres stores such inputs at once). 1 ms keeps tip-mode
-         * blocks, which wait for their predecessors' rows, from queueing.
-         */
-        CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS: '1',
         CHAINGRAPH_CLICKHOUSE_URL: e2eClickHouseServer.url,
         CHAINGRAPH_CLICKHOUSE_USER: e2eClickHouseServer.username ?? '',
         CHAINGRAPH_STORE: 'clickhouse',

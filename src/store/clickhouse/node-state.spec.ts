@@ -11,6 +11,7 @@ import {
   awaitCommitOrder,
   awaitDependencies,
   DependencyFailedError,
+  hasForwardWaits,
   InFlightLimiter,
   NodeRegistry,
   OperationRegistry,
@@ -352,4 +353,17 @@ test('SaveSlot: no slot (unbounded store) leaves waits unchanged', async (t) => 
   await waiting;
   t.is(b.slot, undefined);
   t.is(await b.whileWaiting(Promise.resolve(7)), 7);
+});
+
+test('hasForwardWaits: only a wait on a later live operation counts (child before parent)', (t) => {
+  const registry = new OperationRegistry();
+  const earlier = registry.begin('block', [1]);
+  const later = registry.begin('block', [1]);
+  t.false(hasForwardWaits(registry));
+  later.noteWaitsOn([earlier]);
+  t.false(hasForwardWaits(registry), 'a wait on an earlier operation');
+  earlier.noteWaitsOn([later]);
+  t.true(hasForwardWaits(registry), 'the child waits for its later parent');
+  later.markCommitted();
+  t.false(hasForwardWaits(registry), 'a settled parent no longer counts');
 });

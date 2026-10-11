@@ -35,7 +35,6 @@ export const rowBinaryTableColumns = {
     ['size_bytes', 'UInt32'],
     ['transaction_count', 'UInt32'],
     ['output_value_satoshis', 'Int64'],
-    ['generated_value_satoshis', 'Int64'],
     ['commit_seq', 'UInt64'],
   ],
   block_transaction: [
@@ -53,15 +52,6 @@ export const rowBinaryTableColumns = {
     ['outpoint_index', 'UInt32'],
     ['sequence_number', 'UInt32'],
     ['unlocking_bytecode', 'String'],
-    ['value_satoshis', 'Int64'],
-    ['token_category', 'FixedString(32)'],
-    ['fungible_token_amount', 'Nullable(Int64)'],
-    [
-      'nonfungible_token_capability',
-      "Nullable(Enum8('none' = 1, 'mutable' = 2, 'minting' = 3))",
-    ],
-    ['nonfungible_token_commitment', 'Nullable(String)'],
-    ['locking_bytecode', 'String'],
     ['commit_seq', 'UInt64'],
   ],
   output: [
@@ -119,38 +109,6 @@ export interface EncodedRows {
   rowCount: number;
 }
 
-/**
- * The attributes of a spent output copied onto its `input` row (a
- * `ChaingraphOutput` satisfies this).
- */
-export type SpentOutput = Pick<
-  ChaingraphOutput,
-  | 'fungibleTokenAmount'
-  | 'lockingBytecode'
-  | 'nonfungibleTokenCapability'
-  | 'nonfungibleTokenCommitment'
-  | 'tokenCategory'
-  | 'valueSatoshis'
->;
-
-export type ResolveSpentOutput = (
-  outpointTransactionHash: string,
-  outpointIndex: number
-) => SpentOutput | undefined;
-
-export interface PendingInput {
-  transactionHash: string;
-  inputIndex: number;
-}
-
-export interface EncodedInputRows extends EncodedRows {
-  /**
-   * Inputs whose spent output could not be resolved; no row was written for
-   * them (the `fill_pending` commit writes them later).
-   */
-  pending: PendingInput[];
-}
-
 export interface TransactionRowsContext {
   commitSeq: bigint | number;
   /**
@@ -159,14 +117,15 @@ export interface TransactionRowsContext {
   transactionInternalIds: readonly (bigint | number)[];
 }
 
+/**
+ * A block row. The generated value (outputs minus spent outputs) is not
+ * stored: readers compute it from the block's inputs joined to the outputs
+ * they spend (Postgres: `block_generated_value_satoshis`), so the row needs
+ * nothing but the block itself (docs/clickhouse-port/spend-index.md).
+ */
 export interface BlockRow {
   block: ChaingraphBlock;
   internalId: bigint | number;
-  /**
-   * Block output value minus the value of the outputs spent by its inputs
-   * (needs the spent outputs, so the caller computes it).
-   */
-  generatedValueSatoshis: bigint | number;
 }
 
 const hashBytes = 32;
@@ -174,11 +133,10 @@ const hexCharsPerByte = 2;
 /** Generous per-row allowance for LEB128 prefixes and Nullable flags. */
 const rowSlackBytes = 16;
 const transactionRowBytes = hashBytes + 8 + 4 + 4 + 4 + 1 + 4 + 4 + 8 + 8;
-const blockRowBytes = 3 * hashBytes + 8 + 4 * 7 + 8 + 8 + 8;
+const blockRowBytes = 3 * hashBytes + 8 + 4 * 7 + 8 + 8;
 const blockTransactionRowBytes = 8 + 4 + 8 + hashBytes + 8;
 const outputRowFixedBytes = 2 * hashBytes + 4 + 8 + 8 + 8 + 8 + rowSlackBytes;
-const inputRowFixedBytes =
-  3 * hashBytes + 4 + 8 + 4 + 4 + 8 + 9 + 8 + rowSlackBytes;
+const inputRowFixedBytes = 2 * hashBytes + 4 + 8 + 4 + 4 + 8 + rowSlackBytes;
 
 const internalIdAt = (
   internalIds: readonly (bigint | number)[],
@@ -237,7 +195,7 @@ export const encodeBlockRows = (
   commitSeq: bigint | number
 ): EncodedRows => {
   const writer = new RowBinaryWriter(rows.length * blockRowBytes);
-  rows.forEach(({ block, generatedValueSatoshis, internalId }) => {
+  rows.forEach(({ block, internalId }) => {
     writer
       .fixedString32(block.hash)
       .uint64(internalId)
@@ -251,7 +209,6 @@ export const encodeBlockRows = (
       .uint32(block.sizeBytes)
       .uint32(block.transactions.length)
       .int64(blockOutputValueSatoshis(block))
-      .int64(generatedValueSatoshis)
       .uint64(commitSeq)
       .endRow();
   });
@@ -342,41 +299,15 @@ export const encodeOutputRows = (
   return { data: writer.finish(), rowCount: writer.rowCount };
 };
 
-const writeInputRow = (
-  writer: RowBinaryWriter,
-  row: ResolvedInput & { commitSeq: bigint | number }
-) => {
-  writer
-    .fixedString32(row.transactionHash)
-    .uint32(row.inputIndex)
-    .uint64(row.transactionInternalId)
-    .fixedString32(row.input.outpointTransactionHash)
-    .uint32(row.input.outpointIndex)
-    .uint32(row.input.sequenceNumber)
-    .hexBytes(row.input.unlockingBytecode)
-    .int64(row.spent.valueSatoshis);
-  writeTokenCategory(writer, row.spent.tokenCategory).nullable(
-    row.spent.fungibleTokenAmount,
-    (w, amount) => w.int64(amount)
-  );
-  writeNonfungibleToken(writer, row.spent)
-    .hexBytes(row.spent.lockingBytecode)
-    .uint64(row.commitSeq)
-    .endRow();
-};
-
 /**
- * Input rows carry the attributes of the output they spend, from
- * `resolveSpentOutput` (the caller's lookup over this save's own outputs and
- * the store). Coinbase inputs spend nothing: value 0, no token, empty
- * locking bytecode. Unresolved inputs get no row and are returned in
- * `pending`.
+ * `input` rows: the input's own fields only (outpoint, sequence number,
+ * unlocking bytecode). Every row comes from its own transaction, so a commit
+ * never waits for, or looks up, the outputs its inputs spend.
  */
 export const encodeInputRows = (
   transactions: readonly ChaingraphTransaction[],
-  { commitSeq, transactionInternalIds }: TransactionRowsContext,
-  resolveSpentOutput: ResolveSpentOutput
-): EncodedInputRows => {
+  { commitSeq, transactionInternalIds }: TransactionRowsContext
+): EncodedRows => {
   const expectedBytes = transactions.reduce(
     (total, transaction) =>
       transaction.inputs.reduce(
@@ -389,69 +320,20 @@ export const encodeInputRows = (
     0
   );
   const writer = new RowBinaryWriter(expectedBytes);
-  const pending: PendingInput[] = [];
-  const coinbaseSpentOutput: SpentOutput = {
-    lockingBytecode: '',
-    valueSatoshis: 0n,
-  };
   transactions.forEach((transaction, index) => {
     const transactionInternalId = internalIdAt(transactionInternalIds, index);
     transaction.inputs.forEach((input, inputIndex) => {
-      const spent = transaction.isCoinbase
-        ? coinbaseSpentOutput
-        : resolveSpentOutput(
-            input.outpointTransactionHash,
-            input.outpointIndex
-          );
-      if (spent === undefined) {
-        pending.push({ inputIndex, transactionHash: transaction.hash });
-        return;
-      }
-      writeInputRow(writer, {
-        commitSeq,
-        input,
-        inputIndex,
-        spent,
-        transactionHash: transaction.hash,
-        transactionInternalId,
-      });
+      writer
+        .fixedString32(transaction.hash)
+        .uint32(inputIndex)
+        .uint64(transactionInternalId)
+        .fixedString32(input.outpointTransactionHash)
+        .uint32(input.outpointIndex)
+        .uint32(input.sequenceNumber)
+        .hexBytes(input.unlockingBytecode)
+        .uint64(commitSeq)
+        .endRow();
     });
-  });
-  return { data: writer.finish(), pending, rowCount: writer.rowCount };
-};
-
-/**
- * One input to encode with its (now known) spent output: the late rows of a
- * commit whose inputs were pending (`encodeInputRows` returned them in
- * `pending`).
- */
-export interface ResolvedInput {
-  transactionHash: string;
-  transactionInternalId: bigint | number;
-  inputIndex: number;
-  input: ChaingraphTransaction['inputs'][number];
-  spent: SpentOutput;
-}
-
-/**
- * `input` rows for individually resolved inputs (same columns as
- * `encodeInputRows`).
- */
-export const encodeResolvedInputRows = (
-  inputs: readonly ResolvedInput[],
-  commitSeq: bigint | number
-): EncodedRows => {
-  const writer = new RowBinaryWriter(
-    inputs.reduce(
-      (total, { input }) =>
-        total +
-        inputRowFixedBytes +
-        input.unlockingBytecode.length / hexCharsPerByte,
-      0
-    )
-  );
-  inputs.forEach((resolved) => {
-    writeInputRow(writer, { ...resolved, commitSeq });
   });
   return { data: writer.finish(), rowCount: writer.rowCount };
 };

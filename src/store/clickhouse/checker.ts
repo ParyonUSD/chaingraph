@@ -60,9 +60,9 @@ import {
 } from './visibility.js';
 
 const hashBytes = 32;
+/** Rows listed per kind by `spendIndexCheck` unless asked otherwise. */
+const defaultCheckLimit = 100;
 const zeroCategoryHex = '00'.repeat(hashBytes);
-/** Rows listed per kind by `standInCheck` unless asked otherwise. */
-const defaultStandInCheckLimit = 100;
 const byHex = (a: string, b: string) => (a < b ? -1 : Number(a > b));
 const hashParam = (name: string) =>
   `toFixedString(unhex({${name}:String}), 32)`;
@@ -286,9 +286,11 @@ export class ClickHouseChecker implements StoreChecker {
 
   /**
    * As the Postgres functions: over the distinct transactions linked to the
-   * block; input value = value of the spent outputs (stored on `input`;
-   * coinbase inputs are 0); fee = input − output of non-coinbase
-   * transactions; generated = output − input.
+   * block; input value = value of the outputs spent by its non-coinbase
+   * transactions' inputs, joined on the outpoint (`input` carries no spent
+   * output; a spent output that is not stored counts 0, as Postgres's join);
+   * fee = input − output of non-coinbase transactions; generated = output −
+   * input.
    */
   readonly blockValueAggregates = async (by: BlockSelector) => {
     const params = await this.agnosticSnapshot();
@@ -311,12 +313,20 @@ export class ClickHouseChecker implements StoreChecker {
          (SELECT toString(sumIf(output_value_satoshis, NOT is_coinbase)) FROM ${this.view(
            'transaction_at'
          )} WHERE hash IN ${linked}) AS noncoinbase_output,
-         (SELECT toString(sum(value_satoshis)) FROM ${this.view(
-           'input_at'
-         )} WHERE transaction_hash IN ${linked}
-            AND transaction_hash IN (SELECT hash FROM ${this.view(
-              'transaction_at'
-            )} WHERE NOT is_coinbase)) AS input`,
+         (SELECT toString(sum(o.value_satoshis))
+          FROM (SELECT outpoint_transaction_hash, outpoint_index FROM ${this.view(
+            'input_at'
+          )} WHERE transaction_hash IN ${linked}
+                  AND transaction_hash IN (SELECT hash FROM ${this.view(
+                    'transaction_at'
+                  )} WHERE NOT is_coinbase)) AS i
+          INNER JOIN (SELECT transaction_hash, output_index, value_satoshis FROM ${this.view(
+            'output_at'
+          )} WHERE (transaction_hash, output_index) IN (
+                    SELECT outpoint_transaction_hash, outpoint_index FROM ${this.view(
+                      'input_at'
+                    )} WHERE transaction_hash IN ${linked})) AS o
+            ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index) AS input`,
       { ...params, block: block.internal_id }
     );
     const output = BigInt(row?.output ?? '0');
@@ -838,70 +848,92 @@ export class ClickHouseChecker implements StoreChecker {
     };
   };
 
-  /* ------------------------------------------------------- stand-in check */
+  /* ---------------------------------------------------- spend index check */
 
   /**
-   * The stand-in check (docs/clickhouse-port/mempool-fill-fix.md), on ONE
-   * node-agnostic snapshot: `mismatched` = visible inputs (not coinbase)
-   * whose spent output is visible but whose spent-output columns (value,
-   * locking bytecode, token category, FT amount, NFT capability and
-   * commitment) differ from it, e.g. a stand-in left after its parent was
-   * stored; `duplicated` = inputs with more than one visible row (a stand-in
-   * and its real row both visible). Both must be empty. `limit` caps each
-   * list. Reads every visible input and output: for tests and the lab.
+   * The spend index against the join, on ONE node-agnostic snapshot with
+   * spend watermark W (docs/clickhouse-port/spend-index.md):
+   * - `missing`: visible input/output pairs with both seqs at most W that
+   *   the index (`spend_at`) lacks;
+   * - `extra`: index rows (up to W) with no such pair;
+   * - `duplicated`: inputs with more than one index row;
+   * - `mismatched`: index rows whose outpoint or spent attributes differ from
+   *   the joined output.
+   * All must be empty. `limit` caps each list. Reads every visible input and
+   * output: for tests and the lab.
    */
-  readonly standInCheck = async ({ limit = defaultStandInCheckLimit } = {}) => {
-    const params = await this.agnosticSnapshot();
-    const attributes =
-      'cityHash64(toString((value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment)))';
-    const [mismatched, duplicated] = await Promise.all([
-      this.client.query<{
-        tx: string;
-        input_index: number;
-        outpoint_hash: string;
-        outpoint_index: number;
-      }>(
-        `SELECT ${hexOf(
-          'i.transaction_hash'
-        )} AS tx, i.input_index AS input_index,
-           ${hexOf(
-             'i.outpoint_transaction_hash'
-           )} AS outpoint_hash, i.outpoint_index AS outpoint_index
-         FROM (SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index, ${attributes} AS h
-               FROM ${this.view('input_at')}
-               WHERE outpoint_transaction_hash != toFixedString(unhex({zero:String}), 32)) AS i
-         INNER JOIN (SELECT transaction_hash, output_index, ${attributes} AS h
-                     FROM ${this.view('output_at')}) AS o
-           ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index
-         WHERE i.h != o.h
-         ORDER BY tx, input_index
-         LIMIT {limit:UInt32}`,
-        { ...params, limit, zero: zeroCategoryHex }
+  readonly spendIndexCheck = async ({ limit = defaultCheckLimit } = {}) => {
+    const snapshot = await readSnapshot(this.client, nodeAgnosticId);
+    const params = { ...snapshotParams(snapshot), limit };
+    const attributes = (alias: string) =>
+      `cityHash64(toString((${alias}.value_satoshis, ${alias}.locking_bytecode, ${alias}.token_category, ${alias}.fungible_token_amount, ${alias}.nonfungible_token_capability, ${alias}.nonfungible_token_commitment)))`;
+    const joinSql = `SELECT i.transaction_hash AS tx, i.input_index AS input_index,
+         i.outpoint_transaction_hash AS op_hash, i.outpoint_index AS op_index, ${attributes(
+           'o'
+         )} AS h
+       FROM (SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index, commit_seq
+             FROM ${this.view('input_at')}
+             WHERE commit_seq <= {spend:UInt64}
+               AND outpoint_transaction_hash != toFixedString(unhex(repeat('00', 32)), 32)) AS i
+       INNER JOIN (SELECT * FROM ${this.view(
+         'output_at'
+       )} WHERE commit_seq <= {spend:UInt64}) AS o
+         ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index`;
+    const indexSql = `SELECT s.transaction_hash AS tx, s.input_index AS input_index,
+         s.outpoint_transaction_hash AS op_hash, s.outpoint_index AS op_index, ${attributes(
+           's'
+         )} AS h
+       FROM ${this.view('spend_at')} AS s`;
+    const key = (row: { tx_hex: string; input_index: number }) => ({
+      inputIndex: Number(row.input_index),
+      transactionHash: row.tx_hex,
+    });
+    interface KeyRow {
+      tx_hex: string;
+      input_index: number;
+    }
+    const [counts, missing, extra, duplicated, mismatched] = await Promise.all([
+      this.client.query<{ index_rows: string; join_rows: string }>(
+        `SELECT (SELECT toString(count()) FROM (${indexSql})) AS index_rows,
+                (SELECT toString(count()) FROM (${joinSql})) AS join_rows`,
+        params
       ),
-      this.client.query<{ tx: string; input_index: number; rows: string }>(
-        `SELECT ${hexOf(
-          'transaction_hash'
-        )} AS tx, input_index, toString(count()) AS rows
-         FROM ${this.view('input_at')}
-         GROUP BY transaction_hash, input_index
-         HAVING count() > 1
-         ORDER BY tx, input_index
-         LIMIT {limit:UInt32}`,
-        { ...params, limit }
+      this.client.query<KeyRow>(
+        `SELECT ${hexOf('tx')} AS tx_hex, input_index FROM (${joinSql})
+         WHERE (tx, input_index) NOT IN (SELECT tx, input_index FROM (${indexSql}))
+         ORDER BY tx_hex, input_index LIMIT {limit:UInt32}`,
+        params
+      ),
+      this.client.query<KeyRow>(
+        `SELECT ${hexOf('tx')} AS tx_hex, input_index FROM (${indexSql})
+         WHERE (tx, input_index) NOT IN (SELECT tx, input_index FROM (${joinSql}))
+         ORDER BY tx_hex, input_index LIMIT {limit:UInt32}`,
+        params
+      ),
+      this.client.query<KeyRow>(
+        `SELECT ${hexOf('tx')} AS tx_hex, input_index FROM (${indexSql})
+         GROUP BY tx, input_index HAVING count() > 1
+         ORDER BY tx_hex, input_index LIMIT {limit:UInt32}`,
+        params
+      ),
+      this.client.query<KeyRow>(
+        `SELECT ${hexOf('s.tx')} AS tx_hex, s.input_index AS input_index
+         FROM (${indexSql}) AS s INNER JOIN (${joinSql}) AS j
+           ON j.tx = s.tx AND j.input_index = s.input_index
+         WHERE j.h != s.h OR j.op_hash != s.op_hash OR j.op_index != s.op_index
+         ORDER BY tx_hex, input_index LIMIT {limit:UInt32}`,
+        params
       ),
     ]);
     return {
-      duplicated: duplicated.map((row) => ({
-        inputIndex: Number(row.input_index),
-        rows: Number(row.rows),
-        transactionHash: row.tx,
-      })),
-      mismatched: mismatched.map((row) => ({
-        inputIndex: Number(row.input_index),
-        outpointIndex: Number(row.outpoint_index),
-        outpointTransactionHash: row.outpoint_hash,
-        transactionHash: row.tx,
-      })),
+      duplicated: duplicated.map(key),
+      extra: extra.map(key),
+      indexRows: Number(counts[0]?.index_rows ?? '0'),
+      joinRows: Number(counts[0]?.join_rows ?? '0'),
+      mismatched: mismatched.map(key),
+      missing: missing.map(key),
+      visible0: snapshot.visible0,
+      watermark: snapshot.spend,
     };
   };
 

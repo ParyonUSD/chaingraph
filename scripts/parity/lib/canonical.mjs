@@ -395,44 +395,6 @@ export const tables = {
     }),
   },
 
-  /** Opt-in: ClickHouse's denormalised spent-output columns on input vs a Postgres join (coinbase and unresolved outpoints excluded). */
-  input_spent: {
-    level: 'tx',
-    optIn: true,
-    pg: (ctx, chunk) => ({
-      sql: `WITH ${pgScope(ctx, chunk)} ${select(
-        pgExpr,
-        ctx,
-        [
-          pgExpr.hex('scope.hash'),
-          pgExpr.int('i.input_index'),
-          ...outputFields(pgExpr, 'o').slice(2),
-        ],
-        [],
-        `FROM scope JOIN input i ON i.transaction_internal_id = scope.internal_id
-         JOIN output o ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index`
-      )}`,
-    }),
-    ch: (ctx, chunk) => ({
-      sql: `WITH ${chScope(ctx, chunk)} ${select(
-        chExpr,
-        ctx,
-        [
-          chExpr.hex('i.transaction_hash'),
-          chExpr.int('i.input_index'),
-          ...outputFields(chExpr, 'i').slice(2),
-        ],
-        [],
-        `FROM input_at${agnostic(ctx)} AS i
-         WHERE ${chRangeAnd(
-           'i.transaction_hash',
-           chunk
-         )}i.transaction_hash IN (SELECT hash FROM scope)
-           AND i.outpoint_transaction_hash != unhex('${zeroHashHex}')`
-      )}`,
-    }),
-  },
-
   node_block: {
     level: 'node-block',
     ts: ['accepted_at'],

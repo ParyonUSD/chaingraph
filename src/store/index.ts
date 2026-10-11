@@ -4,6 +4,7 @@ import {
   clickhouseDatabase,
   clickhouseMaxInFlightSaves,
   clickhousePassword,
+  clickhouseSpendIndex,
   clickhouseUrl,
   clickhouseUser,
   clickhouseUtxo,
@@ -17,17 +18,6 @@ import type { ChaingraphStore, ChaingraphStoreBackend } from './types.js';
 export type { ChaingraphStore, ChaingraphStoreBackend } from './types.js';
 
 const clickhouseRequestTimeoutMs = 300_000;
-
-/**
- * Optional `CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS`: how long a block
- * waits for outputs it spends before taking them as unknown (default 60 s;
- * the e2e mockchain spends outputs that never exist).
- */
-const pendingSpendTimeoutFromEnvironment = () => {
-  const raw = process.env.CHAINGRAPH_CLICKHOUSE_PENDING_SPEND_TIMEOUT_MS;
-  const value = raw === undefined ? Number.NaN : Number(raw);
-  return Number.isFinite(value) && value > 0 ? value : undefined;
-};
 
 export interface StoreConfig {
   backend: ChaingraphStoreBackend;
@@ -47,6 +37,8 @@ export interface StoreConfig {
     maxInFlightSaves?: number;
     /** Stored UTXO tables (`CHAINGRAPH_CLICKHOUSE_UTXO`; default `on`). */
     utxo?: 'off' | 'on';
+    /** The spend index (`CHAINGRAPH_CLICKHOUSE_SPEND_INDEX`; default `on`). */
+    spendIndex?: 'off' | 'on';
   };
 }
 
@@ -61,6 +53,7 @@ export const storeConfigFromEnvironment = (): StoreConfig => ({
     database: clickhouseDatabase,
     maxInFlightSaves: clickhouseMaxInFlightSaves,
     password: clickhousePassword,
+    spendIndex: clickhouseSpendIndex,
     url: clickhouseUrl,
     user: clickhouseUser,
     utxo: clickhouseUtxo,
@@ -84,16 +77,20 @@ export const createStore = (
         username: config.clickhouse.user,
       },
       maxInFlightSaves: config.clickhouse.maxInFlightSaves,
+      // eslint-disable-next-line complexity
       onDiagnostic: (diagnostic) => {
         /*
-         * One structured line per void, refused void, failed abort, failed
-         * block batch and pending-spend timeout (g1-fix-pass.md): the lab
-         * greps `clickhouseDiagnostic.event`.
+         * One structured line per void, refused void, failed abort and
+         * failed block batch (g1-fix-pass.md): the lab greps
+         * `clickhouseDiagnostic.event`.
          */
         const { logger } = instances;
         if (logger === undefined) return;
         const message = `ClickHouse store: ${diagnostic.event}.`;
-        if (diagnostic.event === 'void_refused') {
+        if (diagnostic.event === 'spend_index_progress') {
+          // the spend index's watermark and lag (spend-index.md), every ~10 s
+          logger.info({ clickhouseDiagnostic: diagnostic }, message);
+        } else if (diagnostic.event === 'void_refused') {
           logger.fatal({ clickhouseDiagnostic: diagnostic }, message);
         } else if (
           diagnostic.event === 'block_batch_failed' ||
@@ -107,10 +104,10 @@ export const createStore = (
       onError: (error) => {
         instances.logger?.error(
           error,
-          'ClickHouse store: background error (watermark publishing, writer lease or a parked block commit).'
+          'ClickHouse store: background error (watermark publishing or writer lease).'
         );
       },
-      pendingSpendTimeoutMs: pendingSpendTimeoutFromEnvironment(),
+      spendIndex: config.clickhouse.spendIndex,
       utxo: config.clickhouse.utxo,
     });
     if (config.abandonOnShutdownSignals === true) {

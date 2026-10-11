@@ -480,7 +480,6 @@ const seedClickHouse = async (clickhouse) => {
       'size_bytes',
       'transaction_count',
       'output_value_satoshis',
-      'generated_value_satoshis',
       'commit_seq',
     ],
     blocks.map((block) => [
@@ -496,7 +495,6 @@ const seedClickHouse = async (clickhouse) => {
       1000 + block.height,
       block.txs.length,
       block.txs.reduce((sum, key) => sum + outputValue(transactions[key]), 0),
-      5000,
       seq,
     ])
   );
@@ -587,38 +585,19 @@ const seedClickHouse = async (clickhouse) => {
       'outpoint_index',
       'sequence_number',
       'unlocking_bytecode',
-      'value_satoshis',
-      'token_category',
-      'fungible_token_amount',
-      'nonfungible_token_capability',
-      'nonfungible_token_commitment',
-      'locking_bytecode',
       'commit_seq',
     ],
     txs.flatMap((tx) =>
-      tx.inputs.map((input, index) => {
-        const spent =
-          input.tx === undefined
-            ? { lock: Buffer.alloc(0), value: 0 }
-            : outputOf(input.tx, input.index);
-        const literals = outputLiterals(spent);
-        return [
-          lit.bytes(tx.hash),
-          index,
-          tx.chId,
-          lit.bytes(input.tx ? transactions[input.tx].hash : zeroHash),
-          input.index,
-          input.sequence,
-          lit.bytes(input.unlocking),
-          spent.value,
-          literals[0],
-          literals[1],
-          literals[2],
-          literals[3],
-          lit.bytes(spent.lock),
-          seq,
-        ];
-      })
+      tx.inputs.map((input, index) => [
+        lit.bytes(tx.hash),
+        index,
+        tx.chId,
+        lit.bytes(input.tx ? transactions[input.tx].hash : zeroHash),
+        input.index,
+        input.sequence,
+        lit.bytes(input.unlocking),
+        seq,
+      ])
     )
   );
   for (const node of nodes) {

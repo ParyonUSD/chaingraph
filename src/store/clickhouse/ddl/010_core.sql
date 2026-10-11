@@ -8,16 +8,21 @@
 --   * every row carries commit_seq UInt64 (the save that wrote it, §3.1); the gate views (050) hide
 --     rows of unresolved/aborted commits, so these engines never need FINAL.
 --   * index_granularity = 1024 on point-lookup/join tables (plan §2). 256 is the Phase 1 comparison arm.
---   * output: index_granularity = 128 and 4 KiB compressed blocks. The writer resolves every spent
---     output by (transaction_hash, output_index) (one random granule per spent tx per part); at 1024
---     rows and 64 KiB-1 MiB blocks that read and decompressed ~1,500 rows / ~100 KB per outpoint
---     (G1 lab: 0.5-2.7 s per lookup; g1-fix-pass-2.md §2). Its projections (060) keep 1024 and the
---     default block sizes via WITH SETTINGS, so script/category reads are unchanged.
+--   * output: index_granularity = 128 and 4 KiB compressed blocks. Spent outputs are read by
+--     (transaction_hash, output_index) (the spend index filler, block fee/input value reads, the UTXO
+--     add-on's -1 rows: one random granule per spent tx per part); at 1024 rows and 64 KiB-1 MiB blocks
+--     that read and decompressed ~1,500 rows / ~100 KB per outpoint (G1 lab: 0.5-2.7 s per lookup;
+--     g1-fix-pass-2.md §2). Its projections (060) keep 1024 and the default block sizes via WITH
+--     SETTINGS, so script/category reads are unchanged.
 --
 -- Choices where the plan is silent (also listed in README.md):
 --   * Timestamps are DateTime64(3, 'UTC'): the agent writes JS Dates (ms), so ms is exact.
 --   * Derived sort columns (locking_bytecode_prefix, nonfungible_token_commitment_key) are MATERIALIZED,
 --     so the writer cannot get them wrong and -1 rows always match +1 rows.
+--   * Every row a commit writes comes from that commit's own transactions (docs/clickhouse-port/spend-index.md):
+--     `input` holds the input's own fields only, and block has no generated_value_satoshis (Postgres computes it
+--     too: block_generated_value_satoshis). Spent-output attributes are read by joining output on the outpoint,
+--     or from the asynchronous spend index (070_spend.sql).
 --   * non_replicated_deduplication_window = 10000 on every agent-written MergeTree table, so
 --     insert_deduplication_token works on plain MergeTree (§3.4); 10000 mirrors the replicated default.
 --   * old_parts_lifetime 30 s and fast cleanup on every table (fix-pass-3.md §3): with the server defaults
@@ -40,7 +45,6 @@ CREATE TABLE IF NOT EXISTS cg.block
     size_bytes                UInt32,
     transaction_count         UInt32,
     output_value_satoshis     Int64,
-    generated_value_satoshis  Int64,
     commit_seq                UInt64
 )
 ENGINE = MergeTree
@@ -108,8 +112,9 @@ SETTINGS index_granularity = 128, min_compress_block_size = 4096, max_compress_b
          old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
          cleanup_delay_period_random_add = 5;
 
--- input carries the spent output's attributes (plan §2.1 "Why input carries the spent output's attributes").
--- Rows for inputs whose outpoint is not yet stored are written by the fill_pending commit (see README).
+-- input: the input's own fields only (option A of the input denormalisation plan, owner decision 2026-10-11).
+-- The spent output's attributes are a join on (outpoint_transaction_hash, outpoint_index) = output's key, or the
+-- spend index (070_spend.sql). Databases created before 2026-10-11 carry 8 more columns: re-sync (ddl/README.md).
 CREATE TABLE IF NOT EXISTS cg.input
 (
     transaction_hash                  FixedString(32),
@@ -119,15 +124,7 @@ CREATE TABLE IF NOT EXISTS cg.input
     outpoint_index                    UInt32,
     sequence_number                   UInt32,
     unlocking_bytecode                String CODEC(ZSTD(1)),
-    value_satoshis                    Int64,
-    token_category                    FixedString(32),
-    fungible_token_amount             Nullable(Int64),
-    nonfungible_token_capability      Nullable(Enum8('none' = 1, 'mutable' = 2, 'minting' = 3)),
-    nonfungible_token_commitment      Nullable(String),
-    locking_bytecode                  String,
     commit_seq                        UInt64,
-    locking_bytecode_prefix           String MATERIALIZED substring(locking_bytecode, 1, 25),
-    nonfungible_token_commitment_key  String MATERIALIZED ifNull(nonfungible_token_commitment, ''),
     INDEX bf_outpoint_transaction_hash outpoint_transaction_hash TYPE bloom_filter GRANULARITY 4
 )
 ENGINE = MergeTree
@@ -136,10 +133,6 @@ ORDER BY (transaction_hash, input_index)
 SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000,
          old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
          cleanup_delay_period_random_add = 5;
-
--- WP5a: the spent output's fungible_token_amount (plan gap found by WP2), so inputs.outpoint FT filters need
--- no join. Databases created before WP5a get the column here; see README item 23 for their projections.
-ALTER TABLE cg.input ADD COLUMN IF NOT EXISTS fungible_token_amount Nullable(Int64) AFTER token_category;
 
 -- node: a handful of rows. internal_id UInt32 (Postgres integer). Read with FINAL / argMax(updated_at).
 CREATE TABLE IF NOT EXISTS cg.node

@@ -9,7 +9,7 @@ import type {
   ChaingraphTransaction,
 } from '../../types/chaingraph.js';
 
-import type { RowBinaryTable, SpentOutput } from './row-encoders.js';
+import type { RowBinaryTable } from './row-encoders.js';
 import {
   encodeBlockRows,
   encodeBlockTransactionRows,
@@ -225,21 +225,12 @@ const block: ChaingraphBlock = {
 const commitSeq = 42n;
 const transactionInternalIds = [1001n, 2n ** 64n - 1n];
 const context = { commitSeq, transactionInternalIds };
-const spentOutputs = new Map<string, SpentOutput>([
-  [
-    `${hash('11')}:0`,
-    { lockingBytecode: '76a914', valueSatoshis: 625_000_000n },
-  ],
-]);
-const resolveSpentOutput = (outpointHash: string, outpointIndex: number) =>
-  spentOutputs.get(`${outpointHash}:${outpointIndex}`);
 
 const expectedRows = {
   block: [
     {
       bits: 0x1d00ffff,
       commit_seq: '42',
-      generated_value_satoshis: '625000000',
       hash: hash('aa'),
       height: 840_000,
       internal_id: '7',
@@ -272,35 +263,34 @@ const expectedRows = {
   input: [
     {
       commit_seq: '42',
-      fungible_token_amount: null,
       input_index: 0,
-      locking_bytecode: '',
-      nonfungible_token_capability: null,
-      nonfungible_token_commitment: null,
       outpoint_index: 0xffffffff,
       outpoint_transaction_hash: nullHash,
       sequence_number: 0xffffffff,
-      token_category: nullHash,
       transaction_hash: hash('11'),
       transaction_internal_id: '1001',
       unlocking_bytecode: '03aabbcc',
-      value_satoshis: '0',
     },
     {
       commit_seq: '42',
-      fungible_token_amount: null,
       input_index: 0,
-      locking_bytecode: '76a914',
-      nonfungible_token_capability: null,
-      nonfungible_token_commitment: null,
       outpoint_index: 0,
       outpoint_transaction_hash: hash('11'),
       sequence_number: 0xfffffffe,
-      token_category: nullHash,
       transaction_hash: hash('22'),
       transaction_internal_id: '18446744073709551615',
       unlocking_bytecode: '',
-      value_satoshis: '625000000',
+    },
+    // spends an output that is not stored anywhere: written all the same
+    {
+      commit_seq: '42',
+      input_index: 1,
+      outpoint_index: 7,
+      outpoint_transaction_hash: hash('99'),
+      sequence_number: 0,
+      transaction_hash: hash('22'),
+      transaction_internal_id: '18446744073709551615',
+      unlocking_bytecode: '51',
     },
   ],
   output: [
@@ -381,38 +371,28 @@ const expectedRows = {
   ],
 };
 
-const encodeFixture = () => {
-  const inputs = encodeInputRows(
-    block.transactions,
-    context,
-    resolveSpentOutput
-  );
-  return {
-    encoded: {
-      block: encodeBlockRows(
-        [{ block, generatedValueSatoshis: 625_000_000n, internalId: 7n }],
-        commitSeq
-      ),
-      block_transaction: encodeBlockTransactionRows(block, 7n, context),
-      input: inputs,
-      output: encodeOutputRows(block.transactions, context),
-      transaction: encodeTransactionRows(block.transactions, context),
-    },
-    pending: inputs.pending,
-  };
-};
+const encodeFixture = () => ({
+  encoded: {
+    block: encodeBlockRows([{ block, internalId: 7n }], commitSeq),
+    block_transaction: encodeBlockTransactionRows(block, 7n, context),
+    input: encodeInputRows(block.transactions, context),
+    output: encodeOutputRows(block.transactions, context),
+    transaction: encodeTransactionRows(block.transactions, context),
+  },
+});
 
 /**
  * Bytes per row: fixed-width columns plus the LEB128 length of each String
  * and the flag of each Nullable.
  */
 const expectedRowBytes = {
-  block: [32 + 8 + 4 + 4 + 4 + 32 + 32 + 4 + 4 + 4 + 4 + 8 + 8 + 8],
+  block: [32 + 8 + 4 + 4 + 4 + 32 + 32 + 4 + 4 + 4 + 4 + 8 + 8],
   block_transaction: [8 + 4 + 8 + 32 + 8, 8 + 4 + 8 + 32 + 8],
-  // hashes, ints, unlocking (1+n), value, category, 3 null flags, locking (1+n), commit_seq
+  // hashes, ints, unlocking (1+n), commit_seq: the input's own fields only
   input: [
-    32 + 4 + 8 + 32 + 4 + 4 + (1 + 4) + 8 + 32 + 1 + 1 + 1 + (1 + 0) + 8,
-    32 + 4 + 8 + 32 + 4 + 4 + (1 + 0) + 8 + 32 + 1 + 1 + 1 + (1 + 3) + 8,
+    32 + 4 + 8 + 32 + 4 + 4 + (1 + 4) + 8,
+    32 + 4 + 8 + 32 + 4 + 4 + (1 + 0) + 8,
+    32 + 4 + 8 + 32 + 4 + 4 + (1 + 1) + 8,
   ],
   output: [
     32 + 4 + 8 + 8 + (1 + 3) + 32 + 1 + 1 + 1 + 8,
@@ -427,8 +407,7 @@ const expectedRowBytes = {
 };
 
 test('row encoders: fixture rows decode to the expected values and sizes', (t) => {
-  const { encoded, pending } = encodeFixture();
-  t.deepEqual(pending, [{ inputIndex: 1, transactionHash: hash('22') }]);
+  const { encoded } = encodeFixture();
   (Object.keys(expectedRows) as RowBinaryTable[]).forEach((table) => {
     const { data, rowCount } = encoded[table];
     t.is(rowCount, expectedRows[table].length, `${table} rowCount`);

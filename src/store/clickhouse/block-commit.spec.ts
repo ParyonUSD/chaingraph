@@ -11,10 +11,9 @@ import type { Outpoint } from '../mempool-graph.js';
 import {
   appendAll,
   assignTransactionIds,
-  blockUtxoDelta,
+  blockTransitions,
   chunked,
   minMax,
-  pendingSpendRows,
 } from './block-commit.js';
 import { changeRows } from './mempool-commit.js';
 import type {
@@ -74,102 +73,28 @@ const stored = (hash: string, index: number): UtxoOutput => ({
   valueSatoshis: 10n,
 });
 
-test('blockUtxoDelta: per node, only transactions not already accepted transition; unknown spends are pending', (t) => {
+test('blockTransitions: per node, only transactions not already accepted transition, once', (t) => {
   const transactions = [
-    {
-      internalId: 1n,
-      transaction: tx('cb', [['00'.repeat(32), 0xffffffff]], 1, true),
-    },
-    { internalId: 2n, transaction: tx('t1', [['old', 0]], 2) },
-    {
-      internalId: 3n,
-      transaction: tx(
-        't2',
-        [
-          ['t1', 0],
-          ['unknown', 4],
-        ],
-        1
-      ),
-    },
-    { internalId: 4n, transaction: tx('mempool', [['old', 1]], 1) },
+    { transaction: tx('cb', [['00'.repeat(32), 0xffffffff]], 1, true) },
+    { transaction: tx('t1', [['old', 0]], 2) },
+    { transaction: tx('t2', [['t1', 0]], 1) },
+    { transaction: tx('mempool', [['old', 1]], 1) },
+    // a transaction in two blocks of the batch counts once
+    { transaction: tx('t1', [['old', 0]], 2) },
   ];
-  const resolveSpent = (hash: string, index: number) => {
-    if (hash === 'old') return stored(hash, index);
-    if (hash === 't1')
-      return { ...stored(hash, index), transactionInternalId: 2n };
-    return undefined;
-  };
-  const node1 = blockUtxoDelta({
-    acceptedBefore: new Set(['mempool']),
-    nodeInternalId: 1,
-    resolveSpent,
-    transactions,
-  });
-  t.deepEqual(node1.transitions, ['cb', 't1', 't2']);
   t.deepEqual(
-    node1.rows.map((row) => [
-      row.nodeInternalId,
-      `${row.output.transactionHash}:${row.output.outputIndex}`,
-      row.sign,
-    ]),
-    [
-      [1, 'cb:0', 1],
-      [1, 't1:0', 1],
-      [1, 't1:1', 1],
-      [1, 'old:0', -1],
-      [1, 't2:0', 1],
-      [1, 't1:0', -1],
-    ]
+    blockTransitions({ acceptedBefore: new Set(['mempool']), transactions }),
+    ['cb', 't1', 't2']
   );
-  t.deepEqual(node1.pending, [
-    { hash: 'unknown', index: 4, inputIndex: 1, spender: 't2' },
+  t.deepEqual(blockTransitions({ acceptedBefore: new Set(), transactions }), [
+    'cb',
+    't1',
+    't2',
+    'mempool',
   ]);
-  // node 2 has nothing in its mempool: every tx transitions; node 1's state is not consulted
-  const node2 = blockUtxoDelta({
-    acceptedBefore: new Set(),
-    nodeInternalId: 2,
-    resolveSpent,
-    transactions,
-  });
-  t.deepEqual(node2.transitions, ['cb', 't1', 't2', 'mempool']);
-  t.true(node2.rows.every((row) => row.nodeInternalId === 2));
-  t.is(
-    node2.rows.filter((row) => row.output.transactionHash === 'old').length,
-    2
-  );
-  // net effect of the block on t1:0 (created and spent in the block) is 0
-  const t10 = node2.rows
-    .filter(
-      (row) =>
-        row.output.transactionHash === 't1' && row.output.outputIndex === 0
-    )
-    .reduce((sum, row) => sum + row.sign, 0);
-  t.is(t10, 0);
 });
 
-test('utxo off: the pure transition functions produce no utxo rows; pending spends and other rows are unchanged', (t) => {
-  const transactions = [
-    { internalId: 2n, transaction: tx('t1', [['old', 0]], 2) },
-    { internalId: 3n, transaction: tx('t2', [['unknown', 4]], 1) },
-  ];
-  const resolveSpent = (hash: string, index: number) =>
-    hash === 'old' ? stored(hash, index) : undefined;
-  const deltaOf = (utxo: boolean) =>
-    blockUtxoDelta({
-      acceptedBefore: new Set(),
-      nodeInternalId: 1,
-      resolveSpent,
-      transactions,
-      utxo,
-    });
-  const on = deltaOf(true);
-  const off = deltaOf(false);
-  t.true(on.rows.length > 0);
-  t.deepEqual(off.rows, []);
-  t.deepEqual(off.pending, on.pending);
-  t.deepEqual(off.transitions, on.transitions);
-
+test('utxo off: changeRows produces no utxo rows; the other rows are unchanged; no pending-spend rows exist', (t) => {
   // every mempool transition: addition, replacement archive, confirmation, resolution
   const spends: Outpoint[] = ['old:0', 'gone:1'];
   const facts = (hash: string, internalId: bigint): MempoolTxFacts => ({
@@ -221,7 +146,30 @@ test('utxo off: the pure transition functions produce no utxo rows; pending spen
   t.true(rowsOn.utxo.length > 0);
   t.deepEqual(rowsOff.utxo, []);
   t.deepEqual({ ...rowsOff, utxo: [] }, { ...rowsOn, utxo: [] });
-  t.true(rowsOff.pendingSpend.length > 0);
+  t.deepEqual(Object.keys(rowsOn).sort(), [
+    'history',
+    'nodeTransaction',
+    'txAcceptance',
+    'utxo',
+  ]);
+  /*
+   * utxo on: the resolution's −1; the replaced entry's −1 output and +1 for
+   * its written (known) spend only; the addition's +1 output and −1 for its
+   * known spend only (no row of any kind for the unknown `gone:1`)
+   */
+  t.deepEqual(
+    rowsOn.utxo.map((row) => [
+      `${row.output.transactionHash}:${row.output.outputIndex}`,
+      row.sign,
+    ]),
+    [
+      ['late:0', -1],
+      ['replaced:0', -1],
+      ['old:0', 1],
+      ['add:0', 1],
+      ['old:0', -1],
+    ]
+  );
 });
 
 test('appendAll / minMax: 300k elements without a stack overflow (WP6b item 1)', async (t) => {
@@ -252,57 +200,4 @@ test('appendAll / minMax: 300k elements without a stack overflow (WP6b item 1)',
     range: [0, 299_999],
     spread: 'RangeError',
   });
-});
-
-test('pendingSpendRows: 100k unresolved spends for 2 nodes in linear time (WP6b item 2)', (t) => {
-  const count = 100_000;
-  const pendingInputs = Array.from({ length: count }, (_, index) => ({
-    input: { outpointIndex: index, outpointTransactionHash: 'parent' },
-    inputIndex: index % 1_000,
-    transaction: { hash: `spender-${Math.floor(index / 1_000)}` },
-  }));
-  // node 1 and node 2 transition every spender; one input is node-agnostic
-  const pendingUtxo = pendingInputs.slice(1).flatMap((item) =>
-    [1, 2].map((node) => ({
-      inputIndex: item.inputIndex,
-      node,
-      spender: item.transaction.hash,
-    }))
-  );
-  /*
-   * CPU time of this thread only (AVA runs other files in parallel worker
-   * threads, which process.cpuUsage would count). The quadratic version took
-   * about a minute; linear takes ~0.1–0.3 s, so 3 s leaves room for a loaded host.
-   */
-  const threadCpu = () => {
-    // Node >= 23.9 (the typings here predate it); falls back to the process
-    const { threadCpuUsage } = process as unknown as {
-      threadCpuUsage?: () => NodeJS.CpuUsage;
-    };
-    const usage = threadCpuUsage?.() ?? process.cpuUsage();
-    return (usage.user + usage.system) / 1_000;
-  };
-  const started = threadCpu();
-  const plus = pendingSpendRows(pendingInputs, pendingUtxo, 1);
-  const minus = pendingSpendRows(pendingInputs, pendingUtxo, -1);
-  const cpuMs = threadCpu() - started;
-  t.log(`${cpuMs.toFixed(0)} ms of thread CPU`);
-  t.true(cpuMs < 3_000, `took ${cpuMs} ms of CPU`);
-  t.is(plus.length, 1 + 2 * (count - 1));
-  t.is(minus.length, plus.length);
-  t.deepEqual(plus[0], {
-    nodeInternalId: 0,
-    outpointIndex: 0,
-    outpointTransactionHash: 'parent',
-    sign: 1,
-    spenderInputIndex: 0,
-    spenderTransactionHash: 'spender-0',
-  });
-  t.deepEqual(
-    minus.slice(1, 3).map((row) => [row.nodeInternalId, row.sign]),
-    [
-      [1, -1],
-      [2, -1],
-    ]
-  );
 });

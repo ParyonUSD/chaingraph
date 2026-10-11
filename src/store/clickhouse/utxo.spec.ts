@@ -347,9 +347,8 @@ test('heightBatches: half-open batches covering the range', (t) => {
   t.throws(() => heightBatches(0, 1, 0));
 });
 
-test('OutputRegistry: pinned outputs resolve waiters; committed ones move to the bounded cache', async (t) => {
+test('OutputRegistry: pinned outputs are found; committed ones move to the bounded cache', async (t) => {
   const registry = new OutputRegistry<string>(2);
-  const waiting = registry.waitFor('aa:1');
   registry.register('op1', [
     {
       hash: 'aa',
@@ -360,7 +359,7 @@ test('OutputRegistry: pinned outputs resolve waiters; committed ones move to the
       ],
     },
   ]);
-  const resolved = await waiting.promise;
+  const resolved = registry.lookup('aa:1')!;
   t.is(resolved.output.lockingBytecode, '52');
   t.is(resolved.owner, 'op1');
   t.is(await resolved.internalId, 7n);
@@ -390,7 +389,4 @@ test('OutputRegistry: pinned outputs resolve waiters; committed ones move to the
   // capacity 2: the oldest (aa:0) is evicted
   t.is(registry.lookup('aa:0'), undefined);
   t.not(registry.lookup('aa:1'), undefined);
-  const cancelled = registry.waitFor('zz:0');
-  cancelled.cancel();
-  t.is(registry.waitingCount, 0);
 });

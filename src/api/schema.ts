@@ -328,7 +328,7 @@ const valueFields = (
 
 SpentOutputRef.implement({
   description:
-    "The output an input spends (from the input row's copy of its attributes).",
+    'The output an input spends (joined on the outpoint; null when it is not stored, e.g. a coinbase input).',
   fields: valueFields,
 });
 
@@ -357,7 +357,8 @@ InputRef.implement({
   fields: (t) => ({
     input_index: t.int({ resolve: (p) => Number(p.input_index) }),
     outpoint: t.field({
-      resolve: (p) => p.outpoint as Row,
+      nullable: true,
+      resolve: (p) => (p.outpoint ?? null) as Row | null,
       type: SpentOutputRef,
     }),
     outpoint_index: t.field({

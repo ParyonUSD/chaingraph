@@ -19,6 +19,7 @@ import {
   alignTableSettings,
   checkTableSettings,
   ddlTableSettings,
+  legacySchemaFindings,
 } from './ddl-apply.js';
 import { createScratchDatabase, e2eClickHouseUrl } from './test-support.js';
 
@@ -89,7 +90,7 @@ const partCleanup = [
 
 test('the DDL sets the part cleanup settings on every table (fix pass 3)', (t) => {
   const settings = ddlTableSettings();
-  // 20 tables, plus input_stand_in and input_stand_in_resolution (mempool-fill-fix.md)
+  // 19 tables (pending_spend and the stand-in tables were removed with input's spent-output columns), plus spend, spend_orphan and spend_watermark
   t.is(settings.size, 22);
   const wrong = [...settings].flatMap(([table, values]) =>
     partCleanup
@@ -153,6 +154,57 @@ e2e(
         `SELECT value FROM system.merge_tree_settings WHERE name = 'old_parts_lifetime'`
       );
       t.is(row?.value, '480', 'the server default stays (table-level only)');
+    } finally {
+      await scratch.drop();
+    }
+  }
+);
+
+e2e(
+  '[e2e] legacySchemaFindings: a database from before 2026-10-11 (input spent-output columns, pending_spend) is reported, a current one is not',
+  async (t) => {
+    const scratch = await createScratchDatabase('si_legacy');
+    try {
+      const server = { url: e2eClickHouseUrl! };
+      t.deepEqual(await legacySchemaFindings(server, scratch.name), []);
+      t.deepEqual(await legacySchemaFindings(server, 'ch1_si_missing_db'), []);
+      await scratch.client.command(
+        'ALTER TABLE input ADD COLUMN value_satoshis Int64 AFTER unlocking_bytecode'
+      );
+      await scratch.client.command(
+        'CREATE TABLE pending_spend (outpoint_index UInt32) ENGINE = MergeTree ORDER BY outpoint_index'
+      );
+      t.deepEqual(await legacySchemaFindings(server, scratch.name), [
+        'input.value_satoshis',
+        'table pending_spend',
+      ]);
+    } finally {
+      await scratch.drop();
+    }
+  }
+);
+
+e2e(
+  '[e2e] p_outpoint is slim (outpoint, input key, commit_seq) at granularity 128 with 4 KiB blocks',
+  async (t) => {
+    const scratch = await createScratchDatabase('si_outpoint');
+    try {
+      const [row] = await scratch.client.query<{ q: string }>(
+        `SELECT create_table_query AS q FROM system.tables WHERE database = currentDatabase() AND name = 'input'`
+      );
+      const query = row?.q ?? '';
+      const start = query.indexOf('PROJECTION p_outpoint');
+      t.true(start >= 0, query);
+      const next = query.indexOf('PROJECTION', start + 1);
+      const projection = query.slice(start, next < 0 ? undefined : next);
+      t.regex(projection, /index_granularity = 128/u);
+      t.regex(projection, /min_compress_block_size = 4096/u);
+      t.regex(projection, /max_compress_block_size = 4096/u);
+      t.notRegex(
+        projection,
+        /value_satoshis|locking_bytecode|token_category|unlocking_bytecode/u
+      );
+      t.false(/p_spent_script|p_spent_category/u.test(row?.q ?? ''));
     } finally {
       await scratch.drop();
     }

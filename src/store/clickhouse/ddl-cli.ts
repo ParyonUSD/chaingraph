@@ -16,6 +16,7 @@ import {
   applyClickHouseDdl,
   checkTableSettings,
   ddlFiles,
+  legacySchemaFindings,
   listClickHouseTables,
   resolveDdlDirectory,
 } from './ddl-apply.js';
@@ -76,6 +77,14 @@ const run = async (settings: ReturnType<typeof settingsFromEnv>) => {
   );
   const server = { password, url, username };
   const started = Date.now();
+  const legacy = await legacySchemaFindings(server, database);
+  if (legacy.length > 0) {
+    fail(
+      `${database} was created before 2026-10-11 (${legacy.join(
+        ', '
+      )}): input no longer stores the spent output's columns and the current DDL cannot change it in place. Re-sync into a new database (docs/clickhouse-port/spend-index.md, "Upgrade").`
+    );
+  }
   const statements = await applyClickHouseDdl(server, database, {
     directory,
   });

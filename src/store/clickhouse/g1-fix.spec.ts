@@ -10,9 +10,7 @@
  *   ever voided (a poller watches `visibility` and `commit_void`);
  * - per-node parity with an independent recomputation from the blocks: the
  *   node sees a prefix of its chain (no hole), exactly its transactions and
- *   UTXOs, and every input carries its spent output's value (no stand-in);
- * - pending spends resolve without waiting for the timeout when the parent
- *   output is stored.
+ *   UTXOs, and every input's outpoint joins its spent output's value.
  * Scratch databases are `ch1_fix_*` (dropped on teardown).
  */
 import { ClickHouseError } from '@clickhouse/client';
@@ -134,8 +132,7 @@ const outputValues = (blocks: readonly ChaingraphBlock[]) => {
 /**
  * Per-node parity with an independent recomputation: the node sees a prefix
  * of `chain` (no hole), exactly the prefix's transactions and UTXOs, and
- * every non-coinbase input of the prefix carries its spent output's value
- * (never the stand-in of a spend whose output was unknown).
+ * every non-coinbase input of the prefix joins its spent output's value.
  */
 const assertNodeParity = async (
   t: ExecutionContext,
@@ -187,7 +184,7 @@ const assertNodeParity = async (
       });
     });
   });
-  t.deepEqual(wrong, [], `node ${node}: input values (stand-ins are 0)`);
+  t.deepEqual(wrong, [], `node ${node}: input values by join`);
   t.deepEqual(await badUtxoSums(client), [], 'UTXO sums 0 or 1');
 };
 
@@ -264,7 +261,6 @@ const saveAll = async (
         isSavedTransaction: notSaved,
         nodeAcceptances: nodes.map((node) => acceptance(node)),
       });
-      await result.committed;
       return result;
     })
   );
@@ -311,7 +307,6 @@ const failedBatchScenario = (
         maxBlocksPerCommit: 4,
         maxInFlightSaves: 16,
         onError: (error) => errors.push(error),
-        pendingSpendTimeoutMs: 3_000,
         utxo,
       });
       const control = { begun: 0 };
@@ -370,7 +365,6 @@ e2e(
     const harness = await fixScratch(t, 'order', {
       maxBlocksPerCommit: 2,
       maxInFlightSaves: 16,
-      pendingSpendTimeoutMs: 3_000,
     });
     const control = { held: 0 };
     const store = await harness.openStore(async (step, context) => {
@@ -407,7 +401,6 @@ e2e(
     const harness = await fixScratch(t, 'transient', {
       maxBlocksPerCommit: 4,
       maxInFlightSaves: 16,
-      pendingSpendTimeoutMs: 20_000,
     });
     const injected = { insert: 0, query: 0 };
     const store = await openWithClientFault(harness, (request) => {
@@ -459,107 +452,6 @@ e2e(
 );
 
 /* -------------------------------------------------------------------- */
-/* Bug 2: pending spends resolve once the parent is stored               */
-/* -------------------------------------------------------------------- */
-
-e2e(
-  '[e2e] G1 fix: a parked child resolves at once when its parent was committed (by another node) and evicted from the recent-output cache meanwhile',
-  async (t) => {
-    t.timeout(120_000);
-    const timeoutMs = 10_000;
-    const harness = await fixScratch(t, 'evicted', {
-      pendingSpendTimeoutMs: timeoutMs,
-      recentOutputCapacity: 1,
-    });
-    const parentTx = makeTx({
-      label: 'evicted-parent',
-      outputs: [
-        { lockingBytecode: p2pkh('evicted-a'), valueSatoshis: 4_321n },
-        { lockingBytecode: p2pkh('evicted-b'), valueSatoshis: 5n },
-      ],
-      spends: [],
-    });
-    const parentCoinbase = makeTx({
-      coinbase: true,
-      label: 'evicted-parent-cb',
-      outputs: [{ lockingBytecode: p2pkh('miner'), valueSatoshis: 1n }],
-    });
-    const childTx = makeTx({
-      label: 'evicted-child',
-      outputs: [{ lockingBytecode: p2pkh('evicted-c'), valueSatoshis: 4_000n }],
-      spends: [[parentTx.hash, 0]],
-    });
-    const childCoinbase = makeTx({
-      coinbase: true,
-      label: 'evicted-child-cb',
-      outputs: [{ lockingBytecode: p2pkh('miner'), valueSatoshis: 2n }],
-    });
-    const fillerCoinbase = makeTx({
-      coinbase: true,
-      label: 'evicted-filler-cb',
-      outputs: [
-        { lockingBytecode: p2pkh('miner'), valueSatoshis: 3n },
-        { lockingBytecode: p2pkh('miner2'), valueSatoshis: 4n },
-      ],
-    });
-    const parentBlock = makeBlock(1, zeroHash, [parentCoinbase, parentTx]);
-    const childBlock = makeBlock(2, parentBlock.hash, [childCoinbase, childTx]);
-    const fillerBlock = makeBlock(3, childBlock.hash, [fillerCoinbase]);
-    const hold = { release: undefined as (() => void) | undefined };
-    let parked: Promise<void> | undefined;
-    const store = await harness.openStore(async (step, context) => {
-      if (
-        context.kind === 'block' &&
-        step === 'incomplete' &&
-        parked === undefined
-      ) {
-        // the child is parked: hold it before it subscribes to its pending outpoints
-        parked = new Promise<void>((resolve) => {
-          hold.release = resolve;
-        });
-        await parked;
-      }
-    });
-    const { node1, node2 } = await registerNodes(store);
-    // the child (node 1) arrives first: its parent is unknown, it parks
-    const child = store.saveBlock({
-      block: childBlock,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(node1)],
-    });
-    for (let tries = 0; tries < 500 && hold.release === undefined; tries += 1) {
-      await sleep(10);
-    }
-    t.not(hold.release, undefined, 'the child parked');
-    // the parent is saved and committed by node 2, then evicted from the cache
-    await store.saveBlock({
-      block: parentBlock,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(node2)],
-    });
-    await store.saveBlock({
-      block: fillerBlock,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(node2)],
-    });
-    const released = Date.now();
-    hold.release!();
-    const result = await child;
-    await result.committed;
-    const waitedMs = Date.now() - released;
-    t.log(`child committed ${waitedMs} ms after it was released`);
-    t.true(
-      waitedMs < timeoutMs / 2,
-      `the child did not wait for the pending-spend timeout (${waitedMs} ms)`
-    );
-    await store.publishWatermarks();
-    const view = await nodeView(harness.client, node1);
-    const input = view.inputs.find((row) => row.key === `${childTx.hash}:0`);
-    t.is(input?.value, '4321', 'the input carries the parent output value');
-  }
-);
-
-/* -------------------------------------------------------------------- */
 /* lab conditions                                                        */
 /* -------------------------------------------------------------------- */
 
@@ -579,7 +471,6 @@ const labScenario = (utxo: 'off' | 'on') => {
         onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
         onError: (error) => errors.push(error),
         onFatal: (error) => fatal.push(error),
-        pendingSpendTimeoutMs: timeoutMs,
         recentOutputCapacity: 4,
         utxo,
       });
@@ -590,7 +481,7 @@ const labScenario = (utxo: 'off' | 'on') => {
         (request) => {
           if (
             request.kind === 'query' &&
-            request.sql.includes('FROM output') &&
+            request.sql.includes('FROM transaction') &&
             injected.query < 3
           ) {
             injected.query += 1;
@@ -684,7 +575,6 @@ const shutdownScenario = (utxo: 'off' | 'on') => {
         maxBlocksPerCommit: 4,
         maxInFlightSaves: 16,
         onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
-        pendingSpendTimeoutMs: 20_000,
         utxo,
       });
       const control: {
@@ -737,7 +627,10 @@ const shutdownScenario = (utxo: 'off' | 'on') => {
       const events = diagnostics.map((diagnostic) => diagnostic.event);
       t.log(
         `diagnostics: ${JSON.stringify(
-          diagnostics.map((d) => ({ event: d.event, seq: d.seq }))
+          diagnostics.map((d) => ({
+            event: d.event,
+            seq: 'seq' in d ? d.seq : undefined,
+          }))
         )}`
       );
       t.false(events.includes('void_refused'), 'no void_refused');
@@ -746,9 +639,9 @@ const shutdownScenario = (utxo: 'off' | 'on') => {
         states.filter((row) => row.state === 'committed').map((row) => row.seq)
       );
       t.deepEqual(
-        diagnostics
-          .filter((d) => d.event === 'commit_void' && committedSeqs.has(d.seq))
-          .map((d) => d.seq),
+        diagnostics.flatMap((d) =>
+          d.event === 'commit_void' && committedSeqs.has(d.seq) ? [d.seq] : []
+        ),
         [],
         'no committed seq was offered for voiding'
       );
@@ -797,7 +690,6 @@ const streamCommits = async (
   const chain = chainOf(151, `stream-${label}`);
   const harness = await fixScratch(t, `stream_${label}`, {
     batchLingerMs,
-    pendingSpendTimeoutMs: 20_000,
   });
   const store = await harness.openStore();
   const { node1 } = await registerNodes(store);
@@ -811,7 +703,7 @@ const streamCommits = async (
           isSavedTransaction: notSaved,
           nodeAcceptances: [acceptance(node1)],
         })
-        .then(async (result) => result.committed)
+        .then(() => undefined)
     );
     await sleep(4);
   }

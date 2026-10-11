@@ -4,13 +4,14 @@
 --   * commit_log.state adds 'incomplete' (§3.5: a commit with unresolved pending spends). Ranks:
 --     intent 1 < incomplete 2 < committed 3 < aborted 4; state_rank is MATERIALIZED from the enum, so
 --     FINAL always yields the furthest state. committed and aborted are both terminal and exclusive.
+--     Since 2026-10-11 no writer marks a commit incomplete and kind 'fill_pending' is never written (every
+--     row comes from its commit's own transactions, docs/clickhouse-port/spend-index.md); both enum values
+--     stay so older databases keep applying and recovering.
 --   * commit_log.kind adds 'horizon_switch' (§3.8 "records the switch in commit_log") and 'backfill' (the bulk
 --     data commit written by an offline backfill, e.g. the lab transform; block_hash all-zero, no single block).
 --   * commit_log.row_counts is Map(table -> rows); writer_epoch ties each commit to a lease epoch.
 --   * writer_lease uses ReplacingMergeTree(heartbeat_at), not KeeperMap: the local docker server has no
 --     Keeper. It is advisory (no compare-and-set in ClickHouse); see README "at risk".
---   * pending_spend key is (outpoint_transaction_hash, outpoint_index, node_internal_id, spender...):
---     it is probed by outpoint when a parent's outputs arrive. version = commit_seq of the +1 row.
 --   * id_reservation ranges are half-open [range_start, range_end).
 --
 -- WP4 amendments (docs/clickhouse-port/wp4-commit-and-visibility.md):
@@ -124,55 +125,5 @@ SETTINGS non_replicated_deduplication_window = 10000,
          old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
          cleanup_delay_period_random_add = 5;
 
--- Inputs whose spent output is not yet stored (child-before-parent, §3.5), per node.
-CREATE TABLE IF NOT EXISTS cg.pending_spend
-(
-    outpoint_transaction_hash  FixedString(32),
-    outpoint_index             UInt32,
-    node_internal_id           UInt32,
-    spender_transaction_hash   FixedString(32),
-    spender_input_index        UInt32,
-    spender_commit_seq         UInt64,
-    sign                       Int8,
-    version                    UInt64,
-    commit_seq                 UInt64
-)
-ENGINE = VersionedCollapsingMergeTree(sign, version)
-ORDER BY (outpoint_transaction_hash, outpoint_index, node_internal_id, spender_transaction_hash, spender_input_index)
-SETTINGS non_replicated_deduplication_window = 10000,
-         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
-         cleanup_delay_period_random_add = 5;
-
--- Stand-in input rows (docs/clickhouse-port/mempool-fill-fix.md). A mempool transaction saved while a spent output
--- was unknown (an orphan released by the grace period or a full pool) gets `input` rows with a stand-in spent
--- output (value 0, empty bytecode, no token). Those rows carry their own seq P (a `fill_pending` commit, one per
--- unknown parent transaction), not the transaction's seq C. One row per stand-in input: P, its owner C and the input.
--- Readers (visibility.ts snapshotSql) hide every row of P while C is not visible, and once a commit that resolves P
--- (input_stand_in_resolution) is visible; that commit carries the input rows with the real spent output.
-CREATE TABLE IF NOT EXISTS cg.input_stand_in
-(
-    stand_in_seq               UInt64,
-    owner_seq                  UInt64,
-    transaction_hash           FixedString(32),
-    input_index                UInt32,
-    outpoint_transaction_hash  FixedString(32),
-    outpoint_index             UInt32,
-    commit_seq                 UInt64
-)
-ENGINE = MergeTree
-ORDER BY (stand_in_seq, transaction_hash, input_index)
-SETTINGS non_replicated_deduplication_window = 10000,
-         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
-         cleanup_delay_period_random_add = 5;
-
--- P is resolved by commit_seq: that commit wrote the real `input` rows of every input of P.
-CREATE TABLE IF NOT EXISTS cg.input_stand_in_resolution
-(
-    stand_in_seq  UInt64,
-    commit_seq    UInt64
-)
-ENGINE = MergeTree
-ORDER BY (stand_in_seq, commit_seq)
-SETTINGS non_replicated_deduplication_window = 10000,
-         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
-         cleanup_delay_period_random_add = 5;
+-- pending_spend, input_stand_in and input_stand_in_resolution (child-before-parent spends, stand-in input rows)
+-- were removed on 2026-10-11 with input's spent-output columns (docs/clickhouse-port/spend-index.md).

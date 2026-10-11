@@ -1,4 +1,4 @@
-/* eslint-disable max-classes-per-file, @typescript-eslint/member-ordering, complexity, functional/no-mixed-type, max-params, functional/no-try-statement, class-methods-use-this */
+/* eslint-disable max-classes-per-file, @typescript-eslint/member-ordering, complexity, max-params, functional/no-try-statement */
 // cspell:ignore clickhouse
 /**
  * Per-node mempool state of the ClickHouse writer (WP5a-mempool).
@@ -10,11 +10,13 @@
  * (`../mempool-graph.ts`); nothing here reasons across nodes: every plan and
  * every row is for exactly one node.
  *
- * Per node: the entries (validated_at, spends, internal id and the spends
- * whose UTXO −1 row is still outstanding because the spent output was unknown
- * when the entry was added), the spender index and the children index.
- * Shared: the facts of every transaction in some node's mempool (outputs and
- * resolved spent outputs), reference-counted by node membership.
+ * Per node: the entries (validated_at, spends, internal id and, UTXO on, the
+ * spends whose UTXO −1 row is still outstanding because the spent output was
+ * unknown when the entry was added), the spender index and the children index.
+ * Shared: the facts of every transaction in some node's mempool (outputs and,
+ * UTXO on, resolved spent outputs), reference-counted by node membership.
+ * With UTXO off nothing here needs a spent output: entries have no
+ * outstanding spends and nothing is resolved.
  *
  * Design and the end-state tables: docs/clickhouse-port/wp5a-mempool.md.
  */
@@ -35,7 +37,7 @@ import {
   planMempoolReplacement,
 } from '../mempool-graph.js';
 
-import type { Deferred, StoreOperation } from './node-state.js';
+import type { StoreOperation } from './node-state.js';
 import type { UtxoOutput } from './utxo.js';
 
 /** The node-agnostic facts of a transaction some node holds in its mempool. */
@@ -54,12 +56,13 @@ export interface MempoolTxFacts {
 export interface LiveMempoolEntry extends MempoolEntry {
   internalId: bigint;
   /**
-   * Spends whose UTXO −1 row has NOT been written for this node: the spent
-   * output was unknown when the entry was added. Each is persisted as a live
-   * `pending_spend` row (node, outpoint, spender) until it is resolved
-   * (written when its creator becomes accepted by the node, or when the entry
-   * is confirmed and the output is known) or dropped (the entry leaves the
-   * mempool unconfirmed).
+   * UTXO on only (always empty with UTXO off): spends whose UTXO −1 row has
+   * NOT been written for this node, because the spent output was unknown when
+   * the entry was added. Each is resolved (its −1 row written) when its
+   * creator becomes accepted by the node, or when the entry is confirmed and
+   * the output is known, or dropped (the entry leaves the mempool
+   * unconfirmed). Not persisted: a rebuild takes the spends whose output is
+   * not stored as outstanding (spend-index.md §"UTXO add-on").
    */
   unresolved: Set<Outpoint>;
 }
@@ -109,18 +112,6 @@ export const isEmptyChange = (change: NodeMempoolChange) =>
   change.immediate === undefined &&
   change.archives.length === 0 &&
   change.resolutions.length === 0;
-
-/** A mempool tx held back because a spent output is unknown. */
-export interface OrphanEntry {
-  receivedAt: Date;
-  missingParents: readonly TxKey[];
-  /** node → validated_at, merged from every save/validation while parked */
-  validations: Map<number, Date>;
-  done: Deferred<void>;
-  release: () => void;
-}
-
-const defaultRecentlyArchivedCapacity = 100_000;
 
 const pushUnique = <K, V>(map: Map<K, V[]>, key: K, value: V) => {
   const list = map.get(key);
@@ -193,8 +184,8 @@ export class NodeMempoolState implements NodeMempool {
 }
 
 /**
- * The per-node mempools plus the shared transaction facts and the orphan
- * pool. All mutation goes through `apply`, called by the operation that
+ * The per-node mempools plus the shared transaction facts. All mutation
+ * goes through `apply`, called by the operation that
  * planned the change, synchronously after planning (so a later operation of
  * the node, which waits for this one's rows, plans against it).
  */
@@ -202,15 +193,22 @@ export class MempoolState {
   /** Set by `enableMempoolTracking` (after the bulk horizon). */
   tracking = false;
 
+  /**
+   * UTXO on: track outstanding spends (`LiveMempoolEntry.unresolved`). Off:
+   * entries never have any, so no spent output is ever needed.
+   */
+  readonly trackSpends: boolean;
+
+  constructor(trackSpends = true) {
+    this.trackSpends = trackSpends;
+  }
+
   private readonly mempools = new Map<number, NodeMempoolState>();
 
   private readonly facts = new Map<
     TxKey,
     { facts: MempoolTxFacts; refs: number }
   >();
-
-  /** Orphan pool: tx hash → entry (mempool commits are never incomplete). */
-  readonly orphans = new Map<TxKey, OrphanEntry>();
 
   /**
    * Live operations that changed (or will change) a node's mempool; a later
@@ -220,20 +218,6 @@ export class MempoolState {
 
   /** Nodes whose in-memory mempool may be ahead of the store (a modifier failed). */
   readonly stale = new Set<number>();
-
-  /**
-   * tx → node → `replaced_at` of its latest archive with a non-NULL
-   * `replaced_at` (replacement, conflict, descendant, expiry, or a
-   * validation archived on arrival). Bounded (insertion order). Read only for
-   * released orphans: an orphan waited for these parents, so in Postgres
-   * (which saves an orphan at once) it would have been in the node's
-   * mempool when the parent was archived, and the cascade would have taken
-   * it (`inheritedReplacedAt`).
-   */
-  private readonly recentlyArchived = new Map<TxKey, Map<number, Date>>();
-
-  /** Capacity of `recentlyArchived`. */
-  recentlyArchivedCapacity = defaultRecentlyArchivedCapacity;
 
   node(nodeInternalId: number): NodeMempoolState {
     const existing = this.mempools.get(nodeInternalId);
@@ -404,8 +388,6 @@ export class MempoolState {
     confirmed: {
       confirmedFor: boolean;
       conflictReplacedAt: Date | null | undefined;
-      /** a released orphan's parent was archived for the node (descendant) */
-      inheritedReplacedAt?: Date;
     }
   ): NodeMempoolChange | undefined {
     const mempool = this.node(nodeInternalId);
@@ -417,21 +399,14 @@ export class MempoolState {
       node: nodeInternalId,
       resolutions: [],
     };
-    if (
-      confirmed.confirmedFor ||
-      confirmed.conflictReplacedAt !== undefined ||
-      confirmed.inheritedReplacedAt !== undefined
-    ) {
+    if (confirmed.confirmedFor || confirmed.conflictReplacedAt !== undefined) {
       /*
        * Precedence as in Postgres: confirmation (NULL), then a direct
-       * conflict (its own MIN(accepted_at)), then the cascade from a parent
-       * archived while this transaction waited as an orphan.
+       * conflict (its own MIN(accepted_at)).
        */
       const replacedAt = confirmed.confirmedFor
         ? null
-        : confirmed.conflictReplacedAt === undefined
-        ? confirmed.inheritedReplacedAt ?? null
-        : confirmed.conflictReplacedAt;
+        : confirmed.conflictReplacedAt ?? null;
       change.immediate = { facts, replacedAt, validatedAt };
       change.archives = this.withEntries(
         mempool,
@@ -503,57 +478,18 @@ export class MempoolState {
     return {
       internalId: facts.internalId,
       spends: facts.spends,
-      unresolved: new Set(
-        facts.spends.filter((spent) => !facts.spent.has(spent))
-      ),
+      unresolved: this.trackSpends
+        ? new Set(facts.spends.filter((spent) => !facts.spent.has(spent)))
+        : new Set<Outpoint>(),
       validatedAt,
     };
   }
 
   /* ------------------------------------------------------- applying */
 
-  /**
-   * The earliest `replaced_at` with which one of `parents` (the parents a
-   * released orphan waited for) was archived for `node`, if any.
-   */
-  inheritedReplacedAt(
-    nodeInternalId: number,
-    parents: readonly TxKey[]
-  ): Date | undefined {
-    return parents.reduce<Date | undefined>((earliest, parent) => {
-      const at = this.recentlyArchived.get(parent)?.get(nodeInternalId);
-      return at !== undefined &&
-        (earliest === undefined || at.getTime() < earliest.getTime())
-        ? at
-        : earliest;
-    }, undefined);
-  }
-
-  private noteArchived(tx: TxKey, nodeInternalId: number, at: Date | null) {
-    if (at === null) return;
-    const byNode = this.recentlyArchived.get(tx) ?? new Map<number, Date>();
-    this.recentlyArchived.delete(tx);
-    byNode.set(nodeInternalId, at);
-    this.recentlyArchived.set(tx, byNode);
-    if (this.recentlyArchived.size > this.recentlyArchivedCapacity) {
-      const [oldest] = this.recentlyArchived.keys();
-      if (oldest !== undefined) this.recentlyArchived.delete(oldest);
-    }
-  }
-
   /** Apply a planned change to the node's in-memory mempool. */
   apply(change: NodeMempoolChange) {
     const mempool = this.node(change.node);
-    change.archives.forEach((archive) => {
-      this.noteArchived(archive.tx, change.node, archive.replacedAt);
-    });
-    if (change.immediate !== undefined) {
-      this.noteArchived(
-        change.immediate.facts.hash,
-        change.node,
-        change.immediate.replacedAt
-      );
-    }
     change.resolutions.forEach((resolution) => {
       mempool.resolve(resolution.spender, resolution.outpoint);
     });

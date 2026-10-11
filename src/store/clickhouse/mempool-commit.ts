@@ -1,4 +1,4 @@
-/* eslint-disable max-lines, complexity, functional/no-try-statement, functional/no-throw-statement, functional/no-loop-statement, no-await-in-loop, functional/no-let, @typescript-eslint/init-declarations, max-params, @typescript-eslint/naming-convention, camelcase, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, @typescript-eslint/member-ordering, no-continue, no-negated-condition, prefer-destructuring, @typescript-eslint/no-invalid-void-type, prefer-const */
+/* eslint-disable max-lines, complexity, functional/no-try-statement, functional/no-throw-statement, functional/no-loop-statement, no-await-in-loop, functional/no-let, @typescript-eslint/init-declarations, max-params, @typescript-eslint/naming-convention, camelcase, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, @typescript-eslint/member-ordering, no-continue, no-negated-condition, prefer-destructuring */
 // cspell:ignore clickhouse unhex seqs milli
 /**
  * Mempool commits of the ClickHouse store (WP5a-mempool).
@@ -7,19 +7,20 @@
  * is exactly the nodes whose facts it writes; every per-node row carries the
  * node in its key and `version` = its own `commit_seq`:
  * - `saveTransaction` / `recordValidation`: base facts of a new transaction
- *   (`output`, `input`, `transaction`), then per validating node either the
- *   addition (`node_transaction` +1, `tx_acceptance` block 0 +1, `utxo` +1
- *   per output / −1 per known spent output, `pending_spend` +1 per unknown
- *   one) with the replacement archives, or (already confirmed / conflicting
- *   with a confirmed transaction) a history row only;
+ *   (`output`, `input`, `transaction`: its own fields only), then per
+ *   validating node either the addition (`node_transaction` +1,
+ *   `tx_acceptance` block 0 +1 and, UTXO on, `utxo` +1 per output / −1 per
+ *   known spent output) with the replacement archives, or (already confirmed
+ *   / conflicting with a confirmed transaction) a history row only;
  * - `sweep`: the repair scan (`archiveMempoolTransactionsAcceptedByBlocks`);
  * - `expire`: `archiveMempoolTransaction`.
  * Block and header acceptance write their node's cleanup inside their own
  * commit (`changeRows`, used by block-commit.ts and clickhouse-store.ts).
  *
- * A new transaction spending an unknown output is parked in the orphan pool
- * (no commit) until a save registers the output or the grace period ends;
- * mempool commits are never `incomplete` (WP4 §3).
+ * A transaction spending an unknown output is saved at once, as Postgres
+ * does: its rows need nothing but the transaction itself. With UTXO on, the
+ * unknown spends stay outstanding in memory until their creator is accepted
+ * (docs/clickhouse-port/spend-index.md §"UTXO add-on").
  *
  * Design, end-state tables and the Postgres parity notes:
  * docs/clickhouse-port/wp5a-mempool.md.
@@ -53,14 +54,12 @@ import type {
   LiveMempoolEntry,
   MempoolTxFacts,
   NodeMempoolChange,
-  OrphanEntry,
 } from './mempool-state.js';
 import { isEmptyChange } from './mempool-state.js';
 import type {
   Deferred,
   NodeRegistry,
   OperationKind,
-  PendingSpendRow,
   StoreOperation,
   TxAcceptanceRow,
 } from './node-state.js';
@@ -69,7 +68,6 @@ import {
   awaitCommitOrder,
   awaitDependencies,
   deferred,
-  encodePendingSpendRows,
   encodeTxAcceptanceRows,
   waitForPredecessorRows,
 } from './node-state.js';
@@ -80,16 +78,6 @@ import {
   encodeTransactionRows,
   rowBinaryTableColumns,
 } from './row-encoders.js';
-import type { StandInGroup } from './stand-in.js';
-import {
-  abortStandIns,
-  commitStandIns,
-  followClaims,
-  openStandIns,
-  registerStandIns,
-  settleStandIns,
-  writeResolutions,
-} from './stand-in.js';
 import type { UtxoOutput, UtxoRow } from './utxo.js';
 import {
   encodeUtxoRows,
@@ -180,7 +168,6 @@ export interface MempoolRows {
   nodeTransaction: NodeTransactionRow[];
   history: NodeTransactionHistoryRow[];
   txAcceptance: TxAcceptanceRow[];
-  pendingSpend: PendingSpendRow[];
   utxo: UtxoRow[];
 }
 
@@ -202,12 +189,12 @@ const outpointParts = (spent: string) => {
  * (the encoders write the commit's seq into `version`); `historyIds` holds
  * one id per history row.
  *
- * | transition | node_transaction | history | tx_acceptance (block 0) | utxo | pending_spend |
- * | addition | +1 | – | +1 | +1 per output, −1 per known spend | +1 per unknown spend |
- * | confirmed (archive) | −1 | (validated_at, NULL) | −1 | – | −1 per unknown spend |
- * | replaced / conflict / descendant / expired | −1 | (validated_at, replaced_at) | −1 | −1 per output, +1 per written spend | −1 per unknown spend |
- * | resolution | – | – | – | −1 for the spent output | −1 |
- * | immediate (confirmed or conflicting on arrival) | – | (validated_at, replaced_at) | – | – | – |
+ * | transition | node_transaction | history | tx_acceptance (block 0) | utxo (UTXO on) |
+ * | addition | +1 | – | +1 | +1 per output, −1 per known spend |
+ * | confirmed (archive) | −1 | (validated_at, NULL) | −1 | – |
+ * | replaced / conflict / descendant / expired | −1 | (validated_at, replaced_at) | −1 | −1 per output, +1 per written spend |
+ * | resolution | – | – | – | −1 for the spent output |
+ * | immediate (confirmed or conflicting on arrival) | – | (validated_at, replaced_at) | – | – |
  */
 export const changeRows = (
   changes: readonly NodeMempoolChange[],
@@ -217,7 +204,6 @@ export const changeRows = (
   const rows: MempoolRows = {
     history: [],
     nodeTransaction: [],
-    pendingSpend: [],
     txAcceptance: [],
     utxo: [],
   };
@@ -236,45 +222,14 @@ export const changeRows = (
     nextId += 1;
     return id;
   };
-  const pending = (
-    node: number,
-    spender: TxKey,
-    spent: Outpoint,
-    inputIndex: number,
-    sign: -1 | 1
-  ): PendingSpendRow => {
-    const { hash, index } = outpointParts(spent);
-    return {
-      nodeInternalId: node,
-      outpointIndex: index,
-      outpointTransactionHash: hash,
-      sign,
-      spenderInputIndex: Math.max(inputIndex, 0),
-      spenderTransactionHash: spender,
-    };
-  };
   changes.forEach((change) => {
     const { node } = change;
-    const resolvedNow = new Set(
-      change.resolutions.map(
-        (resolution) => `${resolution.spender}|${resolution.outpoint}`
-      )
-    );
     change.resolutions.forEach((resolution) => {
       utxoRows.push({
         nodeInternalId: node,
         output: resolution.output,
         sign: -1,
       });
-      rows.pendingSpend.push(
-        pending(
-          node,
-          resolution.spender,
-          resolution.outpoint,
-          resolution.inputIndex,
-          -1
-        )
-      );
     });
     if (change.immediate !== undefined) {
       const { facts, replacedAt, validatedAt } = change.immediate;
@@ -312,14 +267,8 @@ export const changeRows = (
         transactionInternalId: entry.internalId,
         version: 0n,
       });
-      entry.unresolved.forEach((spent) => {
-        if (resolvedNow.has(`${archive.tx}|${spent}`)) return;
-        rows.pendingSpend.push(
-          pending(node, archive.tx, spent, entry.spends.indexOf(spent), -1)
-        );
-      });
-      if (archive.cause === 'confirmed') {
-        // still accepted (by the block): no UTXO transition
+      if (archive.cause === 'confirmed' || !utxo) {
+        // still accepted (by the block): no UTXO transition; utxo off: none at all
         return;
       }
       const { facts } = archive;
@@ -359,13 +308,9 @@ export const changeRows = (
       facts.outputs.forEach((output) => {
         utxoRows.push({ nodeInternalId: node, output, sign: 1 });
       });
-      facts.spends.forEach((spent, inputIndex) => {
+      facts.spends.forEach((spent) => {
         const output = facts.spent.get(spent);
-        if (output === undefined) {
-          rows.pendingSpend.push(
-            pending(node, facts.hash, spent, inputIndex, 1)
-          );
-        } else {
+        if (output !== undefined) {
           utxoRows.push({ nodeInternalId: node, output, sign: -1 });
         }
       });
@@ -410,8 +355,6 @@ export const factsFromTransaction = (
 
 export interface MempoolContext extends WriterContext {
   nodes: NodeRegistry;
-  orphanGraceMs: number;
-  maxOrphans: number;
   /** Register an operation (call order) once no mode switch is draining. */
   beginOperation: (
     kind: OperationKind,
@@ -425,17 +368,23 @@ interface ResolvedSpend {
   owner: StoreOperation | undefined;
 }
 
-/** Resolve outpoints: the output registry, then the store, then the registry again. */
+/**
+ * UTXO on only: resolve outpoints: the output registry, then the store, then
+ * the registry again. With UTXO off (no registry) nothing is resolved: no
+ * mempool row needs a spent output.
+ */
 export const resolveOutpoints = async (
   context: WriterContext,
   keys: readonly string[],
   operation: StoreOperation | undefined
 ): Promise<Map<string, ResolvedSpend>> => {
   const resolved = new Map<string, ResolvedSpend>();
+  const { outputs } = context;
+  if (outputs === undefined || keys.length === 0) return resolved;
   const fromRegistry = async (wanted: readonly string[]) => {
     const misses: string[] = [];
     for (const key of wanted) {
-      const entry = context.outputs.lookup(key);
+      const entry = outputs.lookup(key);
       if (entry === undefined) {
         misses.push(key);
       } else {
@@ -471,7 +420,7 @@ export const resolveOutpoints = async (
         owner: owner === operation ? undefined : owner,
       });
       if (owner === undefined) {
-        context.outputs.remember(key, {
+        outputs.remember(key, {
           internalId: Promise.resolve(output.transactionInternalId),
           output,
           owner: undefined,
@@ -495,9 +444,6 @@ const pairArraySql = (hashes: string, indexes: string) =>
 export class MempoolCommitter {
   constructor(private readonly context: MempoolContext) {}
 
-  /** Stand-in groups of each live save (aborted with it on failure). */
-  private readonly standInsOf = new Map<StoreOperation, StandInGroup[]>();
-
   private get mempool() {
     return this.context.mempool;
   }
@@ -509,26 +455,13 @@ export class MempoolCommitter {
     transaction: ChaingraphTransaction,
     validations: readonly NodeValidation[]
   ): Promise<void> {
-    const parked = this.mempool.orphans.get(transaction.hash);
-    if (parked !== undefined) {
-      validations.forEach((validation) => {
-        if (!parked.validations.has(validation.nodeInternalId)) {
-          parked.validations.set(
-            validation.nodeInternalId,
-            validation.validatedAt
-          );
-        }
-      });
-      await parked.done.promise;
-      return;
-    }
     const byNode = new Map<number, Date>();
     validations.forEach((validation) => {
       if (!byNode.has(validation.nodeInternalId)) {
         byNode.set(validation.nodeInternalId, validation.validatedAt);
       }
     });
-    await this.saveOrPark(transaction, byNode, false, undefined);
+    await this.save(transaction, byNode);
   }
 
   /** `recordNodeValidation`: a known transaction validated by one more node. */
@@ -536,33 +469,11 @@ export class MempoolCommitter {
     transactionHash: string,
     validation: NodeValidation
   ): Promise<void> {
-    const parked = this.mempool.orphans.get(transactionHash);
-    if (parked !== undefined) {
-      if (!parked.validations.has(validation.nodeInternalId)) {
-        parked.validations.set(
-          validation.nodeInternalId,
-          validation.validatedAt
-        );
-      }
-      await parked.done.promise;
-      return;
-    }
     const nodes = [validation.nodeInternalId];
     const operation = await this.begin(nodes);
     let commit: OpenCommit | undefined;
-    let waitFor: Promise<void> | undefined;
     try {
       await this.awaitPinnedMempoolOwner(transactionHash, operation);
-      const orphan = this.mempool.orphans.get(transactionHash);
-      if (orphan !== undefined) {
-        MempoolCommitter.mergeValidations(
-          orphan,
-          new Map([[validation.nodeInternalId, validation.validatedAt]])
-        );
-        operation.markDone();
-        waitFor = orphan.done.promise;
-        return;
-      }
       const dependencies = new Set<StoreOperation>();
       const facts = await this.loadFacts(
         transactionHash,
@@ -589,9 +500,6 @@ export class MempoolCommitter {
       throw error;
     } finally {
       this.end(operation);
-      if (waitFor !== undefined) {
-        await waitFor;
-      }
     }
   }
 
@@ -768,9 +676,10 @@ export class MempoolCommitter {
   /* --------------------------------------------- block / header helpers */
 
   /**
-   * Outputs (by outpoint) for the unresolved spends of mempool entries the
-   * inclusions confirm (their −1 rows are written at confirmation when the
-   * spent output is known by then).
+   * UTXO on: outputs (by outpoint) for the unresolved spends of mempool
+   * entries the inclusions confirm (their −1 rows are written at
+   * confirmation when the spent output is known by then). Empty with UTXO
+   * off (entries have no unresolved spends).
    */
   async knownOutputsForConfirmed(
     node: number,
@@ -1035,11 +944,6 @@ export class MempoolCommitter {
       mempoolColumns.node_transaction_history,
       encodeNodeTransactionHistoryRows(rows.history, commit.seq)
     );
-    await insert(
-      'pending_spend',
-      acceptanceColumns.pending_spend,
-      encodePendingSpendRows(rows.pendingSpend, commit.seq)
-    );
     if (rows.utxo.length > 0) {
       const encoded = encodeUtxoRows(rows.utxo, commit.seq);
       await insert('utxo', utxoColumns, {
@@ -1056,9 +960,9 @@ export class MempoolCommitter {
   /**
    * Rebuild the in-memory mempools (all nodes, or `only`) from the store's
    * valid rows: live `node_transaction` rows, the transactions' outputs and
-   * inputs, the spent outputs, and live `pending_spend` rows (outstanding
-   * spends). Run at init (no open commits) and after a failure (once the
-   * node's earlier operations have settled).
+   * inputs and (UTXO on) the spent outputs; a spend whose output is not
+   * stored is outstanding. Run at init (no open commits) and after a failure
+   * (once the node's earlier operations have settled).
    */
   async rebuild(only?: readonly number[]) {
     const { client, lookupChunkSize } = this.context;
@@ -1076,23 +980,6 @@ export class MempoolCommitter {
        WHERE ({all:UInt8} = 1 OR has({nodes:Array(UInt32)}, node_internal_id))
          AND ${validCommitSql()}
        GROUP BY node_internal_id, transaction_internal_id
-       HAVING sum(sign) > 0`,
-      { all: only === undefined ? 1 : 0, fence, nodes: only ?? [] }
-    );
-    const pendingRows = await client.query<{
-      node: number;
-      spender: string;
-      hash: string;
-      idx: number;
-    }>(
-      `SELECT node_internal_id AS node, lower(hex(spender_transaction_hash)) AS spender,
-         lower(hex(outpoint_transaction_hash)) AS hash, outpoint_index AS idx
-       FROM pending_spend
-       WHERE node_internal_id != 0
-         AND ({all:UInt8} = 1 OR has({nodes:Array(UInt32)}, node_internal_id))
-         AND ${validCommitSql()}
-       GROUP BY outpoint_transaction_hash, outpoint_index, node_internal_id,
-         spender_transaction_hash, spender_input_index
        HAVING sum(sign) > 0`,
       { all: only === undefined ? 1 : 0, fence, nodes: only ?? [] }
     );
@@ -1157,8 +1044,9 @@ export class MempoolCommitter {
       (spent) => !spent.startsWith('00'.repeat(32))
     );
     const spentOutputs = new Map<string, UtxoOutput>();
-    (
-      await lookupStoredOutputs(this.context, allSpends.map(outpointParts))
+    (this.mempool.trackSpends
+      ? await lookupStoredOutputs(this.context, allSpends.map(outpointParts))
+      : []
     ).forEach(({ output }) => {
       spentOutputs.set(
         outpointKey(output.transactionHash, output.outputIndex),
@@ -1184,13 +1072,6 @@ export class MempoolCommitter {
         spent,
       });
     });
-    const unresolvedOf = new Map<string, Set<Outpoint>>();
-    pendingRows.forEach((row) => {
-      const key = `${row.node}|${row.spender}`;
-      const set = unresolvedOf.get(key) ?? new Set<Outpoint>();
-      set.add(outpoint(row.hash, Number(row.idx)));
-      unresolvedOf.set(key, set);
-    });
     const nodes = only ?? [
       ...new Set([
         ...members.map((row) => Number(row.node)),
@@ -1205,11 +1086,10 @@ export class MempoolCommitter {
           return [
             facts,
             {
-              internalId: facts.internalId,
-              spends: facts.spends,
-              unresolved:
-                unresolvedOf.get(`${node}|${row.hash}`) ?? new Set<Outpoint>(),
-              validatedAt: new Date(Number(row.validated_ms ?? 0)),
+              ...this.mempool.entryFor(
+                facts,
+                new Date(Number(row.validated_ms ?? 0))
+              ),
             },
           ];
         });
@@ -1257,24 +1137,13 @@ export class MempoolCommitter {
     error: unknown,
     method: string
   ) {
-    const standIns = this.standInsOf.get(operation) ?? [];
-    this.standInsOf.delete(operation);
     if (!(error instanceof SimulatedCrash)) {
       this.mempool.markStale(operation);
-      await abortStandIns(
-        this.context,
-        standIns,
-        `${method} failed: ${String(error)}`
-      );
       if (commit !== undefined) {
         await this.context.commitLog
           .abortIfOpen(commit.seq, `${method} failed: ${String(error)}`)
           .catch(() => undefined);
       }
-    } else {
-      standIns.forEach((group) => {
-        this.context.standIns.remove(group);
-      });
     }
     operation.markFailed(error);
   }
@@ -1282,7 +1151,7 @@ export class MempoolCommitter {
   /**
    * Load the facts of a stored transaction (for `recordNodeValidation`):
    * the shared mempool facts if some node holds it, else `transaction`,
-   * `output` and `input` rows plus the spent outputs.
+   * `output` and `input` rows plus (UTXO on) the spent outputs.
    */
   private async loadFacts(
     hash: string,
@@ -1381,8 +1250,7 @@ export class MempoolCommitter {
 
   /**
    * If another live mempool operation has pinned `hash` (it is saving the
-   * same transaction), wait until it settles: it either commits the
-   * transaction or parks it in the orphan pool.
+   * same transaction), wait until it settles.
    */
   private async awaitPinnedMempoolOwner(
     hash: string,
@@ -1402,42 +1270,21 @@ export class MempoolCommitter {
     }
   }
 
-  /** Merge validations into a parked orphan. */
-  private static mergeValidations(
-    entry: OrphanEntry,
-    byNode: ReadonlyMap<number, Date>
-  ) {
-    byNode.forEach((at, node) => {
-      if (!entry.validations.has(node)) entry.validations.set(node, at);
-    });
-  }
-
   /**
-   * Save a new or known transaction for `byNode`; park it in the orphan pool
-   * if it is new and spends an unknown output (unless `force`). Resolves
-   * once it is saved (after parking, when the parked attempt is saved).
+   * Save a new or known transaction for `byNode` (Postgres saves a
+   * transaction spending an unknown output at once too: every row here comes
+   * from the transaction itself).
    */
-  private async saveOrPark(
+  private async save(
     transaction: ChaingraphTransaction,
-    byNode: Map<number, Date>,
-    force: boolean,
-    parkedDone: Deferred<void> | undefined,
-    orphanParents: readonly TxKey[] = []
+    byNode: Map<number, Date>
   ): Promise<void> {
     const nodes = [...byNode.keys()];
     const operation = await this.begin(nodes);
     let commit: OpenCommit | undefined;
-    let waitFor: Promise<void> | undefined;
     const { context } = this;
     try {
       await this.awaitPinnedMempoolOwner(transaction.hash, operation);
-      const parked = this.mempool.orphans.get(transaction.hash);
-      if (parked !== undefined) {
-        MempoolCommitter.mergeValidations(parked, byNode);
-        operation.markDone();
-        waitFor = parked.done.promise;
-        return;
-      }
       const dependencies = new Set<StoreOperation>();
       /* 1. the transaction id (pinned, so concurrent saves share it) */
       let internalId: bigint;
@@ -1453,7 +1300,7 @@ export class MempoolCommitter {
         ownId = deferred<bigint>();
         ownId.promise.catch(() => undefined);
         context.transactions.pin(transaction.hash, operation, ownId.promise);
-        context.outputs.register(operation, [
+        context.outputs?.register(operation, [
           {
             hash: transaction.hash,
             internalId: ownId.promise,
@@ -1476,32 +1323,17 @@ export class MempoolCommitter {
         }
         ownId.resolve(internalId);
       }
-      /* 2. spent outputs */
-      const spendKeys = transaction.isCoinbase
-        ? []
-        : transaction.inputs.map((input) =>
-            outpointKey(input.outpointTransactionHash, input.outpointIndex)
-          );
+      /* 2. UTXO on: the spent outputs (their −1 rows); off: nothing */
+      const spendKeys =
+        transaction.isCoinbase || !this.mempool.trackSpends
+          ? []
+          : transaction.inputs.map((input) =>
+              outpointKey(input.outpointTransactionHash, input.outpointIndex)
+            );
       const resolved = await resolveOutpoints(context, spendKeys, operation);
       resolved.forEach((spend) => {
         if (spend.owner !== undefined) dependencies.add(spend.owner);
       });
-      const missing = spendKeys.filter((key) => !resolved.has(key));
-      if (isNew && missing.length > 0 && !force) {
-        /*
-         * Orphan: no commit. Unpin (synchronously) and enter the pool before
-         * this operation finishes, so a concurrent save of the same tx that
-         * waits for this operation finds the pool entry.
-         */
-        context.outputs.release(operation, false);
-        await context.transactions.release(operation, false);
-        const done = parkedDone ?? deferred<void>();
-        done.promise.catch(() => undefined);
-        this.registerOrphan(transaction, byNode, missing, done, orphanParents);
-        operation.markDone();
-        waitFor = done.promise;
-        return;
-      }
       const spentMap = new Map<string, UtxoOutput>();
       resolved.forEach((spend, key) => {
         spentMap.set(key, spend.output);
@@ -1512,126 +1344,23 @@ export class MempoolCommitter {
       commit = await this.commitValidations(
         operation,
         facts,
-        isNew
-          ? {
-              internalId,
-              resolvedSpend: (key) => resolved.get(key)?.output,
-              transaction,
-            }
-          : undefined,
+        isNew ? { internalId, transaction } : undefined,
         byNode,
         dependencies,
         (opened) => {
           commit = opened;
-        },
-        orphanParents
+        }
       );
-      context.outputs.release(operation, true);
+      context.outputs?.release(operation, true);
       await context.transactions.release(operation, true);
-      parkedDone?.resolve();
     } catch (error) {
       await this.fail(operation, commit, error, 'saveMempoolTransaction');
-      context.outputs.release(operation, false);
+      context.outputs?.release(operation, false);
       await context.transactions.release(operation, false);
-      parkedDone?.reject(error);
       throw error;
     } finally {
       this.end(operation);
-      /*
-       * Parked (an orphan, or merged into one): resolve once the parked
-       * attempt is saved. In `finally`, because the parked paths return.
-       */
-      if (waitFor !== undefined) {
-        await waitFor;
-      }
     }
-  }
-
-  /**
-   * Hold an orphan until one of its missing outputs is registered by a save
-   * (a block or another mempool transaction), or the grace period since it
-   * was first received ends; then it is saved again (after the grace period
-   * with its unknown spends outstanding, as Postgres saves such a
-   * transaction at once). The pool is bounded: when it is full, the oldest
-   * orphan is released early.
-   */
-  private registerOrphan(
-    transaction: ChaingraphTransaction,
-    byNode: Map<number, Date>,
-    missing: readonly string[],
-    done: Deferred<void>,
-    earlierParents: readonly TxKey[]
-  ) {
-    const { orphans } = this.mempool;
-    const parents = [
-      ...new Set([
-        ...earlierParents,
-        ...missing.map((key) => outpointParts(key).hash),
-      ]),
-    ];
-    const waits = missing.map((key) => this.context.outputs.waitFor(key));
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let settled = false;
-    const firstReceived =
-      this.orphanReceivedAt.get(transaction.hash) ?? new Date();
-    this.orphanReceivedAt.set(transaction.hash, firstReceived);
-    const remainingGrace = Math.max(
-      0,
-      firstReceived.getTime() + this.context.orphanGraceMs - Date.now()
-    );
-    const run = (force: boolean) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      waits.forEach(({ cancel }) => {
-        cancel();
-      });
-      const entry = orphans.get(transaction.hash);
-      orphans.delete(transaction.hash);
-      const validations = entry?.validations ?? byNode;
-      this.saveOrPark(transaction, validations, force, done, parents)
-        .catch(() => undefined)
-        .finally(() => {
-          if (!orphans.has(transaction.hash)) {
-            this.orphanReceivedAt.delete(transaction.hash);
-          }
-        });
-    };
-    if (orphans.size >= this.context.maxOrphans) {
-      const [oldest] = orphans.values();
-      oldest?.release();
-    }
-    orphans.set(transaction.hash, {
-      done,
-      missingParents: [
-        ...new Set(missing.map((key) => outpointParts(key).hash)),
-      ],
-      receivedAt: firstReceived,
-      release: () => {
-        run(true);
-      },
-      validations: new Map(byNode),
-    });
-    waits.forEach(({ promise }) => {
-      promise
-        .then(() => {
-          run(false);
-        })
-        .catch(() => undefined);
-    });
-    timer = setTimeout(() => {
-      run(true);
-    }, remainingGrace);
-  }
-
-  private readonly orphanReceivedAt = new Map<string, Date>();
-
-  /** Abandon every parked orphan (store shutdown). */
-  dropOrphans(error: Error) {
-    [...this.mempool.orphans.values()].forEach((entry) => {
-      entry.done.reject(error);
-    });
-    this.mempool.orphans.clear();
   }
 
   /**
@@ -1648,13 +1377,11 @@ export class MempoolCommitter {
       | {
           transaction: ChaingraphTransaction;
           internalId: bigint;
-          resolvedSpend: (key: string) => UtxoOutput | undefined;
         }
       | undefined,
     byNode: ReadonlyMap<number, Date>,
     dependencies: Set<StoreOperation>,
-    onCommit: (commit: OpenCommit) => void,
-    orphanParents: readonly TxKey[] = []
+    onCommit: (commit: OpenCommit) => void
   ): Promise<OpenCommit | undefined> {
     await waitForPredecessorRows(operation);
     const nodes = [...byNode.keys()].sort((a, b) => a - b);
@@ -1681,10 +1408,6 @@ export class MempoolCommitter {
         {
           confirmedFor: state?.confirmedFor ?? false,
           conflictReplacedAt: state?.conflict,
-          inheritedReplacedAt: this.mempool.inheritedReplacedAt(
-            node,
-            orphanParents
-          ),
         }
       );
       if (change !== undefined && !isEmptyChange(change)) {
@@ -1800,7 +1523,6 @@ export class MempoolCommitter {
       | {
           transaction: ChaingraphTransaction;
           internalId: bigint;
-          resolvedSpend: (key: string) => UtxoOutput | undefined;
         }
       | undefined,
     dependencies: Set<StoreOperation>,
@@ -1827,7 +1549,6 @@ export class MempoolCommitter {
     operation.seq = commit.seq;
     await context.fault('intent', { kind, seq: commit.seq });
     const rowCounts: { [table: string]: number } = {};
-    let standInGroups: StandInGroup[] = [];
     if (base !== undefined) {
       const columnsOf = (table: keyof typeof rowBinaryTableColumns) =>
         rowBinaryTableColumns[table].map(([name]) => name);
@@ -1854,56 +1575,14 @@ export class MempoolCommitter {
         'output',
         encodeOutputRows([base.transaction], transactionContext)
       );
-      /*
-       * Spent outputs still unknown get stand-in rows under their own seq
-       * (stand-in.ts). The output registry is checked again here, in the
-       * same tick as the groups are registered: a parent registered since
-       * the lookup is used directly, a later one finds the group.
-       */
-      const encodedInputs = encodeInputRows(
-        [base.transaction],
-        transactionContext,
-        (hash, index) => {
-          const key = outpointKey(hash, index);
-          return base.resolvedSpend(key) ?? context.outputs.lookup(key)?.output;
-        }
+      await insert(
+        'input',
+        encodeInputRows([base.transaction], transactionContext)
       );
-      standInGroups = registerStandIns(
-        context.standIns,
-        base.transaction,
-        base.internalId,
-        encodedInputs.pending,
-        { operation, seq: commit.seq }
-      );
-      if (standInGroups.length > 0) {
-        this.standInsOf.set(operation, standInGroups);
-      }
-      await insert('input', encodedInputs);
-      if (standInGroups.length > 0) {
-        await openStandIns(context, standInGroups);
-        await context.fault('stand-in', { kind, seq: commit.seq });
-      }
       await insert(
         'transaction',
         encodeTransactionRows([base.transaction], transactionContext)
       );
-      /* stand-in rows of mempool children of this transaction */
-      const claims = context.standIns.claim([base.transaction]);
-      claims.forEach(({ group }) => {
-        if (
-          group.owner !== undefined &&
-          group.owner !== operation &&
-          !group.owner.finished
-        ) {
-          dependencies.add(group.owner);
-        }
-      });
-      followClaims(
-        context.standIns,
-        operation,
-        claims.map(({ group }) => group)
-      );
-      await writeResolutions(context, commit, claims, rowCounts);
     }
     await this.insertChangeRows(commit, kind, rows, '0', rowCounts);
     operation.markRowsWritten();
@@ -1913,40 +1592,12 @@ export class MempoolCommitter {
     /*
      * Commit order per node, as for block commits (`awaitCommitOrder`): after
      * every earlier operation of the nodes has settled, except one that
-     * itself waits for this commit. That happens when orphans are released
-     * together: a child's save can begin before its parent's and still read
-     * the parent's outputs from the registry. A plain barrier on every
-     * earlier operation (as before) was a wait cycle that stalled every
-     * later commit of the nodes (chipnet lab, mempool-fill-fix.md §7).
+     * itself waits for this commit (a wait cycle stalls every later commit
+     * of the nodes; chipnet lab, mempool-fill-fix.md §7).
      */
     await awaitCommitOrder(operation, context.abandon);
-    /*
-     * Stand-in groups: a save of the parent that found one `open` left it
-     * to this commit (resolved under this seq, chunk `sc`); the others
-     * become `live` (the parent's save resolves them). Then every P commits
-     * before this commit.
-     */
-    const selfResolved = settleStandIns(standInGroups);
-    if (standInGroups.length > 0) {
-      await context.fault('stand-in-settled', { kind, seq: commit.seq });
-    }
-    await writeResolutions(
-      context,
-      commit,
-      selfResolved.map((group) => ({ group, outputs: group.parentOutputs! })),
-      rowCounts,
-      'c'
-    );
-    await commitStandIns(context, standInGroups);
-    if (standInGroups.length > 0) {
-      await context.fault('stand-in-committed', { kind, seq: commit.seq });
-    }
     await context.commitLog.markCommitted(commit.seq, rowCounts);
     operation.markCommitted();
-    this.standInsOf.delete(operation);
-    selfResolved.forEach((group) => {
-      context.standIns.remove(group);
-    });
     await context.fault('committed', { kind, seq: commit.seq });
     return commit;
   }

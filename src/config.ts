@@ -559,6 +559,25 @@ if (clickhouseUtxoValue !== 'on' && clickhouseUtxoValue !== 'off') {
  */
 const clickhouseUtxo: 'off' | 'on' = clickhouseUtxoValue;
 
+const clickhouseSpendIndexValue = optionalString(
+  optionalOptions.CHAINGRAPH_CLICKHOUSE_SPEND_INDEX,
+  'on'
+);
+if (clickhouseSpendIndexValue !== 'on' && clickhouseSpendIndexValue !== 'off') {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_CLICKHOUSE_SPEND_INDEX' environment variable: ${clickhouseSpendIndexValue}. Must be 'on' or 'off'.`
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_CLICKHOUSE_SPEND_INDEX` environment variable
+ * (default: `on`). `off`: the ClickHouse writer never fills the asynchronous
+ * spend index (`spend`); readers then take every spent-output filter from
+ * the join (docs/clickhouse-port/spend-index.md). Ignored by the Postgres
+ * store.
+ */
+const clickhouseSpendIndex: 'off' | 'on' = clickhouseSpendIndexValue;
+
 const eventLoopDiagnosticValue = Number(
   optionalString(optionalOptions.CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS, '0')
 );
@@ -598,6 +617,7 @@ export {
   clickhousePassword,
   clickhouseUrl,
   clickhouseUser,
+  clickhouseSpendIndex,
   clickhouseUtxo,
   eventLoopDiagnosticMs,
   genesisBlocks,

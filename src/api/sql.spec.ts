@@ -18,6 +18,7 @@ const snapshot: VisibilitySnapshot = {
   committedTail: [7n],
   fence: [1_099_511_627_775n],
   nodeId: 3,
+  spend: 4n,
   visible: 5n,
   visible0: 6n,
   void: [],

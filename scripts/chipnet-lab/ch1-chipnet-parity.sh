@@ -25,7 +25,7 @@ mkdir -p "$out_dir"
 echo "node $CHIPNET_NODE_NAME: chain tip $node_tip, pg tip $pg_tip, ch tip $ch_tip -> compare at height $height; out $out_dir"
 # max_parallel_workers_per_gather=0: ch1-pg runs with Docker's default 64 MB /dev/shm, and parallel hash plans of the
 # digest queries fail there with 53100 "could not resize shared memory segment".
-tables=block,block_transaction,transaction,output,input,input_spent,node_block,tx_acceptance,node_block_history,node_transaction_history
+tables=block,block_transaction,transaction,output,input,node_block,tx_acceptance,node_block_history,node_transaction_history
 set +e
 (
   cd "$CHIPNET_LAB_DIR"

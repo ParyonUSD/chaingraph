@@ -1,5 +1,5 @@
 /* eslint-disable camelcase, @typescript-eslint/naming-convention, complexity, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, max-params, no-underscore-dangle */
-// cspell:ignore clickhouse unhex
+// cspell:ignore clickhouse unhex seqs
 /**
  * SQL building blocks of the v2 API spike (Phase 2): a parameter binder and
  * the filter compilers for the typed `where` inputs.
@@ -9,7 +9,7 @@
  *   client sends is ever interpolated into SQL text. Identifiers come from
  *   fixed tables in this file, never from a request.
  * - The snapshot parameters (`node`, `visible`, `visible0`, `tail`, `fence`,
- *   `void`) are set only from `readSnapshot` (`Sql` constructor). Client
+ *   `void`, `spend`) are set only from `readSnapshot` (`Sql` constructor). Client
  *   values are always bound under `p0`, `p1`, …, so they cannot collide with
  *   or override a snapshot parameter.
  * - Every read goes through a pinned `*_at` view (`Sql.view`).
@@ -23,6 +23,7 @@ import { pinnedView, snapshotParams } from '../store/clickhouse/visibility.js';
 export const snapshotParameterNames = [
   'fence',
   'node',
+  'spend',
   'tail',
   'visible',
   'visible0',
@@ -105,7 +106,7 @@ export interface CapabilityComparison {
   _is_null?: boolean | null;
 }
 
-/** Filters on output attributes; also used for a spent output (input row). */
+/** Filters on output attributes; also used for a spent output (`outpoint`). */
 export interface OutputFilter {
   _and?: readonly OutputFilter[] | null;
   _or?: readonly OutputFilter[] | null;
@@ -125,7 +126,11 @@ export interface InputFilter {
   _not?: InputFilter | null;
   input_index?: IntComparison | null;
   outpoint_transaction_hash?: HexComparison | null;
-  /** The spent output, matched on the same input row (same-row conjunction). */
+  /**
+   * The spent output: the input row's outpoint is the key of an output
+   * matching it (still a predicate on the same input row, so same-row
+   * conjunction holds).
+   */
   outpoint?: OutputFilter | null;
 }
 
@@ -295,20 +300,120 @@ const capabilityComparison = (
 /* ------------------------------------------------------------------ */
 
 /**
- * Columns of an output-like row: `output_at` itself, or an `input_at` row,
- * which carries the spent output's attributes (the outpoint's index is
- * `outpoint_index` there).
+ * Columns of an output-like row (`output_at`, or a spend-index row, whose
+ * outpoint index is `outpoint_index`).
  */
 export interface OutputColumns {
   output_index: string;
 }
 
 export const outputRowColumns: OutputColumns = { output_index: 'output_index' };
+
+/** A spend-relation row: the spent output's index is `outpoint_index`. */
 export const spentOutputColumns: OutputColumns = {
   output_index: 'outpoint_index',
 };
 
-/** An `OutputFilter` as a predicate on one output_at (or input_at) row. */
+const zeroHashSql = `toFixedString(unhex(repeat('00', 32)), 32)`;
+
+const spendRelationColumns =
+  'transaction_hash, input_index, outpoint_transaction_hash, outpoint_index, value_satoshis, locking_bytecode, ' +
+  'locking_bytecode_prefix, token_category, fungible_token_amount, nonfungible_token_capability, ' +
+  'nonfungible_token_commitment, nonfungible_token_commitment_key';
+
+const spentOutputSelect =
+  'transaction_hash, output_index, value_satoshis, locking_bytecode, locking_bytecode_prefix, token_category, ' +
+  'fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment, nonfungible_token_commitment_key';
+
+const joinedSpendColumns = `i.transaction_hash AS transaction_hash, i.input_index AS input_index,
+      i.outpoint_transaction_hash AS outpoint_transaction_hash, i.outpoint_index AS outpoint_index,
+      o.value_satoshis AS value_satoshis, o.locking_bytecode AS locking_bytecode,
+      o.locking_bytecode_prefix AS locking_bytecode_prefix, o.token_category AS token_category,
+      o.fungible_token_amount AS fungible_token_amount,
+      o.nonfungible_token_capability AS nonfungible_token_capability,
+      o.nonfungible_token_commitment AS nonfungible_token_commitment,
+      o.nonfungible_token_commitment_key AS nonfungible_token_commitment_key`;
+
+/**
+ * The spend relation at the request's snapshot: one row per visible input
+ * whose spent output is visible, with the input key, the outpoint and the
+ * spent output's attributes (columns `spendRelationColumns`), filtered by
+ * `predicate` (over those columns). The read rule
+ * (docs/clickhouse-port/spend-index.md): with W the snapshot's spend
+ * watermark (`{spend}`), a pair (input seq i, output seq o) is
+ * - in the spend index (`spend_at`) iff both seqs are at most W;
+ * - else an input above W joined to its output (any seq), or
+ * - an input at or below W spending an output above W.
+ * The three parts are disjoint and cover every visible pair, so the result is
+ * exact at the snapshot whatever the index's lag; only the two tail parts
+ * (recent commits) use the join.
+ */
+export const spendRelationSql = (sql: Sql, predicate: string) => {
+  const input = sql.view('input_at');
+  const output = sql.view('output_at');
+  return `(SELECT ${spendRelationColumns} FROM ${sql.view(
+    'spend_at'
+  )} WHERE ${predicate}
+    UNION ALL
+    SELECT ${spendRelationColumns} FROM (
+      SELECT ${joinedSpendColumns}
+      FROM (SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index FROM ${input}
+            WHERE commit_seq > {spend:UInt64} AND outpoint_transaction_hash != ${zeroHashSql}) AS i
+      INNER JOIN (SELECT ${spentOutputSelect} FROM ${output}
+                  WHERE (transaction_hash, output_index) IN (
+                    SELECT outpoint_transaction_hash, outpoint_index FROM ${input}
+                    WHERE commit_seq > {spend:UInt64})) AS o
+        ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index)
+    WHERE ${predicate}
+    UNION ALL
+    SELECT ${spendRelationColumns} FROM (
+      SELECT ${joinedSpendColumns}
+      FROM (SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index FROM ${input}
+            WHERE commit_seq <= {spend:UInt64}
+              AND (outpoint_transaction_hash, outpoint_index) IN (
+                SELECT transaction_hash, output_index FROM ${output} WHERE commit_seq > {spend:UInt64})) AS i
+      INNER JOIN (SELECT ${spentOutputSelect} FROM ${output} WHERE commit_seq > {spend:UInt64}) AS o
+        ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index)
+    WHERE ${predicate})`;
+};
+
+/**
+ * Redundant key conditions next to a locking bytecode equality: the same
+ * filter on the 25-byte prefix the sort keys use (`output`'s p_script,
+ * `spend`'s primary key), so a range of the key is read, not a scan.
+ */
+const lockingBytecodePrefixKey = (sql: Sql, comparison: HexComparison) => {
+  if (comparison._eq !== undefined && comparison._eq !== null) {
+    return [
+      `locking_bytecode_prefix = substring(unhex(${sql.bind(
+        comparison._eq,
+        'String'
+      )}), 1, 25)`,
+    ];
+  }
+  if (comparison._in !== undefined && comparison._in !== null) {
+    return [
+      `locking_bytecode_prefix IN arrayMap(x -> substring(unhex(x), 1, 25), ${sql.bind(
+        comparison._in,
+        'Array(String)'
+      )})`,
+    ];
+  }
+  return [];
+};
+
+/** The same for an NFT commitment prefix: `nonfungible_token_commitment_key` (p_category). */
+const commitmentKeyCondition = (sql: Sql, comparison: HexComparison) =>
+  comparison._prefix === undefined || comparison._prefix === null
+    ? []
+    : [
+        `startsWith(nonfungible_token_commitment_key, unhex(${sql.bind(
+          comparison._prefix,
+          'String'
+        )}))`,
+      ];
+
+/** An `OutputFilter` as a predicate on one output_at row. */
 export const outputPredicate = (
   sql: Sql,
   filter: OutputFilter | null | undefined,
@@ -354,7 +459,8 @@ export const outputPredicate = (
         'bytes',
         filter.locking_bytecode,
         'locking_bytecode'
-      )
+      ),
+      ...lockingBytecodePrefixKey(sql, filter.locking_bytecode)
     );
   }
   if (filter.token_category) {
@@ -385,7 +491,8 @@ export const outputPredicate = (
         'nullableBytes',
         filter.nonfungible_token_commitment,
         'nonfungible_token_commitment'
-      )
+      ),
+      ...commitmentKeyCondition(sql, filter.nonfungible_token_commitment)
     );
   }
   if (filter._and) {
@@ -400,8 +507,27 @@ export const outputPredicate = (
   return all(parts);
 };
 
-/** An `InputFilter` as a predicate on one input_at row (outpoint fields on the same row). */
-export const inputPredicate = (
+/**
+ * Whether every input matching `filter` has a stored spent output (the filter
+ * requires an `outpoint` match: positively, in a conjunction, or in every
+ * branch of a disjunction). Such a filter is answered from the spend relation
+ * alone (index + tail); any other one that mentions `outpoint` (under `_not`,
+ * or in some `_or` branches) is evaluated on input rows with the outpoint
+ * semi-join.
+ */
+export const requiresOutpoint = (filter: InputFilter): boolean =>
+  (filter.outpoint !== undefined && filter.outpoint !== null) ||
+  (filter._and ?? []).some(requiresOutpoint) ||
+  (filter._or !== undefined &&
+    filter._or !== null &&
+    filter._or.length > 0 &&
+    filter._or.every(requiresOutpoint));
+
+/**
+ * An `InputFilter` as a predicate on one spend-relation row (the input's own
+ * fields and the spent output's attributes on the same row).
+ */
+export const spendRowPredicate = (
   sql: Sql,
   filter: InputFilter | null | undefined
 ): string => {
@@ -425,6 +551,68 @@ export const inputPredicate = (
   }
   if (filter.outpoint) {
     parts.push(outputPredicate(sql, filter.outpoint, spentOutputColumns));
+  }
+  if (filter._and) {
+    parts.push(...filter._and.map((f) => spendRowPredicate(sql, f)));
+  }
+  if (filter._or) {
+    parts.push(any(filter._or.map((f) => spendRowPredicate(sql, f))));
+  }
+  if (filter._not) {
+    parts.push(`NOT (${spendRowPredicate(sql, filter._not)})`);
+  }
+  return all(parts);
+};
+
+/**
+ * An `InputFilter` as a predicate on one input_at row.
+ * - A filter that requires a spent output (`requiresOutpoint`): the input's
+ *   key is in the spend relation filtered by it (`spendRelationSql`: the
+ *   spend index up to the snapshot's spend watermark, the join above it).
+ * - Otherwise `outpoint` sub-filters are a semi-join on the row's outpoint:
+ *   the outpoint is the key of a matching output (a coinbase input, or one
+ *   whose spent output is not stored, matches no `outpoint` filter, as in
+ *   Hasura v1).
+ */
+export const inputPredicate = (
+  sql: Sql,
+  filter: InputFilter | null | undefined
+): string => {
+  if (filter === undefined || filter === null) return '1';
+  if (requiresOutpoint(filter)) {
+    return `(transaction_hash, input_index) IN (SELECT transaction_hash, input_index FROM ${spendRelationSql(
+      sql,
+      spendRowPredicate(sql, filter)
+    )})`;
+  }
+  // eslint-disable-next-line @typescript-eslint/no-use-before-define
+  return inputRowPredicate(sql, filter);
+};
+
+const inputRowPredicate = (sql: Sql, filter: InputFilter): string => {
+  const parts: string[] = [];
+  if (filter.input_index) {
+    parts.push(
+      ...numericComparison(sql, 'input_index', 'UInt32', filter.input_index)
+    );
+  }
+  if (filter.outpoint_transaction_hash) {
+    parts.push(
+      ...hexComparison(
+        sql,
+        'outpoint_transaction_hash',
+        'hash',
+        filter.outpoint_transaction_hash,
+        'outpoint_transaction_hash'
+      )
+    );
+  }
+  if (filter.outpoint) {
+    parts.push(
+      `(outpoint_transaction_hash, outpoint_index) IN (SELECT transaction_hash, output_index FROM ${sql.view(
+        'output_at'
+      )} WHERE ${outputPredicate(sql, filter.outpoint)})`
+    );
   }
   if (filter._and) {
     parts.push(...filter._and.map((f) => inputPredicate(sql, f)));
@@ -465,10 +653,19 @@ export const transactionPredicate = (
     );
   }
   if (filter.has_input) {
+    /*
+     * A filter requiring a spent output reads the spend relation alone (no
+     * `input` rows): an address's or a category's spending transactions.
+     */
     parts.push(
-      `hash IN (SELECT transaction_hash FROM ${sql.view(
-        'input_at'
-      )} WHERE ${inputPredicate(sql, filter.has_input)})`
+      requiresOutpoint(filter.has_input)
+        ? `hash IN (SELECT transaction_hash FROM ${spendRelationSql(
+            sql,
+            spendRowPredicate(sql, filter.has_input)
+          )})`
+        : `hash IN (SELECT transaction_hash FROM ${sql.view(
+            'input_at'
+          )} WHERE ${inputPredicate(sql, filter.has_input)})`
     );
   }
   if (filter.block_window) {
@@ -504,21 +701,30 @@ export const transactionPredicate = (
 /**
  * Per-node unspent outputs at query time (UTXO tables off, Chaingraph v1's
  * definition): outputs of transactions the node accepts, minus outpoints
- * spent by an input of a transaction the node accepts. The anti-join is
- * narrowed with the same filter applied to the spending input's copy of the
- * spent output's attributes (input carries them), so it reads only inputs
- * that could spend a matching output (the `p_spent_*` projections).
+ * spent by an input of a transaction the node accepts. With a filter, the
+ * spends of matching outputs come from the spend relation (spend index up to
+ * the snapshot's spend watermark, the join above it).
  */
 export const unspentOutputPredicate = (
   sql: Sql,
   filter: OutputFilter | null | undefined
 ) => {
-  const spentScope = outputPredicate(sql, filter, spentOutputColumns);
+  const matching = outputPredicate(sql, filter);
+  /*
+   * The spends of matching outputs: from the spend relation when the filter
+   * narrows the outputs (index + tail, by script or category), else every
+   * input of an accepted transaction.
+   */
+  const spent =
+    matching === '1'
+      ? `SELECT outpoint_transaction_hash, outpoint_index FROM ${sql.view(
+          'input_at'
+        )} WHERE transaction_hash IN (${sql.accepted()})`
+      : `SELECT outpoint_transaction_hash, outpoint_index FROM ${spendRelationSql(
+          sql,
+          outputPredicate(sql, filter, spentOutputColumns)
+        )} WHERE transaction_hash IN (${sql.accepted()})`;
   return `transaction_hash IN (${sql.accepted()})
-  AND (transaction_hash, output_index) NOT IN (
-    SELECT outpoint_transaction_hash, outpoint_index FROM ${sql.view(
-      'input_at'
-    )}
-    WHERE (${spentScope}) AND transaction_hash IN (${sql.accepted()}))
-  AND (${outputPredicate(sql, filter)})`;
+  AND (transaction_hash, output_index) NOT IN (${spent})
+  AND (${matching})`;
 };

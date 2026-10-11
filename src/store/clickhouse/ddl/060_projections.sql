@@ -33,32 +33,16 @@ ALTER TABLE cg.output ADD PROJECTION IF NOT EXISTS p_category
     ORDER BY (token_category, nonfungible_token_commitment_key, transaction_hash, output_index)
 ) WITH SETTINGS (index_granularity = 1024, min_compress_block_size = 65536, max_compress_block_size = 1048576);
 
+-- p_outpoint: the outpoint index of input, slim (outpoint + input key + commit_seq) and tuned like output for point
+-- lookups by outpoint (granularity 128, 4 KiB blocks): the join from outputs to the inputs spending them reads one
+-- granule per outpoint per part (input denormalisation plan §3.2: 4-15x fewer rows than the full-column projection
+-- at granularity 1024). Queries that need other input columns read the table itself.
 ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_outpoint
 (
     SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index,
-           sequence_number, value_satoshis, token_category, fungible_token_amount, nonfungible_token_capability,
-           nonfungible_token_commitment, locking_bytecode, commit_seq, locking_bytecode_prefix,
-           nonfungible_token_commitment_key
+           commit_seq
     ORDER BY (outpoint_transaction_hash, outpoint_index)
-);
-
-ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_spent_script
-(
-    SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index,
-           sequence_number, value_satoshis, token_category, fungible_token_amount, nonfungible_token_capability,
-           nonfungible_token_commitment, locking_bytecode, commit_seq, locking_bytecode_prefix,
-           nonfungible_token_commitment_key
-    ORDER BY (locking_bytecode_prefix, transaction_hash, input_index)
-);
-
-ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_spent_category
-(
-    SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index,
-           sequence_number, value_satoshis, token_category, fungible_token_amount, nonfungible_token_capability,
-           nonfungible_token_commitment, locking_bytecode, commit_seq, locking_bytecode_prefix,
-           nonfungible_token_commitment_key
-    ORDER BY (token_category, nonfungible_token_commitment_key, transaction_hash, input_index)
-);
+) WITH SETTINGS (index_granularity = 128, min_compress_block_size = 4096, max_compress_block_size = 4096);
 
 ALTER TABLE cg.tx_acceptance ADD PROJECTION IF NOT EXISTS p_node_height
 (

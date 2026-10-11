@@ -7,6 +7,7 @@ import type { ChaingraphBlock } from '../../types/chaingraph.js';
 import type { ChaingraphStore } from '../types.js';
 
 import { SimulatedCrash } from './block-commit.js';
+import { createClickHouseChecker } from './checker.js';
 import type { ClickHouseStore } from './clickhouse-store.js';
 import { hashChainFromBlocks, linkedBlockSize } from './clickhouse-store.js';
 import { epochOfSeq } from './commit-log.js';
@@ -137,19 +138,20 @@ e2e(
       [chain.block0.hash, chain.block1.hash, chain.block2.hash].sort()
     );
     const blockRow = await client.query<{
-      generated: string;
       outputs: string;
       count: number;
     }>(
-      `SELECT toString(generated_value_satoshis) AS generated, toString(output_value_satoshis) AS outputs,
+      `SELECT toString(output_value_satoshis) AS outputs,
        transaction_count AS count FROM block WHERE hash = toFixedString(unhex({hash:String}), 32)`,
       { hash: chain.block2.hash }
     );
-    t.deepEqual(blockRow[0], {
-      count: 2,
-      generated: '5000000000',
-      outputs: '5000001800',
-    });
+    t.deepEqual(blockRow[0], { count: 2, outputs: '5000001800' });
+    // the generated value is computed at read time (inputs joined to the outputs they spend)
+    const aggregates = await createClickHouseChecker(
+      client
+    ).blockValueAggregates({ hash: chain.block2.hash });
+    t.is(aggregates?.generated, 5000000000n);
+    t.is(aggregates?.output, 5000001800n);
     const again = await store.saveBlock({
       block: chain.block2,
       isSavedTransaction: notSaved,
@@ -369,21 +371,14 @@ e2e(
 );
 
 e2e(
-  '[e2e] ClickHouseStore: child-before-parent across two concurrent saves; no torn read, exact final state',
+  '[e2e] ClickHouseStore: child-before-parent across two concurrent saves; the child waits for the parent rows, no torn read, exact final state',
   async (t) => {
     t.timeout(120_000);
     const { client, openStore } = await scratch(t, 'child');
     const chain = threeBlockChain();
-    let releaseParent: (() => void) | undefined;
-    const childIncomplete = new Promise<void>((resolve) => {
-      releaseParent = resolve;
-    });
     const steps: string[] = [];
     const store = await openStore(async (step, context) => {
-      steps.push(`${context.kind}:${step}`);
-      if (step === 'incomplete') {
-        releaseParent?.();
-      }
+      steps.push(`${context.kind}:${context.seq ?? '-'}:${step}`);
       // slow every insert down so the poller sees intermediate states
       await new Promise((resolve) => {
         setTimeout(resolve, 15);
@@ -434,21 +429,13 @@ e2e(
       }
     })();
 
+    const stepsBefore = steps.length;
     // child (block 2) first: it spends a:0, which only block 1 creates
     const child = store.saveBlock({
       block: chain.block2,
       isSavedTransaction: notSaved,
       nodeAcceptances: [acceptance(node1), acceptance(node2)],
     });
-    await childIncomplete;
-    const incompleteRows = await client.query<{ c: string }>(
-      "SELECT count() AS c FROM commit_log WHERE state = 'incomplete'"
-    );
-    t.is(
-      incompleteRows[0]?.c,
-      '1',
-      'the child commit is incomplete while it waits'
-    );
     const parent = store.saveBlock({
       block: chain.block1,
       isSavedTransaction: notSaved,
@@ -463,7 +450,19 @@ e2e(
     await poller;
     t.true(polls > 4, `poller ran (${polls} reads)`);
     t.deepEqual(torn, []);
-    t.true(steps.includes('block:fill'));
+    // the parent (called second) committed first; nothing waited for a fill
+    const committedSeqs = steps
+      .slice(stepsBefore)
+      .filter((step) => step.endsWith(':committed'))
+      .map((step) => step.split(':')[1]!);
+    t.is(committedSeqs.length, 2);
+    t.true(
+      BigInt(committedSeqs[0]!) > BigInt(committedSeqs[1]!),
+      `the parent's commit (higher seq) committed before the child's: ${committedSeqs.join(
+        ', '
+      )}`
+    );
+    t.false(steps.some((step) => /:(?:fill|incomplete)$/u.test(step)));
     for (const node of [node1, node2]) {
       const view = await nodeView(client, node);
       const blocks = [chain.block0, chain.block1, chain.block2];
@@ -483,10 +482,68 @@ e2e(
         ]
       );
     }
-    const pending = await client.query<{ s: string }>(
-      'SELECT sum(sign) AS s FROM pending_spend'
+    t.deepEqual(await badUtxoSums(client), []);
+  }
+);
+
+e2e(
+  '[e2e] ClickHouseStore: a child saved before its parent is even called: the parent late-parent −1 rows make every UTXO set exact',
+  async (t) => {
+    t.timeout(120_000);
+    const { client, openStore } = await scratch(t, 'late_parent');
+    const chain = threeBlockChain();
+    const store = await openStore();
+    const { node1, node2 } = await registerNodes(store);
+    const both = [acceptance(node1), acceptance(node2)];
+    await store.saveBlock({
+      block: chain.block0,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: both,
+    });
+    // the child commits alone: its spend of a:0 has no output to join yet
+    await store.saveBlock({
+      block: chain.block2,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: both,
+    });
+    await store.publishWatermarks();
+    const between = await nodeView(client, node1);
+    t.true(between.blocks.includes(chain.block2.hash));
+    t.false(between.blocks.includes(chain.block1.hash));
+    // node 2 gets the parent by header acceptance, node 1 by its own save
+    await store.saveBlock({
+      block: chain.block1,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    t.is(
+      await store.acceptBlocksViaHeaders(
+        node2,
+        [{ hash: chain.block1.hash, height: 1 }],
+        new Date('2026-10-11T00:00:00Z')
+      ),
+      1
     );
-    t.is(pending[0]?.s, '0', 'pending spends were filled under the child seq');
+    await store.publishWatermarks();
+    const blocks = [chain.block0, chain.block1, chain.block2];
+    for (const node of [node1, node2]) {
+      const view = await nodeView(client, node);
+      t.deepEqual(
+        view.blocks,
+        blocks.map((block) => block.hash)
+      );
+      t.deepEqual(view.utxo, expectedUnspent(blocks), `node ${node} utxo`);
+      t.deepEqual(view.utxoByScript, view.utxo);
+    }
+    t.deepEqual(await badUtxoSums(client), []);
+    // a re-org of node 1 removing both blocks restores its UTXO set exactly
+    await store.removeStaleBlocksForNode(node1, [
+      chain.block1.hash,
+      chain.block2.hash,
+    ]);
+    await store.publishWatermarks();
+    const afterReorg = await nodeView(client, node1);
+    t.deepEqual(afterReorg.utxo, expectedUnspent([chain.block0]));
     t.deepEqual(await badUtxoSums(client), []);
   }
 );
@@ -500,21 +557,12 @@ e2e(
     let peakWaiting = 0;
     let overCap = 0;
     const holder: { store?: ClickHouseStore } = {};
-    const { client, openStore } = await scratch(
-      t,
-      'cap',
-      /*
-       * a child that waited out the timeout would be stored with stand-in
-       * inputs: keep it far above the completion bound below
-       */
-      {
-        maxBlocksPerCommit: 1,
-        maxInFlightSaves: cap,
-        pendingSpendTimeoutMs: 90_000,
-        // one commit per block, all three working at once (non-batched store)
-        runningBatchesPerNodeSet: 3,
-      }
-    );
+    const { client, openStore } = await scratch(t, 'cap', {
+      maxBlocksPerCommit: 1,
+      maxInFlightSaves: cap,
+      // one commit per block, all three working at once (non-batched store)
+      runningBatchesPerNodeSet: 3,
+    });
     const sample = () => {
       const stats = holder.store?.poolStats();
       if (stats !== undefined) {
@@ -574,7 +622,6 @@ e2e(
     const outcome = await Promise.race([
       (async () => {
         await Promise.all(saves);
-        // a parked child reports early; wait for every commit
         await store.operations.drain();
         return 'completed';
       })(),
@@ -606,7 +653,7 @@ e2e(
       t.deepEqual(view.txs, txHashes(blocks));
       t.deepEqual(view.utxo, expectedUnspent(blocks));
       t.deepEqual(view.utxoByScript, view.utxo);
-      // resolved spent outputs, never the timeout's stand-in (value 0)
+      // every spent output is visible (joined on the outpoint)
       t.deepEqual(
         view.inputs
           .filter(
@@ -631,44 +678,19 @@ e2e(
       [['committed', '4']],
       'four block commits, none aborted'
     );
-    const pending = await client.query<{ s: string }>(
-      'SELECT sum(sign) AS s FROM pending_spend'
-    );
-    t.is(pending[0]?.s ?? '0', '0');
     t.deepEqual(await badUtxoSums(client), []);
   }
 );
 
 e2e(
-  '[e2e] ClickHouseStore: in-flight cap 1, a parked child outlives its pending timeout while its parent is queued for a slot: no stand-in',
+  '[e2e] ClickHouseStore: in-flight cap 1, a child waiting for its queued parent gives its slot up: both commit, exact',
   async (t) => {
     t.timeout(120_000);
-    const slow = { on: false };
-    let childParked: (() => void) | undefined;
-    const parked = new Promise<void>((resolve) => {
-      childParked = resolve;
-    });
-    const { client, openStore } = await scratch(t, 'rearm', {
+    const { client, openStore } = await scratch(t, 'cap1', {
       maxInFlightSaves: 1,
-      pendingSpendTimeoutMs: 300,
     });
-    const store = await openStore(async (step) => {
-      if (step === 'incomplete') childParked?.();
-      if (slow.on) {
-        await new Promise((resolve) => {
-          setTimeout(resolve, 150);
-        });
-      }
-    });
+    const store = await openStore();
     const { node1, node2 } = await registerNodes(store);
-    const node3 = (
-      await store.registerNode({
-        latestConnectionBeganAt: new Date('2026-10-09T00:00:00Z'),
-        nodeName: 'node-three',
-        protocolVersion: 70016,
-        userAgent: '/BCHN:28.0.0/',
-      })
-    ).internalId;
     const chain = threeBlockChain();
     const both = [acceptance(node1), acceptance(node2)];
     await store.saveBlock({
@@ -676,54 +698,28 @@ e2e(
       isSavedTransaction: notSaved,
       nodeAcceptances: both,
     });
-    // the child parks (incomplete) and gives its slot up
     const child = store.saveBlock({
       block: chain.block2,
       isSavedTransaction: notSaved,
       nodeAcceptances: both,
     });
-    await parked;
-    // an unrelated slow save (node 3 only) holds the only slot for > 1 s
-    slow.on = true;
-    const other = makeBlock(
-      0,
-      zeroHash,
-      [
-        makeTx({
-          coinbase: true,
-          label: 'other-c0',
-          outputs: [
-            { lockingBytecode: p2pkh('other'), valueSatoshis: 5_000_000_000n },
-          ],
-        }),
-      ],
-      'other-0'
-    );
-    const holder = store.saveBlock({
-      block: other,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(node3)],
-    });
-    // the parent is queued behind it for several pending timeouts
     const parent = store.saveBlock({
       block: chain.block1,
       isSavedTransaction: notSaved,
       nodeAcceptances: both,
     });
-    await new Promise((resolve) => {
-      setTimeout(resolve, 50);
-    });
-    /*
-     * the parent waits for a slot; it registered its outputs when it was
-     * called (WP6b), so the child already resumed and waits for one too
-     */
-    t.true(
-      store.poolStats().waitingRequests >= 1,
-      'the parent waits for a slot'
-    );
-    await Promise.all([child, holder, parent]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      Promise.all([child, parent]).then(() => 'completed'),
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => {
+          resolve('stuck');
+        }, 30_000);
+      }),
+    ]);
+    clearTimeout(timer);
+    t.is(outcome, 'completed', 'no deadlock under cap 1');
     await store.operations.drain();
-    slow.on = false;
     await store.publishWatermarks();
     const blocks = [chain.block0, chain.block1, chain.block2];
     for (const node of [node1, node2]) {
@@ -740,8 +736,7 @@ e2e(
         [
           ['400', '800'],
           ['1000', '1000'],
-        ],
-        'the spent output was resolved, not the stand-in'
+        ]
       );
     }
     t.deepEqual(await badUtxoSums(client), []);
@@ -1271,7 +1266,7 @@ e2e(
 );
 
 e2e(
-  '[e2e] ClickHouseStore: a child block with 150k unresolved spends parks, its parent completes it',
+  '[e2e] ClickHouseStore: a child block with 150k spends saved before its parent: the parent late-parent rows complete the UTXO set',
   async (t) => {
     t.timeout(300_000);
     const { client, openStore } = await scratch(t, 'wide_child');
@@ -1284,13 +1279,13 @@ e2e(
       nodeAcceptances: [acceptance(node1)],
     });
     const started = Date.now();
-    // child first: it parks (incomplete) with 150k pending spends
+    // child first: it commits at once; its 150k spends have no output to join yet
     await store.saveBlock({
       block: block2,
       isSavedTransaction: notSaved,
       nodeAcceptances: [acceptance(node1)],
     });
-    const parkedMs = Date.now() - started;
+    const childMs = Date.now() - started;
     await store.saveBlock({
       block: block1,
       isSavedTransaction: notSaved,
@@ -1303,16 +1298,12 @@ e2e(
     }
     await store.publishWatermarks();
     t.log(
-      `parked after ${parkedMs} ms, all committed after ${
+      `child committed after ${childMs} ms, parent after ${
         Date.now() - started
       } ms`
     );
     const unspent = await utxoCountAt(client, node1);
     t.is(unspent.n, String(150_000 + 2));
-    const pending = await client.query<{ s: string; n: string }>(
-      'SELECT toString(sum(sign)) AS s, toString(count()) AS n FROM pending_spend'
-    );
-    t.deepEqual(pending[0], { n: String(2 * 150_000), s: '0' });
     t.deepEqual(await badUtxoSums(client), []);
   }
 );
@@ -1507,7 +1498,7 @@ e2e(
 );
 
 e2e(
-  '[e2e] ClickHouseStore: a batch with a child before its parent parks and completes; maxBlocksPerCommit 1 commits per block',
+  '[e2e] ClickHouseStore: blocks saved in reverse order each wait for their parent; maxBlocksPerCommit 1 commits per block',
   async (t) => {
     t.timeout(300_000);
     const { client, openStore } = await scratch(t, 'batch_child', {
@@ -1640,10 +1631,9 @@ e2e(
 
 /*
  * WP6b: the agent hung after "initial sync is complete" with
- * CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES=16: finishInitialSync drains
- * every operation, and parked children re-armed their pending-spend timeout
- * while ANY call was queued for a slot, including children that had only
- * given their slot up for the wait, so they completed one at a time.
+ * CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES=16 (parked children re-armed
+ * their pending-spend timeout). Nothing parks any more: blocks spending
+ * unknown outputs commit at once.
  */
 for (const [cap, maxBlocksPerCommit] of [
   [2, 1],
@@ -1657,7 +1647,6 @@ for (const [cap, maxBlocksPerCommit] of [
       const { client, openStore } = await scratch(t, `sync_cap${cap}`, {
         maxBlocksPerCommit,
         maxInFlightSaves: cap,
-        pendingSpendTimeoutMs: 1,
         // per-block commits all working at once, as the agent's buffer feeds them
         runningBatchesPerNodeSet: maxBlocksPerCommit === 1 ? 64 : undefined,
       });
@@ -1720,51 +1709,6 @@ for (const [cap, maxBlocksPerCommit] of [
     }
   );
 }
-
-e2e(
-  '[e2e] ClickHouseStore: a parked save is answered with `committed`, which resolves only once the block is committed (WP6b item 8)',
-  async (t) => {
-    t.timeout(120_000);
-    const { client, openStore } = await scratch(t, 'parked');
-    const store = await openStore();
-    const { node1 } = await registerNodes(store);
-    const chain = threeBlockChain();
-    const saved = await store.saveBlock({
-      block: chain.block0,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(node1)],
-    });
-    t.is(saved.committed, undefined, 'a committed save has no `committed`');
-    const child = await store.saveBlock({
-      block: chain.block2,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(node1)],
-    });
-    t.not(child.committed, undefined, 'the child parked');
-    let childCommitted = false;
-    const committedPromise = child.committed!.then(() => {
-      childCommitted = true;
-    });
-    await new Promise((resolve) => {
-      setTimeout(resolve, 300);
-    });
-    t.false(childCommitted, 'not committed while its parent is missing');
-    await store.publishWatermarks();
-    t.false((await nodeView(client, node1)).blocks.includes(chain.block2.hash));
-    await store.saveBlock({
-      block: chain.block1,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(node1)],
-    });
-    await committedPromise;
-    await store.publishWatermarks();
-    t.deepEqual((await nodeView(client, node1)).blocks, [
-      chain.block0.hash,
-      chain.block1.hash,
-      chain.block2.hash,
-    ]);
-  }
-);
 
 e2e(
   '[e2e] ClickHouseStore: the inserts of one commit phase go out concurrently, the phases stay ordered (WP6b item 6)',
@@ -1890,50 +1834,5 @@ e2e(
     });
     await store.publishWatermarks();
     t.is((await nodeView(client, node1)).blocks.length, 4);
-  }
-);
-
-e2e(
-  '[e2e] ClickHouseStore: unknown spent outputs are looked up once per save, not once per resolution round',
-  async (t) => {
-    t.timeout(120_000);
-    const { client, name, openStore } = await scratch(t, 'lookups', {
-      lookupChunkSize: 100,
-      pendingSpendTimeoutMs: 1,
-    });
-    const store = await openStore();
-    const { node1 } = await registerNodes(store);
-    const spender = makeTx({
-      label: 'lookups-spender',
-      outputs: [{ lockingBytecode: p2pkh('x'), valueSatoshis: 1n }],
-      spends: Array.from({ length: 1_000 }, (_, index): [string, number] => [
-        sha(`lookups-nowhere-${index}`),
-        0,
-      ]),
-    });
-    const block = makeBlock(0, zeroHash, [
-      makeTx({
-        coinbase: true,
-        label: 'lookups-c0',
-        outputs: [{ lockingBytecode: p2pkh('m'), valueSatoshis: 1n }],
-      }),
-      spender,
-    ]);
-    const saved = await store.saveBlock({
-      block,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(node1)],
-    });
-    await saved.committed;
-    await client.command('SYSTEM FLUSH LOGS');
-    const rows = await client.query<{ n: string }>(
-      `SELECT toString(count()) AS n FROM system.query_log
-       WHERE type = 'QueryFinish' AND current_database = {db:String}
-         AND query LIKE '%FROM output%' AND query LIKE '%arrayZip%'
-         AND event_time > now() - INTERVAL 5 MINUTE`,
-      { db: name }
-    );
-    // 1,000 unknown outpoints in chunks of 100: one round of 10 lookups
-    t.is(rows[0]!.n, '10');
   }
 );

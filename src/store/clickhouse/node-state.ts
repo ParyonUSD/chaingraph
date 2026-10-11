@@ -62,8 +62,7 @@ export type OperationState = 'committed' | 'done' | 'failed' | 'running';
 
 /**
  * One store call that writes node facts. `rowsWritten` resolves once every
- * row it will ever write is acknowledged (including pending-spend fill rows),
- * or once it fails; `committed` resolves when its commit is committed and
+ * row it will ever write is acknowledged, or once it fails; `committed` resolves when its commit is committed and
  * rejects if it failed.
  */
 export class StoreOperation {
@@ -83,7 +82,7 @@ export class StoreOperation {
 
   /**
    * Called once when the operation stops needing its batch lane
-   * (`yieldLane`): its rows are written, it parked, or it finished.
+   * (`yieldLane`): its rows are written, or it finished.
    */
   onYield: (() => void) | undefined;
 
@@ -96,6 +95,8 @@ export class StoreOperation {
   slot: SaveSlot | undefined;
 
   private readonly rows = deferred<void>();
+
+  private readonly agnosticRows = deferred<void>();
 
   private readonly commit = deferred<void>();
 
@@ -166,6 +167,21 @@ export class StoreOperation {
     return this.rows.promise;
   }
 
+  /**
+   * Resolves once the operation's node-agnostic rows (`output`, `input`,
+   * `transaction`, …) are written, or it decided it writes none, or it
+   * ended. A block whose transactions spend outputs of a later block save of
+   * the same node waits for this (UTXO on, tip mode), never for that save's
+   * per-node rows, which wait for its own.
+   */
+  get agnosticRowsWritten(): Promise<void> {
+    return this.agnosticRows.promise;
+  }
+
+  markAgnosticRowsWritten() {
+    this.agnosticRows.resolve();
+  }
+
   get committed(): Promise<void> {
     return this.commit.promise;
   }
@@ -183,6 +199,7 @@ export class StoreOperation {
 
   markRowsWritten() {
     this.yieldLane();
+    this.agnosticRows.resolve();
     if (!this.rowsDone) {
       this.rowsDone = true;
       this.rows.resolve();
@@ -255,7 +272,7 @@ export class AbandonedError extends Error {}
 
 /**
  * Shutdown signal: once `abandon` is called, every wait raced against it
- * (pending spends, commit dependencies) and every commit step rejects with
+ * (commit dependencies, commit order) and every commit step rejects with
  * `AbandonedError`; the commit is aborted and recovery redoes nothing (the
  * agent re-downloads what was not committed).
  */
@@ -856,6 +873,25 @@ const sameOperations = (
 ) => a.length === b.length && a.every((item, index) => item === b[index]);
 
 /**
+ * Whether some live operation waits for the commit of a LATER live
+ * operation (a child-before-parent dependency). Without such an edge every
+ * edge of the wait-for graph points to an earlier operation (barrier waits,
+ * predecessor barriers, ordinary dependencies), so no earlier operation can
+ * reach a later one and the per-blocker cycle check can be skipped: with
+ * hundreds of queued saves it was the agent's CPU (O(ops² × edges) per graph
+ * change; 46 s of CPU for 300 one-block commits under cap 16, 2026-10-11).
+ */
+export const hasForwardWaits = (registry: OperationRegistry) =>
+  registry.liveOperations.some((operation) =>
+    [...operation.waitsOn].some(
+      (target) =>
+        !target.finished &&
+        !(target instanceof PredecessorBarrier) &&
+        target.id > operation.id
+    )
+  );
+
+/**
  * Commit order per node (docs/clickhouse-port/g1-fix-pass.md, bug 1): a
  * block commit is marked committed only after every earlier operation on
  * its nodes has settled, and never if one of them failed
@@ -878,9 +914,10 @@ export const awaitCommitOrder = async (
   // eslint-disable-next-line functional/no-try-statement
   try {
     while (registry.hasUnsettledEarlier(operation)) {
-      const blockers = registry
-        .unsettledEarlier(operation)
-        .filter((earlier) => !waitsTransitively(earlier, operation));
+      const earlier = registry.unsettledEarlier(operation);
+      const blockers = hasForwardWaits(registry)
+        ? earlier.filter((other) => !waitsTransitively(other, operation))
+        : earlier;
       if (!sameOperations(blockers, operation.barrierWaits)) {
         operation.barrierWaits = blockers;
         registry.notifyGraphChanged();
@@ -924,17 +961,6 @@ export const acceptanceColumns = {
     'block_internal_id',
     'internal_id',
     'accepted_at',
-    'commit_seq',
-  ],
-  pending_spend: [
-    'outpoint_transaction_hash',
-    'outpoint_index',
-    'node_internal_id',
-    'spender_transaction_hash',
-    'spender_input_index',
-    'spender_commit_seq',
-    'sign',
-    'version',
     'commit_seq',
   ],
   tx_acceptance: [
@@ -1035,38 +1061,6 @@ export const encodeTxAcceptanceRows = (
       .nullable(row.acceptedAt, (w, at) => w.dateTime64(at))
       .int8Sign(row.sign)
       .uint64(row.version)
-      .uint64(commitSeq)
-      .endRow();
-  });
-  return { data: writer.finish(), rowCount: writer.rowCount };
-};
-
-export interface PendingSpendRow {
-  outpointTransactionHash: string;
-  outpointIndex: number;
-  /** 0 when no node's UTXO rows wait on it (bulk mode or no accepting node). */
-  nodeInternalId: number;
-  spenderTransactionHash: string;
-  spenderInputIndex: number;
-  sign: -1 | 1;
-}
-
-/** `pending_spend` rows; `version` and `spender_commit_seq` are the spender's seq. */
-export const encodePendingSpendRows = (
-  rows: readonly PendingSpendRow[],
-  commitSeq: bigint
-) => {
-  const writer = new RowBinaryWriter(rows.length * 100);
-  rows.forEach((row) => {
-    writer
-      .fixedString32(row.outpointTransactionHash)
-      .uint32(row.outpointIndex)
-      .uint32(row.nodeInternalId)
-      .fixedString32(row.spenderTransactionHash)
-      .uint32(row.spenderInputIndex)
-      .uint64(commitSeq)
-      .int8Sign(row.sign)
-      .uint64(commitSeq)
       .uint64(commitSeq)
       .endRow();
   });

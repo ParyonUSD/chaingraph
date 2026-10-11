@@ -39,7 +39,6 @@ import {
   BlockCommitter,
   chunked,
   freshen,
-  lookupStoredOutputs,
   minMax,
   SimulatedCrash,
   TransactionRegistry,
@@ -75,12 +74,12 @@ import {
   waitForPredecessorRows,
 } from './node-state.js';
 import { RowBinaryWriter } from './row-binary.js';
-import { loadStandIns, repairStandIns, StandInRegistry } from './stand-in.js';
+import type { SpendIndexProgress, SpendIndexStatus } from './spend-index.js';
+import { SpendIndexFiller } from './spend-index.js';
 import {
   committedSql,
   heightBatches,
   horizonDeltasSql,
-  outpointKey,
   OutputRegistry,
   utxoDeltaInsertSql,
   validCommitSql,
@@ -96,16 +95,11 @@ export interface ClickHouseStoreOptions {
   publisher?: PublisherOptions;
   /** Hashes/outpoints per lookup query (query parameters travel in the URL). */
   lookupChunkSize?: number;
-  /** How long a child block waits for the outputs it spends (WP4 §3: bounded). */
-  pendingSpendTimeoutMs?: number;
   /** Heights per statement of the horizon UTXO build. */
   horizonBatchHeights?: number;
+  /** UTXO on only: recent outputs kept for the mempool path's spent outputs. */
   recentOutputCapacity?: number;
   recentTransactionCapacity?: number;
-  /** How long a mempool tx spending an unknown output waits in the orphan pool. */
-  orphanGraceMs?: number;
-  /** Orphan pool bound (the oldest is released early when full). */
-  maxOrphans?: number;
   /**
    * In-flight cap: at most this many `saveBlock` / `acceptBlocksViaHeaders`
    * calls work at once (`CHAINGRAPH_CLICKHOUSE_MAX_IN_FLIGHT_SAVES`). 0 or
@@ -165,12 +159,20 @@ export interface ClickHouseStoreOptions {
    * database: flipping it on an existing database is not supported.
    */
   utxo?: 'off' | 'on';
+  /**
+   * The asynchronous spend index (`CHAINGRAPH_CLICKHOUSE_SPEND_INDEX`,
+   * default `on`; docs/clickhouse-port/spend-index.md). `off`: the writer
+   * never fills `spend`; readers then take every pair from the join.
+   */
+  spendIndex?: 'off' | 'on';
+  /** Spend index filler tuning (tests). */
+  spendIndexOptions?: { intervalMs?: number; maxRowsPerBatch?: number };
   /** Background errors (watermark publishing, lease loss). */
   onError?: (error: unknown) => void;
   /**
    * Structured diagnostics for the lab: every void (with the watermarks it
-   * was checked against), refused void, failed abort, failed block batch
-   * and pending-spend timeout (docs/clickhouse-port/g1-fix-pass.md).
+   * was checked against), refused void, failed abort and failed block batch
+   * (docs/clickhouse-port/g1-fix-pass.md).
    */
   onDiagnostic?: (diagnostic: StoreDiagnostic) => void;
   /**
@@ -188,11 +190,8 @@ export interface ClickHouseStoreOptions {
  * chunks, all in flight at once (`lookupConcurrency`; g1-fix-pass-2.md §2).
  */
 const defaultLookupChunkSize = 750;
-const defaultPendingSpendTimeoutMs = 60_000;
 const defaultHorizonBatchHeights = 10_000;
-const defaultOrphanGraceMs = 1_000;
 const closeDrainTimeoutMs = 5_000;
-const defaultMaxOrphans = 10_000;
 const twoHoursSeconds = 7_200;
 const msPerSecond = 1_000;
 const headerVarintThresholds = [252, 65_535, 4_294_967_295];
@@ -242,6 +241,7 @@ export class StoreClosedError extends Error {}
 /** A structured diagnostic of the ClickHouse store (`onDiagnostic`). */
 export type StoreDiagnostic =
   | CommitLogDiagnostic
+  | SpendIndexProgress
   | WriterDiagnostic
   | {
       event: 'block_batch_failed';
@@ -357,17 +357,15 @@ export class ClickHouseStore implements ChaingraphStore {
    */
   operations = new OperationRegistry();
 
-  mempool = new MempoolState();
+  mempool: MempoolState;
 
   /** Shutdown or lease loss: abandon in-flight work. */
   private abandonSignal = new AbandonSignal();
 
-  outputs: OutputRegistry<StoreOperation>;
+  /** UTXO on only (the mempool path's spent outputs); `undefined` when off. */
+  outputs: OutputRegistry<StoreOperation> | undefined;
 
   transactions: TransactionRegistry;
-
-  /** Unresolved stand-in `input` rows (stand-in.ts); rebuilt per epoch. */
-  standIns = new StandInRegistry();
 
   /** Incremented when the writer lease is lost (work of older generations is re-run). */
   private generation = 0;
@@ -376,6 +374,9 @@ export class ClickHouseStore implements ChaingraphStore {
   private recovery: Promise<void> | undefined;
 
   private committerInstance: BlockCommitter | undefined;
+
+  /** The spend index filler of the current epoch (`undefined` when off). */
+  private spendFiller: SpendIndexFiller | undefined;
 
   private mempoolCommitter: MempoolCommitter | undefined;
 
@@ -397,6 +398,11 @@ export class ClickHouseStore implements ChaingraphStore {
   /** `false` when `utxo: 'off'`: the stored UTXO tables are never written. */
   private readonly utxoEnabled: boolean;
 
+  /** `false` when `spendIndex: 'off'`. */
+  private readonly spendIndexEnabled: boolean;
+
+  private spendFillerStopped: Promise<void> | undefined;
+
   private readonly maxBytesPerCommit: number;
 
   private readonly smallBlocksPerCommit: number;
@@ -413,6 +419,15 @@ export class ClickHouseStore implements ChaingraphStore {
       );
     }
     this.utxoEnabled = options.utxo !== 'off';
+    if (
+      options.spendIndex !== undefined &&
+      !['off', 'on'].includes(options.spendIndex)
+    ) {
+      throw new RangeError(
+        `spendIndex must be 'on' or 'off' (got ${String(options.spendIndex)}).`
+      );
+    }
+    this.spendIndexEnabled = options.spendIndex !== 'off';
     const cap = options.maxInFlightSaves ?? 0;
     if (!Number.isInteger(cap) || cap < 0) {
       throw new RangeError(
@@ -458,12 +473,17 @@ export class ClickHouseStore implements ChaingraphStore {
             defaultBatchLingerMs
           )
         : 0);
-    this.outputs = new OutputRegistry<StoreOperation>(
-      options.recentOutputCapacity
-    );
+    this.mempool = new MempoolState(this.utxoEnabled);
+    this.outputs = this.newOutputRegistry();
     this.transactions = new TransactionRegistry(
       options.recentTransactionCapacity
     );
+  }
+
+  private newOutputRegistry() {
+    return this.utxoEnabled
+      ? new OutputRegistry<StoreOperation>(this.options.recentOutputCapacity)
+      : undefined;
   }
 
   /** `enableMempoolTracking` was called (kept across lease recovery). */
@@ -551,9 +571,6 @@ export class ClickHouseStore implements ChaingraphStore {
       operationOfSeq: (seq) => this.operationOfSeq(seq),
       operations: this.operations,
       outputs: this.outputs,
-      pendingSpendTimeoutMs:
-        this.options.pendingSpendTimeoutMs ?? defaultPendingSpendTimeoutMs,
-      standIns: this.standIns,
       transactions: this.transactions,
       utxo: this.utxoEnabled,
       // eslint-disable-next-line sort-keys
@@ -577,20 +594,16 @@ export class ClickHouseStore implements ChaingraphStore {
         if (epochSignal.abandoned) return;
         /*
          * The batch's blocks will not be committed. Every later block of its
-         * nodes would be visible on top of the missing ones (the c1 hole),
-         * and children of its outputs would wait the pending-spend timeout
-         * and be stored with stand-in inputs. So, as on shutdown: abandon
-         * every in-flight operation (aborted; block saves resolve as
-         * handled) and refuse new work. The agent shuts down on the failed
-         * save and the next start re-downloads everything not committed.
+         * nodes would be visible on top of the missing ones (the c1 hole).
+         * So, as on shutdown: abandon every in-flight operation (aborted;
+         * block saves resolve as handled) and refuse new work. The agent
+         * shuts down on the failed save and the next start re-downloads
+         * everything not committed.
          */
         epochSignal.abandon(
           `a block batch failed (${String(
             failure.error
           )}); nothing later may commit on top of it`
-        );
-        this.mempoolCommitter?.dropOrphans(
-          new StoreClosedError('Orphan dropped: a block batch failed.')
         );
       },
     });
@@ -607,18 +620,13 @@ export class ClickHouseStore implements ChaingraphStore {
       fence: () => this.fenceArray,
       ids,
       lookupChunkSize: this.lookupChunkSize,
-      maxOrphans: this.options.maxOrphans ?? defaultMaxOrphans,
       mempool: this.mempool,
       mode: () => this.mode,
       nodes: this.nodes,
       onCommitted: () => undefined,
       operationOfSeq: (seq) => this.operationOfSeq(seq),
       operations: this.operations,
-      orphanGraceMs: this.options.orphanGraceMs ?? defaultOrphanGraceMs,
       outputs: this.outputs,
-      pendingSpendTimeoutMs:
-        this.options.pendingSpendTimeoutMs ?? defaultPendingSpendTimeoutMs,
-      standIns: this.standIns,
       transactions: this.transactions,
       utxo: this.utxoEnabled,
     });
@@ -650,49 +658,47 @@ export class ClickHouseStore implements ChaingraphStore {
       this.mode = 'tip';
     }
     await this.mempoolCommitter.rebuild();
-    await this.recoverStandIns(client, commitLog);
+    if (this.spendIndexEnabled) {
+      const filler = new SpendIndexFiller(
+        {
+          assertHeld: () => {
+            lease.assertHeld();
+          },
+          client,
+          epoch: () => lease.epoch,
+          fence: () => this.fenceArray,
+        },
+        {
+          ...this.options.spendIndexOptions,
+          onError: (error) => {
+            this.options.onError?.(error);
+          },
+          onProgress: (progress) => {
+            this.diagnostic(progress);
+          },
+        }
+      );
+      this.spendFiller = filler;
+      filler.start();
+    }
+  }
+
+  /** The spend index filler's progress (watermark, lag); `undefined` when off. */
+  spendIndexStatus(): SpendIndexStatus | undefined {
+    return this.spendFiller?.status;
   }
 
   /**
-   * Load the unresolved stand-in groups (stand-in.ts) and resolve, in one
-   * `fill_pending` commit, those whose parent outputs are stored: an earlier
-   * epoch stored the parent but stopped before it could resolve them.
+   * Fill the spend index up to visible(0) as published now (tests and
+   * tools; the background filler does this on its own). Returns the spend
+   * watermark.
    */
-  private async recoverStandIns(
-    client: ClickHouseClient,
-    commitLog: CommitLog
-  ) {
-    const groups = await loadStandIns({ client }, this.fenceArray);
-    if (groups.length === 0) return;
-    const outpoints = groups.flatMap((group) =>
-      group.members.map((member) => ({
-        hash: member.input.outpointTransactionHash,
-        index: member.input.outpointIndex,
-      }))
-    );
-    const stored = new Map(
-      (
-        await lookupStoredOutputs(
-          {
-            client,
-            fence: () => this.fenceArray,
-            lookupChunkSize: this.lookupChunkSize,
-          },
-          outpoints
-        )
-      ).map(({ output }) => [
-        outpointKey(output.transactionHash, output.outputIndex),
-        output,
-      ])
-    );
-    const { left } = await repairStandIns(
-      { client, commitLog, standIns: this.standIns },
-      groups,
-      stored
-    );
-    left.forEach((group) => {
-      this.standIns.add(group);
-    });
+  async catchUpSpendIndex(): Promise<bigint> {
+    const filler = this.spendFiller;
+    if (filler === undefined) {
+      throw new StoreClosedError('The spend index is off.');
+    }
+    return filler.catchUpAndResume(() => !this.closed);
   }
 
   /**
@@ -711,11 +717,10 @@ export class ClickHouseStore implements ChaingraphStore {
     this.generation += 1;
     this.publisher?.stop();
     this.publisher = undefined;
+    this.spendFillerStopped = this.spendFiller?.stop();
+    this.spendFiller = undefined;
     this.commitLogInstance?.retire(String(error));
     this.abandonSignal.abandon(`writer lease lost: ${String(error)}`, true);
-    this.mempoolCommitter?.dropOrphans(
-      new StoreClosedError(`Orphan dropped: writer lease lost.`)
-    );
     this.options.onError?.(error);
     this.recovery = this.recoverLease().then(
       () => {
@@ -766,17 +771,16 @@ export class ClickHouseStore implements ChaingraphStore {
         delayMs = Math.min(delayMs * 2, leaseRetryMaxMs);
       }
     }
+    // the old epoch's spend index filler has ended (no insert of it lands later)
+    await this.spendFillerStopped;
     // 3. drop everything derived from the old epoch, then start the new one
     this.operations = new OperationRegistry();
-    this.mempool = new MempoolState();
+    this.mempool = new MempoolState(this.utxoEnabled);
     this.mempool.tracking = this.mempoolTracking;
-    this.outputs = new OutputRegistry<StoreOperation>(
-      this.options.recentOutputCapacity
-    );
+    this.outputs = this.newOutputRegistry();
     this.transactions = new TransactionRegistry(
       this.options.recentTransactionCapacity
     );
-    this.standIns = new StandInRegistry();
     this.batchLanes.clear();
     this.batchResults.clear();
     this.abandonSignal = new AbandonSignal();
@@ -807,11 +811,9 @@ export class ClickHouseStore implements ChaingraphStore {
       return;
     }
     this.closed = true;
-    this.mempoolCommitter?.dropOrphans(
-      new StoreClosedError('The ClickHouse store is closed.')
-    );
+    await this.spendFiller?.stop();
     if (this.operations.activeCount > 0) {
-      // background work (parked child blocks): abandon it and let it abort
+      // background work: abandon it and let it abort
       this.abandonSignal.abandon('store closed');
       await Promise.race([
         this.operations.drain(),
@@ -835,29 +837,23 @@ export class ClickHouseStore implements ChaingraphStore {
     this.closed = true;
     this.fatal = new SimulatedCrash('crashed');
     this.publisher?.stop();
+    await this.spendFiller?.stop();
     this.lease?.stopHeartbeat();
     await this.client?.close();
   }
 
   /**
    * Shutdown: stop waiting and abandon every operation that has not
-   * committed yet (pending-spend waits, dependency waits, later steps). An
-   * abandoned block save is aborted and resolves as handled (so the agent's
-   * block buffer drains); abandoned mempool saves reject; orphans are
-   * dropped. A commit whose committed row was already sent is never
-   * aborted: it finishes (or, if that write fails, stays open for the next
-   * start's recovery). Nothing abandoned is committed, so the next start restores the
-   * chain without it and the agent downloads it again. Wired to SIGINT /
-   * SIGTERM by `createStore` (the agent's shutdown drains the block buffer
-   * before it closes the store, and a block waiting for a parent that will
-   * never be downloaded would otherwise hold the drain for
-   * `pendingSpendTimeoutMs`).
+   * committed yet (dependency waits, later steps). An abandoned block save
+   * is aborted and resolves as handled (so the agent's block buffer drains);
+   * abandoned mempool saves reject. A commit whose committed row was
+   * already sent is never aborted: it finishes (or, if that write fails,
+   * stays open for the next start's recovery). Nothing abandoned is
+   * committed, so the next start restores the chain without it and the
+   * agent downloads it again. Wired to SIGINT / SIGTERM by `createStore`.
    */
   abandonInFlightWork(reason = 'store shutdown') {
     this.abandonSignal.abandon(reason);
-    this.mempoolCommitter?.dropOrphans(
-      new StoreClosedError(`Orphan dropped: ${reason}.`)
-    );
   }
 
   private diagnostic(diagnostic: StoreDiagnostic) {
@@ -878,7 +874,7 @@ export class ClickHouseStore implements ChaingraphStore {
    * Heartbeat stats. With the in-flight cap: `active` = saves / header
    * acceptances holding a slot, `max` = the cap, `waitingRequests` = calls
    * queued for a slot, `total` = every live store operation (including
-   * parked children and calls waiting on other calls). Unbounded (cap 0):
+   * calls waiting on other calls). Unbounded (cap 0):
    * live operations, `max` 0, as in WP5a.
    */
   poolStats(): StorePoolStats {
@@ -1007,20 +1003,7 @@ export class ClickHouseStore implements ChaingraphStore {
     isSavedTransaction: (hash: string) => boolean;
   }): Promise<SaveBlockResult> {
     this.assertOpen();
-    const result = await this.withLease(async () => this.saveBlockOnce(args));
-    if (result.committed === undefined) return result;
-    /*
-     * Parked: if the lease is lost before it commits, it is saved again
-     * under the next epoch and `committed` follows that save.
-     */
-    const generation = this.generation;
-    const committed = result.committed.catch(async (error: unknown) => {
-      if (generation === this.generation || this.closed) throw error;
-      const again = await this.saveBlock(args);
-      await again.committed;
-    });
-    committed.catch(() => undefined);
-    return { ...result, committed };
+    return this.withLease(async () => this.saveBlockOnce(args));
   }
 
   private async saveBlockOnce(args: {
@@ -1045,16 +1028,7 @@ export class ClickHouseStore implements ChaingraphStore {
       ...new Set(args.nodeAcceptances.map((item) => item.nodeInternalId)),
     ].sort((a, b) => a - b);
     const lane = this.batchLane(nodes.join(','));
-    const parked = deferred<SaveBlockResult>();
-    parked.promise.catch(() => undefined);
-    let reportedEarly = false;
-    const item = {
-      onParked: (result: SaveBlockResult) => {
-        reportedEarly = true;
-        parked.resolve(result);
-      },
-      request: args,
-    };
+    const item = { request: args };
     let batch = lane.open;
     if (batch !== undefined && this.canAppend(batch, args.block)) {
       committer.append(batch, item);
@@ -1081,37 +1055,15 @@ export class ClickHouseStore implements ChaingraphStore {
       this.startBatches(lane);
     }
     const index = batch.items.length - 1;
-    const full = this.batchResults
+    return this.batchResults
       .get(batch)!
       .promise.then((results) => results[index]!);
-    full.catch((error: unknown) => {
-      if (
-        reportedEarly &&
-        !(error instanceof SimulatedCrash) &&
-        !(error instanceof AbandonedError)
-      ) {
-        this.options.onError?.(error);
-      }
-    });
-    /*
-     * A block of a batch waiting for its parent's outputs resolves once the
-     * commit is `incomplete` (block-commit.ts), with `committed` (resolves
-     * when the commit is committed, rejects if it fails), so the agent can
-     * keep downloading and still log "Saved new block" only once it is
-     * saved; everything else resolves on commit.
-     */
-    const early = parked.promise.then((result) => {
-      const committed = full.then(() => undefined);
-      committed.catch(() => undefined);
-      return { ...result, committed };
-    });
-    return Promise.race([full, early]);
   }
 
   /**
    * The batch lane of one node set: batches in creation order; at most
    * `maxRunningBatches` of them run at once (until their rows are written,
-   * they park or they finish), and blocks arriving meanwhile join the open
+   * they finish), and blocks arriving meanwhile join the open
    * (last, not yet started) batch. A block arriving with nothing running
    * starts at once, alone (the tip case).
    */
@@ -1235,7 +1187,7 @@ export class ClickHouseStore implements ChaingraphStore {
           batch.pendingIds.forEach((id) => {
             id.reject(error);
           });
-          this.outputs.release(operation, false);
+          this.outputs?.release(operation, false);
           await this.transactions.release(operation, false);
           results.resolve(empty());
           return;
@@ -1944,12 +1896,16 @@ export class ClickHouseStore implements ChaingraphStore {
               toHeight,
             };
             await client.insertSelect(
-              utxoDeltaInsertSql('utxo', horizonDeltasSql),
+              utxoDeltaInsertSql('utxo', horizonDeltasSql, {
+                lateParents: false,
+              }),
               params,
               { deduplicationToken: commit.token('utxo', `n${node}b${index}`) }
             );
             await client.insertSelect(
-              utxoDeltaInsertSql('utxo_by_script', horizonDeltasSql),
+              utxoDeltaInsertSql('utxo_by_script', horizonDeltasSql, {
+                lateParents: false,
+              }),
               params,
               {
                 deduplicationToken: commit.token(

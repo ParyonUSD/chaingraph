@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-magic-numbers, max-lines, max-params, functional/no-mixed-type */
-// cspell:ignore clickhouse seqs
+// cspell:ignore clickhouse seqs sats
 /**
  * `[e2e]` tests of the ClickHouse `StoreChecker` (WP5b): rows are seeded for
  * two nodes through the real commit protocol (CommitLog + VisibilityPublisher,
@@ -38,7 +38,6 @@ import type { CommitLease, OpenCommit } from './commit-log.js';
 import { CommitLog } from './commit-log.js';
 import { applyClickHouseDdl, dropClickHouseDatabase } from './ddl-apply.js';
 import { RowBinaryWriter } from './row-binary.js';
-import type { SpentOutput } from './row-encoders.js';
 import {
   encodeBlockRows,
   encodeBlockTransactionRows,
@@ -107,12 +106,6 @@ const fromLibauth = (
     },
   };
 };
-
-/** Every spent output resolves to a fixed 1000-sat P2PKH-ish output. */
-const anySpentOutput = (): SpentOutput => ({
-  lockingBytecode: `76a914${'11'.repeat(20)}88ac`,
-  valueSatoshis: 1000n,
-});
 
 interface Harness {
   checker: ClickHouseChecker;
@@ -272,7 +265,7 @@ const saveTransactions = async (
     commit,
     'input',
     table('input'),
-    encodeInputRows(transactions, context, anySpentOutput).data
+    encodeInputRows(transactions, context).data
   );
 };
 
@@ -427,10 +420,7 @@ const saveBlock = async (
     commit,
     'block',
     columnsOf('block'),
-    encodeBlockRows(
-      [{ block, generatedValueSatoshis: 0n, internalId: blockId }],
-      commit.seq
-    ).data
+    encodeBlockRows([{ block, internalId: blockId }], commit.seq).data
   );
   await insert(
     client,
@@ -819,6 +809,49 @@ e2e(
         tokens.transaction,
       ],
     };
+    /*
+     * The outputs the multi block's inputs spend, 1000 sats each, so the
+     * block's input value is a join of its inputs to stored outputs (input
+     * rows carry no spent output).
+     */
+    const spentParents = new Map<string, number>();
+    [hal, tokens].forEach(({ transaction }) => {
+      transaction.inputs.forEach((input) => {
+        spentParents.set(
+          input.outpointTransactionHash,
+          Math.max(
+            spentParents.get(input.outpointTransactionHash) ?? 0,
+            input.outpointIndex + 1
+          )
+        );
+      });
+    });
+    const parents = [...spentParents].map(
+      ([hash, outputCount]): ChaingraphTransaction => ({
+        hash,
+        inputs: [],
+        isCoinbase: false,
+        locktime: 0,
+        outputs: Array.from({ length: outputCount }, () => ({
+          lockingBytecode: `76a914${'11'.repeat(20)}88ac`,
+          valueSatoshis: 1000n,
+        })),
+        sizeBytes: 10,
+        version: 2,
+      })
+    );
+    await harness.commit([nodeB], async (commit) => {
+      await insert(
+        client,
+        commit,
+        'output',
+        columnsOf('output'),
+        encodeOutputRows(parents, {
+          commitSeq: commit.seq,
+          transactionInternalIds: parents.map((_, index) => 900 + index),
+        }).data
+      );
+    });
     await harness.commit([nodeB], async (commit) => {
       await saveBlock(client, commit, multi, 2, 200, [
         { acceptedAt, node: nodeB },
@@ -965,7 +998,6 @@ e2e(
           [
             {
               block: { ...bitcoreBlockToChaingraphBlock(genesisBlock, 0) },
-              generatedValueSatoshis: 0n,
               internalId: 7,
             },
           ],

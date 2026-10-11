@@ -138,7 +138,7 @@ const transactionColumns: readonly Column[] = [
   ['output_value_satoshis', 'toString(output_value_satoshis)'],
 ];
 
-/** The token/value attributes shared by output and input (spent output) rows. */
+/** The token/value attributes of an output row. */
 const valueColumns: readonly Column[] = [
   ['value_satoshis', 'toString(value_satoshis)'],
   ['locking_bytecode', hex('locking_bytecode')],
@@ -158,6 +158,40 @@ const outputColumns: readonly Column[] = [
   ...valueColumns,
 ];
 
+/**
+ * The spent output's attributes on a row of `inputsWithSpentSql` (`spent_*`
+ * columns; `spent_found` = 0 when no output is stored for the outpoint, e.g.
+ * a coinbase input: then `outpoint` is null, as in Hasura v1).
+ */
+const spentColumns: readonly Column[] = [
+  [
+    'outpoint.value_satoshis',
+    'if(spent_found = 1, toString(spent_value_satoshis), NULL)',
+  ],
+  [
+    'outpoint.locking_bytecode',
+    `if(spent_found = 1, ${hex('spent_locking_bytecode')}, NULL)`,
+  ],
+  [
+    'outpoint.token_category',
+    `if(spent_found = 1 AND spent_token_category != ${zeroCategory}, ${hex(
+      'spent_token_category'
+    )}, NULL)`,
+  ],
+  [
+    'outpoint.fungible_token_amount',
+    'if(spent_found = 1, toString(spent_fungible_token_amount), NULL)',
+  ],
+  [
+    'outpoint.nonfungible_token_capability',
+    'if(spent_found = 1, toString(spent_nonfungible_token_capability), NULL)',
+  ],
+  [
+    'outpoint.nonfungible_token_commitment',
+    `if(spent_found = 1, ${hex('spent_nonfungible_token_commitment')}, NULL)`,
+  ],
+];
+
 const inputColumns = (withUnlocking: boolean): readonly Column[] => [
   ['transaction_hash', hex('transaction_hash')],
   ['input_index', 'input_index'],
@@ -166,8 +200,31 @@ const inputColumns = (withUnlocking: boolean): readonly Column[] => [
   ['outpoint_index', 'outpoint_index'],
   ['sequence_number', 'sequence_number'],
   ['unlocking_bytecode', withUnlocking ? hex('unlocking_bytecode') : "''"],
-  ...valueColumns.map(([name, sql]): Column => [`outpoint.${name}`, sql]),
+  ...spentColumns,
 ];
+
+/**
+ * `input_at` rows matching `scope` (a predicate on input_at columns), each
+ * with the attributes of the output it spends (`spent_*`), by a join on the
+ * outpoint: `input` stores the input's own fields only. The output side is
+ * read by primary key for the outpoints of the scoped inputs, so the cost is
+ * proportional to the scoped rows (a page, or one page's transactions).
+ */
+export const inputsWithSpentSql = (sql: Sql, scope: string) =>
+  `(SELECT i.*, o.found AS spent_found, o.value_satoshis AS spent_value_satoshis,
+     o.locking_bytecode AS spent_locking_bytecode, o.token_category AS spent_token_category,
+     o.fungible_token_amount AS spent_fungible_token_amount,
+     o.nonfungible_token_capability AS spent_nonfungible_token_capability,
+     o.nonfungible_token_commitment AS spent_nonfungible_token_commitment
+   FROM (SELECT * FROM ${sql.view('input_at')} WHERE ${scope}) AS i
+   LEFT JOIN (SELECT transaction_hash, output_index, toUInt8(1) AS found, value_satoshis, locking_bytecode,
+                token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment
+              FROM ${sql.view('output_at')}
+              WHERE (transaction_hash, output_index) IN (
+                SELECT outpoint_transaction_hash, outpoint_index FROM ${sql.view(
+                  'input_at'
+                )} WHERE ${scope})) AS o
+     ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index)`;
 
 const inclusionColumns: readonly Column[] = [
   ['block.hash', hex('b.hash')],
@@ -202,6 +259,11 @@ const decodeTuple = (columns: readonly Column[], value: unknown) => {
     });
     target[path[path.length - 1]!] = values[index] ?? null;
   });
+  /* an input whose spent output is not stored (coinbase): no `outpoint` */
+  const spent = record.outpoint as { value_satoshis?: unknown } | undefined;
+  if (spent !== undefined && spent.value_satoshis === null) {
+    record.outpoint = null;
+  }
   return record;
 };
 
@@ -358,8 +420,11 @@ const transactionRelations = (
         rootKey,
         sql: `SELECT transaction_hash AS k, groupArray(${tupleOf(
           columns
-        )}) AS v FROM ${sql.view('input_at')}
-          WHERE transaction_hash IN (${keys}) AND (${where}) GROUP BY transaction_hash`,
+        )}) AS v FROM ${inputsWithSpentSql(
+          sql,
+          `transaction_hash IN (${keys}) AND (${where})`
+        )}
+          GROUP BY transaction_hash`,
       });
       const order = (field.args.order as Order | undefined) ?? 'ASC';
       const limit = nestedLimit(field.args.limit);
@@ -687,26 +752,38 @@ export const runInputs = async (
   args: KeysetArgs
 ): Promise<Page> => {
   const after = decodeCursor(args.after);
+  const where = [
+    `transaction_hash IN (${sql.accepted()})`,
+    ...(after === undefined
+      ? []
+      : [
+          `(transaction_internal_id, input_index) > (${sql.bind(
+            after.id,
+            'UInt64'
+          )}, ${sql.bind(after.index, 'UInt32')})`,
+        ]),
+    `(${inputPredicate(sql, filter)})`,
+  ].join(' AND ');
+  const limit = sql.bind(args.limit + 1, 'UInt32');
+  /*
+   * The page of inputs first (keyset order, limit), then its spent outputs
+   * by outpoint: the join reads one page of outputs, never every input's.
+   */
+  const page = `(transaction_hash, input_index) IN (
+    SELECT transaction_hash, input_index FROM ${sql.view('input_at')}
+    WHERE ${where} ORDER BY transaction_internal_id, input_index LIMIT ${limit})`;
   const compiled = compileRoot(
     sql,
     info,
     {
-      from: `(SELECT *, transaction_hash AS k_tx FROM ${sql.view('input_at')})`,
+      from: `(SELECT *, transaction_hash AS k_tx FROM ${inputsWithSpentSql(
+        sql,
+        page
+      )})`,
       limit: args.limit + 1,
       order: 'ASC',
       orderColumns: ['transaction_internal_id', 'input_index'],
-      where: [
-        `transaction_hash IN (${sql.accepted()})`,
-        ...(after === undefined
-          ? []
-          : [
-              `(transaction_internal_id, input_index) > (${sql.bind(
-                after.id,
-                'UInt64'
-              )}, ${sql.bind(after.index, 'UInt32')})`,
-            ]),
-        `(${inputPredicate(sql, filter)})`,
-      ].join(' AND '),
+      where: '1',
     },
     inputColumns(true),
     nodeFieldsOfPage(info),

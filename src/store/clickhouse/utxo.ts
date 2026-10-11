@@ -1,9 +1,11 @@
-/* eslint-disable max-classes-per-file, @typescript-eslint/no-magic-numbers, max-params, @typescript-eslint/init-declarations, functional/no-let */
+/* eslint-disable max-classes-per-file, @typescript-eslint/no-magic-numbers, max-params, functional/no-let */
 // cspell:ignore clickhouse dedup unhex
 /**
  * The per-node UTXO set (plan §2.3, WP5a-core): the transition rules, the
- * row encoders for `utxo` / `utxo_by_script`, the server-side delta SQL, and
- * the in-memory output registry used to resolve spent outputs.
+ * row encoders for `utxo` / `utxo_by_script`, the server-side delta SQL (the
+ * only source of block, header and re-org −1 rows: `input` carries no spent
+ * output), and the in-memory output registry the mempool path uses for its
+ * spent outputs (UTXO on only).
  *
  * Rules (docs/clickhouse-port/wp5a-core.md §3):
  * - `tx-accepted(n, t)` is "t has at least one live acceptance container for
@@ -273,18 +275,6 @@ export const validCommitSql = (column = 'commit_seq') =>
          OR ${column} <= arrayElement({fence:Array(UInt64)}, bitShiftRight(${column}, 40))))`;
 
 /**
- * Writer-side: `input` rows of a stand-in seq that no longer counts
- * (docs/clickhouse-port/mempool-fill-fix.md): its owner is void, or a valid
- * commit resolved it (that commit carries the real rows). Without it a
- * transaction would have two `input` rows per resolved input.
- */
-export const liveStandInSql = (column = 'commit_seq') =>
-  `(${column} NOT IN (SELECT stand_in_seq FROM input_stand_in_resolution
-                     WHERE commit_seq NOT IN (SELECT commit_seq FROM commit_void))
-    AND ${column} NOT IN (SELECT stand_in_seq FROM input_stand_in
-                         WHERE owner_seq IN (SELECT commit_seq FROM commit_void)))`;
-
-/**
  * As `validCommitSql`, and also not one of this writer's open commits
  * (`{open:Array(UInt64)}`): the latest committed state.
  */
@@ -300,15 +290,26 @@ const outputColumnsFrom = (alias: string) =>
  * `INSERT … SELECT` of UTXO rows for node `{node:UInt32}` under commit
  * `{seq:UInt64}`, for the transactions in the CTE `deltas` with columns
  * `transaction_hash` and `d` (d = +1 became accepted, −1 stopped being
- * accepted): `d` per output of
- * each transaction, `−d` per output it spends (joined from `output`, so the
- * rows are byte-identical to the ones the creating transition wrote).
- * `deltasSql` must be a `SELECT transaction_hash, d` (it may use `{node}`,
+ * accepted): `d` per output of each transaction, `−d` per output it spends
+ * (joined from `output`, so the rows are byte-identical to the ones the
+ * creating transition wrote). `input` carries no spent output, so this is
+ * the only source of −1 rows of blocks, header acceptance and re-orgs.
+ *
+ * Late parents (d = +1 only): an output of a transaction becoming accepted
+ * that a transaction the node already accepts in a block spends, with no
+ * `utxo` row for the node yet, gets its −1 now too (net 0 with its +1). That
+ * spender became accepted before the output was stored (a child block saved
+ * before its parent), so its transition could not join the output.
+ * Mempool-accepted spenders are resolved by the mempool path instead.
+ * `lateParents: false` leaves this branch out (the horizon build: bulk mode
+ * wrote no UTXO row, so nothing is missing; re-orgs: nothing becomes
+ * accepted). `deltasSql` must be a `SELECT transaction_hash, d` (it may use `{node}`,
  * `{seq}`, `{fence}` and its own parameters).
  */
 export const utxoDeltaInsertSql = (
   table: 'utxo_by_script' | 'utxo',
-  deltasSql: string
+  deltasSql: string,
+  { lateParents = true }: { lateParents?: boolean } = {}
 ) => {
   const columns = table === 'utxo' ? utxoColumns : utxoByScriptColumns;
   const select = (alias: string, signExpression: string) => {
@@ -327,9 +328,10 @@ WITH
     SELECT i.outpoint_transaction_hash AS spent_hash, i.outpoint_index AS spent_index, d.d AS d
     FROM input AS i INNER JOIN deltas AS d ON i.transaction_hash = d.transaction_hash
     WHERE i.transaction_hash IN (SELECT transaction_hash FROM deltas)
+      AND i.outpoint_transaction_hash != toFixedString(unhex(repeat('00', 32)), 32)
       AND ${validCommitSql('i.commit_seq')}
-      AND ${liveStandInSql('i.commit_seq')}
-  )
+  ),
+  created AS (SELECT transaction_hash FROM deltas WHERE d = 1)
 SELECT ${select('o', 'toInt8(d.d)')}
 FROM output AS o INNER JOIN deltas AS d ON o.transaction_hash = d.transaction_hash
 WHERE o.transaction_hash IN (SELECT transaction_hash FROM deltas)
@@ -339,7 +341,35 @@ SELECT ${select('o', 'toInt8(-s.d)')}
 FROM output AS o INNER JOIN spends AS s
   ON o.transaction_hash = s.spent_hash AND o.output_index = s.spent_index
 WHERE o.transaction_hash IN (SELECT spent_hash FROM spends)
-  AND ${validCommitSql('o.commit_seq')}`;
+  AND ${validCommitSql('o.commit_seq')}${
+    lateParents
+      ? `
+UNION ALL
+SELECT ${select('o', 'toInt8(-1)')}
+FROM output AS o
+WHERE o.transaction_hash IN (SELECT transaction_hash FROM created)
+  AND ${validCommitSql('o.commit_seq')}
+  AND (o.transaction_hash, o.output_index) IN (
+    SELECT outpoint_transaction_hash, outpoint_index FROM input
+    WHERE outpoint_transaction_hash IN (SELECT transaction_hash FROM created)
+      AND transaction_hash NOT IN (SELECT transaction_hash FROM deltas)
+      AND ${validCommitSql()}
+      AND transaction_hash IN (
+        SELECT transaction_hash FROM tx_acceptance
+        WHERE node_internal_id = {node:UInt32} AND block_internal_id != 0 AND commit_seq != {seq:UInt64}
+          AND transaction_hash IN (
+            SELECT transaction_hash FROM input
+            WHERE outpoint_transaction_hash IN (SELECT transaction_hash FROM created) AND ${validCommitSql()})
+          AND ${validCommitSql()}
+        GROUP BY transaction_hash, block_internal_id
+        HAVING sum(sign) > 0))
+  AND (o.transaction_hash, o.output_index) NOT IN (
+    SELECT transaction_hash, output_index FROM utxo
+    WHERE node_internal_id = {node:UInt32} AND commit_seq != {seq:UInt64}
+      AND transaction_hash IN (SELECT transaction_hash FROM created)
+      AND ${validCommitSql()})`
+      : ''
+  }`;
 };
 
 /**
@@ -414,27 +444,21 @@ export interface RegisteredOutput<Owner> {
   owner: Owner | undefined;
 }
 
-interface Waiter<Owner> {
-  resolve: (entry: RegisteredOutput<Owner>) => void;
-}
-
 /**
  * Recent outputs (plan §3.5 "in-memory output cache, including in-flight
- * saves"): outputs of open commits are pinned until their commit ends;
- * outputs of committed commits stay in a bounded insertion-order cache.
- * Waiters (pending spends) are resolved as soon as any save registers the
- * outpoint.
+ * saves"), UTXO on only: the mempool path resolves the outputs its
+ * transactions spend here before it asks the store. Outputs of open commits
+ * are pinned until their commit ends; outputs of committed commits stay in a
+ * bounded, constant-time recent cache (`RecentCache`).
  */
 export class OutputRegistry<Owner> {
   private readonly pinned = new Map<OutpointKey, RegisteredOutput<Owner>[]>();
 
   private readonly recent: RecentCache<OutpointKey, RegisteredOutput<Owner>>;
 
-  private readonly waiters = new Map<OutpointKey, Waiter<Owner>[]>();
-
   private readonly keysByOwner = new Map<Owner, OutpointKey[]>();
 
-  constructor(recentCapacity = 500_000) {
+  constructor(recentCapacity = 100_000) {
     this.recent = new RecentCache(recentCapacity);
   }
 
@@ -446,14 +470,7 @@ export class OutputRegistry<Owner> {
     return this.recent.size;
   }
 
-  get waitingCount() {
-    return [...this.waiters.values()].reduce(
-      (total, list) => total + list.length,
-      0
-    );
-  }
-
-  /** Pin the outputs of `transactions` for `owner` and wake their waiters. */
+  /** Pin the outputs of `transactions` for `owner`. */
   register(
     owner: Owner,
     transactions: readonly {
@@ -488,7 +505,6 @@ export class OutputRegistry<Owner> {
         } else {
           list.push(entry);
         }
-        this.wake(key, entry);
       });
     });
   }
@@ -525,46 +541,5 @@ export class OutputRegistry<Owner> {
 
   lookup(key: OutpointKey): RegisteredOutput<Owner> | undefined {
     return this.pinned.get(key)?.[0] ?? this.recent.get(key);
-  }
-
-  /**
-   * Resolve when some save registers `key`. Returns the promise and a
-   * cancel function (call it on timeout).
-   */
-  waitFor(key: OutpointKey): {
-    promise: Promise<RegisteredOutput<Owner>>;
-    cancel: () => void;
-  } {
-    let waiter: Waiter<Owner> | undefined;
-    const promise = new Promise<RegisteredOutput<Owner>>((resolve) => {
-      waiter = { resolve };
-    });
-    const list = this.waiters.get(key) ?? [];
-    list.push(waiter!);
-    this.waiters.set(key, list);
-    return {
-      cancel: () => {
-        const current = (this.waiters.get(key) ?? []).filter(
-          (item) => item !== waiter
-        );
-        if (current.length === 0) {
-          this.waiters.delete(key);
-        } else {
-          this.waiters.set(key, current);
-        }
-      },
-      promise,
-    };
-  }
-
-  private wake(key: OutpointKey, entry: RegisteredOutput<Owner>) {
-    const list = this.waiters.get(key);
-    if (list === undefined) {
-      return;
-    }
-    this.waiters.delete(key);
-    list.forEach((waiter) => {
-      waiter.resolve(entry);
-    });
   }
 }

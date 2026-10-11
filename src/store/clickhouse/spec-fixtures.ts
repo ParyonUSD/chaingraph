@@ -231,7 +231,6 @@ export const scratch = async (
       connection: connectionFor(name),
       fault,
       lease: { safetyMarginMs: 500, settleMs: 20, ttlMs: leaseTtlMs },
-      pendingSpendTimeoutMs: 20_000,
       publisher: { minIntervalMs: 10 },
       ...storeOptions,
       ...overrides,
@@ -301,10 +300,20 @@ export const nodeView = async (client: ClickHouseClient, node: number) => {
        FROM ${pinnedView('node_block_history_at')}`,
       params
     ),
+    /*
+     * Each visible input with the spent output's FT amount and value, joined
+     * on the outpoint at the same snapshot (input stores no spent output);
+     * `value` is '' when the spent output is not visible.
+     */
     client.query<{ key: string; amount: string | null; value: string }>(
-      `SELECT concat(lower(hex(transaction_hash)), ':', toString(input_index)) AS key,
-         fungible_token_amount AS amount, toString(value_satoshis) AS value
-       FROM ${pinnedView('input_at')} ORDER BY key`,
+      `SELECT concat(lower(hex(i.transaction_hash)), ':', toString(i.input_index)) AS key,
+         o.fungible_token_amount AS amount, if(o.found = 1, toString(o.value_satoshis), '') AS value
+       FROM ${pinnedView('input_at')} AS i
+       LEFT JOIN (SELECT transaction_hash, output_index, fungible_token_amount, value_satoshis, toUInt8(1) AS found
+                  FROM ${pinnedView('output_at')}) AS o
+         ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index
+       ORDER BY key
+       SETTINGS join_use_nulls = 1`,
       params
     ),
   ]);
