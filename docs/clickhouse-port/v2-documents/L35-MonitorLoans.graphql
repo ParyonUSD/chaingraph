@@ -1,7 +1,7 @@
 # L35 MonitorLoans (v1: v1/L35-MonitorLoans.graphql)
 # status: works
 # chipnet equality: equal (v1 1040 rows in 1 pages, v2 1040 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 315.4 ms; v1 Hasura/Postgres 169.7 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 266.9 ms; v1 Hasura/Postgres 156.1 ms
 subscription MonitorLoans($paryonTokenId: Hex!, $loanContractLockingBytecode: Hex!, $node: String!, $limit: Int!, $after: BigInt) {
   transaction: transactions(node: $node, limit: $limit, after: $after, where: {
     has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $loanContractLockingBytecode } } }

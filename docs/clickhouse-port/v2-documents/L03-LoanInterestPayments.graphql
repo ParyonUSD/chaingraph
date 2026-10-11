@@ -1,7 +1,7 @@
 # L3 LoanInterestPayments (v1: v1/L03-LoanInterestPayments.graphql)
 # status: works
 # chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 695 rows in 1 pages, v2 695 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 145.9 ms; v1 Hasura/Postgres 123.5 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 139.1 ms; v1 Hasura/Postgres 117.9 ms
 query LoanInterestPayments($userLoanKeys: [Hex!], $paryonTokenId: Hex, $node: String!, $limit: Int!, $after: BigInt) {
   transaction: transactions(node: $node, limit: $limit, after: $after, where: {
     has_input: { outpoint: { token_category: { _in: $userLoanKeys }, nonfungible_token_capability: { _eq: NONE } } }

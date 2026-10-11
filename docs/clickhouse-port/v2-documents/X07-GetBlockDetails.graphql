@@ -1,7 +1,7 @@
 # X7 GetBlockDetails (v1: v1/X07-GetBlockDetails.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 132.6 ms; v1 Hasura/Postgres 19.1 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 131.3 ms; v1 Hasura/Postgres 19.8 ms
 query GetBlockDetails($node: String!, $height: Int!) {
   block: blocks(node: $node, limit: 1, where: { height: { _eq: $height } }) {
     nodes {

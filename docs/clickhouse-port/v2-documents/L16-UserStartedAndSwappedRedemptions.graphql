@@ -1,7 +1,7 @@
 # L16 UserStartedAndSwappedRedemptions (v1: v1/L16-UserStartedAndSwappedRedemptions.graphql)
 # status: works
 # chipnet equality: equal (v1 3 rows in 1 pages, v2 3 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 74.5 ms; v1 Hasura/Postgres 3.0 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 59.2 ms; v1 Hasura/Postgres 3.3 ms
 query UserStartedAndSwappedRedemptions($redeemerTokenId: Hex, $sidecarCommitments: [Hex!], $node: String!, $limit: Int!, $after: String) {
   output: outputs(node: $node, limit: $limit, after: $after,
     order_by: [{ transaction: { internal_id: ASC } }, { output_index: ASC }],

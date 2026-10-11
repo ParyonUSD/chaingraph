@@ -1,7 +1,7 @@
 # X10 SearchOutputsByLockingBytecode (v1: v1/X10-SearchOutputsByLockingBytecode.graphql)
 # status: works
 # chipnet equality: equal (v1 71 rows in 1 pages, v2 71 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 57.6 ms; v1 Hasura/Postgres 7.5 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 30.2 ms; v1 Hasura/Postgres 7.3 ms
 query SearchOutputsByLockingBytecode($node: String!, $lockingBytecodes: [Hex!]!, $limit: Int!, $after: String) {
   search_output: outputs(node: $node, limit: $limit, after: $after, where: { locking_bytecode: { _in: $lockingBytecodes } }, order_by: { locking_bytecode: ASC }) {
     has_more

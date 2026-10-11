@@ -1,7 +1,7 @@
 # L5 UserLoanInteractionsExcludingInterest (v1: v1/L05-UserLoanInteractionsExcludingInterest.graphql)
 # status: works
 # chipnet equality: equal (v1 12 rows in 1 pages, v2 12 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 104.7 ms; v1 Hasura/Postgres 219.8 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 100.4 ms; v1 Hasura/Postgres 229.2 ms
 query UserLoanInteractionsExcludingInterest($userLoanKeys: [Hex!], $paryonTokenId: Hex, $fromBlockHeight: Int, $toBlockHeight: Int, $node: String!, $limit: Int!, $after: BigInt) {
   transaction: transactions(node: $node, limit: $limit, after: $after, where: {
     has_input: { outpoint: { token_category: { _in: $userLoanKeys }, nonfungible_token_capability: { _eq: NONE } } }

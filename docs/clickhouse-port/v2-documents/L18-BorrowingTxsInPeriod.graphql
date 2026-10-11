@@ -1,7 +1,7 @@
 # L18 BorrowingTxsInPeriod (v1: v1/L18-BorrowingTxsInPeriod.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 50.1 ms; v1 Hasura/Postgres 100.3 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 46.9 ms; v1 Hasura/Postgres 82.6 ms
 query BorrowingTxsInPeriod($periodCommitment: Hex, $paryonTokenId: Hex, $node: String!, $limit: Int!, $after: BigInt) {
   transaction: transactions(node: $node, limit: $limit, after: $after, where: {
     has_output: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MINTING }, nonfungible_token_commitment: { _eq: $periodCommitment } }

@@ -1,7 +1,7 @@
 # X1 MonitorMempools (v1: v1/X01-MonitorMempools.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 18.1 ms; v1 Hasura/Postgres 89.0 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 17.4 ms; v1 Hasura/Postgres 90.6 ms
 subscription MonitorMempools($node: String!, $limit: Int = 5) {
   node(node: $node) {
     name

@@ -1,7 +1,7 @@
 # X6 GetTransactionDetails (v1: v1/X06-GetTransactionDetails.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 392.5 ms; v1 Hasura/Postgres 82.0 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 351.9 ms; v1 Hasura/Postgres 85.5 ms
 query GetTransactionDetails($hash: Hex!, $node: String!) {
   transaction: transactions(node: $node, limit: 1, where: { hash: { _eq: $hash } }) {
     nodes {

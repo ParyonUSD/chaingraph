@@ -1,7 +1,7 @@
 # L14 finalizedUserRedemptions (v1: v1/L14-finalizedUserRedemptions.graphql)
 # status: works
 # chipnet equality: equal (v1 3 rows in 1 pages, v2 3 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 113.0 ms; v1 Hasura/Postgres 93.1 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 98.5 ms; v1 Hasura/Postgres 85.5 ms
 query finalizedUserRedemptions($paryonTokenId: Hex, $userLockingBytecodes: [Hex!], $node: String!, $limit: Int!, $after: BigInt) {
   transaction: transactions(node: $node, limit: $limit, after: $after, where: {
     has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _eq: "03" } } }

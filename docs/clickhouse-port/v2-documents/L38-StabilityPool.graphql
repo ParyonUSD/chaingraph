@@ -1,7 +1,7 @@
 # L38 StabilityPool (v1: v1/L38-StabilityPool.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 55.5 ms; v1 Hasura/Postgres 4.2 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 52.6 ms; v1 Hasura/Postgres 4.2 ms
 subscription StabilityPool($poolTokenId: Hex!, $poolLockingBytecode: Hex!, $node: String!) {
   transaction: transactions(node: $node, limit: 1, order_by: [{ locktime: DESC }], where: {
     has_input: { outpoint: { token_category: { _eq: $poolTokenId }, nonfungible_token_capability: { _eq: MINTING }, locking_bytecode: { _eq: $poolLockingBytecode } } }

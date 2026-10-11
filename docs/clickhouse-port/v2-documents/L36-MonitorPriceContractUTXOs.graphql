@@ -1,7 +1,7 @@
 # L36 MonitorPriceContractUTXOs (v1: v1/L36-MonitorPriceContractUTXOs.graphql)
 # status: works
 # chipnet equality: equal-unordered (root order: by store-local ids, not selected) (v1 5 rows in 1 pages, v2 5 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 76.0 ms; v1 Hasura/Postgres 114.7 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 71.6 ms; v1 Hasura/Postgres 111.7 ms
 subscription MonitorPriceContractUTXOs($paryonTokenId: Hex!, $priceContractLockingBytecode: Hex!, $node: String!, $limit: Int!) {
   output: unspent_outputs(node: $node, limit: $limit, where: {
     token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $priceContractLockingBytecode }

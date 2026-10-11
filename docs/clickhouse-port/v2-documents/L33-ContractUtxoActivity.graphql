@@ -1,7 +1,7 @@
 # L33 ContractUtxoActivity (v1: v1/L33-ContractUtxoActivity.graphql)
 # status: works
 # chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 2305 rows in 1 pages, v2 2305 rows in 1 pages)
-# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 364.5 ms; v1 Hasura/Postgres 2911.9 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 299.5 ms; v1 Hasura/Postgres 2603.0 ms
 query ContractUtxoActivity($tokenId: Hex!, $lockingBytecode: Hex!, $after: BigInt, $node: String!, $limit: Int!, $order: Order!) {
   transaction: transactions(node: $node, after: $after, order: $order, limit: $limit, where: {
     _or: [{ has_output: { token_category: { _eq: $tokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecode } } }, { has_input: { outpoint: { token_category: { _eq: $tokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecode } } } }]
