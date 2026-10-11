@@ -20,6 +20,7 @@ Files run in order; every statement is `IF NOT EXISTS`, so re-running is safe.
 | `050_views.sql` | visibility gate views: `*_v` (live, subqueries; ad-hoc use) and `*_at` (pinned, pure parameters; the API path, WP4/WP6b); `CREATE OR REPLACE` |
 | `060_projections.sql` | the §2.1/§2.4 projections as `ALTER TABLE … ADD PROJECTION IF NOT EXISTS` |
 | `070_spend.sql` | the asynchronous spend index: spend (+ p_category), spend_orphan, spend_watermark, view `spend_at` (item 28) |
+| `080_authchain.sql` | the authchain index: authchain_link (+ p_tx), view `authchain_link_at` (Phase 2 stage 2; filled with each spend batch; `bin/chaingraph-clickhouse-authchain-backfill.js` for existing databases) |
 
 Server-fact checks are in `../checks/` (`run.sh <url> <file>`); results below.
 
@@ -54,6 +55,7 @@ engine as written. VersionedCollapsingMergeTree appends `version` to the sorting
 | spend (item 28) | MergeTree / SharedMergeTree | `locking_bytecode_prefix, transaction_hash, input_index` (p_category: `token_category, nonfungible_token_commitment_key, transaction_hash, input_index`) | `intDiv(batch, 2^20)` | 1024 | node-agnostic (7); filled behind `spend_watermark`, never on the commit path |
 | spend_orphan (item 28) | MergeTree / SharedMergeTree | `outpoint_transaction_hash, outpoint_index` | `intDiv(batch, 2^20)` | 8192 | inputs a spend batch found no stored output for |
 | spend_watermark (item 28) | ReplacingMergeTree(watermark) / SharedReplacingMergeTree | `watermark` | none | 8192 | one row per finished spend batch; readers take `max` |
+| authchain_link (Phase 2 stage 2) | MergeTree / SharedMergeTree | `segment, position, transaction_hash` (p_tx: `transaction_hash`) | `intDiv(batch, 2^20)` | 1024 | node-agnostic placement of output-0 spenders on heavy-path segments; readers keep what their node accepts; behind `spend_watermark` |
 
 `pending_spend`, `input_stand_in` and `input_stand_in_resolution` were removed on 2026-10-11 (item 28).
 
@@ -83,6 +85,12 @@ job is the spend index's). All accepted by both servers. Skip indexes: `bloom_fi
 | `block_at`, `transaction_at`, `block_transaction_at`, `output_at`, `input_at` (WP4, WP6b) | `visible0`, `tail`, `fence`, `void` | (`seq <= visible0` or `seq` in `tail`), fence and void as above | none | pinned node-agnostic snapshot |
 | `node_v` | none | `FINAL` | Replacing | 7 (name → id) |
 | `spend_at` (070) | `spend` | `batch <= spend` (the snapshot's spend watermark, at most visible(0)); the pairs above it come from the join (read rule, item 28) | none | node-agnostic |
+| `authchain_link_at` (080) | `spend` | `batch <= spend`, as `spend_at` | none | node-agnostic |
+
+Since Phase 2 stage 2 the API does not name the `*_at` views in its statements: it reads their rows with the same gate
+inlined over the base table (`visibility.ts` `inlinePinnedView`, a mirror of these views; `visibility.spec.ts` proves
+view = inlined form for each, with fences, inline and overflow voids and a committed tail). The views stay for ad-hoc
+readers and the checks. A change to a `*_at` view must be made in both places.
 
 Querying a node-scoped view without `node` is an error, so no acceptance answer can be had without naming
 a node. Verified on both servers: every view executes; the outer `WHERE` on a key column is pushed into the

@@ -399,36 +399,95 @@ export const maxAuthchainDepth = 100_000;
  * `collect_authchains`, at the node's view: at most one spender per output,
  * so one chain per base). Columns: base, head, length, path (hashes, base
  * first), unspent (false only when the depth limit cut the chain).
+ *
+ * A walk over the authchain index's segments (ddl/080_authchain.sql), one
+ * recursive CTE alternating two steps per base:
+ * - phase 0, along a segment: the segment members after the current
+ *   transaction that the node accepts, in position order while contiguous
+ *   (one keyed read of the segment; conflicting spends leave one branch);
+ * - phase 1, across a segment end: the spender of the last transaction's
+ *   output 0 that the node accepts, from the input table (any commit, so
+ *   transactions above the spend watermark are followed link by link);
+ *   none: the chain ends (phase 2).
+ * Segments come from heavy-path placement, so a chain crosses few ends
+ * (chipnet: at most 6 over every chain; X6's 776-long chain crosses 2, the
+ * longest, 56,904 links, none). The stage-1 walk followed one link per
+ * recursion step (~9 ms each).
  */
-const authchainSql = (c: Ctx, link: string) => {
+export const authchainSql = (c: Ctx, link: string) => {
+  const zero = `toFixedString(unhex(repeat('00', 32)), 32)`;
+  const links = c.sql.view('authchain_link_at');
+  const max = String(maxAuthchainDepth);
   /*
-   * The recursion follows every stored spend of output 0 (all branches, as
-   * v1's collect_authchains), without an acceptance check per step (one per
-   * step cost ~14 ms on chipnet: 10.8 s for a 776-long chain). The node's
-   * chain is then the longest branch whose transactions the node all
-   * accepts, read in one acceptance check of every transaction seen.
+   * walk(base, cur, len, path, phase). Steps read `walk` (the previous
+   * round's rows) and name their own columns differently, so no alias
+   * shadows a column it is computed from.
    */
-  const spends = `SELECT transaction_hash, outpoint_transaction_hash FROM ${c.sql.view(
-    'input_at'
-  )} WHERE (outpoint_transaction_hash, outpoint_index) IN (SELECT chain_head, toUInt32(0) FROM chain)`;
-  return `WITH RECURSIVE chain AS (
-      SELECT hash AS chain_base, hash AS chain_head, toUInt32(1) AS chain_length, [hash] AS chain_path
+  /* phase 0: the current transaction's segment and position (no row: it starts its own) */
+  const here = `SELECT w.base AS h_base, w.cur AS h_cur, w.len AS h_len, w.path AS h_path,
+      if(l.transaction_hash = ${zero}, t.t_id, l.l_segment) AS h_seg,
+      if(l.transaction_hash = ${zero}, toUInt32(0), l.l_position) AS h_pos
+    FROM walk AS w
+    LEFT JOIN (SELECT transaction_hash, min(segment) AS l_segment, argMin(position, segment) AS l_position
+      FROM ${links} WHERE transaction_hash IN (SELECT cur FROM walk WHERE phase = 0)
+      GROUP BY transaction_hash) AS l ON l.transaction_hash = w.cur
+    LEFT JOIN (SELECT hash, min(internal_id) AS t_id FROM ${c.sql.view(
+      'transaction_at'
+    )} WHERE hash IN (SELECT cur FROM walk WHERE phase = 0) GROUP BY hash) AS t ON t.hash = w.cur
+    WHERE w.phase = 0`;
+  const segments = `SELECT h_seg FROM (${here})`;
+  const members = `SELECT segment AS m_seg, position AS m_pos, transaction_hash AS m_hash FROM ${links}
+    WHERE segment IN (${segments}) AND transaction_hash IN (${c.sql.accepted(
+    c.node,
+    `SELECT transaction_hash FROM ${links} WHERE segment IN (${segments})`
+  )})`;
+  /* the accepted members after the current position, while their positions are contiguous */
+  const contiguous = `arrayFirstIndex((x, i) -> x.1 != g_pos + i, g_sorted, arrayEnumerate(g_sorted))`;
+  const along = `SELECT g_base, if(empty(g_next), g_cur, g_next[-1]), g_len + length(g_next),
+      arrayConcat(g_path, g_next), toUInt8(if(g_len + length(g_next) >= ${max}, 2, 1))
+    FROM (SELECT g_base, g_cur, g_len, g_path,
+        arraySlice(arrayMap(x -> x.2, arraySlice(g_sorted, 1,
+          toInt64(if(${contiguous} = 0, length(g_sorted), ${contiguous} - 1)))), 1,
+          toInt64(${max}) - toInt64(g_len)) AS g_next
+      FROM (SELECT h_base AS g_base, any(h_cur) AS g_cur, any(h_len) AS g_len, any(h_path) AS g_path,
+          any(h_pos) AS g_pos,
+          arraySort(x -> x.1, groupUniqArrayIf((m_pos, m_hash), m_pos > h_pos)) AS g_sorted
+        FROM (${here}) AS h LEFT JOIN (${members}) AS m ON m.m_seg = h.h_seg
+        GROUP BY h_base))`;
+  /* phase 1: the accepted spender of the current transaction's output 0 */
+  const spent = `SELECT cur, toUInt32(0) FROM walk WHERE phase = 1`;
+  const spenders = `SELECT outpoint_transaction_hash AS s_spent, min(transaction_hash) AS s_spender
+    FROM ${c.sql.view(
+      'input_at'
+    )} WHERE (outpoint_transaction_hash, outpoint_index) IN (${spent})
+      AND transaction_hash IN (${c.sql.accepted(
+        c.node,
+        `SELECT transaction_hash FROM ${c.sql.view(
+          'input_at'
+        )} WHERE (outpoint_transaction_hash, outpoint_index) IN (${spent})`
+      )})
+    GROUP BY outpoint_transaction_hash`;
+  const across = `SELECT w.base, if(s.s_spender = ${zero}, w.cur, s.s_spender),
+      w.len + (s.s_spender != ${zero}),
+      if(s.s_spender = ${zero}, w.path, arrayPushBack(w.path, s.s_spender)),
+      toUInt8(if(s.s_spender = ${zero} OR w.len + 1 >= ${max}, 2, 0))
+    FROM walk AS w LEFT JOIN (${spenders}) AS s ON s.s_spent = w.cur
+    WHERE w.phase = 1`;
+  /* a statement-level CTE: the recursion is never nested in a subquery that is referenced twice */
+  return `SELECT * FROM ${c.sql.cte(
+    'authchains',
+    `WITH RECURSIVE walk AS (
+      SELECT hash AS base, hash AS cur, toUInt64(1) AS len, [hash] AS path, toUInt8(0) AS phase
       FROM (SELECT DISTINCT hash FROM (${link}))
-      UNION ALL
-      SELECT chain.chain_base AS chain_base, s.transaction_hash AS chain_head, chain.chain_length + 1 AS chain_length,
-        arrayPushBack(chain.chain_path, s.transaction_hash) AS chain_path
-      FROM chain INNER JOIN (${spends}) AS s ON s.outpoint_transaction_hash = chain.chain_head
-      WHERE chain.chain_length < ${maxAuthchainDepth}
-    ),
-    accepted_heads AS (${c.sql.accepted(
-      c.node,
-      'SELECT chain_head FROM chain'
-    )})
-    SELECT chain_base AS base, argMax(chain_head, chain_length) AS head, max(chain_length) AS length,
-      argMax(chain_path, chain_length) AS path, max(chain_length) < ${maxAuthchainDepth} AS unspent
-    FROM chain
-    WHERE arrayAll(h -> h IN accepted_heads, chain_path)
-    GROUP BY chain_base`;
+      WHERE hash IN (${c.sql.accepted(c.node, `SELECT hash FROM (${link})`)})
+      UNION ALL ${along}
+      UNION ALL ${across}
+    )
+    SELECT base, argMax(cur, len) AS head, max(len) AS length, argMax(path, len) AS path,
+      max(len) < ${max} AS unspent
+    FROM walk WHERE phase = 2
+    GROUP BY base`
+  )}`;
 };
 
 /* ------------------------------------------------------------------ */
@@ -515,6 +574,7 @@ export const TransactionEntity: Entity = {
       many: true,
       parentKeys: ['hash'],
       perNode: true,
+      recursive: true,
       source: authchainSql,
       target: () => AuthchainEntity,
     },

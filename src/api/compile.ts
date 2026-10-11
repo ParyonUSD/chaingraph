@@ -243,6 +243,14 @@ export interface RelationField {
   /** The `where` argument as a predicate on child rows. */
   /** The `where` argument as a predicate on child rows (`source`: the level's restricted rows). */
   where?: (c: Ctx, where: unknown, source: string) => string;
+  /**
+   * The source runs a recursive CTE. A scalar subquery containing one is
+   * evaluated again at every reference (ClickHouse 26.8), so this level and
+   * every level below it are evaluated in the statement's pipeline instead:
+   * their rows are MATERIALIZED CTEs (`<level>_rows`, computed once there)
+   * and their arrays are cross-joined one-row subqueries of the final SELECT.
+   */
+  recursive?: boolean;
   /** Order terms from the arguments (undefined: `defaultOrder`). */
   order?: (args: { [name: string]: unknown }) => OrderTerm[] | undefined;
   defaultOrder: readonly OrderTerm[];
@@ -329,6 +337,9 @@ class Statement {
   /** Key width (child key columns) of each level, by name. */
   readonly keyWidths = new Map<string, number>();
 
+  /** The arrays of pipeline levels (`recursive`): one-row subqueries of the final SELECT. */
+  readonly pipelineOutputs: string[] = [];
+
   constructor(readonly sql: Sql) {}
 
   levelName(keyWidth: number) {
@@ -411,7 +422,8 @@ const planLevel = (
   sels: readonly Sel[],
   level: string,
   prefix: number,
-  c: Ctx
+  c: Ctx,
+  pipeline = false
 ): LevelPlan => {
   const elements: string[] = [];
   const needs = new Set<string>();
@@ -450,13 +462,15 @@ const planLevel = (
     const reserved = sql.withItems.length;
     sql.withItems.push('');
     const childPrefix = 1 + field.childKeys.length;
+    const childPipeline = pipeline || field.recursive === true;
     const plan = planLevel(
       st,
       target,
       sel.sels ?? [],
       child,
       childPrefix,
-      childCtx
+      childCtx,
+      childPipeline
     );
     const linkColumns = field.linkColumns ?? field.parentKeys;
     [...linkColumns, ...field.parentKeys].forEach((column) =>
@@ -466,14 +480,16 @@ const planLevel = (
     const parentKeyPositions = field.parentKeys.map((column) =>
       element(keyText(column))
     );
-    const link = `SELECT ${linkColumns
-      .map(
-        (column, index) =>
-          `tupleElement(__r, ${
-            prefix + linkPositions[index]! + 1
-          }) AS ${column}`
-      )
-      .join(', ')} FROM (SELECT arrayJoin(${level}) AS __r)`;
+    const link = pipeline
+      ? `SELECT ${linkColumns.join(', ')} FROM ${level}_rows`
+      : `SELECT ${linkColumns
+          .map(
+            (column, index) =>
+              `tupleElement(__r, ${
+                prefix + linkPositions[index]! + 1
+              }) AS ${column}`
+          )
+          .join(', ')} FROM (SELECT arrayJoin(${level}) AS __r)`;
     const order = field.order?.(sel.args) ?? field.defaultOrder;
     order.forEach((term) => {
       referencedColumns(term.expr, target.columns).forEach((column) =>
@@ -531,14 +547,26 @@ const planLevel = (
       ...field.childKeys.map((_, index) => keyText(`__pk${index}`)),
       ...plan.elements,
     ];
-    sql.withItems[reserved] = [
-      ...added,
-      `(SELECT groupArray(tuple(${childTuple.join(', ')})) FROM (SELECT ${pk}${
-        childNeeds.length === 0 ? '' : `, ${childNeeds.join(', ')}`
-      }, ${rowNumber} FROM (${rows}))${
-        bounds.length === 0 ? '' : ` WHERE ${bounds.join(' AND ')}`
-      }) AS ${child}`,
-    ].join(',\n');
+    const body = `SELECT * FROM (SELECT ${pk}${
+      childNeeds.length === 0 ? '' : `, ${childNeeds.join(', ')}`
+    }, ${rowNumber} FROM (${rows}))${
+      bounds.length === 0 ? '' : ` WHERE ${bounds.join(' AND ')}`
+    }`;
+    const array = `groupArray(tuple(${childTuple.join(', ')}))`;
+    if (childPipeline) {
+      sql.withItems[reserved] = [
+        ...added,
+        `${child}_rows AS MATERIALIZED (${body})`,
+      ].join(',\n');
+      st.pipelineOutputs.push(
+        `(SELECT ${array} AS ${child} FROM ${child}_rows)`
+      );
+    } else {
+      sql.withItems[reserved] = [
+        ...added,
+        `(SELECT ${array} FROM (${body})) AS ${child}`,
+      ].join(',\n');
+    }
     decoders.push((values, _record, related, data, count) => {
       const key = keyOf(parentKeyPositions.map((position) => values[position]));
       const tuples = key === undefined ? [] : data.get(child)?.get(key) ?? [];
@@ -726,7 +754,13 @@ export const compileRoot = (
     },
     sql: `${sql.withClause()}SELECT __page, ${[...st.keyWidths.keys()].join(
       ', '
-    )}`,
+    )}${
+      st.pipelineOutputs.length === 0
+        ? ''
+        : ` FROM ${st.pipelineOutputs
+            .map((output, index) => `${output} AS __o${index}`)
+            .join(' CROSS JOIN ')}`
+    }`,
   };
 };
 

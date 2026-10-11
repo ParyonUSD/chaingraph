@@ -18,7 +18,9 @@
  *   in a commit at or below `to`;
  * - orphans: inputs of `(from, to]` whose output is not stored at or below
  *   `to` (into `spend_orphan`);
- * - reverse: earlier orphans whose output a commit in `(from, to]` stored.
+ * - reverse: earlier orphans whose output a commit in `(from, to]` stored;
+ * - the authchain index's placement of the batch's output-0 spenders
+ *   (authchain-index.ts), tagged with the same batch.
  * So after batch `to` the index holds exactly the pairs whose input and
  * output commits are both at or below `to`, each once, tagged `batch` =
  * the batch that completed the pair. Readers take `spend` rows with
@@ -31,6 +33,7 @@
  * that delete is never swallowed by deduplication of the earlier attempt,
  * while a retried request of one attempt is.
  */
+import { fillAuthchainLinks } from './authchain-index.js';
 import type { ClickHouseClient } from './client.js';
 import { validCommitSql } from './utxo.js';
 import { nodeAgnosticId, readWatermark } from './visibility.js';
@@ -286,7 +289,7 @@ export class SpendIndexFiller {
   /** Delete rows of batches that never published their watermark. */
   async removeUnfinished(watermark: bigint) {
     const { client } = this.context;
-    for (const table of ['spend', 'spend_orphan']) {
+    for (const table of ['spend', 'spend_orphan', 'authchain_link']) {
       const [row] = await client.query<{ n: string }>(
         `SELECT toString(count()) AS n FROM ${table} WHERE batch > {watermark:UInt64}`,
         { watermark }
@@ -382,6 +385,9 @@ export class SpendIndexFiller {
         deduplicationToken: token('r'),
         settings,
       });
+      /* the authchain index places the batch's output-0 spenders (080_authchain.sql) */
+      this.context.assertHeld();
+      await fillAuthchainLinks(client, to, token('a'));
       const [counted] = await client.query<{ rows: string; orphans: string }>(
         `SELECT (SELECT toString(count()) FROM spend WHERE batch = {to:UInt64}) AS rows,
            (SELECT toString(count()) FROM spend_orphan WHERE batch = {to:UInt64}) AS orphans`,

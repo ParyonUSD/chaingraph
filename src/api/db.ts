@@ -24,6 +24,7 @@ import {
 } from '../store/clickhouse/visibility.js';
 
 import type { Ctx } from './compile.js';
+import { maxAuthchainDepth } from './model.js';
 import { Sql } from './sql.js';
 
 /**
@@ -32,6 +33,12 @@ import { Sql } from './sql.js';
  */
 export const dataQuerySettings = {
   enable_materialized_cte: 1,
+  /*
+   * The authchain walk (model.ts) takes two recursion steps per segment end,
+   * and per link above the spend watermark or without an index row: up to
+   * two per link of v1's maximum depth.
+   */
+  max_recursive_cte_evaluation_depth: 2 * maxAuthchainDepth + 10,
 } as unknown as ClickHouseSettings;
 
 export interface ApiStats {
