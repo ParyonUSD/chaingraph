@@ -66,6 +66,39 @@ export const resolveDdlDirectory = (
 const databasePattern = /^[A-Za-z_][0-9A-Za-z_]*$/u;
 const applyTimeoutMs = 300_000;
 
+/**
+ * Optional DDL items (`ddl/optional/<name>.sql`), off by default; applied
+ * after the numbered files when named in `CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL`
+ * (comma-separated) or the DDL CLI's `--optional <name>`. A projection item
+ * added to a table that already has rows is materialized once (an
+ * asynchronous mutation), never again on a re-apply.
+ */
+export const optionalDdlItems: {
+  readonly [name: string]: { table: string; projection: string };
+} = {
+  // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
+  p_node_tx: { projection: 'p_node_tx', table: 'tx_acceptance' },
+};
+
+/** The optional items named in `value` (comma-separated; unknown names throw). */
+export const parseOptionalDdl = (value: string | undefined): string[] => {
+  const names = (value ?? '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name !== '');
+  names.forEach((name) => {
+    if (optionalDdlItems[name] === undefined) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new Error(
+        `Unknown optional DDL item ${name} (known: ${Object.keys(
+          optionalDdlItems
+        ).join(', ')}).`
+      );
+    }
+  });
+  return [...new Set(names)];
+};
+
 /** The DDL files, in apply order. */
 export const ddlFiles = (directory = resolveDdlDirectory()) =>
   readdirSync(directory)
@@ -124,14 +157,66 @@ export const dropClickHouseDatabase = async (
   }
 };
 
+const runStatements = async (
+  client: ClickHouseClient,
+  statements: readonly string[]
+) =>
+  statements.reduce<Promise<void>>(
+    async (previous, statement) =>
+      previous.then(async () => client.command(statement)),
+    Promise.resolve()
+  );
+
 /**
- * Apply every DDL file to `database` (created if missing). With
- * `recreate`, drop the database first. Returns the number of statements run.
+ * Apply one optional item; a projection added to a table with rows is
+ * materialized (once: it was not there before). Returns the statements run.
+ */
+const applyOptionalItem = async (
+  client: ClickHouseClient,
+  { database, directory }: { database: string; directory: string },
+  name: string
+) => {
+  const item = optionalDdlItems[name]!;
+  const [state] = await client.query<{ present: number; rows: string }>(
+    `SELECT
+       (SELECT count() FROM system.projections WHERE database = {database:String}
+          AND table = {table:String} AND name = {projection:String}) AS present,
+       (SELECT toString(sum(rows)) FROM system.parts WHERE database = {database:String}
+          AND table = {table:String} AND active) AS rows`,
+    { database, projection: item.projection, table: item.table }
+  );
+  const statements = ddlStatements(
+    readFileSync(join(directory, 'optional', `${name}.sql`), 'utf8'),
+    database
+  );
+  await runStatements(client, statements);
+  const materialize =
+    Number(state?.present ?? 0) === 0 && BigInt(state?.rows ?? '0') > 0n;
+  if (materialize) {
+    await client.command(
+      `ALTER TABLE ${database}.${item.table} MATERIALIZE PROJECTION ${item.projection}`
+    );
+  }
+  return statements.length + Number(materialize);
+};
+
+/**
+ * Apply every DDL file to `database` (created if missing), then the
+ * `optional` items. With `recreate`, drop the database first. Returns the
+ * number of statements run.
  */
 export const applyClickHouseDdl = async (
   server: ClickHouseServer,
   database: string,
-  { directory = resolveDdlDirectory(), recreate = false } = {}
+  {
+    directory = resolveDdlDirectory(),
+    recreate = false,
+    optional = parseOptionalDdl(process.env.CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL),
+  }: {
+    directory?: string;
+    recreate?: boolean;
+    optional?: readonly string[];
+  } = {}
 ): Promise<number> => {
   if (recreate) {
     await dropClickHouseDatabase(server, database);
@@ -142,15 +227,19 @@ export const applyClickHouseDdl = async (
   const client = adminClient(server);
   // eslint-disable-next-line functional/no-try-statement
   try {
-    await statements.reduce<Promise<void>>(
-      async (previous, statement) =>
-        previous.then(async () => client.command(statement)),
-      Promise.resolve()
+    await runStatements(client, statements);
+    return await parseOptionalDdl(optional.join(',')).reduce<Promise<number>>(
+      async (previous, name) =>
+        previous.then(
+          async (count) =>
+            count +
+            (await applyOptionalItem(client, { database, directory }, name))
+        ),
+      Promise.resolve(statements.length)
     );
   } finally {
     await client.close();
   }
-  return statements.length;
 };
 
 /** The table/view names in `database` (empty if it does not exist). */

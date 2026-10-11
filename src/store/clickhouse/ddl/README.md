@@ -17,10 +17,11 @@ Files run in order; every statement is `IF NOT EXISTS`, so re-running is safe.
 | `020_acceptance.sql` | node_block, node_transaction, tx_acceptance, node_block_history, node_transaction_history |
 | `030_utxo.sql` | utxo, utxo_by_script |
 | `040_bookkeeping.sql` | commit_log, commit_void, epoch_fence, visibility, id_reservation, writer_lease |
-| `050_views.sql` | visibility gate views: `*_v` (live, subqueries; ad-hoc use) and `*_at` (pinned, pure parameters; the API path, WP4/WP6b); `CREATE OR REPLACE` |
+| `050_views.sql` | visibility gate views: `*_v` (live, subqueries; ad-hoc use) and `*_at` (pinned, pure parameters; the API path, WP4/WP6b); `CREATE OR REPLACE`. **Generated** from `visibility.ts` (`pinnedViewDefinitions`, the definition the API inlines): `yarn clickhouse:views:generate`; `view-ddl.spec.ts` fails on a hand edit |
 | `060_projections.sql` | the §2.1/§2.4 projections as `ALTER TABLE … ADD PROJECTION IF NOT EXISTS` |
 | `070_spend.sql` | the asynchronous spend index: spend (+ p_category), spend_orphan, spend_watermark, view `spend_at` (item 28) |
 | `080_authchain.sql` | the authchain index: authchain_link (+ p_tx), view `authchain_link_at` (Phase 2 stage 2; filled with each spend batch; `bin/chaingraph-clickhouse-authchain-backfill.js` for existing databases) |
+| `optional/p_node_tx.sql` | **optional, off by default**: tx_acceptance projection ordered by (node, transaction internal id) for unselective per-node `transactions` pages. Applied only when named: `CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL=p_node_tx` (DDL CLI, `applyClickHouseDdl`, `apply.sh`) or `--optional p_node_tx` (DDL CLI, which materializes it once on a filled table). The API notices it (`system.projections`) |
 
 Server-fact checks are in `../checks/` (`run.sh <url> <file>`); results below.
 

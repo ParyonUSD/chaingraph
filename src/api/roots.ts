@@ -173,6 +173,50 @@ export interface TransactionsArgs extends PageArgs {
   cursor?: string | null;
 }
 
+/** A filter with no condition at all (an unselective root). */
+const unselective = (where: TransactionFilter | null | undefined) =>
+  where === undefined ||
+  where === null ||
+  Object.values(where).every((value) => value === undefined || value === null);
+
+/**
+ * The acceptance condition of an unselective `transactions(node:)` page in
+ * internal-id order (owner question 1, decided 2026-10-11): with the
+ * optional projection p_node_tx, a window of the node's acceptance rows read
+ * in id order (`Sql.acceptedInIdOrder`: exact page and `has_more`); without
+ * it, the id range applied to the base acceptance rows below the collapse
+ * (no store change; an id window then reads the parts holding those ids).
+ */
+const acceptedInIdOrder = async (
+  env: RootEnv,
+  range: { _gt?: bigint; _lt?: bigint },
+  args: TransactionsArgs
+) => {
+  const { sql, ctx } = env;
+  /* qualified: the collapsed view's select list aliases any(transaction_internal_id) */
+  const onIds = numericComparison(
+    sql,
+    'tx_acceptance.transaction_internal_id',
+    'UInt64',
+    range
+  );
+  const { acceptanceByIdProjection } = await env.db.storeFeatures();
+  if (acceptanceByIdProjection) {
+    return `hash IN (${sql.acceptedInIdOrder(
+      ctx.node,
+      onIds,
+      args.order ?? 'ASC',
+      args.limit + 1 + (args.offset ?? 0),
+      env.db.acceptanceWindowRows(args.limit + 1 + (args.offset ?? 0))
+    )})`;
+  }
+  return `hash IN (SELECT transaction_hash FROM ${sql.nodeView(
+    'tx_acceptance_at',
+    ctx.node,
+    onIds.length === 0 ? undefined : onIds.join(' AND ')
+  )})`;
+};
+
 export const runTransactions = async (
   env: RootEnv,
   label: string,
@@ -196,10 +240,11 @@ export const runTransactions = async (
     candidates === undefined
       ? undefined
       : `SELECT * FROM ${sql.cte('candidates', candidates)}`;
-  const bounds = numericComparison(sql, 'internal_id', 'UInt64', {
+  const range = {
     _gt: args.after_internal_id ?? undefined,
     _lt: args.before ?? undefined,
-  });
+  };
+  const bounds = numericComparison(sql, 'internal_id', 'UInt64', range);
   return pageOf(
     env,
     label,
@@ -209,7 +254,11 @@ export const runTransactions = async (
       ...(among === undefined ? [] : [`hash IN (${among})`]),
       ...(impliesAcceptance(args.where)
         ? []
-        : [`hash IN (${sql.accepted(ctx.node, among)})`]),
+        : [
+            unselective(args.where) && explicit === undefined
+              ? await acceptedInIdOrder(env, range, args)
+              : `hash IN (${sql.accepted(ctx.node, among)})`,
+          ]),
       ...bounds,
       transactionPredicate(sql, args.where, ctx.node, among),
     ],

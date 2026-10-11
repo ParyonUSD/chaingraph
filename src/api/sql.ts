@@ -28,6 +28,7 @@ import type { VisibilitySnapshot } from '../store/clickhouse/visibility.js';
 import {
   inlinePinnedView,
   nodeAgnosticId,
+  pinnedGateTerms,
   snapshotParams,
 } from '../store/clickhouse/visibility.js';
 
@@ -58,6 +59,15 @@ export const invalid = (message: string) =>
 
 /** Maximum list elements bound in one query parameter (ClickHouse's 128 KiB field limit). */
 export const maxListChunk = 1_000;
+
+/**
+ * Raw acceptance rows read in order to bound the window of an
+ * `acceptedInIdOrder` page needing `need` transactions: an accepted
+ * transaction has 1-3 rows (a block, or mempool +1, -1 and its block), so
+ * this covers pages of all-churned transactions; fewer accepted ones fall
+ * back to the whole range (exact, slower).
+ */
+export const acceptanceWindowRows = (need: number) => 8 * need + 1_000;
 
 const chunks = <T>(values: readonly T[], size = maxListChunk): T[][] => {
   const out: T[][] = [];
@@ -160,25 +170,95 @@ export class Sql {
    * `node_<id>` / `visible_<id>` parameters come from that snapshot.
    */
   nodeView(name: string, node?: number, keyFilter?: string) {
+    return inlinePinnedView(
+      name,
+      this.snapshot,
+      this.nodeParams(node),
+      keyFilter
+    );
+  }
+
+  /**
+   * The placeholder names of `node`'s snapshot parameters (default: the
+   * primary node's `node`/`visible`); a further pinned node's
+   * `node_<id>`/`visible_<id>` are registered from the request snapshot.
+   */
+  private nodeParams(node?: number) {
     const id = node ?? this.primaryNode;
     if (id === undefined || id === nodeAgnosticId) {
       throw invalid(
         'This field reads per-node data: name the node (`node:` argument).'
       );
     }
-    if (id === this.snapshot.nodeId) return this.view(name, keyFilter);
+    if (id === this.snapshot.nodeId)
+      return { node: 'node', visible: 'visible' };
     const visible = this.others.get(id);
     if (visible === undefined) {
       throw new GraphQLError(`Node ${id} is not pinned by this request.`);
     }
     this.params[`node_${id}`] = id;
     this.params[`visible_${id}`] = visible;
-    return inlinePinnedView(
-      name,
-      this.snapshot,
-      { node: `node_${id}`, visible: `visible_${id}` },
-      keyFilter
+    return { node: `node_${id}`, visible: `visible_${id}` };
+  }
+
+  /**
+   * ACC for a page in internal-id order with no other filter (an
+   * unselective per-node root), when tx_acceptance has the optional
+   * projection p_node_tx (ORDER BY node, transaction internal id):
+   * `SELECT transaction_hash` of accepted transactions that contain the
+   * first `need` accepted ones in `dir` order within `range` (predicates on
+   * `tx_acceptance.transaction_internal_id`: qualified, since the collapsed
+   * rows alias `any(transaction_internal_id)`). Exact, so the page and
+   * `has_more` are too:
+   * - the first `rawLimit` raw acceptance rows in `dir` order (read in
+   *   order from the projection: a few granules) bound a window: ids before
+   *   the last one read (every row of a transaction shares its id, so no
+   *   transaction is cut);
+   * - the accepted transactions of that window (collapsed, as the view);
+   * - if the window holds fewer than `need` of them and the raw read was
+   *   capped (many released or cancelled rows), the whole range instead
+   *   (a constant condition: the branch not taken reads nothing).
+   */
+  acceptedInIdOrder(
+    node: number | undefined,
+    range: readonly string[],
+    dir: 'ASC' | 'DESC',
+    need: number,
+    rawLimit = acceptanceWindowRows(need)
+  ) {
+    const params = this.nodeParams(node);
+    const inRange = range.length === 0 ? '1' : all(range);
+    const k = this.bind(rawLimit, 'UInt64');
+    const needed = this.bind(need, 'UInt64');
+    const raw = this.uniqueName('__raw');
+    const acc = this.uniqueName('__acc');
+    const rawRows = `SELECT transaction_internal_id FROM tx_acceptance WHERE ${[
+      inRange,
+      ...pinnedGateTerms('node', { params, snapshot: this.snapshot }),
+    ].join(
+      ' AND '
+    )} ORDER BY node_internal_id ${dir}, transaction_internal_id ${dir} LIMIT ${k}`;
+    const capped = `length(${raw}) = ${k}`;
+    const window = `NOT ${capped} OR tx_acceptance.transaction_internal_id ${
+      dir === 'ASC' ? '<' : '>'
+    } ${raw}[-1]`;
+    this.withItems.push(
+      `(SELECT groupArray(transaction_internal_id) FROM (${rawRows})) AS ${raw}`,
+      `(SELECT groupUniqArray(transaction_hash) FROM ${inlinePinnedView(
+        'tx_acceptance_at',
+        this.snapshot,
+        params,
+        `${inRange} AND (${window})`
+      )}) AS ${acc}`
     );
+    const enough = `(NOT ${capped} OR length(${acc}) >= ${needed})`;
+    return `SELECT arrayJoin(${acc}) AS transaction_hash WHERE ${enough}
+      UNION ALL SELECT transaction_hash FROM ${inlinePinnedView(
+        'tx_acceptance_at',
+        this.snapshot,
+        params,
+        `${inRange} AND NOT ${enough}`
+      )}`;
   }
 
   /**

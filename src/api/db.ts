@@ -25,7 +25,7 @@ import {
 
 import type { Ctx } from './compile.js';
 import { maxAuthchainDepth } from './model.js';
-import { Sql } from './sql.js';
+import { acceptanceWindowRows, Sql } from './sql.js';
 
 /**
  * Settings of every data query. `enable_materialized_cte`: a root page with
@@ -54,8 +54,14 @@ export interface ApiStats {
   watermarkPolls: number;
 }
 
+/** Optional store objects the compiler adapts to (optional DDL items). */
+export interface StoreFeatures {
+  /** tx_acceptance has the projection p_node_tx (ddl/optional/p_node_tx.sql). */
+  acceptanceByIdProjection: boolean;
+}
+
 export interface QueryEvent {
-  kind: 'data' | 'nodeLookup' | 'snapshot' | 'watermarkPoll';
+  kind: 'data' | 'nodeLookup' | 'snapshot' | 'storeFeatures' | 'watermarkPoll';
   sql: string;
   params: QueryParams;
   label: string;
@@ -77,6 +83,50 @@ export class ApiDb {
   onQuery: ((event: QueryEvent) => void) | undefined;
 
   private readonly nodeIds = new Map<string, number>();
+
+  /** How long a store-feature check is reused (an optional item added later is noticed). */
+  featureTtlMs = 60_000;
+
+  /** Raw acceptance rows bounding an `acceptedInIdOrder` window (tests force the fallback with a small value). */
+  acceptanceWindowRows: (need: number) => number = acceptanceWindowRows;
+
+  /** Tests: fix the features instead of reading them. */
+  forceFeatures: StoreFeatures | undefined;
+
+  private features: { at: number; value: Promise<StoreFeatures> } | undefined;
+
+  /**
+   * The optional store objects present (one query per `featureTtlMs`, only
+   * when a root can use them). Not part of any snapshot: they change plans,
+   * never results.
+   */
+  async storeFeatures(): Promise<StoreFeatures> {
+    if (this.forceFeatures !== undefined) return this.forceFeatures;
+    const now = Date.now();
+    if (
+      this.features === undefined ||
+      now - this.features.at > this.featureTtlMs
+    ) {
+      const sql = `SELECT count() AS n FROM system.projections
+        WHERE database = currentDatabase() AND table = 'tx_acceptance' AND name = 'p_node_tx'`;
+      const value = this.client
+        .query<{ n: number | string }>(sql)
+        .then((rows) => {
+          this.onQuery?.({
+            kind: 'storeFeatures',
+            label: 'storeFeatures',
+            params: {},
+            sql,
+          });
+          return { acceptanceByIdProjection: Number(rows[0]?.n ?? 0) > 0 };
+        });
+      this.features = { at: now, value };
+      value.catch(() => {
+        this.features = undefined;
+      });
+    }
+    return this.features.value;
+  }
 
   /** The snapshot client: every query is reported as a `snapshot` event. */
   private readonly snapshotClient = {

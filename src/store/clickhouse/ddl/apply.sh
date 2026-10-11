@@ -6,6 +6,8 @@
 #   url       e.g. http://localhost:18123 or https://<host>:8443
 #   database  optional; rewrites the literal `cg` database name (e.g. a scratch db)
 #   CH_USER / CH_PASSWORD  optional credentials (passed to curl via a config on stdin, never argv)
+#   CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL  optional items to apply after the numbered files (comma-separated
+#             names of optional/<name>.sql, e.g. p_node_tx; off by default). No MATERIALIZE: meant for new databases.
 #
 # Statements are split on a ';' at end of line; full-line '--' comments are dropped.
 # Every statement is idempotent (IF NOT EXISTS), so re-running is safe.
@@ -25,7 +27,19 @@ post_statement() {
   fi
 }
 
-for sql_file in "$ddl_dir"/[0-9][0-9][0-9]_*.sql; do
+sql_files=("$ddl_dir"/[0-9][0-9][0-9]_*.sql)
+IFS=',' read -r -a optional_items <<<"${CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL:-}"
+for item in ${optional_items[@]+"${optional_items[@]}"}; do
+  item="${item// /}"
+  [[ -z "$item" ]] && continue
+  if [[ ! -f "$ddl_dir/optional/$item.sql" ]]; then
+    echo "unknown optional DDL item: $item" >&2
+    exit 1
+  fi
+  sql_files+=("$ddl_dir/optional/$item.sql")
+done
+
+for sql_file in "${sql_files[@]}"; do
   echo "== $(basename "$sql_file")"
   statement_count=0
   while IFS= read -r -d '' statement; do
