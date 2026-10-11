@@ -1423,8 +1423,17 @@ export const acceptedBlockCondition = (
 export const transactionPredicate = (
   sql: Sql,
   filter: TransactionFilter | null | undefined,
-  node?: number
+  node?: number,
+  among?: string
 ): string => {
+  /*
+   * `among`: a subquery of transaction hashes every result row is among (the
+   * root's candidates; the root's WHERE has `hash IN (among)` too). Each
+   * semi-join below then reads only those transactions' rows by key: safe
+   * under any negation, since a row outside `among` is excluded anyway.
+   */
+  const restrict = (column: string) =>
+    among === undefined ? '' : `${column} IN (${among}) AND `;
   if (!given(filter)) return '1';
   const parts: string[] = [];
   if (given(filter.internal_id)) {
@@ -1456,7 +1465,7 @@ export const transactionPredicate = (
     parts.push(
       `hash IN (SELECT transaction_hash FROM ${sql.view(
         'output_at'
-      )} WHERE ${outputPredicate(
+      )} WHERE ${restrict('transaction_hash')}${outputPredicate(
         sql,
         filter.has_output,
         outputRowColumns,
@@ -1473,11 +1482,19 @@ export const transactionPredicate = (
       requiresOutpoint(filter.has_input)
         ? `hash IN (SELECT transaction_hash FROM ${spendRelationSql(
             sql,
-            spendRowPredicate(sql, filter.has_input, node)
+            `${restrict('transaction_hash')}(${spendRowPredicate(
+              sql,
+              filter.has_input,
+              node
+            )})`
           )})`
         : `hash IN (SELECT transaction_hash FROM ${sql.view(
             'input_at'
-          )} WHERE ${inputPredicate(sql, filter.has_input, node)})`
+          )} WHERE ${restrict('transaction_hash')}${inputPredicate(
+            sql,
+            filter.has_input,
+            node
+          )})`
     );
   }
   if (given(filter.block_window)) {
@@ -1502,9 +1519,9 @@ export const transactionPredicate = (
       `hash IN (SELECT transaction_hash FROM ${sql.nodeView(
         'tx_acceptance_at',
         node
-      )} WHERE ${
+      )} WHERE ${restrict('transaction_hash')}(${
         mempool ? any([all(heights), 'block_internal_id = 0']) : all(heights)
-      })`
+      }))`
     );
   }
   if (given(filter.in_block)) {
@@ -1512,7 +1529,9 @@ export const transactionPredicate = (
       `hash IN (SELECT transaction_hash FROM ${sql.nodeView(
         'tx_acceptance_at',
         node
-      )} WHERE block_internal_id != 0 AND (${acceptedBlockCondition(
+      )} WHERE ${restrict(
+        'transaction_hash'
+      )}block_internal_id != 0 AND (${acceptedBlockCondition(
         sql,
         filter.in_block,
         node
@@ -1523,17 +1542,21 @@ export const transactionPredicate = (
     const inMempool = `hash IN (SELECT transaction_hash FROM ${sql.nodeView(
       'node_transaction_at',
       node
-    )})`;
+    )}${among === undefined ? '' : ` WHERE transaction_hash IN (${among})`})`;
     parts.push(filter.in_mempool ? inMempool : `NOT (${inMempool})`);
   }
   if (given(filter._and)) {
-    parts.push(...filter._and.map((f) => transactionPredicate(sql, f, node)));
+    parts.push(
+      ...filter._and.map((f) => transactionPredicate(sql, f, node, among))
+    );
   }
   if (given(filter._or)) {
-    parts.push(any(filter._or.map((f) => transactionPredicate(sql, f, node))));
+    parts.push(
+      any(filter._or.map((f) => transactionPredicate(sql, f, node, among)))
+    );
   }
   if (given(filter._not)) {
-    parts.push(`NOT (${transactionPredicate(sql, filter._not, node)})`);
+    parts.push(`NOT (${transactionPredicate(sql, filter._not, node, among)})`);
   }
   return all(parts);
 };

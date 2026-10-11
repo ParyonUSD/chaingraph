@@ -133,7 +133,8 @@ const pageOf = async (
   args: PageArgs,
   sels: readonly Sel[],
   max: number,
-  cursorOf?: (row: Row, values: string[]) => string
+  cursorOf?: (row: Row, values: string[]) => string,
+  ctes?: readonly string[]
 ): Promise<Page> => {
   checkLimit(args.limit, max);
   const offset = checkOffset(args.offset);
@@ -141,6 +142,7 @@ const pageOf = async (
     env.sql,
     env.ctx,
     {
+      ...(ctes === undefined ? {} : { ctes }),
       entity,
       limit: args.limit + 1,
       offset,
@@ -184,6 +186,13 @@ export const runTransactions = async (
     [term('internal_id', args.order ?? 'ASC')]
   );
   const candidates = transactionCandidates(sql, args.where, ctx.node);
+  /*
+   * Candidates (a positive, selective conjunct of the filter) are
+   * materialized once: the transaction rows, the acceptance check and every
+   * per-transaction semi-join of the filter read only them, by key.
+   */
+  const name = sql.uniqueName('candidates');
+  const among = candidates === undefined ? undefined : `SELECT * FROM ${name}`;
   const bounds = numericComparison(sql, 'internal_id', 'UInt64', {
     _gt: args.after_internal_id ?? undefined,
     _lt: args.before ?? undefined,
@@ -194,16 +203,20 @@ export const runTransactions = async (
     TransactionEntity,
     sql.view('transaction_at'),
     [
-      `hash IN (${sql.accepted(ctx.node, candidates)})`,
+      ...(among === undefined ? [] : [`hash IN (${among})`]),
+      `hash IN (${sql.accepted(ctx.node, among)})`,
       ...bounds,
-      transactionPredicate(sql, args.where, ctx.node),
+      transactionPredicate(sql, args.where, ctx.node, among),
     ],
     order,
     { ...args, after: args.cursor },
     sels,
     maxLimits.transactions,
     /* the spike's cursor: the last internal_id (pass as `after`/`before`) */
-    explicit === undefined ? (_row, values) => values[0]! : undefined
+    explicit === undefined ? (_row, values) => values[0]! : undefined,
+    candidates === undefined
+      ? undefined
+      : [`${name} AS MATERIALIZED (${candidates})`]
   );
 };
 
@@ -689,14 +702,13 @@ export const rowSets = {
     where: TransactionFilter | null | undefined
   ): RowSet => {
     const { sql, ctx } = env;
+    const among = transactionCandidates(sql, where, ctx.node);
     return {
       source: viewSource(sql.view('transaction_at')),
       where: [
-        `hash IN (${sql.accepted(
-          ctx.node,
-          transactionCandidates(sql, where, ctx.node)
-        )})`,
-        transactionPredicate(sql, where, ctx.node),
+        ...(among === undefined ? [] : [`hash IN (${among})`]),
+        `hash IN (${sql.accepted(ctx.node, among)})`,
+        transactionPredicate(sql, where, ctx.node, among),
       ],
     };
   },

@@ -401,6 +401,13 @@ export const maxAuthchainDepth = 100_000;
  * first), unspent (false only when the depth limit cut the chain).
  */
 const authchainSql = (c: Ctx, link: string) => {
+  /*
+   * The recursion follows every stored spend of output 0 (all branches, as
+   * v1's collect_authchains), without an acceptance check per step (one per
+   * step cost ~14 ms on chipnet: 10.8 s for a 776-long chain). The node's
+   * chain is then the longest branch whose transactions the node all
+   * accepts, read in one acceptance check of every transaction seen.
+   */
   const spends = `SELECT transaction_hash, outpoint_transaction_hash FROM ${c.sql.view(
     'input_at'
   )} WHERE (outpoint_transaction_hash, outpoint_index) IN (SELECT chain_head, toUInt32(0) FROM chain)`;
@@ -410,15 +417,18 @@ const authchainSql = (c: Ctx, link: string) => {
       UNION ALL
       SELECT chain.chain_base AS chain_base, s.transaction_hash AS chain_head, chain.chain_length + 1 AS chain_length,
         arrayPushBack(chain.chain_path, s.transaction_hash) AS chain_path
-      FROM chain INNER JOIN (${spends} AND transaction_hash IN (${c.sql.accepted(
-    c.node,
-    `SELECT transaction_hash FROM (${spends})`
-  )})) AS s ON s.outpoint_transaction_hash = chain.chain_head
+      FROM chain INNER JOIN (${spends}) AS s ON s.outpoint_transaction_hash = chain.chain_head
       WHERE chain.chain_length < ${maxAuthchainDepth}
-    )
+    ),
+    accepted_heads AS (${c.sql.accepted(
+      c.node,
+      'SELECT chain_head FROM chain'
+    )})
     SELECT chain_base AS base, argMax(chain_head, chain_length) AS head, max(chain_length) AS length,
       argMax(chain_path, chain_length) AS path, max(chain_length) < ${maxAuthchainDepth} AS unspent
-    FROM chain GROUP BY chain_base`;
+    FROM chain
+    WHERE arrayAll(h -> h IN accepted_heads, chain_path)
+    GROUP BY chain_base`;
 };
 
 /* ------------------------------------------------------------------ */

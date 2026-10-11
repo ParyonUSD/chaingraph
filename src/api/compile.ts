@@ -514,6 +514,8 @@ export interface RootQuery {
   /** Rows to fetch (page size + 1 for `has_more`); undefined: all. */
   limit?: number;
   offset?: number;
+  /** Statement-level CTEs the source/where refer to (e.g. materialized candidates). */
+  ctes?: readonly string[];
 }
 
 export interface CompiledRoot {
@@ -576,12 +578,15 @@ export const compileRoot = (
   }) AS __row${
     cursorColumns.length === 0 ? '' : `, ${cursorColumns.join(', ')}`
   }`;
+  const rootCtes = root.ctes ?? [];
   const statement =
     st.ctes.length === 0
-      ? `${select} FROM (${page}) AS page${
+      ? `${
+          rootCtes.length === 0 ? '' : `WITH ${rootCtes.join(',\n')}\n`
+        }${select} FROM (${page}) AS page${
           order === '' ? '' : ` ORDER BY ${order}`
         }`
-      : `WITH page AS MATERIALIZED (${page}),
+      : `WITH ${[...rootCtes, `page AS MATERIALIZED (${page})`].join(',\n')},
 ${st.ctes.join(',\n')}
 ${select} FROM page ${plan.joins.join('\n')}${
           order === '' ? '' : `\nORDER BY ${order}`
