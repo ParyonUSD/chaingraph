@@ -6,6 +6,7 @@ import type {
   BitcoreBlock,
   BitcoreBlockHeader,
   BitcoreTransaction,
+  BlockMessage,
 } from '@chaingraph/bitcore-p2p-cash';
 import bitcoreP2pCash, {
   BitcoreInventoryType,
@@ -19,6 +20,13 @@ import {
 } from './bitcore.js';
 import { BlockBuffer } from './components/block-buffer.js';
 import { BlockTree } from './components/block-tree.js';
+import { BlockWorkerPool } from './components/block-workers.js';
+import {
+  keepRawBlockPayloads,
+  parseRawBlock,
+  rawBlockHeader,
+  rawPayloadOf,
+} from './components/raw-block-messages.js';
 import { SyncState } from './components/sync-state.js';
 import {
   formatBytes,
@@ -28,7 +36,9 @@ import {
 import {
   blockBufferTargetSizeMb,
   chaingraphLogFirehose,
+  chaingraphStore,
   chaingraphUserAgent,
+  encodeWorkers,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
   mempoolTransactionExpirationMs,
@@ -115,6 +125,14 @@ const renderSyncPercentage = (value: number) => {
 };
 
 const msPerSecond = 1000;
+
+/**
+ * A downloaded block: parsed by bitcore (no block workers), or raw bytes for
+ * a block worker, with the header parsed here either way.
+ */
+type BlockSource =
+  | { bitcoreBlock: BitcoreBlock; header: BitcoreBlockHeader; raw?: undefined }
+  | { bitcoreBlock?: undefined; header: BitcoreBlockHeader; raw: Buffer };
 const durationDecimalPlaces = 1;
 const transactionRateDecimalPlaces = 2;
 
@@ -388,6 +406,12 @@ export class Agent {
   /** Block conversions, chained so blocks are buffered in arrival order. */
   blockParses: Promise<void> = Promise.resolve();
 
+  /**
+   * Block workers (`CHAINGRAPH_ENCODE_WORKERS`, `undefined` when 0): convert
+   * downloaded blocks and encode their rows off this thread.
+   */
+  blockWorkers: BlockWorkerPool | undefined;
+
   constructor(config: {
     logger: pino.BaseLogger;
     onShutdown: () => void;
@@ -399,6 +423,19 @@ export class Agent {
     this.heartbeatInterval = setInterval(() => {
       this.agentHeartbeat();
     }, heartbeatIntervalMs);
+    if (encodeWorkers > 0) {
+      keepRawBlockPayloads();
+      this.blockWorkers = new BlockWorkerPool({
+        onWorkerError: (error) => {
+          this.logger.error(error, 'Agent: a block worker failed.');
+        },
+        rowTemplates: chaingraphStore === 'clickhouse',
+        size: encodeWorkers,
+      });
+      this.logger.info(
+        `Agent: ${encodeWorkers} block worker(s) convert and encode blocks.`
+      );
+    }
 
     this.blockTree = new BlockTree({
       genesisBlockByNode: trustedNodes.reduce(
@@ -658,7 +695,7 @@ export class Agent {
       });
 
       peer.on('block', (message) => {
-        this.handleBlockFromNode(node.name, message.block);
+        this.handleBlockFromNode(node.name, message);
       });
 
       peer.on('inv', (message) => {
@@ -1631,15 +1668,25 @@ export class Agent {
     this.scheduleBlockBufferFill();
   }
 
-  handleBlockFromNode(nodeName: string, bitcoreBlock: BitcoreBlock) {
-    const { hash } = bitcoreBlock.header;
+  handleBlockFromNode(nodeName: string, message: BlockMessage) {
+    /*
+     * With block workers the payload stays raw: only the header is parsed
+     * here, the worker parses and converts the rest.
+     */
+    const raw =
+      this.blockWorkers === undefined ? undefined : rawPayloadOf(message);
+    const source: BlockSource =
+      raw === undefined
+        ? { bitcoreBlock: message.block, header: message.block.header }
+        : { header: rawBlockHeader(raw), raw };
+    const { hash } = source.header;
     const finishedDownloadAt = Date.now();
     const download = this.blockDownloads.find((d) => d.hash === hash);
     if (download === undefined) {
       this.logger.info(
         `${nodeName}: received an un-requested block – hash: ${hash} – this likely means the block was mined by this node.`
       );
-      this.blockTree.updateHeaders(nodeName, [bitcoreBlock.header]);
+      this.blockTree.updateHeaders(nodeName, [source.header]);
       const height = this.blockTree.getBlockHeightAccordingToNode(
         nodeName,
         hash
@@ -1652,7 +1699,7 @@ export class Agent {
         this.requestHeaders(nodeName);
         return;
       }
-      this.scheduleBlockParse(bitcoreBlock, height);
+      this.scheduleBlockParse(source, height);
       return;
     }
     this.logger.trace(
@@ -1661,7 +1708,7 @@ export class Agent {
     this.clearDownload(download);
     this.blockBuffer.releaseReservedBlock();
     const durationMs = finishedDownloadAt - download.requestStartTime;
-    this.scheduleBlockParse(bitcoreBlock, download.height, (block) => {
+    this.scheduleBlockParse(source, download.height, (block) => {
       this.nodes[nodeName]!.downloadThroughput.addStatistic({
         durationMs: durationMs === 0 ? 1 : durationMs,
         metrics: { bytes: block.sizeBytes },
@@ -1671,14 +1718,18 @@ export class Agent {
   }
 
   /**
-   * Because parsing a block can be expensive (all transactions must be
-   * re-serialized and hashed), parsing is scheduled to avoid blocking the
-   * current iteration of the event loop.
+   * Convert a downloaded block to Chaingraph form, then buffer and save it.
+   * Conversions may run concurrently (block workers); blocks are buffered
+   * one at a time in arrival order.
    *
-   * TODO: efficiency – parse the transactions/block as it comes in (modify or replace `bitcore-p2p-cash`)
+   * Without block workers the conversion runs here, in slices of 5,000
+   * transactions so a large block does not hold the event loop
+   * (g1-fix-pass-2.md §1). With them, a worker parses and converts the raw
+   * block and encodes its row templates; if it fails, the block is
+   * converted here instead (pre-phase2-concurrency-mempool.md §1).
    */
   scheduleBlockParse(
-    bitcoreBlock: BitcoreBlock,
+    source: BlockSource,
     height: number,
     // eslint-disable-next-line @typescript-eslint/no-unused-vars, @typescript-eslint/no-empty-function
     callback = (_block: ChaingraphBlock) => {}
@@ -1695,14 +1746,38 @@ export class Agent {
      * only meaningful differences in acceptance time are likely to be recorded.
      */
     const receivedTime = new Date();
-    /*
-     * One block at a time, in arrival order, each converted in slices so a
-     * large block does not hold the event loop (g1-fix-pass-2.md §1).
-     */
+    const onThisThread = async () =>
+      bitcoreBlockToChaingraphBlockInSlices(
+        source.bitcoreBlock ?? parseRawBlock(source.raw),
+        height
+      );
+    const workers = this.blockWorkers;
+    const converted =
+      workers === undefined || source.raw === undefined
+        ? undefined
+        : workers.convert(source.raw, height).catch(async (error: unknown) => {
+            this.logger.error(
+              error,
+              `Agent: a block worker could not convert block ${source.header.hash}; converting it on the main thread.`
+            );
+            return onThisThread();
+          });
+    // the result is awaited in order below; a rejection is handled there
+    converted?.catch(() => undefined);
     this.blockParses = this.blockParses
-      .then(async () =>
-        bitcoreBlockToChaingraphBlockInSlices(bitcoreBlock, height)
-      )
+      .then(async () => {
+        if (converted === undefined) return onThisThread();
+        const block = await converted;
+        /*
+         * One block per event-loop turn: conversions that finished together
+         * would otherwise be buffered and appended (pinning every
+         * transaction) in one turn.
+         */
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+        return block;
+      })
       .then((block) => {
         this.bufferParsedBlock(block, receivedTime);
         callback(block);
@@ -2289,6 +2364,7 @@ export class Agent {
         this.logger.debug('Block buffer drained, stopping PG pool...');
         return this.store.close();
       })
+      .then(async () => this.blockWorkers?.close())
       .then(() => {
         this.logger.debug('PG pool cleared.');
         this.logger.info('Exiting...');

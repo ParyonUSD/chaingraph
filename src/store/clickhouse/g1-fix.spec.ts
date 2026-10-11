@@ -727,6 +727,48 @@ const streamCommits = async (
   return { streamed, tipMs };
 };
 
+/*
+ * pre-phase2-concurrency-mempool.md §1: a tip followed block by block (each
+ * block saved once the previous one committed, as the gate's concurrent
+ * writers do) arrives on an idle lane every time: no linger, although the
+ * lane started a batch less than `batchLingerMs` ago.
+ */
+e2e(
+  '[e2e] a tip followed block by block never lingers (each block arrives on an idle lane)',
+  async (t) => {
+    t.timeout(120_000);
+    const lingerMs = 300;
+    const chain = chainOf(12, 'tip-follow');
+    const harness = await fixScratch(t, 'tip_follow', {
+      batchLingerMs: lingerMs,
+    });
+    const store = await harness.openStore();
+    const { node1 } = await registerNodes(store);
+    const durations: number[] = [];
+    for (const block of chain) {
+      const started = Date.now();
+      await store.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: [acceptance(node1)],
+      });
+      durations.push(Date.now() - started);
+    }
+    await store.operations.drain();
+    await store.publishWatermarks();
+    t.log(`per-block save ms: ${durations.join(', ')}`);
+    t.true(
+      Math.max(...durations.slice(1)) < lingerMs - 50,
+      `no block waited for the ${lingerMs} ms linger (${durations.join(', ')})`
+    );
+    t.is((await commitStates(harness.client)).length, chain.length);
+    await assertNodeParity(t, harness.client, node1, chain, {
+      exactBlocks: chain.length,
+      utxo: true,
+    });
+  }
+);
+
 e2e(
   '[e2e] fix pass 3: a stream of small blocks lingers into few large commits; a block on a quiet lane starts at once',
   async (t) => {

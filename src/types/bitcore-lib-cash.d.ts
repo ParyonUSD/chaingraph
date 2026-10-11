@@ -96,7 +96,14 @@ declare module 'bitcore-lib-cash' {
     constructor(hexOrObject: BitcoreTransactionObjectOptions | string);
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-extraneous-class
+  export class BlockHeader {
+    static fromBuffer: (raw: Uint8Array) => BitcoreBlockHeader;
+  }
+
   export class Block {
+    static fromBuffer: (raw: Uint8Array) => Block;
+
     static fromObject: (contents: unknown) => Block;
 
     static fromString: (raw: string) => Block;

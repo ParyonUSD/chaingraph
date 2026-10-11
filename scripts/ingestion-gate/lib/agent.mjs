@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const heapSamplerUrl = pathToFileURL(fileURLToPath(new URL('./heap-sampler.mjs', import.meta.url))).href;
 
-const passThroughPattern = /^(CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS|CHAINGRAPH_CLICKHOUSE_[A-Z_]+)$/;
+const passThroughPattern = /^(CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS|CHAINGRAPH_ENCODE_WORKERS|CHAINGRAPH_MEMPOOL_FETCH|CHAINGRAPH_CLICKHOUSE_[A-Z_]+)$/;
 /** INGESTION_GATE_AGENT_NODE_OPTIONS becomes the agent's NODE_OPTIONS (e.g. `--cpu-prof --cpu-prof-dir=...`). */
 const passThroughEnvironment = () => ({
   ...Object.fromEntries(Object.entries(process.env).filter(([name]) => passThroughPattern.test(name))),

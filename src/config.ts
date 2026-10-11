@@ -4,7 +4,7 @@
  * `CHAINGRAPH_LOG_PATH` configuration.
  */
 import { readFileSync } from 'fs';
-import { cpus, freemem, homedir } from 'os';
+import { availableParallelism, cpus, freemem, homedir } from 'os';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -598,6 +598,53 @@ if (
  */
 const eventLoopDiagnosticMs = eventLoopDiagnosticValue;
 
+/** Block workers by default: one per spare core, at most 4. */
+const maxDefaultEncodeWorkers = 4;
+const defaultEncodeWorkers = Math.max(
+  0,
+  Math.min(maxDefaultEncodeWorkers, availableParallelism() - 1)
+);
+const encodeWorkersValue = Number(
+  optionalString(
+    optionalOptions.CHAINGRAPH_ENCODE_WORKERS,
+    String(defaultEncodeWorkers)
+  )
+);
+if (!Number.isInteger(encodeWorkersValue) || encodeWorkersValue < 0) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    'The CHAINGRAPH_ENCODE_WORKERS environment variable must be an integer greater than or equal to 0.'
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_ENCODE_WORKERS` environment variable (default:
+ * min(4, cores − 1)). The number of block worker threads that convert
+ * downloaded blocks and encode their RowBinary rows off the agent's JS
+ * thread; `0` converts and encodes on the main thread, as before
+ * (docs/clickhouse-port/pre-phase2-concurrency-mempool.md).
+ */
+const encodeWorkers = encodeWorkersValue;
+
+const mempoolFetchValue = optionalString(
+  optionalOptions.CHAINGRAPH_MEMPOOL_FETCH,
+  'on'
+);
+if (mempoolFetchValue !== 'on' && mempoolFetchValue !== 'off') {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_MEMPOOL_FETCH' environment variable: ${mempoolFetchValue}. Must be 'on' or 'off'.`
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_MEMPOOL_FETCH` environment variable (default:
+ * `on`). When mempool tracking starts, and on every reconnect after that,
+ * the agent asks each node for its mempool (P2P `mempool`) and saves what it
+ * announces, parents before children. The node must allow it (whitelisted
+ * peer or bloom filters enabled); a node that disconnects right after the
+ * request is not asked again.
+ */
+const mempoolFetch: 'off' | 'on' = mempoolFetchValue;
+
 /**
  * `true` if the `NODE_ENV` environment variable is `production`.
  */
@@ -619,11 +666,13 @@ export {
   clickhouseUser,
   clickhouseSpendIndex,
   clickhouseUtxo,
+  encodeWorkers,
   eventLoopDiagnosticMs,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
   mempoolTransactionExpirationMs,
   mempoolTransactionExpirationScanIntervalMs,
+  mempoolFetch,
   postgresMaxConnections,
   postgresConnectionString,
   postgresSynchronousCommit,

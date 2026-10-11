@@ -40,11 +40,13 @@ export const bitcoreTransactionToChaingraphTransaction = (
   };
 };
 
-export const bitcoreBlockToChaingraphBlock = (
-  bitcoreBlock: BitcoreBlock,
-  height: number
-): ChaingraphBlock => {
-  const bitcoreBlockHeader = bitcoreBlock.header.toObject();
+/** A block's fields other than its transactions, from its parsed header. */
+export const bitcoreHeaderToChaingraph = (
+  header: BitcoreBlock['header'],
+  height: number,
+  sizeBytes: number
+): Omit<ChaingraphBlock, 'transactions'> => {
+  const bitcoreBlockHeader = header.toObject();
   return {
     bits: bitcoreBlockHeader.bits,
     hash: bitcoreBlockHeader.hash,
@@ -52,14 +54,86 @@ export const bitcoreBlockToChaingraphBlock = (
     merkleRoot: bitcoreBlockHeader.merkleRoot.toString('hex'),
     nonce: bitcoreBlockHeader.nonce,
     previousBlockHash: bitcoreBlockHeader.prevHash.toString('hex'),
-    sizeBytes: bitcoreBlock.toBuffer().length,
+    sizeBytes,
     timestamp: bitcoreBlockHeader.time,
-    transactions: bitcoreBlock.transactions.map(
-      bitcoreTransactionToChaingraphTransaction
-    ),
     version: bitcoreBlockHeader.version,
   };
 };
+
+/** A block's fields other than its transactions (`bitcoreBlockToChaingraphBlock`). */
+export const bitcoreBlockHeaderToChaingraph = (
+  bitcoreBlock: BitcoreBlock,
+  height: number
+): Omit<ChaingraphBlock, 'transactions'> =>
+  bitcoreHeaderToChaingraph(
+    bitcoreBlock.header,
+    height,
+    bitcoreBlock.toBuffer().length
+  );
+
+/**
+ * The byte offset just after the serialized transaction at `offset` in
+ * `bytes` (version, inputs, outputs, locktime; a CashTokens prefix is inside
+ * the locking bytecode field). Throws if the transaction runs past the end.
+ */
+export const transactionEnd = (bytes: Uint8Array, offset: number) => {
+  // eslint-disable-next-line functional/no-let
+  let position = offset;
+  const need = (length: number) => {
+    if (position + length > bytes.length) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw new RangeError('Transaction runs past the end of the block.');
+    }
+  };
+  const skip = (length: number) => {
+    need(length);
+    position += length;
+  };
+  /* eslint-disable @typescript-eslint/no-magic-numbers */
+  const varInt = () => {
+    need(1);
+    const first = bytes[position]!;
+    position += 1;
+    if (first < 0xfd) return first;
+    const length = first === 0xfd ? 2 : first === 0xfe ? 4 : 8;
+    need(length);
+    // eslint-disable-next-line functional/no-let
+    let value = 0;
+    // eslint-disable-next-line functional/no-let, functional/no-loop-statement
+    for (let index = length - 1; index >= 0; index -= 1) {
+      value = value * 256 + bytes[position + index]!;
+    }
+    position += length;
+    return value;
+  };
+  skip(4);
+  const inputs = varInt();
+  // eslint-disable-next-line functional/no-let, functional/no-loop-statement
+  for (let index = 0; index < inputs; index += 1) {
+    skip(36);
+    skip(varInt());
+    skip(4);
+  }
+  const outputs = varInt();
+  // eslint-disable-next-line functional/no-let, functional/no-loop-statement
+  for (let index = 0; index < outputs; index += 1) {
+    skip(8);
+    skip(varInt());
+  }
+  skip(4);
+  /* eslint-enable @typescript-eslint/no-magic-numbers */
+  return position;
+};
+
+export const bitcoreBlockToChaingraphBlock = (
+  bitcoreBlock: BitcoreBlock,
+  height: number
+): ChaingraphBlock => ({
+  ...bitcoreBlockHeaderToChaingraph(bitcoreBlock, height),
+  transactions: bitcoreBlock.transactions.map(
+    bitcoreTransactionToChaingraphTransaction
+  ),
+});
 
 /** Transactions converted per turn of the event loop (`bitcoreBlockToChaingraphBlockInSlices`). */
 export const blockParseSliceTransactions = 5_000;

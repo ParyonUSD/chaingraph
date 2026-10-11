@@ -115,6 +115,11 @@ export interface TransactionRowsContext {
    * The internal id of each transaction, by index.
    */
   transactionInternalIds: readonly (bigint | number)[];
+  /**
+   * If set, the byte offset after each encoded row is appended (row
+   * templates: `row-templates.ts`).
+   */
+  rowEnds?: number[];
 }
 
 /**
@@ -264,7 +269,7 @@ export const encodeBlockTransactionRows = (
 
 export const encodeOutputRows = (
   transactions: readonly ChaingraphTransaction[],
-  { commitSeq, transactionInternalIds }: TransactionRowsContext
+  { commitSeq, rowEnds, transactionInternalIds }: TransactionRowsContext
 ): EncodedRows => {
   const expectedBytes = transactions.reduce(
     (total, transaction) =>
@@ -294,6 +299,7 @@ export const encodeOutputRows = (
         (w, amount) => w.int64(amount)
       );
       writeNonfungibleToken(writer, output).uint64(commitSeq).endRow();
+      rowEnds?.push(writer.offset);
     });
   });
   return { data: writer.finish(), rowCount: writer.rowCount };
@@ -306,7 +312,7 @@ export const encodeOutputRows = (
  */
 export const encodeInputRows = (
   transactions: readonly ChaingraphTransaction[],
-  { commitSeq, transactionInternalIds }: TransactionRowsContext
+  { commitSeq, rowEnds, transactionInternalIds }: TransactionRowsContext
 ): EncodedRows => {
   const expectedBytes = transactions.reduce(
     (total, transaction) =>
@@ -333,6 +339,7 @@ export const encodeInputRows = (
         .hexBytes(input.unlockingBytecode)
         .uint64(commitSeq)
         .endRow();
+      rowEnds?.push(writer.offset);
     });
   });
   return { data: writer.finish(), rowCount: writer.rowCount };

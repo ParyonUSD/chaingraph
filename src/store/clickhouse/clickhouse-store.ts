@@ -1081,6 +1081,7 @@ export class ClickHouseStore implements ChaingraphStore {
         this.operations.begin('block', nodes),
         deferPrepare
       );
+      batch.openedBehindWork = lane.running > 0 || lane.queue.length > 0;
       committer.append(batch, item);
       lane.queue.push(batch);
       lane.open = deferPrepare ? undefined : batch;
@@ -1154,13 +1155,17 @@ export class ClickHouseStore implements ChaingraphStore {
 
   /**
    * How long the lane's open `batch` should still wait for more blocks: only
-   * while it is small and the lane started a batch less than
+   * while it is small, it was opened behind other work of the lane (blocks
+   * are streaming in) and the lane started a batch less than
    * `batchLingerMs` ago (a stream of small blocks: fewer, larger commits;
-   * fix-pass-3.md §3). 0: start now.
+   * fix-pass-3.md §3). A block arriving on an idle lane starts at once,
+   * even right after a commit (a tip followed block by block;
+   * pre-phase2-concurrency-mempool.md §1). 0: start now.
    */
   private lingerFor(lane: BatchLane, batch: BlockBatch, now: number) {
     if (
       this.batchLingerMs === 0 ||
+      !batch.openedBehindWork ||
       lane.open !== batch ||
       batch.items.length >= this.smallBlocksPerCommit ||
       batch.bytes >= this.smallBatchBytes ||

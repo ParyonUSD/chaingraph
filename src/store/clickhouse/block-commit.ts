@@ -53,6 +53,13 @@ import {
   encodeTransactionRows,
   rowBinaryTableColumns,
 } from './row-encoders.js';
+import {
+  assembleBlockTransactionRows,
+  assembleTransactionRows,
+  assembleVariableRows,
+  blockRowTemplates,
+  templateAt,
+} from './row-templates.js';
 import type { NewTransactionProof, TransactionLookup } from './tx-lookup.js';
 import { uniqueToItsBlock } from './tx-lookup.js';
 import type { OutputRegistry, UtxoOutput, UtxoRow } from './utxo.js';
@@ -541,6 +548,14 @@ export class BlockBatch {
   /** `open` (accepts appends), then `started`. */
   state: 'open' | 'started' = 'open';
 
+  /**
+   * Whether the batch was opened behind other work of its lane (a running or
+   * queued batch): blocks are streaming in, so it may linger to grow. A
+   * batch opened on an idle lane (the tip, one block at a time) starts at
+   * once (pre-phase2-concurrency-mempool.md §1).
+   */
+  openedBehindWork = false;
+
   /** Ids of every transaction of the batch (own promises or other owners'). */
   readonly idOf = new Map<string, Promise<bigint> | bigint>();
 
@@ -904,16 +919,19 @@ export class BlockCommitter {
       }
     );
     const newTransactions: ChaingraphTransaction[] = [];
+    /** Where each new transaction sits: its block and index (row templates). */
+    const newTransactionAt: { block: ChaingraphBlock; index: number }[] = [];
     {
       const added = new Set<string>();
       blocks.forEach((block) => {
-        block.transactions.forEach((transaction) => {
+        block.transactions.forEach((transaction, index) => {
           if (
             insertedBy.has(transaction.hash) &&
             !added.has(transaction.hash)
           ) {
             added.add(transaction.hash);
             newTransactions.push(transaction);
+            newTransactionAt.push({ block, index });
           }
         });
       });
@@ -1124,26 +1142,50 @@ export class BlockCommitter {
      * (intent, node-agnostic rows, per-node rows, committed). Every row comes
      * from the batch's own blocks.
      */
+    /*
+     * Rows of blocks converted by a block worker are copied from their
+     * templates and patched with ids and seq (row-templates.ts); the bytes
+     * are those the encoders give.
+     */
+    const templateRefs = newTransactionAt.map(({ block, index }) => {
+      const parts = blockRowTemplates.get(block);
+      return parts === undefined ? undefined : templateAt(parts, index);
+    });
+    const templated = templateRefs.every(
+      (ref): ref is NonNullable<typeof ref> => ref !== undefined
+    )
+      ? templateRefs.map((ref, position) => ({
+          index: ref.index,
+          internalId: newContext.transactionInternalIds[position]!,
+          templates: ref.templates,
+        }))
+      : undefined;
     const agnosticWrites: Promise<void>[] = [];
     agnosticWrites.push(
       insert(
         'output',
         columnsOf('output'),
-        encodeOutputRows(newTransactions, newContext)
+        templated === undefined
+          ? encodeOutputRows(newTransactions, newContext)
+          : assembleVariableRows('output', templated, commit.seq)
       )
     );
     agnosticWrites.push(
       insert(
         'input',
         columnsOf('input'),
-        encodeInputRows(newTransactions, newContext)
+        templated === undefined
+          ? encodeInputRows(newTransactions, newContext)
+          : assembleVariableRows('input', templated, commit.seq)
       )
     );
     agnosticWrites.push(
       insert(
         'transaction',
         columnsOf('transaction'),
-        encodeTransactionRows(newTransactions, newContext)
+        templated === undefined
+          ? encodeTransactionRows(newTransactions, newContext)
+          : assembleTransactionRows(templated, commit.seq)
       )
     );
     agnosticWrites.push(
@@ -1162,28 +1204,55 @@ export class BlockCommitter {
       )
     );
     {
-      const writer = new RowBinaryWriter();
-      plans.forEach((plan) => {
-        const indexes = plan.blockExists
+      const linksOf = (plan: (typeof plans)[number]) =>
+        plan.blockExists
           ? plan.missingLinks
           : plan.block.transactions.map((_, index) => index);
-        indexes.forEach((index) => {
-          const transaction = plan.block.transactions[index]!;
-          writer
-            .uint64(plan.blockInternalId)
-            .uint32(index)
-            .uint64(idByHash.get(transaction.hash)!)
-            .fixedString32(transaction.hash)
-            .uint64(commit.seq)
-            .endRow();
-        });
+      const links = plans.flatMap((plan) => {
+        const parts = blockRowTemplates.get(plan.block);
+        return linksOf(plan).map((index) => ({
+          blockInternalId: plan.blockInternalId,
+          internalId: idByHash.get(plan.block.transactions[index]!.hash)!,
+          ref: parts === undefined ? undefined : templateAt(parts, index),
+        }));
       });
-      agnosticWrites.push(
-        insert('block_transaction', columnsOf('block_transaction'), {
-          data: writer.finish(),
-          rowCount: writer.rowCount,
-        })
-      );
+      if (links.every((link) => link.ref !== undefined)) {
+        agnosticWrites.push(
+          insert(
+            'block_transaction',
+            columnsOf('block_transaction'),
+            assembleBlockTransactionRows(
+              links.map((link) => ({
+                blockInternalId: link.blockInternalId,
+                index: link.ref!.index,
+                internalId: link.internalId,
+                templates: link.ref!.templates,
+              })),
+              commit.seq
+            )
+          )
+        );
+      } else {
+        const writer = new RowBinaryWriter();
+        plans.forEach((plan) => {
+          linksOf(plan).forEach((index) => {
+            const transaction = plan.block.transactions[index]!;
+            writer
+              .uint64(plan.blockInternalId)
+              .uint32(index)
+              .uint64(idByHash.get(transaction.hash)!)
+              .fixedString32(transaction.hash)
+              .uint64(commit.seq)
+              .endRow();
+          });
+        });
+        agnosticWrites.push(
+          insert('block_transaction', columnsOf('block_transaction'), {
+            data: writer.finish(),
+            rowCount: writer.rowCount,
+          })
+        );
+      }
     }
 
     await Promise.all(agnosticWrites);
