@@ -879,8 +879,9 @@ inserted_block_transactions AS (
     RETURNING transaction_internal_id
 ),
 inserted_node_blocks AS (
-  INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
-  SELECT node.node_internal_id, blk.internal_id, node.accepted_at
+  INSERT INTO node_block (node_internal_id, block_internal_id, block_height, accepted_at)
+  SELECT node.node_internal_id, blk.internal_id,
+         ${block.height}::bigint, node.accepted_at
     FROM new_or_existing_block blk CROSS JOIN accepting_nodes node
   ON CONFLICT ON CONSTRAINT "node_block_pkey" DO NOTHING
   RETURNING block_internal_id
@@ -970,14 +971,14 @@ export const acceptBlocksViaHeaders = async (
   );
 
   const insertNodeBlocks = /* sql */ `
-  WITH matching_blocks (internal_id, use_null) AS (
-    SELECT internal_id, (timestamp < ${nullifyAcceptedTimeBeforeBlockTimestamp}::bigint) AS use_null
+  WITH matching_blocks (internal_id, height, use_null) AS (
+    SELECT internal_id, height, (timestamp < ${nullifyAcceptedTimeBeforeBlockTimestamp}::bigint) AS use_null
     FROM block WHERE hash IN (VALUES ${acceptedBlocks
       .map((block) => `('${hexToByteaString(block.hash)}'::bytea)`)
       .join(',')})
   )
-    INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
-      SELECT n.id, blk.internal_id, CASE WHEN blk.use_null=true THEN NULL ELSE ${dateToTimestampWithoutTimezone(
+    INSERT INTO node_block (node_internal_id, block_internal_id, block_height, accepted_at)
+      SELECT n.id, blk.internal_id, blk.height, CASE WHEN blk.use_null=true THEN NULL ELSE ${dateToTimestampWithoutTimezone(
         acceptedAt
       )} END
       FROM matching_blocks blk CROSS JOIN (VALUES (${nodeInternalId}::bigint)) n(id)

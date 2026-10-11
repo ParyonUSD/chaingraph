@@ -100,7 +100,7 @@ subscription MonitorSyncTips {
 >
 > Note, Chaingraph saves blocks asynchronously, and large blocks can take longer to save to the database. During initial sync, this may cause the subscription to occasionally update its result with lower-height (more recently saved) blocks. Regardless, this subscription will roughly track sync progress for each connected node.
 >
-> This query could also be ordered by block height, but because non-primary indexes are created after initial sync (to reduce time required), ordering by block height can be slow until after the initial sync is complete.
+> To get each node's highest accepted block instead, order by `block_height` (a copy of the block's height on each `node_block`): `accepted_blocks(limit: 1, order_by: { block_height: desc })` is a single probe of the `(node_internal_id, block_height)` index, which exists from the start of initial sync. Prefer it to `block(where: { accepted_by: { node: { name: { _eq: $node } } } }, order_by: { height: desc }, limit: 1)`, which walks every block above the node's tip and is slow when one database holds several networks.
 
 </details>
 
