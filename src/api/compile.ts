@@ -232,7 +232,8 @@ export interface RelationField {
    */
   source: (c: Ctx, link: string, args: { [name: string]: unknown }) => string;
   /** The `where` argument as a predicate on child rows. */
-  where?: (c: Ctx, where: unknown) => string;
+  /** The `where` argument as a predicate on child rows (`source`: the level's restricted rows). */
+  where?: (c: Ctx, where: unknown, source: string) => string;
   /** Order terms from the arguments (undefined: `defaultOrder`). */
   order?: (args: { [name: string]: unknown }) => OrderTerm[] | undefined;
   defaultOrder: readonly OrderTerm[];
@@ -427,7 +428,7 @@ const planLevel = (
       sel.args.where === undefined ||
       sel.args.where === null
         ? '1'
-        : field.where(childCtx, sel.args.where);
+        : field.where(childCtx, sel.args.where, source);
     const order = field.order?.(sel.args) ?? field.defaultOrder;
     order.forEach((term) => {
       referencedColumns(term.expr, target.columns).forEach((column) =>

@@ -403,22 +403,22 @@ export const maxAuthchainDepth = 100_000;
 const authchainSql = (c: Ctx, link: string) => {
   const spends = `SELECT transaction_hash, outpoint_transaction_hash FROM ${c.sql.view(
     'input_at'
-  )} WHERE (outpoint_transaction_hash, outpoint_index) IN (SELECT head, toUInt32(0) FROM chain)`;
+  )} WHERE (outpoint_transaction_hash, outpoint_index) IN (SELECT chain_head, toUInt32(0) FROM chain)`;
   return `WITH RECURSIVE chain AS (
-      SELECT hash AS base, hash AS head, toUInt32(1) AS length, [hash] AS path
+      SELECT hash AS chain_base, hash AS chain_head, toUInt32(1) AS chain_length, [hash] AS chain_path
       FROM (SELECT DISTINCT hash FROM (${link}))
       UNION ALL
-      SELECT chain.base AS base, s.transaction_hash AS head, chain.length + 1 AS length,
-        arrayPushBack(chain.path, s.transaction_hash) AS path
+      SELECT chain.chain_base AS chain_base, s.transaction_hash AS chain_head, chain.chain_length + 1 AS chain_length,
+        arrayPushBack(chain.chain_path, s.transaction_hash) AS chain_path
       FROM chain INNER JOIN (${spends} AND transaction_hash IN (${c.sql.accepted(
     c.node,
     `SELECT transaction_hash FROM (${spends})`
-  )})) AS s ON s.outpoint_transaction_hash = chain.head
-      WHERE chain.length < ${maxAuthchainDepth}
+  )})) AS s ON s.outpoint_transaction_hash = chain.chain_head
+      WHERE chain.chain_length < ${maxAuthchainDepth}
     )
-    SELECT base, argMax(head, length) AS head, max(length) AS length, argMax(path, length) AS path,
-      max(length) < ${maxAuthchainDepth} AS unspent
-    FROM chain GROUP BY base`;
+    SELECT chain_base AS base, argMax(chain_head, chain_length) AS head, max(chain_length) AS length,
+      argMax(chain_path, chain_length) AS path, max(chain_length) < ${maxAuthchainDepth} AS unspent
+    FROM chain GROUP BY chain_base`;
 };
 
 /* ------------------------------------------------------------------ */
@@ -594,7 +594,13 @@ export const TransactionEntity: Entity = {
           'input_at'
         )} WHERE transaction_hash IN (${link})`,
       target: () => InputEntity,
-      where: (c, where) => inputPredicate(c.sql, where as InputFilter, c.node),
+      where: (c, where, source) =>
+        inputPredicate(
+          c.sql,
+          where as InputFilter,
+          c.node,
+          `SELECT outpoint_transaction_hash, outpoint_index FROM (${source})`
+        ),
     },
     internal_id: scalar(str('internal_id')),
     is_coinbase: scalar('is_coinbase'),
@@ -681,7 +687,13 @@ export const OutputEntity: Entity = {
           c.node
         ),
       target: () => InputEntity,
-      where: (c, where) => inputPredicate(c.sql, where as InputFilter, c.node),
+      where: (c, where, source) =>
+        inputPredicate(
+          c.sql,
+          where as InputFilter,
+          c.node,
+          `SELECT outpoint_transaction_hash, outpoint_index FROM (${source})`
+        ),
     },
     token_category: scalar(
       `if(token_category = ${zeroCategory}, NULL, ${hex('token_category')})`
@@ -933,6 +945,7 @@ export const BlockInclusionEntity: Entity = {
   fields: {
     accepted_at: scalar(time('accepted_at')),
     block: blockById('block_internal_id'),
+    block_internal_id: scalar(str('block_internal_id')),
     transaction_index: scalar('transaction_index'),
   },
   name: 'BlockInclusion',
@@ -964,6 +977,7 @@ export const NodeTransactionEntity: Entity = {
   ],
   fields: {
     node: nodeById,
+    node_internal_id: scalar('node_internal_id'),
     transaction: transactionByHash('transaction_hash'),
     transaction_hash: scalar(hex('transaction_hash')),
     transaction_internal_id: scalar(str('transaction_internal_id')),
@@ -1004,6 +1018,7 @@ export const NodeBlockEntity: Entity = {
     block_internal_id: scalar(str('block_internal_id')),
     height: scalar('height'),
     node: nodeById,
+    node_internal_id: scalar('node_internal_id'),
   },
   name: 'NodeBlock',
 };

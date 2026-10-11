@@ -1134,22 +1134,29 @@ export const spendRowPredicate = (
 export const inputPredicate = (
   sql: Sql,
   filter: InputFilter | null | undefined,
-  node?: number
+  node?: number,
+  among?: string
 ): string => {
   if (!given(filter)) return '1';
-  if (requiresOutpoint(filter)) {
+  if (among === undefined && requiresOutpoint(filter)) {
     return `(transaction_hash, input_index) IN (SELECT transaction_hash, input_index FROM ${spendRelationSql(
       sql,
       spendRowPredicate(sql, filter, node)
     )})`;
   }
-  return inputRowPredicate(sql, filter, node);
+  return inputRowPredicate(sql, filter, node, among);
 };
 
+/**
+ * `among`: a subquery of the outpoints of the rows being filtered (a nested
+ * relationship's own input rows). The `outpoint` semi-join then reads only
+ * those outputs by primary key instead of every output matching the filter.
+ */
 const inputRowPredicate = (
   sql: Sql,
   filter: InputFilter,
-  node?: number
+  node?: number,
+  among?: string
 ): string => {
   const parts = inputOwnColumns(sql, filter, node);
   if (given(filter.sequence_number)) {
@@ -1166,22 +1173,21 @@ const inputRowPredicate = (
     parts.push(
       `(outpoint_transaction_hash, outpoint_index) IN (SELECT transaction_hash, output_index FROM ${sql.view(
         'output_at'
-      )} WHERE ${outputPredicate(
-        sql,
-        filter.outpoint,
-        outputRowColumns,
-        node
-      )})`
+      )} WHERE ${
+        among === undefined
+          ? ''
+          : `(transaction_hash, output_index) IN (${among}) AND `
+      }${outputPredicate(sql, filter.outpoint, outputRowColumns, node)})`
     );
   }
   if (given(filter._and)) {
-    parts.push(...filter._and.map((f) => inputPredicate(sql, f, node)));
+    parts.push(...filter._and.map((f) => inputPredicate(sql, f, node, among)));
   }
   if (given(filter._or)) {
-    parts.push(any(filter._or.map((f) => inputPredicate(sql, f, node))));
+    parts.push(any(filter._or.map((f) => inputPredicate(sql, f, node, among))));
   }
   if (given(filter._not)) {
-    parts.push(`NOT (${inputPredicate(sql, filter._not, node)})`);
+    parts.push(`NOT (${inputPredicate(sql, filter._not, node, among)})`);
   }
   return all(parts);
 };

@@ -1,4 +1,4 @@
-/* eslint-disable max-lines, @typescript-eslint/no-magic-numbers, functional/no-loop-statement, functional/no-let, no-await-in-loop, camelcase, @typescript-eslint/naming-convention, functional/no-throw-statement, @typescript-eslint/require-array-sort-compare, complexity, @typescript-eslint/no-loop-func, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/restrict-template-expressions, functional/no-mixed-type, max-params, no-bitwise, require-atomic-updates */
+/* eslint-disable max-lines, @typescript-eslint/no-magic-numbers, functional/no-loop-statement, functional/no-let, no-await-in-loop, camelcase, @typescript-eslint/naming-convention, functional/no-throw-statement, @typescript-eslint/require-array-sort-compare, complexity, @typescript-eslint/no-loop-func, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/restrict-template-expressions, functional/no-mixed-type, max-params, no-bitwise */
 // cspell:ignore clickhouse paryon unhex pothos seqs
 /**
  * Phase 2 spike proofs (docs/clickhouse-port/phase2-spike.md §3): S1–S6
@@ -6,20 +6,11 @@
  * compared with an independent computation (the in-memory model of
  * spec-dataset.ts, the store checker, or direct SQL on the same snapshot).
  */
-import type { ExecutionContext } from 'ava';
 import test from 'ava';
 import { createClient as createWsClient } from 'graphql-ws';
 import WebSocket from 'ws';
 
 import { createClickHouseChecker } from '../store/clickhouse/checker.js';
-import type { ClickHouseStore } from '../store/clickhouse/clickhouse-store.js';
-import type { ClickHouseClient } from '../store/clickhouse/client.js';
-import {
-  acceptance,
-  notSaved,
-  registerNodes,
-  scratch,
-} from '../store/clickhouse/spec-fixtures.js';
 import { e2eClickHouseUrl } from '../store/clickhouse/test-support.js';
 import {
   nodeAgnosticId,
@@ -31,15 +22,11 @@ import {
 import type { QueryEvent } from './db.js';
 import { dataQuerySettings } from './db.js';
 import { schema } from './schema.js';
-import type { Api, RunningServer } from './server.js';
-import { createApi, listen } from './server.js';
-import type { Dataset, ModelInput, ModelOutput } from './spec-dataset.js';
+import type { Model, ModelInput, ModelOutput } from './spec-dataset.js';
 import {
-  buildDataset,
   genesis,
   holder1,
   loanScript,
-  Model,
   opReturn,
   paryon,
   priceScript,
@@ -47,132 +34,15 @@ import {
   user1,
   user2,
 } from './spec-dataset.js';
+import type { Env } from './spec-env.js';
+import { one, recordQueries, setup, two } from './spec-env.js';
 import { snapshotParameterNames } from './sql.js';
 
 const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
 
-const one = 'node-one';
-const two = 'node-two';
-
 /* ------------------------------------------------------------------ */
 /* setup                                                                */
 /* ------------------------------------------------------------------ */
-
-interface Env {
-  api: Api;
-  server: RunningServer;
-  store: ClickHouseStore;
-  client: ClickHouseClient;
-  data: Dataset;
-  model: Model;
-  nodes: { node1: number; node2: number };
-  /** Accept blocks on node-one (model and store), publish. */
-  extendNodeOne: (txs: Parameters<Dataset['laterBlock']>[2]) => Promise<void>;
-  gql: <T = { [key: string]: unknown }>(
-    query: string,
-    variables?: { [key: string]: unknown }
-  ) => Promise<T>;
-}
-
-const setup = async (
-  t: ExecutionContext,
-  label: string,
-  utxo: 'off' | 'on' = 'off'
-): Promise<Env> => {
-  const { client, openStore } = await scratch(t, label, { utxo }, 'ch1_api');
-  const store = await openStore();
-  const nodes = await registerNodes(store);
-  const data = buildDataset();
-  const model = new Model();
-  const both = [acceptance(nodes.node1), acceptance(nodes.node2)];
-  for (const block of [data.block0, data.block1]) {
-    await store.saveBlock({
-      block,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: both,
-    });
-    model.addBlock(block, [one, two]);
-  }
-  await store.saveBlock({
-    block: data.block2,
-    isSavedTransaction: notSaved,
-    nodeAcceptances: [acceptance(nodes.node1)],
-  });
-  model.addBlock(data.block2, [one]);
-  await store.saveMempoolTransaction(data.redeemB, [
-    { nodeInternalId: nodes.node1, validatedAt: new Date() },
-  ]);
-  model.addMempool(data.redeemB, [one]);
-  await store.publishWatermarks();
-
-  const api = createApi(client, {
-    live: {
-      onError: (error) => {
-        t.log('live error', error);
-      },
-      pollMs: 20,
-    },
-  });
-  const server = await listen(api);
-  t.teardown(async () => server.close());
-  let tip = data.block2;
-  const extendNodeOne = async (txs: Parameters<Dataset['laterBlock']>[2]) => {
-    const block = data.laterBlock(tip.height + 1, tip, txs);
-    await store.saveBlock({
-      block,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(nodes.node1)],
-    });
-    model.addBlock(block, [one]);
-    tip = block;
-    await store.publishWatermarks();
-  };
-  const gql = async <T>(
-    query: string,
-    variables: { [key: string]: unknown } = {}
-  ) => {
-    const response = await fetch(server.url, {
-      body: JSON.stringify({ query, variables }),
-      headers: { 'content-type': 'application/json' },
-      method: 'POST',
-    });
-    const body = (await response.json()) as {
-      data?: T;
-      errors?: unknown[];
-    };
-    if (body.errors !== undefined) {
-      throw new Error(JSON.stringify(body.errors));
-    }
-    return body.data!;
-  };
-  return {
-    api,
-    client,
-    data,
-    extendNodeOne,
-    gql,
-    model,
-    nodes,
-    server,
-    store,
-  };
-};
-
-/** Every query an API request sends, recorded. */
-const recordQueries = (api: Api) => {
-  const events: QueryEvent[] = [];
-  const previous = api.db.onQuery;
-  api.db.onQuery = (event) => {
-    events.push(event);
-    previous?.(event);
-  };
-  return {
-    events,
-    stop: () => {
-      api.db.onQuery = previous;
-    },
-  };
-};
 
 const sorted = (values: readonly string[]) => [...values].sort();
 

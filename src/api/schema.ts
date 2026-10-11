@@ -996,6 +996,7 @@ BlockInclusionRef.implement({
       resolve: (p, _a, _c, info) => one(p, info)!,
       type: BlockRef,
     }),
+    block_internal_id: bigIntField(t, 'block_internal_id'),
     transaction_index: t.int({
       nullable: true,
       resolve: (p) => num(p.transaction_index),
@@ -1029,6 +1030,7 @@ NodeTransactionRef.implement({
       resolve: (p, _a, _c, info) => one(p, info)!,
       type: NodeRef,
     }),
+    node_internal_id: intField(t, 'node_internal_id'),
     transaction: t.field({
       resolve: (p, _a, _c, info) => one(p, info)!,
       type: TransactionRef,
@@ -1072,6 +1074,7 @@ NodeBlockRef.implement({
       resolve: (p, _a, _c, info) => one(p, info)!,
       type: NodeRef,
     }),
+    node_internal_id: intField(t, 'node_internal_id'),
   }),
 });
 
