@@ -189,6 +189,7 @@ export const readClickHouseSnapshot = async (clickhouse, chNodeIds) => {
        (SELECT groupArray((n, v)) FROM
           (SELECT node_internal_id AS n, max(visible_seq) AS v FROM visibility
            WHERE node_internal_id IN (${[0, ...ids].join(', ')}) GROUP BY n)) AS marks,
+       (SELECT max(watermark) FROM spend_watermark) AS spend_mark,
        arrayMax(arrayMap(m -> if(m.1 = 0, m.2, toUInt64(0)), arrayPushBack(marks, (toUInt32(0), toUInt64(0))))) AS v0,
        (SELECT arraySort(groupArray(commit_seq)) FROM commit_log
         WHERE state = 'committed' AND commit_seq > v0) AS tail_seqs,
@@ -203,6 +204,7 @@ export const readClickHouseSnapshot = async (clickhouse, chNodeIds) => {
                                                  arrayPushBack(marks, (toUInt32(0), toUInt64(0)))))),
                 [${ids.length === 0 ? '' : ids.join(', ')}]::Array(UInt32)) AS visible,
        toString(v0) AS visible0,
+       toString(least(v0, spend_mark)) AS spend,
        arrayMap(x -> toString(x), tail_seqs) AS tail,
        arrayMap(x -> toString(x), void_seqs) AS void,
        arrayMap(e -> toString(if(indexOf(fences.1, e) = 0, ${counterMask},
@@ -214,6 +216,7 @@ export const readClickHouseSnapshot = async (clickhouse, chNodeIds) => {
   );
   return {
     fence: row?.fence ?? [],
+    spend: row?.spend ?? '0',
     tail: row?.tail ?? [],
     visible,
     visible0: row?.visible0 ?? '0',

@@ -195,6 +195,31 @@ const chRangeAnd = (column, chunk) =>
 const heightBetween = (column, chunk) =>
   `${column} BETWEEN ${chunk.lo} AND ${chunk.hi}`;
 
+
+/**
+ * A spend row: spending tx, input index, outpoint, then the spent output's
+ * value, script and token fields. `alias` holds the spent attributes,
+ * `inputAlias` the input key and outpoint (the same alias on a spend-index row).
+ */
+const spendFields = (expr, alias, hashColumn, inputAlias = alias) => [
+  expr.hex(hashColumn),
+  expr.int(`${inputAlias}.input_index`),
+  expr.hex(`${inputAlias}.outpoint_transaction_hash`),
+  expr.int(`${inputAlias}.outpoint_index`),
+  ...outputFields(expr, alias).slice(2),
+];
+
+/** Postgres side of `spend` / `spend_join`: input ⋈ output on the outpoint. */
+const pgSpendSql = (ctx, chunk) =>
+  `WITH ${pgScope(ctx, chunk)} ${select(
+    pgExpr,
+    ctx,
+    spendFields(pgExpr, 'o', 'scope.hash', 'i'),
+    [],
+    `FROM scope JOIN input i ON i.transaction_internal_id = scope.internal_id
+     JOIN output o ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index`
+  )}`;
+
 // ---------------------------------------------------------------- tables
 
 /**
@@ -391,6 +416,64 @@ export const tables = {
            'i.transaction_hash',
            chunk
          )}i.transaction_hash IN (SELECT hash FROM scope)`
+      )}`,
+    }),
+  },
+
+  /**
+   * Opt-in: the spend index (`spend_at` up to the snapshot's spend watermark)
+   * vs Postgres `input ⋈ output` on the outpoint, per spending transaction in
+   * the chunk's scope (coinbase inputs and unknown outpoints have no row on
+   * either side). Exact only when the index has caught up with the compared
+   * height (spend watermark ≥ every commit of the scope; the lab compares
+   * after `spend_index_progress` shows lag 0); `spend_join` has no lag.
+   */
+  spend: {
+    level: 'tx',
+    optIn: true,
+    pg: (ctx, chunk) => ({ sql: pgSpendSql(ctx, chunk) }),
+    ch: (ctx, chunk) => ({
+      sql: `WITH ${chScope(ctx, chunk)} ${select(
+        chExpr,
+        ctx,
+        spendFields(chExpr, 's', 's.transaction_hash'),
+        [],
+        `FROM spend_at(spend = ${ctx.ch.spend}) AS s
+         WHERE ${chRangeAnd(
+           's.transaction_hash',
+           chunk
+         )}s.transaction_hash IN (SELECT hash FROM scope)`
+      )}`,
+    }),
+  },
+
+  /** Opt-in: the same pairs by ClickHouse's join (`input_at ⋈ output_at`) vs Postgres. */
+  spend_join: {
+    level: 'tx',
+    optIn: true,
+    pg: (ctx, chunk) => ({ sql: pgSpendSql(ctx, chunk) }),
+    ch: (ctx, chunk) => ({
+      sql: `WITH ${chScope(ctx, chunk)} ${select(
+        chExpr,
+        ctx,
+        spendFields(chExpr, 'o', 'i.transaction_hash', 'i'),
+        [],
+        `FROM (SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index
+               FROM input_at${agnostic(ctx)}
+               WHERE ${chRangeAnd(
+                 'transaction_hash',
+                 chunk
+               )}transaction_hash IN (SELECT hash FROM scope)) AS i
+         INNER JOIN (SELECT * FROM output_at${agnostic(ctx)}
+                     WHERE (transaction_hash, output_index) IN (
+                       SELECT outpoint_transaction_hash, outpoint_index FROM input_at${agnostic(
+                         ctx
+                       )}
+                       WHERE ${chRangeAnd(
+                         'transaction_hash',
+                         chunk
+                       )}transaction_hash IN (SELECT hash FROM scope))) AS o
+           ON o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index`
       )}`,
     }),
   },
