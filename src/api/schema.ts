@@ -738,7 +738,7 @@ TransactionRef.implement({
         where: t.arg({ type: BlockInclusionFilterInput }),
       },
       description:
-        'Every stored block that includes the transaction (node-agnostic: blocks of stale forks included), by height. `accepted_by: node` keeps the blocks that node accepts; `accepted(node:)` on each inclusion tells them apart.',
+        'Every stored block that includes the transaction (node-agnostic: blocks of stale forks included), in the order the blocks were stored (`order_by: { block: { height: ASC } }` for height order). `accepted_by: node` keeps the blocks that node accepts; `accepted(node:)` on each inclusion tells them apart.',
       resolve: (p, _a, _c, info) => many(p, info),
       type: [BlockInclusionRef],
     }),
