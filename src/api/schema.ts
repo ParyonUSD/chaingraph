@@ -1,4 +1,4 @@
-/* eslint-disable camelcase, @typescript-eslint/naming-convention, @typescript-eslint/no-magic-numbers, functional/no-throw-statement, complexity, max-params, max-lines */
+/* eslint-disable camelcase, @typescript-eslint/naming-convention, functional/no-throw-statement, complexity, max-params, max-lines, sort-keys */
 // cspell:ignore clickhouse pothos unhex authchain authchains authhead bytecode
 /**
  * The Chaingraph v2 GraphQL schema (Pothos). Shape and requirement mapping:
@@ -18,6 +18,18 @@ import { GraphQLError, Kind, print } from 'graphql';
 
 import type { VisibilitySnapshot } from '../store/clickhouse/visibility.js';
 
+import type {
+  AggregateRow,
+  AggregateSpec,
+  GroupOrder,
+  KeyKind,
+} from './aggregates.js';
+import {
+  aggregateSpecs,
+  requestedAggregates,
+  runAggregate,
+  runGroups,
+} from './aggregates.js';
 import {
   encodeBlock,
   encodeBlockHeader,
@@ -27,7 +39,7 @@ import {
 } from './bytecode.js';
 import type { Page, Row, Sel } from './compile.js';
 import { pageNodeSels, prefetched, rootSels } from './compile.js';
-import type { ApiDb, PinnedSnapshot, StatementEnv } from './db.js';
+import type { ApiDb, PinnedSnapshot } from './db.js';
 import { singleNodeEnv } from './db.js';
 import type { LiveHub } from './live.js';
 import { resultKey } from './live.js';
@@ -40,8 +52,7 @@ import type {
   TransactionsArgs,
 } from './roots.js';
 import {
-  checkLimit,
-  maxLimits,
+  rowSets,
   runBlocks,
   runBlocksByHash,
   runBlockTip,
@@ -75,7 +86,6 @@ import type {
   TimestampComparison,
   TransactionFilter,
 } from './sql.js';
-import { unspentOutputPredicate } from './sql.js';
 
 export { maxLimits } from './roots.js';
 
@@ -1207,159 +1217,164 @@ const WatermarkRef = builder.objectRef<WatermarkRow>('Watermark').implement({
 });
 
 /* ------------------------------------------------------------------ */
-/* group-by (S3)                                                        */
+/* aggregates (R24) and group-by (R25)                                  */
 /* ------------------------------------------------------------------ */
 
-type GroupColumn = 'LOCKING_BYTECODE' | 'TOKEN_CATEGORY';
-type GroupOrderField =
-  | 'COUNT'
-  | 'KEY'
-  | 'SUM_FUNGIBLE_TOKEN_AMOUNT'
-  | 'SUM_VALUE_SATOSHIS';
-type Order = 'ASC' | 'DESC';
-
-const GroupColumnEnum = builder.enumType('OutputGroupColumn', {
-  values: ['LOCKING_BYTECODE', 'TOKEN_CATEGORY'] as const,
-});
-
-const GroupOrderFieldEnum = builder.enumType('OutputGroupOrderField', {
-  values: [
-    'COUNT',
-    'KEY',
-    'SUM_FUNGIBLE_TOKEN_AMOUNT',
-    'SUM_VALUE_SATOSHIS',
-  ] as const,
-});
-
-const GroupOrderInput = builder
-  .inputRef<{ by: GroupOrderField; direction?: Order | null }>(
-    'OutputGroupOrder'
-  )
-  .implement({
-    fields: (t) => ({
-      by: t.field({ required: true, type: GroupOrderFieldEnum }),
-      direction: t.field({ defaultValue: 'DESC', type: OrderEnum }),
-    }),
-  });
-
-interface GroupRow {
-  locking_bytecode: string | null;
-  token_category: string | null;
-  count: string;
-  sum_fungible_token_amount: string;
-  sum_value_satoshis: string;
+interface NumericParent {
+  row: AggregateRow;
+  fn: 'max' | 'min' | 'sum';
 }
 
-const GroupKeyRef = builder.objectRef<GroupRow>('OutputGroupKey').implement({
-  fields: (t) => ({
-    locking_bytecode: t.field({
-      nullable: true,
-      resolve: (p) => p.locking_bytecode,
-      type: 'Hex',
-    }),
-    token_category: t.field({
-      nullable: true,
-      resolve: (p) => p.token_category,
-      type: 'Hex',
-    }),
-  }),
-});
+const keyType = (kind: KeyKind) =>
+  kind === 'hex'
+    ? 'Hex'
+    : kind === 'int'
+    ? 'Int'
+    : kind === 'bool'
+    ? 'Boolean'
+    : 'String';
 
-const GroupSumRef = builder.objectRef<GroupRow>('OutputGroupSum').implement({
-  fields: (t) => ({
-    fungible_token_amount: t.field({
-      resolve: (p) => p.sum_fungible_token_amount,
-      type: 'BigInt',
-    }),
-    value_satoshis: t.field({
-      resolve: (p) => p.sum_value_satoshis,
-      type: 'BigInt',
-    }),
-  }),
-});
-
-const GroupAggregateRef = builder
-  .objectRef<GroupRow>('OutputGroupAggregate')
-  .implement({
+/** The aggregate, group and group-page types of one entity (aggregates.ts spec). */
+const aggregateTypes = (spec: AggregateSpec, keyEnumName?: string) => {
+  const fields = Object.keys(spec.numeric);
+  const Numeric = builder
+    .objectRef<NumericParent>(`${spec.name}AggregateNumeric`)
+    .implement({
+      fields: (t) =>
+        Object.fromEntries(
+          fields.map((field) => [
+            field,
+            t.field({
+              nullable: true,
+              resolve: (p) => p.row.values[`${p.fn}.${field}`] as string | null,
+              type: 'BigInt',
+            }),
+          ])
+        ),
+    });
+  const Avg = builder
+    .objectRef<AggregateRow>(`${spec.name}AggregateAvg`)
+    .implement({
+      fields: (t) =>
+        Object.fromEntries(
+          fields.map((field) => [
+            field,
+            t.float({
+              nullable: true,
+              resolve: (p) => p.values[`avg.${field}`] as number | null,
+            }),
+          ])
+        ),
+    });
+  const Fields = builder
+    .objectRef<AggregateRow>(`${spec.name}AggregateFields`)
+    .implement({
+      description:
+        'count, and sum/min/max/avg of the numeric fields (null over no rows, as in SQL).',
+      fields: (t) => ({
+        avg: t.field({ resolve: (p) => p, type: Avg }),
+        count: t.field({ resolve: (p) => p.count, type: 'BigInt' }),
+        max: t.field({
+          resolve: (row): NumericParent => ({ fn: 'max', row }),
+          type: Numeric,
+        }),
+        min: t.field({
+          resolve: (row): NumericParent => ({ fn: 'min', row }),
+          type: Numeric,
+        }),
+        sum: t.field({
+          resolve: (row): NumericParent => ({ fn: 'sum', row }),
+          type: Numeric,
+        }),
+      }),
+    });
+  const Aggregate = builder
+    .objectRef<AggregateRow>(`${spec.name}Aggregate`)
+    .implement({
+      fields: (t) => ({
+        aggregate: t.field({ resolve: (p) => p, type: Fields }),
+      }),
+    });
+  const keys = Object.entries(spec.keys);
+  if (keys.length === 0) return { Aggregate, Fields };
+  const KeyEnum = builder.enumType(keyEnumName ?? `${spec.name}GroupColumn`, {
+    values: keys.map(([key]) => key) as [string, ...string[]],
+  });
+  const OrderField = builder.enumType(`${spec.name}GroupOrderField`, {
+    values: [
+      'COUNT',
+      'KEY',
+      ...fields.flatMap((field) =>
+        ['SUM', 'MIN', 'MAX', 'AVG'].map((fn) => `${fn}_${field.toUpperCase()}`)
+      ),
+    ] as [string, ...string[]],
+  });
+  const Order = builder
+    .inputRef<GroupOrder>(`${spec.name}GroupOrder`)
+    .implement({
+      fields: (t) => ({
+        by: t.field({ required: true, type: OrderField }),
+        direction: t.field({ defaultValue: 'DESC', type: OrderEnum }),
+      }),
+    });
+  const Key = builder
+    .objectRef<AggregateRow>(`${spec.name}GroupKey`)
+    .implement({
+      description: 'The group key (only the group_by columns are set).',
+      fields: (t) =>
+        Object.fromEntries(
+          keys.map(([, key]) => [
+            key.field,
+            t.field({
+              nullable: true,
+              resolve: ((p: AggregateRow) => {
+                const value = p.key[key.field];
+                if (value === null || value === undefined) return null;
+                if (key.kind === 'int') return Number(value);
+                if (key.kind === 'bool') return value === true || value === 1;
+                return String(value);
+              }) as never,
+              type: keyType(key.kind) as never,
+            }),
+          ])
+        ),
+    });
+  const Group = builder.objectRef<AggregateRow>(`${spec.name}Group`).implement({
     fields: (t) => ({
-      count: t.field({ resolve: (p) => p.count, type: 'BigInt' }),
-      sum: t.field({ resolve: (p) => p, type: GroupSumRef }),
+      aggregate: t.field({ resolve: (p) => p, type: Fields }),
+      key: t.field({ resolve: (p) => p, type: Key }),
     }),
   });
-
-const GroupRef = builder.objectRef<GroupRow>('OutputGroup').implement({
-  fields: (t) => ({
-    aggregate: t.field({ resolve: (p) => p, type: GroupAggregateRef }),
-    key: t.field({ resolve: (p) => p, type: GroupKeyRef }),
-  }),
-});
-
-const zeroCategory = `toFixedString(unhex('${'00'.repeat(32)}'), 32)`;
-const groupColumns: { [column in GroupColumn]: readonly [string, string] } = {
-  LOCKING_BYTECODE: ['locking_bytecode', 'lower(hex(locking_bytecode))'],
-  TOKEN_CATEGORY: [
-    'token_category',
-    `if(token_category = ${zeroCategory}, NULL, lower(hex(token_category)))`,
-  ],
-};
-
-const runGroups = async (
-  db: ApiDb,
-  env: StatementEnv,
-  args: {
-    where?: OutputFilter | null;
-    group_by: readonly GroupColumn[];
-    order_by?: { by: GroupOrderField; direction?: Order | null } | null;
-    limit: number;
-  }
-) => {
-  const { sql } = env;
-  const columns = [...new Set(args.group_by)];
-  if (columns.length === 0) {
-    throw new GraphQLError('group_by needs at least one column.');
-  }
-  const raw = columns.map((column) => groupColumns[column][0]);
-  const direction = args.order_by?.direction ?? 'DESC';
-  const aggregates: { [field in GroupOrderField]: string } = {
-    COUNT: 'count()',
-    KEY: raw.join(', '),
-    SUM_FUNGIBLE_TOKEN_AMOUNT:
-      'sum(toInt128(ifNull(fungible_token_amount, 0)))',
-    SUM_VALUE_SATOSHIS: 'sum(toInt128(value_satoshis))',
-  };
-  const orderBy =
-    args.order_by === undefined || args.order_by === null
-      ? raw.join(', ')
-      : `${aggregates[args.order_by.by]} ${direction}, ${raw.join(', ')}`;
-  const statement = `SELECT ${columns
-    .map(
-      (column) =>
-        `${groupColumns[column][1]} AS \`g.${groupColumns[column][0]}\``
+  const GroupPage = builder
+    .objectRef<{ nodes: AggregateRow[]; has_more: boolean }>(
+      `${spec.name}GroupPage`
     )
-    .join(', ')},
-    toString(count()) AS count,
-    toString(sum(toInt128(ifNull(fungible_token_amount, 0)))) AS sum_fungible_token_amount,
-    toString(sum(toInt128(value_satoshis))) AS sum_value_satoshis
-  FROM ${sql.view('output_at')}
-  WHERE ${unspentOutputPredicate(sql, args.where, env.ctx.node)}
-  GROUP BY ${raw.join(', ')}
-  ORDER BY ${orderBy}
-  LIMIT ${sql.bind(args.limit, 'UInt32')}`;
-  const rows = await db.query<{ [key: string]: string | null }>(
-    'unspent_output_groups',
-    statement,
-    sql.params
-  );
-  return rows.map(
-    (row): GroupRow => ({
-      count: String(row.count),
-      locking_bytecode: row['g.locking_bytecode'] ?? null,
-      sum_fungible_token_amount: String(row.sum_fungible_token_amount),
-      sum_value_satoshis: String(row.sum_value_satoshis),
-      token_category: row['g.token_category'] ?? null,
-    })
-  );
+    .implement({
+      description: 'One page of groups; `has_more` signals more groups (R33).',
+      fields: (t) => ({
+        has_more: t.boolean({ resolve: (p) => p.has_more }),
+        nodes: t.field({ resolve: (p) => p.nodes, type: [Group] }),
+      }),
+    });
+  return { Aggregate, Fields, Group, GroupPage, KeyEnum, Order };
 };
+
+const OutputAggregates = aggregateTypes(
+  aggregateSpecs.Output,
+  'OutputGroupColumn'
+);
+const SpendAggregates = aggregateTypes(aggregateSpecs.Spend);
+const TransactionAggregates = aggregateTypes(aggregateSpecs.Transaction);
+const BlockAggregates = aggregateTypes(aggregateSpecs.Block);
+const MempoolAggregates = aggregateTypes(aggregateSpecs.Mempool);
+
+/** The aggregates requested under `aggregate` (aggregate roots) or `nodes { aggregate }` (groups). */
+const aggregateSelection = (sels: readonly Sel[]) =>
+  requestedAggregates(
+    sels
+      .filter((sel) => sel.name === 'aggregate')
+      .flatMap((sel) => sel.sels ?? [])
+  );
 
 /* ------------------------------------------------------------------ */
 /* roots                                                                */
@@ -1649,22 +1664,251 @@ builder.queryType({
           ),
         type: [TransactionRef],
       }),
-      unspent_output_groups: t.field({
+      blocks_aggregate: t.field({
         args: {
-          group_by: t.arg({ required: true, type: [GroupColumnEnum] }),
+          node: t.arg.string({ required: true }),
+          where: t.arg({ type: BlockFilterInput }),
+        },
+        description: 'Aggregates over the blocks the node accepts (R24).',
+        resolve: async (_root, args, context, info) => {
+          const env = await requestEnv(context, args.node);
+          return runAggregate(
+            env,
+            'blocks_aggregate',
+            aggregateSpecs.Block,
+            rowSets.blocks(env, args.where),
+            aggregateSelection(rootSels(info))
+          );
+        },
+        type: BlockAggregates.Aggregate,
+      }),
+      block_groups: t.field({
+        args: {
+          group_by: t.arg({ required: true, type: [BlockAggregates.KeyEnum!] }),
           limit: t.arg.int({ required: true }),
           node: t.arg.string({ required: true }),
-          order_by: t.arg({ type: GroupOrderInput }),
+          offset: t.arg.int(),
+          order_by: t.arg({ type: [BlockAggregates.Order!] }),
+          where: t.arg({ type: BlockFilterInput }),
+        },
+        description:
+          'Group-by over the blocks the node accepts (e.g. block statistics per DAY / MONTH, R25).',
+        resolve: async (_root, args, context, info) => {
+          const env = await requestEnv(context, args.node);
+          return runGroups(
+            env,
+            'block_groups',
+            aggregateSpecs.Block,
+            rowSets.blocks(env, args.where),
+            args,
+            aggregateSelection(pageNodeSels(info))
+          );
+        },
+        type: BlockAggregates.GroupPage!,
+      }),
+      mempool_aggregate: t.field({
+        args: {
+          node: t.arg.string({ required: true }),
+          where: t.arg({ type: NodeTransactionFilterInput }),
+        },
+        description: "Aggregates over the node's mempool.",
+        resolve: async (_root, args, context, info) => {
+          const env = await requestEnv(context, args.node);
+          return runAggregate(
+            env,
+            'mempool_aggregate',
+            aggregateSpecs.Mempool,
+            rowSets.mempool(env, args.where),
+            aggregateSelection(rootSels(info))
+          );
+        },
+        type: MempoolAggregates.Aggregate,
+      }),
+      output_groups: t.field({
+        args: {
+          group_by: t.arg({
+            required: true,
+            type: [OutputAggregates.KeyEnum!],
+          }),
+          limit: t.arg.int({ required: true }),
+          node: t.arg.string({ required: true }),
+          offset: t.arg.int(),
+          order_by: t.arg({ type: [OutputAggregates.Order!] }),
+          unspent: t.arg.boolean({
+            defaultValue: false,
+            description: "Only the node's unspent outputs.",
+          }),
           where: t.arg({ type: OutputFilterInput }),
         },
         description:
-          "Group-by aggregate over the node's unspent outputs (computed at query time).",
-        resolve: async (_root, args, context) => {
-          checkLimit(args.limit, maxLimits.groups);
+          'Group-by over the outputs the node accepts (or its unspent outputs): holder balances per locking bytecode, supply per category, … (R25).',
+        resolve: async (_root, args, context, info) => {
           const env = await requestEnv(context, args.node);
-          return runGroups(context.db, env, args);
+          return runGroups(
+            env,
+            'output_groups',
+            aggregateSpecs.Output,
+            args.unspent === true
+              ? rowSets.unspentOutputs(env, args.where)
+              : rowSets.outputs(env, args.where),
+            args,
+            aggregateSelection(pageNodeSels(info))
+          );
         },
-        type: [GroupRef],
+        type: OutputAggregates.GroupPage!,
+      }),
+      outputs_aggregate: t.field({
+        args: {
+          node: t.arg.string({ required: true }),
+          where: t.arg({ type: OutputFilterInput }),
+        },
+        description:
+          'Aggregates over the outputs the node accepts (search roots: count of a locking bytecode prefix, …).',
+        resolve: async (_root, args, context, info) => {
+          const env = await requestEnv(context, args.node);
+          return runAggregate(
+            env,
+            'outputs_aggregate',
+            aggregateSpecs.Output,
+            rowSets.outputs(env, args.where),
+            aggregateSelection(rootSels(info))
+          );
+        },
+        type: OutputAggregates.Aggregate,
+      }),
+      spend_groups: t.field({
+        args: {
+          group_by: t.arg({ required: true, type: [SpendAggregates.KeyEnum!] }),
+          limit: t.arg.int({ required: true }),
+          node: t.arg.string({ required: true }),
+          offset: t.arg.int(),
+          order_by: t.arg({ type: [SpendAggregates.Order!] }),
+          where: t.arg({ type: InputFilterInput }),
+        },
+        description:
+          'Group-by over spends (inputs of transactions the node accepts, with the outputs they spend; coinbase inputs are not spends): e.g. value paid per spent token category or per transaction.',
+        resolve: async (_root, args, context, info) => {
+          const env = await requestEnv(context, args.node);
+          return runGroups(
+            env,
+            'spend_groups',
+            aggregateSpecs.Spend,
+            rowSets.spends(env, args.where),
+            args,
+            aggregateSelection(pageNodeSels(info))
+          );
+        },
+        type: SpendAggregates.GroupPage!,
+      }),
+      spends_aggregate: t.field({
+        args: {
+          node: t.arg.string({ required: true }),
+          where: t.arg({ type: InputFilterInput }),
+        },
+        description:
+          'Aggregates over spends (inputs of transactions the node accepts, with the spent outputs).',
+        resolve: async (_root, args, context, info) => {
+          const env = await requestEnv(context, args.node);
+          return runAggregate(
+            env,
+            'spends_aggregate',
+            aggregateSpecs.Spend,
+            rowSets.spends(env, args.where),
+            aggregateSelection(rootSels(info))
+          );
+        },
+        type: SpendAggregates.Aggregate,
+      }),
+      transaction_groups: t.field({
+        args: {
+          group_by: t.arg({
+            required: true,
+            type: [TransactionAggregates.KeyEnum!],
+          }),
+          limit: t.arg.int({ required: true }),
+          node: t.arg.string({ required: true }),
+          offset: t.arg.int(),
+          order_by: t.arg({ type: [TransactionAggregates.Order!] }),
+          where: t.arg({ type: TransactionFilterInput }),
+        },
+        description:
+          'Group-by over the transactions the node accepts (e.g. per BLOCK_DAY or BLOCK_HEIGHT of the block the node accepts them in; null in its mempool).',
+        resolve: async (_root, args, context, info) => {
+          const env = await requestEnv(context, args.node);
+          return runGroups(
+            env,
+            'transaction_groups',
+            aggregateSpecs.Transaction,
+            rowSets.transactions(env, args.where),
+            args,
+            aggregateSelection(pageNodeSels(info))
+          );
+        },
+        type: TransactionAggregates.GroupPage!,
+      }),
+      transactions_aggregate: t.field({
+        args: {
+          node: t.arg.string({ required: true }),
+          where: t.arg({ type: TransactionFilterInput }),
+        },
+        description: 'Aggregates over the transactions the node accepts (R24).',
+        resolve: async (_root, args, context, info) => {
+          const env = await requestEnv(context, args.node);
+          return runAggregate(
+            env,
+            'transactions_aggregate',
+            aggregateSpecs.Transaction,
+            rowSets.transactions(env, args.where),
+            aggregateSelection(rootSels(info))
+          );
+        },
+        type: TransactionAggregates.Aggregate,
+      }),
+      unspent_output_groups: t.field({
+        args: {
+          group_by: t.arg({
+            required: true,
+            type: [OutputAggregates.KeyEnum!],
+          }),
+          limit: t.arg.int({ required: true }),
+          node: t.arg.string({ required: true }),
+          order_by: t.arg({ type: [OutputAggregates.Order!] }),
+          where: t.arg({ type: OutputFilterInput }),
+        },
+        description:
+          "Group-by over the node's unspent outputs (the spike's S3 root; output_groups(unspent: true) pages).",
+        resolve: async (_root, args, context, info) => {
+          const env = await requestEnv(context, args.node);
+          return (
+            await runGroups(
+              env,
+              'unspent_output_groups',
+              aggregateSpecs.Output,
+              rowSets.unspentOutputs(env, args.where),
+              args,
+              aggregateSelection(rootSels(info))
+            )
+          ).nodes;
+        },
+        type: [OutputAggregates.Group!],
+      }),
+      unspent_outputs_aggregate: t.field({
+        args: {
+          node: t.arg.string({ required: true }),
+          where: t.arg({ type: OutputFilterInput }),
+        },
+        description: "Aggregates over the node's unspent outputs.",
+        resolve: async (_root, args, context, info) => {
+          const env = await requestEnv(context, args.node);
+          return runAggregate(
+            env,
+            'unspent_outputs_aggregate',
+            aggregateSpecs.Output,
+            rowSets.unspentOutputs(env, args.where),
+            aggregateSelection(rootSels(info))
+          );
+        },
+        type: OutputAggregates.Aggregate,
       }),
       watermark: t.field({
         args: { node: t.arg.string({ required: true }) },

@@ -8,8 +8,6 @@ import { inspect } from 'util';
 
 import {
   binToHex,
-  encodeDataPush,
-  flattenBinArray,
   hexToBin,
   swapEndianness,
   utf8ToBin,
@@ -30,6 +28,7 @@ import { execa } from 'execa';
 import got from 'got';
 import pg from 'pg';
 
+import { patternVectors } from '../api/bytecode-pattern.vectors.js';
 import { indexDefinitions } from '../components/db-utils.js';
 import { createChecker } from '../store/checker-factory.js';
 import type { StoreChecker } from '../store/checker.js';
@@ -3075,275 +3074,25 @@ const bytecodeFunctionReturnsNull = test.macro<[string, string]>({
     `[e2e] [postgres] ${functionName} – ${bytecodeHex}: ${providedTitle ?? ''}`,
 });
 
-postgresTest.concurrent(
-  'P2PKH',
-  bytecodeFunction,
-  'parse_bytecode_pattern',
-  '76a914000000000000000000000000000000000000000088ac',
-  '76a91488ac'
-);
-postgresTest.concurrent(
-  'P2SH',
-  bytecodeFunction,
-  'parse_bytecode_pattern',
-  'a914000000000000000000000000000000000000000087',
-  'a91487'
-);
-postgresTest.concurrent(
-  'OP_RETURN (fixed pushes)',
-  bytecodeFunction,
-  'parse_bytecode_pattern',
-  '6a04000000005120000000000000000000000000000000000000000000000000000000000000000004000000000400000000',
-  '6a0451200404'
-);
-postgresTest.concurrent(
-  'OP_RETURN with OP_PUSHDATA1',
-  bytecodeFunction,
-  'parse_bytecode_pattern',
-  '6a026d0c090000000000000000004c5c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000',
-  '6a02094c'
-);
-
-const allOnes = 0x11;
-const minPushData2 = 256;
-postgresTest.concurrent(
-  'OP_RETURN with OP_PUSHDATA2',
-  bytecodeFunction,
-  'parse_bytecode_pattern',
-  `6a${binToHex(
-    encodeDataPush(new Uint8Array(minPushData2).fill(allOnes))
-  )}515151`,
-  '6a4d515151'
-);
-
-const minPushData4 = 65536;
-postgresTest.concurrent(
-  'OP_RETURN with OP_PUSHDATA4',
-  bytecodeFunction,
-  'parse_bytecode_pattern',
-  `6a${binToHex(
-    encodeDataPush(new Uint8Array(minPushData4).fill(allOnes))
-  )}515151`,
-  '6a4e515151'
-);
-
-postgresTest.concurrent(
-  'malformed OP_PUSHBYTES',
-  bytecodeFunction,
-  'parse_bytecode_pattern',
-  '515102',
-  '515102'
-);
-postgresTest.concurrent(
-  'malformed OP_PUSHDATA1',
-  bytecodeFunction,
-  'parse_bytecode_pattern',
-  '51514c',
-  '51514c'
-);
-postgresTest.concurrent(
-  'malformed OP_PUSHDATA2',
-  bytecodeFunction,
-  'parse_bytecode_pattern',
-  '51514d11',
-  '51514d'
-);
-postgresTest.concurrent(
-  'malformed OP_PUSHDATA4',
-  bytecodeFunction,
-  'parse_bytecode_pattern',
-  '51514e112233',
-  '51514e'
-);
-
-postgresTest.concurrent(
-  'P2PKH',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  '76a914000000000000000000000000000000000000000088ac',
-  '76a91488ac'
-);
-postgresTest.concurrent(
-  'P2SH',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  'a914000000000000000000000000000000000000000087',
-  'a91487'
-);
-postgresTest.concurrent(
-  'OP_RETURN (fixed pushes)',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  '6a04000000005120000000000000000000000000000000000000000000000000000000000000000004000000000400000000',
-  '6a0451200404'
-);
-postgresTest.concurrent(
-  'OP_RETURN with OP_PUSHDATA1 (memo.cash)',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  '6a026d0c090000000000000000004c5c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000',
-  '6a02094c5c'
-);
-
-postgresTest.concurrent(
-  'zero-length OP_PUSHDATA1',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  '4c00',
-  '4c00'
-);
-postgresTest.concurrent(
-  'zero-length OP_PUSHDATA2',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  '4d0000',
-  '4d0000'
-);
-postgresTest.concurrent(
-  'zero-length OP_PUSHDATA4',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  '4e00000000',
-  '4e00000000'
-);
-
-postgresTest.concurrent(
-  'OP_RETURN with OP_PUSHDATA2',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  `6a${binToHex(
-    encodeDataPush(new Uint8Array(minPushData2).fill(allOnes))
-  )}515151`,
-  '6a4d0001515151'
-);
-
-postgresTest.concurrent(
-  'OP_RETURN with OP_PUSHDATA4',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  `6a${binToHex(
-    encodeDataPush(new Uint8Array(minPushData4).fill(allOnes))
-  )}515151`,
-  '6a4e00000100515151'
-);
-
-postgresTest.concurrent(
-  'malformed OP_PUSHBYTES',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  '515102',
-  '515102'
-);
-postgresTest.concurrent(
-  'malformed OP_PUSHDATA1',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  '51514c',
-  '51514c'
-);
-postgresTest.concurrent(
-  'malformed OP_PUSHDATA2',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  '51514d11',
-  '51514d'
-);
-postgresTest.concurrent(
-  'malformed OP_PUSHDATA4',
-  bytecodeFunction,
-  'parse_bytecode_pattern_with_pushdata_lengths',
-  '51514e112233',
-  '51514e'
-);
-
-postgresTest.concurrent(
-  'no redeem',
-  bytecodeFunctionReturnsNull,
-  'parse_bytecode_pattern_redeem',
-  `0002000051`
-);
-
-postgresTest.concurrent(
-  'OP_PUSHBYTES redeem',
-  bytecodeFunction,
-  'parse_bytecode_pattern_redeem',
-  `0003019951`,
-  '0151'
-);
-
-const minPushData1 = 76;
-postgresTest.concurrent(
-  'OP_PUSHDATA1 redeem',
-  bytecodeFunction,
-  'parse_bytecode_pattern_redeem',
-  `00020000${binToHex(
-    encodeDataPush(
-      flattenBinArray([
-        hexToBin('00'),
-        encodeDataPush(new Uint8Array(minPushData1).fill(allOnes)),
-        hexToBin('515253'),
-      ])
-    )
-  )}`,
-  '004c515253'
-);
-
-postgresTest.concurrent(
-  'OP_PUSHDATA2 redeem',
-  bytecodeFunction,
-  'parse_bytecode_pattern_redeem',
-  `00020000${binToHex(
-    encodeDataPush(
-      flattenBinArray([
-        hexToBin('00'),
-        encodeDataPush(new Uint8Array(minPushData2).fill(allOnes)),
-        hexToBin('515253'),
-      ])
-    )
-  )}`,
-  '004d515253'
-);
-
-postgresTest.concurrent(
-  'OP_PUSHDATA4 redeem',
-  bytecodeFunction,
-  'parse_bytecode_pattern_redeem',
-  `00020000${binToHex(
-    encodeDataPush(
-      flattenBinArray([
-        hexToBin('00'),
-        encodeDataPush(new Uint8Array(minPushData4).fill(allOnes)),
-        hexToBin('515253'),
-      ])
-    )
-  )}`,
-  '004e515253'
-);
-
-postgresTest.concurrent(
-  'malformed OP_PUSHDATA1 redeem',
-  bytecodeFunctionReturnsNull,
-  'parse_bytecode_pattern_redeem',
-  '4c'
-);
-postgresTest.concurrent(
-  'malformed OP_PUSHDATA2 redeem',
-  bytecodeFunctionReturnsNull,
-  'parse_bytecode_pattern_redeem',
-  '4d11'
-);
-postgresTest.concurrent(
-  'malformed OP_PUSHDATA4 redeem',
-  bytecodeFunctionReturnsNull,
-  'parse_bytecode_pattern_redeem',
-  '4e112233'
-);
-postgresTest.concurrent(
-  'oversized OP_PUSHDATA4 redeem',
-  bytecodeFunctionReturnsNull,
-  'parse_bytecode_pattern_redeem',
-  '4effffffff'
-);
+/* the vectors are shared with the v2 API's TypeScript port (src/api/bytecode.spec.ts) */
+patternVectors.forEach((vector) => {
+  if (vector.pattern === null) {
+    postgresTest.concurrent(
+      vector.title,
+      bytecodeFunctionReturnsNull,
+      vector.fn,
+      vector.bytecode
+    );
+  } else {
+    postgresTest.concurrent(
+      vector.title,
+      bytecodeFunction,
+      vector.fn,
+      vector.bytecode,
+      vector.pattern
+    );
+  }
+});
 
 postgresTest.concurrent('[e2e] [postgres] encode_uint16le', async (t) => {
   const query = async (encoded: number) =>

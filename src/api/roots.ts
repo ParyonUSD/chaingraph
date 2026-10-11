@@ -594,3 +594,117 @@ export const runWatermark = (env: RootEnv, nodeName: string) => {
     visible0: String(env.sql.snapshot.visible0),
   };
 };
+
+/* ------------------------------------------------------------------ */
+/* row sets (aggregates and groups)                                     */
+/* ------------------------------------------------------------------ */
+
+/** The rows a per-node root reads (before ordering and paging): a source and its conditions. */
+export interface RowSet {
+  source: string;
+  where: string[];
+}
+
+const viewSource = (view: string) => `SELECT * FROM ${view}`;
+
+export const rowSets = {
+  blocks: (env: RootEnv, where: BlockFilter | null | undefined): RowSet => ({
+    source: viewSource(env.sql.view('block_at')),
+    where: [
+      acceptedBlocks(env.sql, env.ctx.node),
+      blockPredicate(env.sql, where, env.ctx.node),
+    ],
+  }),
+  inputs: (env: RootEnv, where: InputFilter | null | undefined): RowSet => {
+    const { sql, ctx } = env;
+    const candidates =
+      where !== undefined && where !== null && requiresOutpoint(where)
+        ? `SELECT transaction_hash FROM ${spendRelationSql(
+            sql,
+            spendRowPredicate(sql, where, ctx.node)
+          )}`
+        : undefined;
+    return {
+      source: viewSource(sql.view('input_at')),
+      where: [
+        `transaction_hash IN (${sql.accepted(ctx.node, candidates)})`,
+        inputPredicate(sql, where, ctx.node),
+      ],
+    };
+  },
+  mempool: (
+    env: RootEnv,
+    where: NodeTransactionFilter | null | undefined
+  ): RowSet => ({
+    source: viewSource(env.sql.nodeView('node_transaction_at', env.ctx.node)),
+    where: [nodeTransactionPredicate(env.sql, where, env.ctx.node)],
+  }),
+  outputs: (env: RootEnv, where: OutputFilter | null | undefined): RowSet => {
+    const { sql, ctx } = env;
+    const candidates = outputFilterIsSelective(where)
+      ? `SELECT transaction_hash FROM ${sql.view(
+          'output_at'
+        )} WHERE ${outputPredicate(sql, where, outputRowColumns, ctx.node)}`
+      : undefined;
+    return {
+      source: viewSource(sql.view('output_at')),
+      where: [
+        `transaction_hash IN (${sql.accepted(ctx.node, candidates)})`,
+        outputPredicate(sql, where, outputRowColumns, ctx.node),
+      ],
+    };
+  },
+  /**
+   * Spends: inputs of transactions the node accepts with the attributes of
+   * the output each spends (the spend relation: index + tail). Inputs whose
+   * spent output is not stored (coinbase inputs) are not spends.
+   */
+  spends: (env: RootEnv, where: InputFilter | null | undefined): RowSet => {
+    const { sql, ctx } = env;
+    const evaluable =
+      where === undefined || where === null || requiresOutpoint(where);
+    const relation = spendRelationSql(
+      sql,
+      evaluable ? spendRowPredicate(sql, where, ctx.node) : '1'
+    );
+    return {
+      source: `SELECT * FROM ${relation}`,
+      where: [
+        `transaction_hash IN (${sql.accepted(
+          ctx.node,
+          `SELECT transaction_hash FROM ${relation}`
+        )})`,
+        ...(evaluable
+          ? []
+          : [
+              `(transaction_hash, input_index) IN (SELECT transaction_hash, input_index FROM ${sql.view(
+                'input_at'
+              )} WHERE ${inputPredicate(sql, where, ctx.node)})`,
+            ]),
+      ],
+    };
+  },
+  transactions: (
+    env: RootEnv,
+    where: TransactionFilter | null | undefined
+  ): RowSet => {
+    const { sql, ctx } = env;
+    return {
+      source: viewSource(sql.view('transaction_at')),
+      where: [
+        `hash IN (${sql.accepted(
+          ctx.node,
+          transactionCandidates(sql, where, ctx.node)
+        )})`,
+        transactionPredicate(sql, where, ctx.node),
+      ],
+    };
+  },
+  unspentOutputs: (
+    env: RootEnv,
+    where: OutputFilter | null | undefined
+  ): RowSet => ({
+    source: viewSource(env.sql.view('output_at')),
+    where: [unspentOutputPredicate(env.sql, where, env.ctx.node)],
+  }),
+};

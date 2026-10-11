@@ -79,6 +79,37 @@ type Block {
   version: Int!
 }
 
+type BlockAggregate {
+  aggregate: BlockAggregateFields!
+}
+
+type BlockAggregateAvg {
+  height: Float
+  output_value_satoshis: Float
+  size_bytes: Float
+  timestamp: Float
+  transaction_count: Float
+}
+
+"""
+count, and sum/min/max/avg of the numeric fields (null over no rows, as in SQL).
+"""
+type BlockAggregateFields {
+  avg: BlockAggregateAvg!
+  count: BigInt!
+  max: BlockAggregateNumeric!
+  min: BlockAggregateNumeric!
+  sum: BlockAggregateNumeric!
+}
+
+type BlockAggregateNumeric {
+  height: BigInt
+  output_value_satoshis: BigInt
+  size_bytes: BigInt
+  timestamp: BigInt
+  transaction_count: BigInt
+}
+
 input BlockFilter {
   _and: [BlockFilter!]
   _not: BlockFilter
@@ -97,6 +128,62 @@ input BlockFilter {
   timestamp: BigIntComparison
   transaction_count: IntComparison
   version: IntComparison
+}
+
+type BlockGroup {
+  aggregate: BlockAggregateFields!
+  key: BlockGroupKey!
+}
+
+enum BlockGroupColumn {
+  DAY
+  MONTH
+  VERSION
+  YEAR
+}
+
+"""The group key (only the group_by columns are set)."""
+type BlockGroupKey {
+  day: String
+  month: String
+  version: Int
+  year: String
+}
+
+input BlockGroupOrder {
+  by: BlockGroupOrderField!
+  direction: Order = DESC
+}
+
+enum BlockGroupOrderField {
+  AVG_HEIGHT
+  AVG_OUTPUT_VALUE_SATOSHIS
+  AVG_SIZE_BYTES
+  AVG_TIMESTAMP
+  AVG_TRANSACTION_COUNT
+  COUNT
+  KEY
+  MAX_HEIGHT
+  MAX_OUTPUT_VALUE_SATOSHIS
+  MAX_SIZE_BYTES
+  MAX_TIMESTAMP
+  MAX_TRANSACTION_COUNT
+  MIN_HEIGHT
+  MIN_OUTPUT_VALUE_SATOSHIS
+  MIN_SIZE_BYTES
+  MIN_TIMESTAMP
+  MIN_TRANSACTION_COUNT
+  SUM_HEIGHT
+  SUM_OUTPUT_VALUE_SATOSHIS
+  SUM_SIZE_BYTES
+  SUM_TIMESTAMP
+  SUM_TRANSACTION_COUNT
+}
+
+"""One page of groups; `has_more` signals more groups (R33)."""
+type BlockGroupPage {
+  has_more: Boolean!
+  nodes: [BlockGroup!]!
 }
 
 """
@@ -347,6 +434,29 @@ type NodeTransaction {
   validated_at: Timestamp
 }
 
+type NodeTransactionAggregate {
+  aggregate: NodeTransactionAggregateFields!
+}
+
+type NodeTransactionAggregateAvg {
+  transaction_internal_id: Float
+}
+
+"""
+count, and sum/min/max/avg of the numeric fields (null over no rows, as in SQL).
+"""
+type NodeTransactionAggregateFields {
+  avg: NodeTransactionAggregateAvg!
+  count: BigInt!
+  max: NodeTransactionAggregateNumeric!
+  min: NodeTransactionAggregateNumeric!
+  sum: NodeTransactionAggregateNumeric!
+}
+
+type NodeTransactionAggregateNumeric {
+  transaction_internal_id: BigInt
+}
+
 """A mempool entry: the node's validation of a transaction."""
 input NodeTransactionFilter {
   _and: [NodeTransactionFilter!]
@@ -428,6 +538,33 @@ type Output {
   value_satoshis: BigInt!
 }
 
+type OutputAggregate {
+  aggregate: OutputAggregateFields!
+}
+
+type OutputAggregateAvg {
+  fungible_token_amount: Float
+  output_index: Float
+  value_satoshis: Float
+}
+
+"""
+count, and sum/min/max/avg of the numeric fields (null over no rows, as in SQL).
+"""
+type OutputAggregateFields {
+  avg: OutputAggregateAvg!
+  count: BigInt!
+  max: OutputAggregateNumeric!
+  min: OutputAggregateNumeric!
+  sum: OutputAggregateNumeric!
+}
+
+type OutputAggregateNumeric {
+  fungible_token_amount: BigInt
+  output_index: BigInt
+  value_satoshis: BigInt
+}
+
 """
 Predicates on one output row (or, as `outpoint`, on the spent output of one input row). All fields of one object bind to the same row.
 """
@@ -455,23 +592,25 @@ input OutputFilter {
 }
 
 type OutputGroup {
-  aggregate: OutputGroupAggregate!
+  aggregate: OutputAggregateFields!
   key: OutputGroupKey!
-}
-
-type OutputGroupAggregate {
-  count: BigInt!
-  sum: OutputGroupSum!
 }
 
 enum OutputGroupColumn {
   LOCKING_BYTECODE
+  NONFUNGIBLE_TOKEN_CAPABILITY
+  NONFUNGIBLE_TOKEN_COMMITMENT
   TOKEN_CATEGORY
+  TRANSACTION_HASH
 }
 
+"""The group key (only the group_by columns are set)."""
 type OutputGroupKey {
   locking_bytecode: Hex
+  nonfungible_token_capability: String
+  nonfungible_token_commitment: Hex
   token_category: Hex
+  transaction_hash: Hex
 }
 
 input OutputGroupOrder {
@@ -480,15 +619,26 @@ input OutputGroupOrder {
 }
 
 enum OutputGroupOrderField {
+  AVG_FUNGIBLE_TOKEN_AMOUNT
+  AVG_OUTPUT_INDEX
+  AVG_VALUE_SATOSHIS
   COUNT
   KEY
+  MAX_FUNGIBLE_TOKEN_AMOUNT
+  MAX_OUTPUT_INDEX
+  MAX_VALUE_SATOSHIS
+  MIN_FUNGIBLE_TOKEN_AMOUNT
+  MIN_OUTPUT_INDEX
+  MIN_VALUE_SATOSHIS
   SUM_FUNGIBLE_TOKEN_AMOUNT
+  SUM_OUTPUT_INDEX
   SUM_VALUE_SATOSHIS
 }
 
-type OutputGroupSum {
-  fungible_token_amount: BigInt!
-  value_satoshis: BigInt!
+"""One page of groups; `has_more` signals more groups (R33)."""
+type OutputGroupPage {
+  has_more: Boolean!
+  nodes: [OutputGroup!]!
 }
 
 input OutputOrderBy {
@@ -513,6 +663,11 @@ type OutputPage {
 
 type Query {
   """
+  Group-by over the blocks the node accepts (e.g. block statistics per DAY / MONTH, R25).
+  """
+  block_groups(group_by: [BlockGroupColumn!]!, limit: Int!, node: String!, offset: Int, order_by: [BlockGroupOrder!], where: BlockFilter): BlockGroupPage!
+
+  """
   The node's tip: its accepted block with the greatest height (with previous_block_hash for re-org detection).
   """
   block_tip(node: String!): Block
@@ -533,6 +688,9 @@ type Query {
     order_by: [BlockOrderBy!]
     where: BlockFilter
   ): BlockPage!
+
+  """Aggregates over the blocks the node accepts (R24)."""
+  blocks_aggregate(node: String!, where: BlockFilter): BlockAggregate!
 
   """
   Blocks by hash (node-agnostic: per-node relationships below need `node:`). Up to 10,000 hashes.
@@ -573,6 +731,9 @@ type Query {
     where: NodeTransactionFilter
   ): NodeTransactionPage!
 
+  """Aggregates over the node's mempool."""
+  mempool_aggregate(node: String!, where: NodeTransactionFilter): NodeTransactionAggregate!
+
   """One node: metadata, mempool, accepted blocks."""
   node(node: String!): Node
 
@@ -580,6 +741,21 @@ type Query {
   Every node's metadata (node-agnostic; mempool and accepted blocks: `node(node:)`).
   """
   nodes: [Node!]!
+
+  """
+  Group-by over the outputs the node accepts (or its unspent outputs): holder balances per locking bytecode, supply per category, … (R25).
+  """
+  output_groups(
+    group_by: [OutputGroupColumn!]!
+    limit: Int!
+    node: String!
+    offset: Int
+    order_by: [OutputGroupOrder!]
+
+    """Only the node's unspent outputs."""
+    unspent: Boolean = false
+    where: OutputFilter
+  ): OutputGroupPage!
 
   """
   Outputs of transactions the node accepts (search by locking bytecode set or prefix, category, commitment prefix …; default keyset order: transaction_internal_id, output_index).
@@ -599,9 +775,29 @@ type Query {
   ): OutputPage!
 
   """
+  Aggregates over the outputs the node accepts (search roots: count of a locking bytecode prefix, …).
+  """
+  outputs_aggregate(node: String!, where: OutputFilter): OutputAggregate!
+
+  """
   Outputs of transactions by hash (node-agnostic: no acceptance; per-node relationships below need `node:`). Up to 10,000 hashes.
   """
   outputs_by_transaction_hash(transaction_hashes: [Hex!]!, where: OutputFilter): [Output!]!
+
+  """
+  Group-by over spends (inputs of transactions the node accepts, with the outputs they spend; coinbase inputs are not spends): e.g. value paid per spent token category or per transaction.
+  """
+  spend_groups(group_by: [SpendGroupColumn!]!, limit: Int!, node: String!, offset: Int, order_by: [SpendGroupOrder!], where: InputFilter): SpendGroupPage!
+
+  """
+  Aggregates over spends (inputs of transactions the node accepts, with the spent outputs).
+  """
+  spends_aggregate(node: String!, where: InputFilter): SpendAggregate!
+
+  """
+  Group-by over the transactions the node accepts (e.g. per BLOCK_DAY or BLOCK_HEIGHT of the block the node accepts them in; null in its mempool).
+  """
+  transaction_groups(group_by: [TransactionGroupColumn!]!, limit: Int!, node: String!, offset: Int, order_by: [TransactionGroupOrder!], where: TransactionFilter): TransactionGroupPage!
 
   """
   The newest transaction internal_id in the request snapshot (node-agnostic).
@@ -630,15 +826,18 @@ type Query {
     where: TransactionFilter
   ): TransactionPage!
 
+  """Aggregates over the transactions the node accepts (R24)."""
+  transactions_aggregate(node: String!, where: TransactionFilter): TransactionAggregate!
+
   """
   Transactions by hash (node-agnostic: no acceptance; per-node relationships below need `node:`). Up to 10,000 hashes.
   """
   transactions_by_hash(hashes: [Hex!]!): [Transaction!]!
 
   """
-  Group-by aggregate over the node's unspent outputs (computed at query time).
+  Group-by over the node's unspent outputs (the spike's S3 root; output_groups(unspent: true) pages).
   """
-  unspent_output_groups(group_by: [OutputGroupColumn!]!, limit: Int!, node: String!, order_by: OutputGroupOrder, where: OutputFilter): [OutputGroup!]!
+  unspent_output_groups(group_by: [OutputGroupColumn!]!, limit: Int!, node: String!, order_by: [OutputGroupOrder!], where: OutputFilter): [OutputGroup!]!
 
   """
   The node's unspent outputs, computed at query time from outputs minus spending inputs (UTXO tables off), keyset on (transaction_internal_id, output_index).
@@ -657,10 +856,82 @@ type Query {
     where: OutputFilter
   ): OutputPage!
 
+  """Aggregates over the node's unspent outputs."""
+  unspent_outputs_aggregate(node: String!, where: OutputFilter): OutputAggregate!
+
   """
   The visibility watermark the request reads for the node (R32; equal watermarks = equal results).
   """
   watermark(node: String!): Watermark!
+}
+
+type SpendAggregate {
+  aggregate: SpendAggregateFields!
+}
+
+type SpendAggregateAvg {
+  outpoint_fungible_token_amount: Float
+  outpoint_value_satoshis: Float
+}
+
+"""
+count, and sum/min/max/avg of the numeric fields (null over no rows, as in SQL).
+"""
+type SpendAggregateFields {
+  avg: SpendAggregateAvg!
+  count: BigInt!
+  max: SpendAggregateNumeric!
+  min: SpendAggregateNumeric!
+  sum: SpendAggregateNumeric!
+}
+
+type SpendAggregateNumeric {
+  outpoint_fungible_token_amount: BigInt
+  outpoint_value_satoshis: BigInt
+}
+
+type SpendGroup {
+  aggregate: SpendAggregateFields!
+  key: SpendGroupKey!
+}
+
+enum SpendGroupColumn {
+  OUTPOINT_LOCKING_BYTECODE
+  OUTPOINT_NONFUNGIBLE_TOKEN_COMMITMENT
+  OUTPOINT_TOKEN_CATEGORY
+  TRANSACTION_HASH
+}
+
+"""The group key (only the group_by columns are set)."""
+type SpendGroupKey {
+  outpoint_locking_bytecode: Hex
+  outpoint_nonfungible_token_commitment: Hex
+  outpoint_token_category: Hex
+  transaction_hash: Hex
+}
+
+input SpendGroupOrder {
+  by: SpendGroupOrderField!
+  direction: Order = DESC
+}
+
+enum SpendGroupOrderField {
+  AVG_OUTPOINT_FUNGIBLE_TOKEN_AMOUNT
+  AVG_OUTPOINT_VALUE_SATOSHIS
+  COUNT
+  KEY
+  MAX_OUTPOINT_FUNGIBLE_TOKEN_AMOUNT
+  MAX_OUTPOINT_VALUE_SATOSHIS
+  MIN_OUTPOINT_FUNGIBLE_TOKEN_AMOUNT
+  MIN_OUTPOINT_VALUE_SATOSHIS
+  SUM_OUTPOINT_FUNGIBLE_TOKEN_AMOUNT
+  SUM_OUTPOINT_VALUE_SATOSHIS
+}
+
+"""One page of groups; `has_more` signals more groups (R33)."""
+type SpendGroupPage {
+  has_more: Boolean!
+  nodes: [SpendGroup!]!
 }
 
 """
@@ -893,6 +1164,37 @@ type Transaction {
   version: Int!
 }
 
+type TransactionAggregate {
+  aggregate: TransactionAggregateFields!
+}
+
+type TransactionAggregateAvg {
+  input_count: Float
+  locktime: Float
+  output_count: Float
+  output_value_satoshis: Float
+  size_bytes: Float
+}
+
+"""
+count, and sum/min/max/avg of the numeric fields (null over no rows, as in SQL).
+"""
+type TransactionAggregateFields {
+  avg: TransactionAggregateAvg!
+  count: BigInt!
+  max: TransactionAggregateNumeric!
+  min: TransactionAggregateNumeric!
+  sum: TransactionAggregateNumeric!
+}
+
+type TransactionAggregateNumeric {
+  input_count: BigInt
+  locktime: BigInt
+  output_count: BigInt
+  output_value_satoshis: BigInt
+  size_bytes: BigInt
+}
+
 """
 Predicates on one transaction. `has_output` / `has_input` are EXISTS over one output/input row; `block_window`, `in_block` and `in_mempool` are per node.
 """
@@ -922,6 +1224,62 @@ input TransactionFilter {
   output_value_satoshis: BigIntComparison
   size_bytes: IntComparison
   version: IntComparison
+}
+
+type TransactionGroup {
+  aggregate: TransactionAggregateFields!
+  key: TransactionGroupKey!
+}
+
+enum TransactionGroupColumn {
+  BLOCK_DAY
+  BLOCK_HEIGHT
+  IS_COINBASE
+  VERSION
+}
+
+"""The group key (only the group_by columns are set)."""
+type TransactionGroupKey {
+  block_day: String
+  block_height: Int
+  is_coinbase: Boolean
+  version: Int
+}
+
+input TransactionGroupOrder {
+  by: TransactionGroupOrderField!
+  direction: Order = DESC
+}
+
+enum TransactionGroupOrderField {
+  AVG_INPUT_COUNT
+  AVG_LOCKTIME
+  AVG_OUTPUT_COUNT
+  AVG_OUTPUT_VALUE_SATOSHIS
+  AVG_SIZE_BYTES
+  COUNT
+  KEY
+  MAX_INPUT_COUNT
+  MAX_LOCKTIME
+  MAX_OUTPUT_COUNT
+  MAX_OUTPUT_VALUE_SATOSHIS
+  MAX_SIZE_BYTES
+  MIN_INPUT_COUNT
+  MIN_LOCKTIME
+  MIN_OUTPUT_COUNT
+  MIN_OUTPUT_VALUE_SATOSHIS
+  MIN_SIZE_BYTES
+  SUM_INPUT_COUNT
+  SUM_LOCKTIME
+  SUM_OUTPUT_COUNT
+  SUM_OUTPUT_VALUE_SATOSHIS
+  SUM_SIZE_BYTES
+}
+
+"""One page of groups; `has_more` signals more groups (R33)."""
+type TransactionGroupPage {
+  has_more: Boolean!
+  nodes: [TransactionGroup!]!
 }
 
 """

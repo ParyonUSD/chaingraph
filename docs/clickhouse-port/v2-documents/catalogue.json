@@ -1774,8 +1774,7 @@
    "root": "search_output_prefix_aggregate",
    "paginate": null
   },
-  "compare": {},
-  "expect": "not compared: v2 error"
+  "compare": {}
  },
  {
   "id": "X12",
@@ -1846,8 +1845,7 @@
    "root": "bchn_blocks",
    "paginate": null
   },
-  "compare": {},
-  "expect": "not compared: v2 error"
+  "compare": {}
  },
  {
   "id": "X15",
@@ -1869,8 +1867,7 @@
    "root": "block_aggregate",
    "paginate": null
   },
-  "compare": {},
-  "expect": "not compared: v2 error"
+  "compare": {}
  },
  {
   "id": "X16",
@@ -1893,7 +1890,6 @@
    "root": "transaction_aggregate",
    "paginate": null
   },
-  "compare": {},
-  "expect": "not compared: v2 error"
+  "compare": {}
  }
 ]

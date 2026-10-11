@@ -23,7 +23,9 @@ import { accepted, loadOracle } from './spec-oracle.js';
 
 const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
 
-interface Row { [key: string]: unknown }
+interface Row {
+  [key: string]: unknown;
+}
 
 /** Walk every page of `field` (`after` = end_cursor, or `cursor` for an order_by transactions page). */
 const walk = async (

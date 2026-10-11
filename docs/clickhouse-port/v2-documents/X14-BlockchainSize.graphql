@@ -1,6 +1,6 @@
 # X14 BlockchainSize (v1: v1/X14-BlockchainSize.graphql)
-# status: blocked (v2 error: v2: Cannot query field "blocks_aggregate" on type "Query".)
-# chipnet equality: not compared: v2 error (v1 0 rows in 0 pages, v2 0 rows in 0 pages); expected: not compared: v2 error
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
 query BlockchainSize($node: String!) {
   bchn_blocks: blocks_aggregate(node: $node) {
     aggregate { sum { size_bytes } }
