@@ -1,4 +1,4 @@
-/* eslint-disable functional/no-mixed-type */
+/* eslint-disable functional/no-mixed-type, complexity, functional/no-let, @typescript-eslint/init-declarations, functional/no-try-statement */
 // cspell:ignore clickhouse serialised Pothos
 /**
  * The Phase 2 spike server: GraphQL Yoga over the Pothos schema, HTTP
@@ -29,6 +29,18 @@ import type { ClickHouseClient } from '../store/clickhouse/client.js';
 import { ApiDb, PinnedSnapshot } from './db.js';
 import type { LiveHubOptions } from './live.js';
 import { LiveHub } from './live.js';
+import type {
+  QueryLimits,
+  ResponseCacheOptions,
+  TrustedDocuments,
+} from './plugins.js';
+import {
+  defaultQueryLimits,
+  resolveTrustedDocument,
+  ResponseCache,
+  useQueryLimits,
+  useTrustedDocuments,
+} from './plugins.js';
 import type { ApiContext } from './schema.js';
 import { schema } from './schema.js';
 
@@ -110,25 +122,78 @@ export interface Api {
   db: ApiDb;
   hub: LiveHub;
   yoga: YogaServerInstance<{ [key: string]: unknown }, ApiContext>;
+  /** The response cache (R37), when enabled. */
+  responseCache?: ResponseCache;
+  /** Trusted documents (R34), when configured. */
+  trustedDocuments?: TrustedDocuments;
+}
+
+export interface ApiOptions {
+  live?: LiveHubOptions;
+  graphiql?: boolean;
+  /** Depth / alias / root-field / field limits (R34); false: none. */
+  limits?: Partial<QueryLimits> | false;
+  /** Run only trusted documents (or also arbitrary ones), by sha256. */
+  trustedDocuments?: TrustedDocuments;
+  /** Watermark-keyed response cache (R37); default off. */
+  responseCache?: ResponseCacheOptions | false;
+  /** The agent's internal API, for send_transaction (R38). */
+  agentUrl?: string;
+  /** Rows one root statement may return (R33). */
+  maxResultRows?: number;
 }
 
 export const createApi = (
   client: ClickHouseClient,
-  options: { live?: LiveHubOptions; graphiql?: boolean } = {}
+  options: ApiOptions = {}
 ): Api => {
   const db = new ApiDb(client);
+  if (options.maxResultRows !== undefined) {
+    db.maxResultRows = options.maxResultRows;
+  }
   const hub = new LiveHub(db, options.live);
+  const responseCache =
+    options.responseCache === undefined || options.responseCache === false
+      ? undefined
+      : new ResponseCache(db, options.responseCache);
   const yoga = createYoga<{ [key: string]: unknown }, ApiContext>({
-    context: () => ({ db, hub }),
+    context: () => ({ agentUrl: options.agentUrl, db, hub }),
     graphiql: options.graphiql ?? false,
     graphqlEndpoint: '/graphql',
     landingPage: false,
     logging: false,
     maskedErrors: false,
-    plugins: [useRequestSnapshot(db)],
+    plugins: [
+      ...(options.trustedDocuments === undefined
+        ? []
+        : [useTrustedDocuments(options.trustedDocuments)]),
+      ...(options.limits === false
+        ? []
+        : [useQueryLimits({ ...defaultQueryLimits, ...options.limits })]),
+      ...(responseCache === undefined
+        ? []
+        : [
+            responseCache.plugin((args) =>
+              operationNodeNames(
+                args.document,
+                args.operationName,
+                args.variableValues
+              )
+            ),
+          ]),
+      useRequestSnapshot(db),
+    ],
     schema,
   });
-  return { db, hub, yoga };
+  return {
+    db,
+    hub,
+    yoga,
+    ...(responseCache === undefined ? {} : { responseCache }),
+    ...(options.trustedDocuments === undefined
+      ? {}
+      : { trustedDocuments: options.trustedDocuments }),
+  };
 };
 
 export interface RunningServer {
@@ -175,9 +240,18 @@ export const listen = async (
           req: context.extra.request,
           socket: context.extra.socket,
         }) as unknown as Enveloped;
+        let query: string;
+        try {
+          query =
+            api.trustedDocuments === undefined
+              ? payload.query
+              : resolveTrustedDocument(api.trustedDocuments, payload as never);
+        } catch (error) {
+          return [error as GraphQLError];
+        }
         const args = {
           contextValue: await enveloped.contextFactory(),
-          document: enveloped.parse(payload.query),
+          document: enveloped.parse(query),
           operationName: payload.operationName,
           rootValue: {
             execute: enveloped.execute,

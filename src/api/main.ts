@@ -1,19 +1,45 @@
+/* eslint-disable complexity */
 // cspell:ignore clickhouse
 /**
- * `yarn api:dev`: the Phase 2 spike API on CHAINGRAPH_API_HOST:CHAINGRAPH_API_PORT
- * (default 127.0.0.1:4000),
- * reading the ClickHouse store named by CHAINGRAPH_CLICKHOUSE_URL /
- * CHAINGRAPH_CLICKHOUSE_DATABASE (default `cg`). GraphiQL at /graphql.
+ * `yarn api:dev`: the Chaingraph v2 API on CHAINGRAPH_API_HOST:CHAINGRAPH_API_PORT
+ * (default 127.0.0.1:4000), reading the ClickHouse store named by
+ * CHAINGRAPH_CLICKHOUSE_URL / CHAINGRAPH_CLICKHOUSE_DATABASE (default `cg`).
+ * GraphiQL at /graphql. Options:
+ * - CHAINGRAPH_API_RESPONSE_CACHE=off disables the watermark-keyed response cache;
+ * - CHAINGRAPH_API_TRUSTED_DOCUMENTS=<dir of .graphql files> registers trusted
+ *   documents (by sha256), CHAINGRAPH_API_TRUSTED_DOCUMENTS_ONLY=true runs
+ *   nothing else;
+ * - CHAINGRAPH_API_AGENT_URL=<agent internal API> enables send_transaction;
+ * - CHAINGRAPH_API_MAX_RESULT_ROWS caps the rows of one root statement.
  */
 import { ClickHouseClient } from '../store/clickhouse/client.js';
 
+import { loadTrustedDocuments } from './plugins.js';
 import { createApi, listen } from './server.js';
 
 const defaultPort = 4000;
 
 const main = async () => {
   const client = ClickHouseClient.fromEnv();
+  const { env } = process;
+  const trusted = env.CHAINGRAPH_API_TRUSTED_DOCUMENTS;
   const api = createApi(client, {
+    ...(env.CHAINGRAPH_API_AGENT_URL === undefined
+      ? {}
+      : { agentUrl: env.CHAINGRAPH_API_AGENT_URL }),
+    ...(env.CHAINGRAPH_API_MAX_RESULT_ROWS === undefined
+      ? {}
+      : { maxResultRows: Number(env.CHAINGRAPH_API_MAX_RESULT_ROWS) }),
+    responseCache: env.CHAINGRAPH_API_RESPONSE_CACHE === 'off' ? false : {},
+    ...(trusted === undefined
+      ? {}
+      : {
+          trustedDocuments: {
+            allowArbitraryDocuments:
+              env.CHAINGRAPH_API_TRUSTED_DOCUMENTS_ONLY !== 'true',
+            documents: loadTrustedDocuments(trusted),
+          },
+        }),
     graphiql: true,
     live: {
       onError: (error) => {
@@ -30,7 +56,7 @@ const main = async () => {
   );
   // eslint-disable-next-line no-console
   console.log(
-    `Chaingraph v2 API spike: ${server.url} (ws: ${
+    `Chaingraph v2 API: ${server.url} (ws: ${
       server.wsUrl
     }), store ${client.toString()}`
   );

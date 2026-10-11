@@ -378,6 +378,13 @@ input IntComparison {
   _nin: [Int!]
 }
 
+type Mutation {
+  """
+  Relay an encoded transaction to the named node over P2P (through the agent). R38.
+  """
+  send_transaction(encoded_hex: Hex!, node: String!): SendTransactionResult!
+}
+
 """
 A node Chaingraph follows. Its mempool and accepted blocks are per node: select them under `node(node:)` (or a relationship naming the node).
 """
@@ -863,6 +870,14 @@ type Query {
   The visibility watermark the request reads for the node (R32; equal watermarks = equal results).
   """
   watermark(node: String!): Watermark!
+}
+
+type SendTransactionResult {
+  transaction_hash: Hex!
+  transmission_error_message: String
+  transmission_success: Boolean!
+  validation_error_message: String
+  validation_success: Boolean!
 }
 
 type SpendAggregate {

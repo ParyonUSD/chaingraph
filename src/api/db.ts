@@ -1,4 +1,4 @@
-/* eslint-disable camelcase, functional/no-throw-statement, @typescript-eslint/parameter-properties, @typescript-eslint/naming-convention, complexity, max-classes-per-file */
+/* eslint-disable camelcase, functional/no-throw-statement, @typescript-eslint/parameter-properties, @typescript-eslint/naming-convention, complexity, max-classes-per-file, @typescript-eslint/no-magic-numbers, @typescript-eslint/member-ordering */
 // cspell:ignore clickhouse
 /**
  * The API's access to ClickHouse: query counters (tests assert one
@@ -62,6 +62,9 @@ export class ApiDb {
     snapshots: 0,
     watermarkPolls: 0,
   };
+
+  /** Rows (all levels) one root statement may return (R33): more is an error. */
+  maxResultRows = 500_000;
 
   /** Test hook: every query the API sends (after it is sent). */
   onQuery: ((event: QueryEvent) => void) | undefined;
@@ -168,11 +171,13 @@ const unknownNode = (name: string) =>
  */
 export const singleNodeEnv = (
   snapshot: VisibilitySnapshot,
-  nodeName: string | undefined
+  nodeName: string | undefined,
+  maxRows?: number
 ): StatementEnv => {
   const sql = new Sql(snapshot);
   return {
     ctx: {
+      maxRows,
       node: snapshot.nodeId === nodeAgnosticId ? undefined : snapshot.nodeId,
       nodeId: (name) => {
         if (name !== nodeName) {
@@ -202,6 +207,9 @@ export const singleNodeEnv = (
  */
 export class PinnedSnapshot {
   private pending: Promise<MultiNodeSnapshot> | undefined;
+
+  /** The snapshot once read (the response cache keys on its watermarks). */
+  resolved: MultiNodeSnapshot | undefined;
 
   private readonly ids = new Map<string, number>();
 
@@ -241,7 +249,11 @@ export class PinnedSnapshot {
   async statement(node?: string): Promise<StatementEnv> {
     if (this.preset !== undefined) {
       await this.get(node);
-      return singleNodeEnv(this.preset, this.nodeNames[0]);
+      return singleNodeEnv(
+        this.preset,
+        this.nodeNames[0],
+        this.db.maxResultRows
+      );
     }
     const snapshot = await this.get(node);
     const multi = await this.pending!;
@@ -251,6 +263,7 @@ export class PinnedSnapshot {
     const sql = new Sql(snapshot, others);
     return {
       ctx: {
+        maxRows: this.db.maxResultRows,
         node: snapshot.nodeId === nodeAgnosticId ? undefined : snapshot.nodeId,
         nodeId: (name) => {
           const id = this.ids.get(name);
@@ -271,6 +284,9 @@ export class PinnedSnapshot {
         return id;
       })
     );
-    return this.db.pinnedSnapshot(ids.length === 0 ? [nodeAgnosticId] : ids);
+    this.resolved = await this.db.pinnedSnapshot(
+      ids.length === 0 ? [nodeAgnosticId] : ids
+    );
+    return this.resolved;
   }
 }

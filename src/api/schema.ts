@@ -68,6 +68,7 @@ import {
   runUnspentOutputs,
   runWatermark,
 } from './roots.js';
+import { sendTransaction } from './send.js';
 import type {
   BigIntComparison,
   BlockFilter,
@@ -92,6 +93,8 @@ export { maxLimits } from './roots.js';
 export interface ApiContext {
   db: ApiDb;
   hub: LiveHub;
+  /** The agent's internal API (send_transaction, R38). */
+  agentUrl?: string;
   /** Set per execution by the snapshot plugin (server.ts). */
   snapshot?: PinnedSnapshot;
 }
@@ -1922,6 +1925,57 @@ builder.queryType({
   },
 });
 
+interface SendResult {
+  transaction_hash: string;
+  validation_success: boolean;
+  validation_error_message: string | null;
+  transmission_success: boolean;
+  transmission_error_message: string | null;
+}
+
+const SendTransactionResultRef = builder
+  .objectRef<SendResult>('SendTransactionResult')
+  .implement({
+    fields: (t) => ({
+      transaction_hash: t.field({
+        resolve: (p) => p.transaction_hash,
+        type: 'Hex',
+      }),
+      transmission_error_message: t.string({
+        nullable: true,
+        resolve: (p) => p.transmission_error_message,
+      }),
+      transmission_success: t.boolean({
+        resolve: (p) => p.transmission_success,
+      }),
+      validation_error_message: t.string({
+        nullable: true,
+        resolve: (p) => p.validation_error_message,
+      }),
+      validation_success: t.boolean({ resolve: (p) => p.validation_success }),
+    }),
+  });
+
+builder.mutationType({
+  fields: (t) => ({
+    send_transaction: t.field({
+      args: {
+        encoded_hex: t.arg({ required: true, type: 'Hex' }),
+        node: t.arg.string({ required: true }),
+      },
+      description:
+        'Relay an encoded transaction to the named node over P2P (through the agent). R38.',
+      resolve: async (_root, args, context) =>
+        sendTransaction(
+          context.agentUrl,
+          await context.db.nodeId(args.node),
+          args.encoded_hex
+        ),
+      type: SendTransactionResultRef,
+    }),
+  }),
+});
+
 /** Topic key of a live query: the operation, its fragments and variables. */
 export const liveTopicKey = (info: GraphQLResolveInfo, node: number) =>
   [
@@ -1937,7 +1991,7 @@ const liveEnv = (
   db: ApiDb,
   snapshot: VisibilitySnapshot,
   nodeName: string
-): RootEnv => ({ ...singleNodeEnv(snapshot, nodeName), db });
+): RootEnv => ({ ...singleNodeEnv(snapshot, nodeName, db.maxResultRows), db });
 
 builder.subscriptionType({
   description:

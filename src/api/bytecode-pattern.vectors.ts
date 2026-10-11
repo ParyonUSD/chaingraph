@@ -1,4 +1,3 @@
- 
 // cspell:ignore pushdata bytecode memo
 /**
  * Bytecode pattern vectors shared by the Postgres macro tests of Chaingraph
@@ -14,7 +13,9 @@ import {
 } from '@bitauth/libauth';
 
 export type PatternFunction =
-  'parse_bytecode_pattern_redeem' | 'parse_bytecode_pattern_with_pushdata_lengths' | 'parse_bytecode_pattern';
+  | 'parse_bytecode_pattern_redeem'
+  | 'parse_bytecode_pattern_with_pushdata_lengths'
+  | 'parse_bytecode_pattern';
 
 export interface PatternVector {
   title: string;

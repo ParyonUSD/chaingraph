@@ -199,6 +199,8 @@ export interface Ctx {
   node: number | undefined;
   /** A node name of the request → its id (it must be pinned by the request snapshot). */
   nodeId: (name: string) => number;
+  /** Rows one statement may return (all levels); default `maxRowsPerStatement`. */
+  maxRows?: number;
 }
 
 export interface ScalarField {
@@ -590,9 +592,10 @@ ${select} FROM page ${plan.joins.join('\n')}${
       const decoded = rows.map((row) =>
         plan.decode(tupleValues(row.__row).slice(1), count)
       );
-      if (count.rows > maxRowsPerStatement) {
+      const cap = c.maxRows ?? maxRowsPerStatement;
+      if (count.rows > cap) {
         throw new GraphQLError(
-          `The result has ${count.rows} rows (limit ${maxRowsPerStatement}): page it with limit/after.`,
+          `The result has ${count.rows} rows (limit ${cap}): page it with limit/after, or limit the nested lists.`,
           { extensions: { code: 'RESULT_TOO_LARGE' } }
         );
       }
