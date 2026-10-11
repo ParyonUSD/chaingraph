@@ -259,6 +259,18 @@ const cacheKey = (
  * A request first reads those watermarks (one small query); if a cached
  * response was computed at the same ones, it is returned without a snapshot
  * or data query.
+ *
+ * The snapshot rule, as restated by the owner (2026-10-11): every answer
+ * corresponds to exactly one consistent snapshot. A miss reads one
+ * (`readSnapshot(Multi)`, once for the whole request); a hit returns an
+ * answer computed entirely at one earlier snapshot whose watermarks equal
+ * the ones the request just read. Commits that land without moving a
+ * watermark (the committed tail above visible(0), the spend watermark) can
+ * be newer than a hit's snapshot, exactly as with the snapshot cache; the
+ * spend watermark never changes an answer (the spend relation and the
+ * authchain walk are exact at any index lag). On by default in `main.ts`
+ * (`CHAINGRAPH_API_RESPONSE_CACHE=off` disables it); off in `createApi`
+ * unless asked for.
  */
 export class ResponseCache {
   readonly stats: ResponseCacheStats = { hits: 0, misses: 0, skipped: 0 };

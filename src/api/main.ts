@@ -5,7 +5,9 @@
  * (default 127.0.0.1:4000), reading the ClickHouse store named by
  * CHAINGRAPH_CLICKHOUSE_URL / CHAINGRAPH_CLICKHOUSE_DATABASE (default `cg`).
  * GraphiQL at /graphql. Options:
- * - CHAINGRAPH_API_RESPONSE_CACHE=off disables the watermark-keyed response cache;
+ * - the watermark-keyed response cache is on by default (every answer still
+ *   corresponds to exactly one consistent snapshot: plugins.ts
+ *   `ResponseCache`); CHAINGRAPH_API_RESPONSE_CACHE=off disables it;
  * - CHAINGRAPH_API_TRUSTED_DOCUMENTS=<dir of .graphql files> registers trusted
  *   documents (by sha256), CHAINGRAPH_API_TRUSTED_DOCUMENTS_ONLY=true runs
  *   nothing else;
