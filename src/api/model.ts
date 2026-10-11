@@ -431,11 +431,17 @@ export const authchainSql = (c: Ctx, link: string) => {
    * round's rows) and name their own columns differently, so no alias
    * shadows a column it is computed from.
    */
-  /* phase 0: the current transaction's segment and position (no row: it starts its own) */
-  const here = `SELECT w.base AS h_base, w.cur AS h_cur, w.len AS h_len, w.path AS h_path,
+  /*
+   * phase 0: the current transaction's segment and position (no row: it
+   * starts its own). The path stays out of the join with the segment's
+   * members (one copy per member: a 5,870-link path into a 23,027-member
+   * segment is ~4 GB on chipnet); it is joined back by base (one walk row
+   * per base).
+   */
+  const here = `SELECT w.base AS h_base, w.cur AS h_cur, w.len AS h_len,
       if(l.transaction_hash = ${zero}, t.t_id, l.l_segment) AS h_seg,
       if(l.transaction_hash = ${zero}, toUInt32(0), l.l_position) AS h_pos
-    FROM walk AS w
+    FROM (SELECT base, cur, len, phase FROM walk) AS w
     LEFT JOIN (SELECT transaction_hash, min(segment) AS l_segment, argMin(position, segment) AS l_position
       FROM ${links} WHERE transaction_hash IN (SELECT cur FROM walk WHERE phase = 0)
       GROUP BY transaction_hash) AS l ON l.transaction_hash = w.cur
@@ -452,16 +458,17 @@ export const authchainSql = (c: Ctx, link: string) => {
   /* the accepted members after the current position, while their positions are contiguous */
   const contiguous = `arrayFirstIndex((x, i) -> x.1 != g_pos + i, g_sorted, arrayEnumerate(g_sorted))`;
   const along = `SELECT g_base, if(empty(g_next), g_cur, g_next[-1]), g_len + length(g_next),
-      arrayConcat(g_path, g_next), toUInt8(if(g_len + length(g_next) >= ${max}, 2, 1))
-    FROM (SELECT g_base, g_cur, g_len, g_path,
+      arrayConcat(p.p_path, g_next), toUInt8(if(g_len + length(g_next) >= ${max}, 2, 1))
+    FROM (SELECT g_base, g_cur, g_len,
         arraySlice(arrayMap(x -> x.2, arraySlice(g_sorted, 1,
           toInt64(if(${contiguous} = 0, length(g_sorted), ${contiguous} - 1)))), 1,
           toInt64(${max}) - toInt64(g_len)) AS g_next
-      FROM (SELECT h_base AS g_base, any(h_cur) AS g_cur, any(h_len) AS g_len, any(h_path) AS g_path,
+      FROM (SELECT h_base AS g_base, any(h_cur) AS g_cur, any(h_len) AS g_len,
           any(h_pos) AS g_pos,
           arraySort(x -> x.1, groupUniqArrayIf((m_pos, m_hash), m_pos > h_pos)) AS g_sorted
         FROM (${here}) AS h LEFT JOIN (${members}) AS m ON m.m_seg = h.h_seg
-        GROUP BY h_base))`;
+        GROUP BY h_base)) AS g
+    INNER JOIN (SELECT base AS p_base, path AS p_path FROM walk WHERE phase = 0) AS p ON p.p_base = g.g_base`;
   /* phase 1: the accepted spender of the current transaction's output 0 */
   const spent = `SELECT cur, toUInt32(0) FROM walk WHERE phase = 1`;
   const spenders = `SELECT outpoint_transaction_hash AS s_spent, min(transaction_hash) AS s_spender
@@ -529,17 +536,19 @@ export const authchainBranchesSql = (c: Ctx, link: string) => {
   /*
    * A walk row is identified by (base, sipHash64(path)): the steps join and
    * group by that, never by the path itself, and take the path back once
-   * per row (`paths`): carrying a 56,904-link path through a join with
-   * every member of a segment, or through the members of its own run,
-   * would copy it once per row (~100 GB on chipnet's longest chain).
+   * per row (`paths`). A path carried into a join with every member of a
+   * segment is copied once per member: ClickHouse 26.8 may evaluate an
+   * expression over `walk`'s columns after a later join, so the path is
+   * dropped in a subquery of `walk` before any join (a 5,870-link path into
+   * a 23,027-member segment: 7.2 GB and 2.3 s; dropped: 0.3 GB, 0.25 s).
    */
   const paths = (phase: number) =>
     `SELECT base AS p_base, sipHash64(path) AS p_pid, path AS p_path FROM walk WHERE phase = ${phase}`;
   /* phase 0: the current transaction's segment and position (no row: it starts its own) */
-  const here = `SELECT w.base AS h_base, w.cur AS h_cur, w.len AS h_len, sipHash64(w.path) AS h_pid,
+  const here = `SELECT w.base AS h_base, w.cur AS h_cur, w.len AS h_len, w.pid AS h_pid,
       if(l.transaction_hash = ${zero}, t.t_id, l.l_segment) AS h_seg,
       if(l.transaction_hash = ${zero}, toUInt32(0), l.l_position) AS h_pos
-    FROM walk AS w
+    FROM (SELECT base, cur, len, phase, sipHash64(path) AS pid FROM walk) AS w
     LEFT JOIN (SELECT transaction_hash, min(segment) AS l_segment, argMin(position, segment) AS l_position
       FROM ${links} WHERE transaction_hash IN (SELECT cur FROM walk WHERE phase = 0)
       GROUP BY transaction_hash) AS l ON l.transaction_hash = w.cur
@@ -552,8 +561,10 @@ export const authchainBranchesSql = (c: Ctx, link: string) => {
   /* per walk row: members at or after its position, sorted; a position holding two members is a conflict */
   const runs = `SELECT g_base, g_cur, g_len, g_pid, g_pos, g_sorted,
       arrayMap(x -> x.1, g_sorted) AS g_ps,
-      arrayMap((p, i) -> (i > 1 AND g_ps[i - 1] = p) OR (i < length(g_ps) AND g_ps[i + 1] = p),
-        g_ps, arrayEnumerate(g_ps)) AS g_dup,
+      /* neighbours as shifted arrays: a lambda capturing g_ps would copy it per element */
+      arrayMap((p, before, after) -> p = before OR p = after, g_ps,
+        arrayPushFront(arrayPopBack(g_ps), toUInt32(0)),
+        arrayPushBack(arrayPopFront(g_ps), toUInt32(0))) AS g_dup,
       arrayFilter(x -> tupleElement(x.1, 1) > g_pos, arrayZip(g_sorted, g_dup)) AS g_after,
       arrayFirstIndex((x, i) -> tupleElement(x.1, 1) != g_pos + i OR x.2, g_after, arrayEnumerate(g_after)) AS g_fail,
       g_pos = 0 OR countEqual(g_ps, g_pos) = 1 AS g_unique
@@ -577,31 +588,48 @@ export const authchainBranchesSql = (c: Ctx, link: string) => {
       SELECT member, toUInt32(0) FROM (SELECT arraySlice(path, start) AS added FROM walk WHERE phase = 1)
         ARRAY JOIN added AS member)
     GROUP BY outpoint_transaction_hash`;
-  /* (j, member j, member j + 1) of each row's added members; the path itself stays behind */
+  /*
+   * (j, member j, member j + 1) of each row's added members, zipped from
+   * slices (a lambda reading `path` would copy it per element); the path
+   * itself stays behind
+   */
   const items = `SELECT x.x_base AS x_base, x.x_pid AS x_pid, x.x_j AS x_j, x.x_next AS x_next,
       s.s_kids AS x_kids
     FROM (SELECT x_base, x_pid, e.1 AS x_j, e.2 AS x_m, e.3 AS x_next
       FROM (SELECT base AS x_base, sipHash64(path) AS x_pid,
-          arrayMap(j -> (j, path[j], if(j < len, path[j + 1], ${zero})), range(start, len + 1)) AS x_list
+          arrayZip(range(start, len + 1), arraySlice(path, start),
+            arrayPushBack(arraySlice(path, start + 1), ${zero})) AS x_list
         FROM walk WHERE phase = 1)
       ARRAY JOIN x_list AS e) AS x
     LEFT JOIN (${spenders}) AS s ON s.s_parent = x.x_m`;
-  /* the path holds while each next member spends the previous one's output 0 */
-  const ends = `SELECT y_base, p.p_path AS y_path,
-      if(y_fail = 0, length(y_items), y_fail) AS y_c,
-      arrayFlatten(arrayMap(x -> arrayMap(k -> (x.1, k, toUInt8(0)), arrayFilter(k -> k != x.2, x.3)),
-        arraySlice(y_items, 1, y_c))) AS y_branches,
-      if(empty(y_items[y_c].3), [(y_items[y_c].1, ${zero}, toUInt8(2))], []) AS y_end
+  /* the path holds while each next member spends the previous one's output 0 (y_c: the last item kept) */
+  const ends = `SELECT y_base, y_pid, y_items, if(y_fail = 0, length(y_items), y_fail) AS y_c
     FROM (SELECT y_base, y_pid, y_items,
         arrayFirstIndex(x -> x.2 != ${zero} AND NOT has(x.3, x.2), y_items) AS y_fail
       FROM (SELECT x_base AS y_base, x_pid AS y_pid,
           arraySort(x -> x.1, groupArray((x_j, x_next, x_kids))) AS y_items
-        FROM (${items}) GROUP BY x_base, x_pid)) AS y
-    INNER JOIN (${paths(1)}) AS p ON p.p_base = y.y_base AND p.p_pid = y.y_pid`;
-  const across = `SELECT y_base, if(e.3 = 2, y_path[e.1], e.2), if(e.3 = 2, e.1, e.1 + 1),
-      if(e.3 = 2, arraySlice(y_path, 1, e.1), arrayPushBack(arraySlice(y_path, 1, e.1), e.2)),
-      toUInt8(if(e.3 = 2 OR e.1 + 1 >= ${max}, 2, 0)), toUInt64(1)
-    FROM (${ends}) ARRAY JOIN arrayConcat(y_branches, y_end) AS e`;
+        FROM (${items}) GROUP BY x_base, x_pid))`;
+  /*
+   * New rows: a branch for every spender of a kept item other than the next
+   * member (kind 0), the end of the path where the last kept item has no
+   * spender (kind 2). Expanded by ARRAY JOIN without the path, which is
+   * joined back once per new row (array expressions over the items that
+   * build these rows cost ~7 GB on a 5,870-item run on ClickHouse 26.8).
+   */
+  const branches = `SELECT b_base, b_pid, b_j, b_kid, toUInt8(0) AS b_kind
+    FROM (SELECT y_base AS b_base, y_pid AS b_pid, item.1 AS b_j, item.2 AS b_next, item.3 AS b_kids
+      FROM (SELECT y_base, y_pid, arraySlice(y_items, 1, y_c) AS kept FROM (${ends}))
+      ARRAY JOIN kept AS item)
+    ARRAY JOIN b_kids AS b_kid
+    WHERE b_kid != b_next`;
+  const terminals = `SELECT y_base, y_pid, y_items[y_c].1, ${zero}, toUInt8(2)
+    FROM (${ends}) WHERE empty(y_items[y_c].3)`;
+  const across = `SELECT e.b_base, if(e.b_kind = 2, p.p_path[e.b_j], e.b_kid),
+      if(e.b_kind = 2, e.b_j, e.b_j + 1),
+      if(e.b_kind = 2, arraySlice(p.p_path, 1, e.b_j), arrayPushBack(arraySlice(p.p_path, 1, e.b_j), e.b_kid)),
+      toUInt8(if(e.b_kind = 2 OR e.b_j + 1 >= ${max}, 2, 0)), toUInt64(1)
+    FROM (${branches} UNION ALL ${terminals}) AS e
+    INNER JOIN (${paths(1)}) AS p ON p.p_base = e.b_base AND p.p_pid = e.b_pid`;
   return `SELECT * FROM ${c.sql.cte(
     'authchain_branches',
     `WITH RECURSIVE walk AS (
