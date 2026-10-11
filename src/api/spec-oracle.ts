@@ -358,8 +358,8 @@ export const evalOutput = (
           `${output.transaction_hash}:${output.output_index}`
         ) ?? []
       ).some(
+        /* node-agnostic: any stored spend (opt-in acceptance through the input's transaction filter) */
         (input) =>
-          accepted(oracle, input.transaction_hash) &&
           // eslint-disable-next-line @typescript-eslint/no-use-before-define
           evalInput(oracle, input, filter.spent_by) === true
       )

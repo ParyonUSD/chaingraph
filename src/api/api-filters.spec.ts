@@ -141,6 +141,9 @@ const outputFilters = (c0: string): OutputFilter[] => [
     },
   },
   { _not: { spent_by: {} } },
+  /* opt-in acceptance of the spend: the level's node accepts the spending transaction */
+  { _not: { spent_by: { transaction: { block_window: {} } } } },
+  { spent_by: { transaction: { block_window: { include_mempool: false } } } },
   {
     _and: [
       { token_category: { _eq: paryon } },

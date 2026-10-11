@@ -8,14 +8,14 @@ query GetSpendingTransactions($hash: Hex!, $node: String!) {
     output_index
     value_satoshis
     locking_bytecode_pattern
-    spent_by(node: $node) {
+    spent_by {
       unlocking_bytecode_pattern
       outpoint_index
       transaction {
         hash
-        node_validations { validated_at node { name } }
-        node_validation_timeline { node { name } validated_at replaced_at }
-        block_inclusions { transaction_index block { hash height accepted_by { accepted_at node { name user_agent } } } }
+        node_validations(node: $node) { validated_at node { name } }
+        node_validation_timeline(node: $node) { node { name } validated_at replaced_at }
+        block_inclusions { transaction_index block { hash height accepted_by(node: $node) { accepted_at node { name user_agent } } } }
       }
     }
   }

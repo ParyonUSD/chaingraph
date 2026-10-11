@@ -10,12 +10,20 @@
  *  1. Transaction.outputs                       7. Transaction.node_validations (per node)
  *  2. Transaction.inputs, Input.outpoint        8. Transaction.node_validation_timeline (per node)
  *  3. Output.spent_by → Input.transaction       9. Node.unconfirmed_transactions (per node)
- *     (per node)                               10. Node.accepted_blocks (per node)
+ *     (structural; opt-in `accepted_by`)       10. Node.accepted_blocks (per node)
  *  4. Output.transaction, Input.transaction    11. Block.transactions → BlockTransaction.transaction
  *  5. Transaction.block_inclusions → block     12. Transaction.authchains → authhead / migrations
- *     (per node)                                   (per node)
+ *     (structural; opt-in `accepted_by`)           (per node); authchain_branches (structural)
  *  6. Block.accepted_by → node (per node)      13. Transaction.identity_output, signing_output,
  *                                                  data_carrier_outputs
+ *
+ * Structural facts (owner decision 2026-10-11) are node-agnostic and
+ * complete: every stored block containing a transaction (stale and fork
+ * blocks included), every stored input spending an output (conflicting
+ * spends included), every branch of an identity-output tree. Acceptance is
+ * opt-in and per node: `accepted_by: node` on those relationships,
+ * `accepted(node:)` on transactions, inputs and inclusions. No field answers
+ * "accepted by any node".
  */
 import type {
   Ctx,
@@ -484,9 +492,113 @@ export const authchainSql = (c: Ctx, link: string) => {
       UNION ALL ${across}
     )
     SELECT base, argMax(cur, len) AS head, max(len) AS length, argMax(path, len) AS path,
-      max(len) < ${max} AS unspent
+      max(len) < ${max} AS unspent, toUInt64(0) AS branch
     FROM walk WHERE phase = 2
     GROUP BY base`
+  )}`;
+};
+
+/**
+ * Node-agnostic: every branch of the identity-output tree from each base
+ * transaction, over all stored spends of output 0 (conflicting spends and
+ * transactions of stale blocks included; no acceptance). One row per path
+ * from the base to an output 0 no stored transaction spends (or to the depth
+ * limit); a transaction spending the outputs 0 of two members of the tree
+ * (a merge) is on two paths. Columns as `authchainSql`; `branch` tells the
+ * paths of one base apart.
+ *
+ * A walk over the authchain index, one recursive CTE alternating two steps:
+ * - phase 0, along a segment: if the current transaction is the only member
+ *   at its position (or it starts the segment), the run of positions after
+ *   it holding exactly one member each (one keyed read of the segment). A
+ *   member at position p + 1 was placed from its heavy parent at position p,
+ *   so the run is a chain of output-0 spends; conflicting spends placed on
+ *   the segment (two members at one position) end the run;
+ * - phase 1, verify and branch: every spender of output 0 of the members just
+ *   added (the input table, any commit: also above the spend watermark).
+ *   Spenders other than the next member start new branches (light children,
+ *   conflicting spends placed elsewhere, transactions not indexed yet); the
+ *   path is cut where the next member is not a spender (a stale placement
+ *   costs a step, never a wrong edge); an output 0 without spenders ends a
+ *   branch (phase 2).
+ */
+export const authchainBranchesSql = (c: Ctx, link: string) => {
+  const zero = `toFixedString(unhex(repeat('00', 32)), 32)`;
+  const links = c.sql.view('authchain_link_at');
+  const max = String(maxAuthchainDepth);
+  /* phase 0: the current transaction's segment and position (no row: it starts its own) */
+  const here = `SELECT w.base AS h_base, w.cur AS h_cur, w.len AS h_len, w.path AS h_path,
+      if(l.transaction_hash = ${zero}, t.t_id, l.l_segment) AS h_seg,
+      if(l.transaction_hash = ${zero}, toUInt32(0), l.l_position) AS h_pos
+    FROM walk AS w
+    LEFT JOIN (SELECT transaction_hash, min(segment) AS l_segment, argMin(position, segment) AS l_position
+      FROM ${links} WHERE transaction_hash IN (SELECT cur FROM walk WHERE phase = 0)
+      GROUP BY transaction_hash) AS l ON l.transaction_hash = w.cur
+    LEFT JOIN (SELECT hash, min(internal_id) AS t_id FROM ${c.sql.view(
+      'transaction_at'
+    )} WHERE hash IN (SELECT cur FROM walk WHERE phase = 0) GROUP BY hash) AS t ON t.hash = w.cur
+    WHERE w.phase = 0`;
+  const members = `SELECT segment AS m_seg, position AS m_pos, transaction_hash AS m_hash FROM ${links}
+    WHERE segment IN (SELECT h_seg FROM (${here}))`;
+  /* per walk row: members at or after its position, sorted; a position holding two members is a conflict */
+  const runs = `SELECT g_base, g_cur, g_len, g_path, g_pos, g_sorted,
+      arrayMap(x -> x.1, g_sorted) AS g_ps,
+      arrayMap((p, i) -> (i > 1 AND g_ps[i - 1] = p) OR (i < length(g_ps) AND g_ps[i + 1] = p),
+        g_ps, arrayEnumerate(g_ps)) AS g_dup,
+      arrayFilter(x -> tupleElement(x.1, 1) > g_pos, arrayZip(g_sorted, g_dup)) AS g_after,
+      arrayFirstIndex((x, i) -> tupleElement(x.1, 1) != g_pos + i OR x.2, g_after, arrayEnumerate(g_after)) AS g_fail,
+      g_pos = 0 OR countEqual(g_ps, g_pos) = 1 AS g_unique
+    FROM (SELECT h_base AS g_base, any(h_cur) AS g_cur, any(h_len) AS g_len, h_path AS g_path,
+        any(h_pos) AS g_pos,
+        arraySort(groupUniqArrayIf((m_pos, m_hash), m_pos >= h_pos)) AS g_sorted
+      FROM (${here}) AS h LEFT JOIN (${members}) AS m ON m.m_seg = h.h_seg
+      GROUP BY h_base, h_path)`;
+  const along = `SELECT g_base, if(empty(g_next), g_cur, g_next[-1]), g_len + length(g_next),
+      arrayConcat(g_path, g_next), toUInt8(1), g_len
+    FROM (SELECT g_base, g_cur, g_len, g_path,
+        if(g_unique, arraySlice(arrayMap(x -> tupleElement(x.1, 2), arraySlice(g_after, 1,
+          toInt64(if(g_fail = 0, length(g_after), g_fail - 1)))), 1,
+          toInt64(${max}) - toInt64(g_len)), []) AS g_next
+      FROM (${runs}))`;
+  /* phase 1: every spender of output 0 of the members added since `start` */
+  const spenders = `SELECT outpoint_transaction_hash AS s_parent, groupUniqArray(transaction_hash) AS s_kids
+    FROM ${c.sql.view('input_at')}
+    WHERE (outpoint_transaction_hash, outpoint_index) IN (
+      SELECT arrayJoin(arraySlice(path, start)), toUInt32(0) FROM walk WHERE phase = 1)
+    GROUP BY outpoint_transaction_hash`;
+  const items = `SELECT x.x_base AS x_base, x.x_path AS x_path, x.x_j AS x_j, x.x_next AS x_next,
+      s.s_kids AS x_kids
+    FROM (SELECT base AS x_base, path AS x_path, j AS x_j, path[j] AS x_m,
+        if(j < len, path[j + 1], ${zero}) AS x_next
+      FROM walk ARRAY JOIN range(start, len + 1) AS j WHERE phase = 1) AS x
+    LEFT JOIN (${spenders}) AS s ON s.s_parent = x.x_m`;
+  /* the path holds while each next member spends the previous one's output 0 */
+  const ends = `SELECT y_base, y_path,
+      if(y_fail = 0, length(y_items), y_fail) AS y_c,
+      arrayFlatten(arrayMap(x -> arrayMap(k -> (x.1, k, toUInt8(0)), arrayFilter(k -> k != x.2, x.3)),
+        arraySlice(y_items, 1, y_c))) AS y_branches,
+      if(empty(y_items[y_c].3), [(y_items[y_c].1, ${zero}, toUInt8(2))], []) AS y_end
+    FROM (SELECT y_base, y_path, y_items,
+        arrayFirstIndex(x -> x.2 != ${zero} AND NOT has(x.3, x.2), y_items) AS y_fail
+      FROM (SELECT x_base AS y_base, x_path AS y_path,
+          arraySort(x -> x.1, groupArray((x_j, x_next, x_kids))) AS y_items
+        FROM (${items}) GROUP BY x_base, x_path))`;
+  const across = `SELECT y_base, if(e.3 = 2, y_path[e.1], e.2), if(e.3 = 2, e.1, e.1 + 1),
+      if(e.3 = 2, arraySlice(y_path, 1, e.1), arrayPushBack(arraySlice(y_path, 1, e.1), e.2)),
+      toUInt8(if(e.3 = 2 OR e.1 + 1 >= ${max}, 2, 0)), toUInt64(1)
+    FROM (${ends}) ARRAY JOIN arrayConcat(y_branches, y_end) AS e`;
+  return `SELECT * FROM ${c.sql.cte(
+    'authchain_branches',
+    `WITH RECURSIVE walk AS (
+      SELECT hash AS base, hash AS cur, toUInt64(1) AS len, [hash] AS path, toUInt8(0) AS phase,
+        toUInt64(1) AS start
+      FROM (SELECT DISTINCT hash FROM (${link}))
+      UNION ALL ${along}
+      UNION ALL ${across}
+    )
+    SELECT DISTINCT base, cur AS head, len AS length, path, len < ${max} AS unspent,
+      sipHash64(path) AS branch
+    FROM walk WHERE phase = 2`
   )}`;
 };
 
@@ -532,6 +644,32 @@ const nodeById: RelationField = {
   target: () => NodeEntity,
 };
 
+/** The node an `accepted_by:` argument names (undefined: node-agnostic). */
+const acceptedByNode = (c: Ctx, args: { [name: string]: unknown }) =>
+  typeof args.accepted_by === 'string' ? c.nodeId(args.accepted_by) : undefined;
+
+/**
+ * `accepted(node:)`: whether the named node accepts the parent row (a
+ * transaction: a block it accepts or its mempool; a block: it accepts the
+ * block). One row per accepted parent key; the resolver answers "any row".
+ * The node is required: no field answers "accepted by any node".
+ */
+const acceptedTransaction = (parentKey: string): RelationField => ({
+  childKeys: ['transaction_hash'],
+  defaultOrder: [],
+  kind: 'relation',
+  many: true,
+  parentKeys: [parentKey],
+  perNode: true,
+  source: (c, link) =>
+    `SELECT DISTINCT transaction_hash FROM ${c.sql.nodeView(
+      'tx_acceptance_at',
+      c.node,
+      `transaction_hash IN (${link})`
+    )}`,
+  target: () => AcceptanceMarkEntity,
+});
+
 const blockById = (parentKey: string): RelationField => ({
   childKeys: ['internal_id'],
   defaultOrder: [],
@@ -567,6 +705,21 @@ export const TransactionEntity: Entity = {
       source: inputValuesSql,
       target: () => InputValueEntity,
     },
+    accepted: acceptedTransaction('hash'),
+    authchain_branches: {
+      childKeys: ['base'],
+      defaultOrder: [
+        term('length', 'DESC'),
+        term('head', 'ASC', 'hex'),
+        term('branch'),
+      ],
+      kind: 'relation',
+      many: true,
+      parentKeys: ['hash'],
+      recursive: true,
+      source: authchainBranchesSql,
+      target: () => AuthchainEntity,
+    },
     authchains: {
       childKeys: ['base'],
       defaultOrder: [],
@@ -585,16 +738,35 @@ export const TransactionEntity: Entity = {
       many: true,
       order: listOrder(blockInclusionOrder, [term('block_internal_id')]),
       parentKeys: ['hash'],
-      perNode: true,
-      /* transaction_index comes from block_transaction: joined only when read (the join costs ~5 ms) */
-      source: (c, link, _args, needs) => {
-        const acceptance = `SELECT transaction_hash, block_internal_id, height, accepted_at FROM ${c.sql.nodeView(
+      /*
+       * Node-agnostic and complete: every stored block containing the
+       * transaction (blocks of stale forks included). `accepted_by: node`
+       * keeps the blocks that node accepts (read from its acceptance rows;
+       * transaction_index from block_transaction only when read: ~5 ms).
+       */
+      source: (c, link, args, needs) => {
+        const node = acceptedByNode(c, args);
+        if (node === undefined) {
+          const included = `SELECT block_internal_id, transaction_hash, transaction_index FROM ${c.sql.view(
+            'block_transaction_at'
+          )} WHERE transaction_hash IN (${link})`;
+          return needs.has('height')
+            ? `SELECT bt.transaction_hash AS transaction_hash, bt.block_internal_id AS block_internal_id,
+          b.height AS height, bt.transaction_index AS transaction_index
+        FROM (${included}) AS bt
+        INNER JOIN (SELECT internal_id, height FROM ${c.sql.view(
+          'block_at'
+        )} WHERE internal_id IN (SELECT block_internal_id FROM (${included}))) AS b
+          ON b.internal_id = bt.block_internal_id`
+            : `SELECT transaction_hash, block_internal_id, toUInt32(0) AS height, transaction_index FROM (${included})`;
+        }
+        const acceptance = `SELECT transaction_hash, block_internal_id, height FROM ${c.sql.nodeView(
           'tx_acceptance_at',
-          c.node
+          node
         )} WHERE block_internal_id != 0 AND transaction_hash IN (${link})`;
         return needs.has('transaction_index')
           ? `SELECT a.transaction_hash AS transaction_hash, a.block_internal_id AS block_internal_id,
-          a.height AS height, a.accepted_at AS accepted_at, bt.transaction_index AS transaction_index
+          a.height AS height, bt.transaction_index AS transaction_index
         FROM (${acceptance}) AS a
         LEFT JOIN (SELECT block_internal_id, transaction_hash, transaction_index FROM ${c.sql.view(
           'block_transaction_at'
@@ -750,15 +922,18 @@ export const OutputEntity: Entity = {
         term('input_index'),
       ]),
       parentKeys: ['transaction_hash', 'output_index'],
-      perNode: true,
-      source: (c, link) =>
-        c.sql.acceptedRows(
-          `SELECT * FROM ${c.sql.view(
-            'input_at'
-          )} WHERE (outpoint_transaction_hash, outpoint_index) IN (${link})`,
-          '*',
-          c.node
-        ),
+      /*
+       * Node-agnostic and complete: every stored input spending the output
+       * (conflicting spends included). `accepted_by: node` keeps the inputs
+       * of transactions that node accepts.
+       */
+      source: (c, link, args) => {
+        const rows = `SELECT * FROM ${c.sql.view(
+          'input_at'
+        )} WHERE (outpoint_transaction_hash, outpoint_index) IN (${link})`;
+        const node = acceptedByNode(c, args);
+        return node === undefined ? rows : c.sql.acceptedRows(rows, '*', node);
+      },
       target: () => InputEntity,
       where: (c, where, source) =>
         inputPredicate(
@@ -792,6 +967,7 @@ export const InputEntity: Entity = {
         outputsOf(c, `(transaction_hash, output_index) IN (${link})`),
       target: () => OutputEntity,
     },
+    accepted: acceptedTransaction('transaction_hash'),
     input_index: scalar('input_index'),
     outpoint: {
       childKeys: ['transaction_hash', 'output_index'],
@@ -1012,11 +1188,24 @@ export const BlockInclusionEntity: Entity = {
     'transaction_hash',
     'block_internal_id',
     'height',
-    'accepted_at',
     'transaction_index',
   ],
   fields: {
-    accepted_at: scalar(time('accepted_at')),
+    accepted: {
+      childKeys: ['block_internal_id'],
+      defaultOrder: [],
+      kind: 'relation',
+      many: true,
+      parentKeys: ['block_internal_id'],
+      perNode: true,
+      source: (c, link) =>
+        `SELECT DISTINCT block_internal_id FROM ${c.sql.nodeView(
+          'node_block_at',
+          c.node,
+          `block_internal_id IN (${link})`
+        )}`,
+      target: () => AcceptanceMarkEntity,
+    },
     block: blockById('block_internal_id'),
     block_internal_id: scalar(str('block_internal_id')),
     transaction_index: scalar('transaction_index'),
@@ -1167,6 +1356,13 @@ export const NodeEntity: Entity = {
   name: 'Node',
 };
 
+/** A row of an `accepted(node:)` relation: only its key. */
+export const AcceptanceMarkEntity: Entity = {
+  columns: ['transaction_hash', 'block_internal_id'],
+  fields: {},
+  name: 'AcceptanceMark',
+};
+
 export const CountEntity: Entity = {
   columns: ['node_internal_id', 'count'],
   fields: { count: scalar(str('count')) },
@@ -1178,21 +1374,21 @@ export const CountEntity: Entity = {
 /* ------------------------------------------------------------------ */
 
 export const AuthchainEntity: Entity = {
-  columns: ['base', 'head', 'length', 'path', 'unspent'],
+  columns: ['base', 'head', 'length', 'path', 'unspent', 'branch'],
   fields: {
     authchain_length: scalar('length'),
     authhead: transactionByHash('head'),
     authhead_transaction_hash: scalar(hex('head')),
     migrations: {
-      childKeys: ['base'],
+      childKeys: ['base', 'branch'],
       defaultOrder: [term('migration_index')],
       kind: 'relation',
-      linkColumns: ['base', 'path'],
+      linkColumns: ['base', 'branch', 'path'],
       many: true,
       order: listOrder(migrationOrder, [term('migration_index')]),
-      parentKeys: ['base'],
+      parentKeys: ['base', 'branch'],
       source: (_c, link) =>
-        `SELECT base, toUInt32(index - 1) AS migration_index, migration AS transaction_hash
+        `SELECT base, branch, toUInt32(index - 1) AS migration_index, migration AS transaction_hash
           FROM (${link}) ARRAY JOIN path AS migration, arrayEnumerate(path) AS index`,
       target: () => MigrationEntity,
     },
@@ -1202,7 +1398,7 @@ export const AuthchainEntity: Entity = {
 };
 
 export const MigrationEntity: Entity = {
-  columns: ['base', 'migration_index', 'transaction_hash'],
+  columns: ['base', 'branch', 'migration_index', 'transaction_hash'],
   fields: {
     migration_index: scalar('migration_index'),
     transaction: transactionByHash('transaction_hash'),

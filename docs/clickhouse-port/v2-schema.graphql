@@ -187,13 +187,16 @@ type BlockGroupPage {
 }
 
 """
-A block that includes the transaction and that the node accepts (per node).
+A stored block that includes the transaction (a structural fact; acceptance is per node: `accepted(node:)`, or `block { accepted_by(node:) { accepted_at } }`).
 """
 type BlockInclusion {
-  """
-  When the node accepted the block (null if known only from a historical sync).
-  """
-  accepted_at: Timestamp
+  """Whether the node accepts the block."""
+  accepted(
+    """
+    The node (required: no field answers "accepted by any node"). Pinned by the request snapshot.
+    """
+    node: String!
+  ): Boolean!
   block: Block!
   block_internal_id: BigInt!
   transaction_index: Int
@@ -297,6 +300,15 @@ input HexComparison {
 }
 
 type Input {
+  """
+  Whether the node accepts the spending transaction (in a block it accepts or in its mempool).
+  """
+  accepted(
+    """
+    The node (required: no field answers "accepted by any node"). Pinned by the request snapshot.
+    """
+    node: String!
+  ): Boolean!
   input_index: Int!
 
   """
@@ -524,15 +536,14 @@ type Output {
   output_index: Int!
 
   """
-  Inputs spending this output, in transactions the node accepts (per node; at most one unless the node accepts a double spend in its mempool view).
+  Every stored input spending this output (node-agnostic: conflicting spends included). `accepted_by: node` keeps the inputs of transactions that node accepts (at most one unless its mempool view holds a double spend); `accepted(node:)` on each input tells them apart.
   """
   spent_by(
+    """
+    Opt-in acceptance: only rows the named node accepts (default: every stored row, node-agnostic). It must be pinned by the request: any `node:` or `accepted_by:` argument of the operation is.
+    """
+    accepted_by: String
     limit: Int
-
-    """
-    The node whose view this relationship reads (default: the node of the level above; required below a node-agnostic root). It must be pinned by the request: any `node:` argument of the operation is.
-    """
-    node: String
     order_by: [InputOrderBy!]
     where: InputFilter
   ): [Input!]!
@@ -586,7 +597,7 @@ input OutputFilter {
   output_index: IntComparison
 
   """
-  EXISTS an input spending this output, in a transaction the node accepts, matching (per node).
+  EXISTS a stored input spending this output (node-agnostic: conflicting spends included), matching. For a spend a node accepts, add `transaction: { block_window: {} }` (the node of the level).
   """
   spent_by: InputFilter
   token_category: HexComparison
@@ -1098,6 +1109,21 @@ input TokenCapabilityComparison {
 
 type Transaction {
   """
+  Whether the node accepts the transaction (in a block it accepts or in its mempool).
+  """
+  accepted(
+    """
+    The node (required: no field answers "accepted by any node"). Pinned by the request snapshot.
+    """
+    node: String!
+  ): Boolean!
+
+  """
+  Node-agnostic: every branch of the identity-output tree from this transaction, over all stored spends of output 0 (conflicting spends and stale blocks included): one Authchain per path to an output 0 no stored transaction spends (`unspent_authhead`) or to the depth limit. For fork analysis; the chain one node accepts is `authchains(node:)`. Longest first.
+  """
+  authchain_branches(limit: Int, offset: Int): [Authchain!]!
+
+  """
   Per node: the authchain from this transaction (v1 `collect_authchains` at the node's view: output 0 followed through spends the node accepts, to the unspent authhead). At most one element.
   """
   authchains(
@@ -1108,15 +1134,14 @@ type Transaction {
   ): [Authchain!]!
 
   """
-  Blocks that include the transaction and that the node accepts (per node).
+  Every stored block that includes the transaction (node-agnostic: blocks of stale forks included), by height. `accepted_by: node` keeps the blocks that node accepts; `accepted(node:)` on each inclusion tells them apart.
   """
   block_inclusions(
+    """
+    Opt-in acceptance: only rows the named node accepts (default: every stored row, node-agnostic). It must be pinned by the request: any `node:` or `accepted_by:` argument of the operation is.
+    """
+    accepted_by: String
     limit: Int
-
-    """
-    The node whose view this relationship reads (default: the node of the level above; required below a node-agnostic root). It must be pinned by the request: any `node:` argument of the operation is.
-    """
-    node: String
     offset: Int
     order_by: [BlockInclusionOrderBy!]
     where: BlockInclusionFilter

@@ -296,7 +296,7 @@ OutputFilterInput.implement({
     output_index: t.field({ type: IntComparisonInput }),
     spent_by: t.field({
       description:
-        'EXISTS an input spending this output, in a transaction the node accepts, matching (per node).',
+        'EXISTS a stored input spending this output (node-agnostic: conflicting spends included), matching. For a spend a node accepts, add `transaction: { block_window: {} }` (the node of the level).',
       type: InputFilterInput,
     }),
     token_category: t.field({ type: HexComparisonInput }),
@@ -654,6 +654,26 @@ const nodeArg = (t: FieldBuilder) =>
       'The node whose view this relationship reads (default: the node of the level above; required below a node-agnostic root). It must be pinned by the request: any `node:` argument of the operation is.',
   });
 
+const acceptedByArg = (t: FieldBuilder) =>
+  t.arg.string({
+    description:
+      'Opt-in acceptance: only rows the named node accepts (default: every stored row, node-agnostic). It must be pinned by the request: any `node:` or `accepted_by:` argument of the operation is.',
+  });
+
+/** `accepted(node:)`: per-node exactness, the node is required. */
+const acceptedField = (t: FieldBuilder, description: string) =>
+  t.boolean({
+    args: {
+      node: t.arg.string({
+        description:
+          'The node (required: no field answers "accepted by any node"). Pinned by the request snapshot.',
+        required: true,
+      }),
+    },
+    description,
+    resolve: (p, _a, _c, info) => many(p, info).length > 0,
+  });
+
 const outputListArgs = (t: FieldBuilder) => ({
   limit: t.arg.int(),
   offset: t.arg.int(),
@@ -691,6 +711,17 @@ const inputValue = (row: Row) =>
 
 TransactionRef.implement({
   fields: (t) => ({
+    accepted: acceptedField(
+      t,
+      'Whether the node accepts the transaction (in a block it accepts or in its mempool).'
+    ),
+    authchain_branches: t.field({
+      args: { limit: t.arg.int(), offset: t.arg.int() },
+      description:
+        'Node-agnostic: every branch of the identity-output tree from this transaction, over all stored spends of output 0 (conflicting spends and stale blocks included): one Authchain per path to an output 0 no stored transaction spends (`unspent_authhead`) or to the depth limit. For fork analysis; the chain one node accepts is `authchains(node:)`. Longest first.',
+      resolve: (p, _a, _c, info) => many(p, info),
+      type: [AuthchainRef],
+    }),
     authchains: t.field({
       args: { node: nodeArg(t) },
       description:
@@ -700,14 +731,14 @@ TransactionRef.implement({
     }),
     block_inclusions: t.field({
       args: {
+        accepted_by: acceptedByArg(t),
         limit: t.arg.int(),
-        node: nodeArg(t),
         offset: t.arg.int(),
         order_by: t.arg({ type: [BlockInclusionOrderBy] }),
         where: t.arg({ type: BlockInclusionFilterInput }),
       },
       description:
-        'Blocks that include the transaction and that the node accepts (per node).',
+        'Every stored block that includes the transaction (node-agnostic: blocks of stale forks included), by height. `accepted_by: node` keeps the blocks that node accepts; `accepted(node:)` on each inclusion tells them apart.',
       resolve: (p, _a, _c, info) => many(p, info),
       type: [BlockInclusionRef],
     }),
@@ -833,13 +864,13 @@ OutputRef.implement({
     output_index: intField(t, 'output_index'),
     spent_by: t.field({
       args: {
+        accepted_by: acceptedByArg(t),
         limit: t.arg.int(),
-        node: nodeArg(t),
         order_by: t.arg({ type: [InputOrderBy] }),
         where: t.arg({ type: InputFilterInput }),
       },
       description:
-        'Inputs spending this output, in transactions the node accepts (per node; at most one unless the node accepts a double spend in its mempool view).',
+        'Every stored input spending this output (node-agnostic: conflicting spends included). `accepted_by: node` keeps the inputs of transactions that node accepts (at most one unless its mempool view holds a double spend); `accepted(node:)` on each input tells them apart.',
       resolve: (p, _a, _c, info) => many(p, info),
       type: [InputRef],
     }),
@@ -857,6 +888,10 @@ OutputRef.implement({
 
 InputRef.implement({
   fields: (t) => ({
+    accepted: acceptedField(
+      t,
+      'Whether the node accepts the spending transaction (in a block it accepts or in its mempool).'
+    ),
     input_index: intField(t, 'input_index'),
     outpoint: t.field({
       description:
@@ -998,13 +1033,9 @@ BlockRef.implement({
 
 BlockInclusionRef.implement({
   description:
-    'A block that includes the transaction and that the node accepts (per node).',
+    'A stored block that includes the transaction (a structural fact; acceptance is per node: `accepted(node:)`, or `block { accepted_by(node:) { accepted_at } }`).',
   fields: (t) => ({
-    accepted_at: timestampField(
-      t,
-      'accepted_at',
-      'When the node accepted the block (null if known only from a historical sync).'
-    ),
+    accepted: acceptedField(t, 'Whether the node accepts the block.'),
     block: t.field({
       resolve: (p, _a, _c, info) => one(p, info)!,
       type: BlockRef,

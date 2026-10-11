@@ -168,7 +168,7 @@ export interface StatementEnv {
 
 const unknownNode = (name: string) =>
   new GraphQLError(
-    `Node ${name} is not named by this operation (every node a request reads must appear as a \`node:\` argument).`,
+    `Node ${name} is not named by this operation (every node a request reads must appear as a \`node:\` or \`accepted_by:\` argument).`,
     { extensions: { code: 'BAD_USER_INPUT' } }
   );
 

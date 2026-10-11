@@ -18,8 +18,9 @@
  *   table (`inlinePinnedView`: same rows, same snapshot parameters; the
  *   views themselves stay for ad-hoc readers). Phase 2 stage 2 contract
  *   change: the API no longer names the views in its statements.
- * - Per-node predicates (acceptance, mempool, blocks, spends) name their node
- *   explicitly; a filter without a node is node-agnostic.
+ * - Per-node predicates (acceptance, mempool, accepted blocks: `block_window`,
+ *   `in_block`, `in_mempool`) read the level's node; structural ones
+ *   (`has_output`, `has_input`, `spent_by`, `outpoint`) are node-agnostic.
  */
 import { GraphQLError } from 'graphql';
 
@@ -284,7 +285,7 @@ export interface OutputFilter {
   nonfungible_token_commitment?: HexComparison | null;
   /** The creating transaction matches (same output row). */
   transaction?: TransactionFilter | null;
-  /** EXISTS an input spending the output, in a transaction the node accepts, matching. */
+  /** EXISTS a stored input spending the output (node-agnostic), matching. */
   spent_by?: InputFilter | null;
 }
 
@@ -1088,14 +1089,15 @@ export const outputPredicate = (
     );
   }
   if (given(filter.spent_by)) {
+    /* node-agnostic, as the `spent_by` relationship: any stored spending input */
     parts.push(
       `(${columns.transaction_hash}, ${
         columns.output_index
-      }) IN (${sql.acceptedRows(
-        inputRowsSql(sql, filter.spent_by, node),
-        'outpoint_transaction_hash, outpoint_index',
+      }) IN (SELECT outpoint_transaction_hash, outpoint_index FROM (${inputRowsSql(
+        sql,
+        filter.spent_by,
         node
-      )})`
+      )}))`
     );
   }
   if (given(filter._and)) {
@@ -1453,8 +1455,8 @@ export const acceptedBlockCondition = (
  * A `TransactionFilter` as a predicate on a transaction_at row (`hash`,
  * `internal_id`, …). Relationship filters are semi-joins on the pinned views
  * (EXISTS = `hash IN (…)`, NOT EXISTS = `NOT (hash IN (…))`). `node`: the
- * node of the per-node parts (`block_window`, `in_block`, `in_mempool`, and
- * acceptance inside `spent_by`); default the statement's primary node.
+ * node of the per-node parts (`block_window`, `in_block`, `in_mempool`);
+ * default the statement's primary node.
  */
 export const transactionPredicate = (
   sql: Sql,

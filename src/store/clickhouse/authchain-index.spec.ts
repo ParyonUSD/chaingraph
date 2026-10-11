@@ -13,7 +13,7 @@
 import test from 'ava';
 
 import type { Ctx } from '../../api/compile.js';
-import { authchainSql } from '../../api/model.js';
+import { authchainBranchesSql, authchainSql } from '../../api/model.js';
 import { Sql } from '../../api/sql.js';
 import type {
   ChaingraphBlock,
@@ -259,6 +259,56 @@ e2e(
       return rows.map((row) => `${row.base}:${row.path.join(',')}`).sort();
     };
 
+    /* node-agnostic branches: every path over all stored spends of output 0 */
+    const branchModel = all
+      .flatMap((tx) => {
+        const paths: string[][] = [];
+        const extend = (path: string[]) => {
+          const next = spenders.get(path[path.length - 1]!) ?? [];
+          if (next.length === 0) paths.push(path);
+          next.forEach((hash) => {
+            extend([...path, hash]);
+          });
+        };
+        extend([tx.hash]);
+        return paths.map((path) => `${tx.hash}:${path.join(',')}`);
+      })
+      .sort();
+    t.true(
+      branchModel.length > all.length,
+      'the conflict (k1, k2) and the merges give some bases several branches'
+    );
+    const walkBranches = async (spend: bigint) => {
+      const sql = new Sql({ ...snapshot, nodeId: 0, spend });
+      const c: Ctx = { node: undefined, nodeId: () => 0, sql };
+      const bases = sql.bind(
+        all.map((tx) => tx.hash),
+        'Array(String)'
+      );
+      const query = authchainBranchesSql(
+        c,
+        `SELECT toFixedString(unhex(h), 32) AS hash FROM (SELECT arrayJoin(${bases}) AS h)`
+      );
+      const rows = await client.query<{
+        base: string;
+        path: string[];
+        length: number;
+        head: string;
+        unspent: boolean | number;
+      }>(
+        `${sql.withClause()}SELECT lower(hex(base)) AS base, arrayMap(h -> lower(hex(h)), path) AS path,
+           length, lower(hex(head)) AS head, unspent FROM (${query})`,
+        sql.params,
+        { max_recursive_cte_evaluation_depth: 10_000 } as never
+      );
+      rows.forEach((row) => {
+        t.is(Number(row.length), row.path.length);
+        t.is(row.head, row.path[row.path.length - 1]!);
+        t.true(row.unspent === true || Number(row.unspent) === 1);
+      });
+      return rows.map((row) => `${row.base}:${row.path.join(',')}`).sort();
+    };
+
     const expected = new Map([
       [node1, model(node1)],
       [node2, model(node2)],
@@ -297,6 +347,13 @@ e2e(
             `${label}: node ${node}, spend watermark ${spend}`
           );
         }
+      }
+      for (const spend of spends) {
+        t.deepEqual(
+          await walkBranches(spend),
+          branchModel,
+          `${label}: branches, spend watermark ${spend}`
+        );
       }
     };
     await check('filler', [

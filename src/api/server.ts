@@ -54,9 +54,10 @@ const argumentValue = (
 };
 
 /**
- * The node names of an operation: every `node:` argument of every field at
- * any depth (root fields and per-node relationships), with fragments
- * flattened. The request snapshot pins exactly these nodes.
+ * The node names of an operation: every `node:` and `accepted_by:` argument
+ * of every field at any depth (root fields, per-node relationships, opt-in
+ * acceptance), with fragments flattened. The request snapshot pins exactly
+ * these nodes.
  */
 export const operationNodeNames = (
   document: DocumentNode,
@@ -83,7 +84,12 @@ export const operationNodeNames = (
     selectionSet?.selections.forEach((selection) => {
       if (selection.kind === Kind.FIELD) {
         selection.arguments?.forEach((argument) => {
-          if (argument.name.value !== 'node') return;
+          if (
+            argument.name.value !== 'node' &&
+            argument.name.value !== 'accepted_by'
+          ) {
+            return;
+          }
           const value = argumentValue(argument.value, variables);
           if (typeof value === 'string') names.add(value);
         });

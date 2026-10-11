@@ -234,6 +234,11 @@ e2e(
           };
         }[];
         two_inclusions: { block: { height: number } }[];
+        all_inclusions: {
+          block: { height: number };
+          on_one: boolean;
+          on_two: boolean;
+        }[];
         validations: { node: { name: string } }[];
         timeline: { replaced_at: string | null; node: { name: string } }[];
       }[];
@@ -241,11 +246,12 @@ e2e(
       `query($hashes: [Hex!]!) {
         transactions_by_hash(hashes: $hashes) {
           hash
-          one_inclusions: block_inclusions(node: "node-one") {
+          one_inclusions: block_inclusions(accepted_by: "node-one") {
             transaction_index
-            block { hash height accepted_by { node { name } } two: accepted_by(node: "node-two") { node { name } } }
+            block { hash height accepted_by(node: "node-one") { node { name } } two: accepted_by(node: "node-two") { node { name } } }
           }
-          two_inclusions: block_inclusions(node: "node-two") { block { height } }
+          two_inclusions: block_inclusions(accepted_by: "node-two") { block { height } }
+          all_inclusions: block_inclusions { block { height } on_one: accepted(node: "node-one") on_two: accepted(node: "node-two") }
           validations: node_validations(node: "node-one") { node { name } }
           timeline: node_validation_timeline(node: "node-one") { replaced_at node { name } }
         }
@@ -303,6 +309,28 @@ e2e(
           });
         }
       }
+      /* node-agnostic: every stored block with the transaction, and per-node acceptance of each */
+      const stored = await sql<{ height: number; one: number; two: number }>(
+        env,
+        `SELECT b.height AS height,
+           b.internal_id IN (SELECT block_internal_id FROM node_block_v(node = ${env.nodes.node1})) AS one,
+           b.internal_id IN (SELECT block_internal_id FROM node_block_v(node = ${env.nodes.node2})) AS two
+         FROM block_transaction_v AS bt INNER JOIN block_v AS b ON b.internal_id = bt.block_internal_id
+         WHERE bt.transaction_hash = unhex('${row.hash}') ORDER BY b.height`
+      );
+      t.deepEqual(
+        row.all_inclusions.map((inclusion) => [
+          inclusion.block.height,
+          inclusion.on_one,
+          inclusion.on_two,
+        ]),
+        stored.map((inclusion) => [
+          inclusion.height,
+          Number(inclusion.one) === 1,
+          Number(inclusion.two) === 1,
+        ]),
+        `${row.hash.slice(0, 8)} all inclusions`
+      );
       const validations = await sql<{ n: string }>(
         env,
         `SELECT toString(count()) AS n FROM node_transaction_v(node = ${env.nodes.node1}) WHERE transaction_hash = unhex('${row.hash}')`
@@ -346,6 +374,7 @@ e2e(
         transaction_hash: string;
         output_index: number;
         spent_by: { transaction: { hash: string } }[];
+        all_spends: { transaction: { hash: string }; on_two: boolean }[];
       }[];
       blocks_by_hash: { height: number }[];
       transaction_watermark: string;
@@ -353,7 +382,8 @@ e2e(
       `query($hashes: [Hex!]!, $blocks: [Hex!]!) {
         transactions_by_hash(hashes: $hashes) { hash }
         outputs_by_transaction_hash(transaction_hashes: $hashes, where: { output_index: { _lt: 8 } }) {
-          transaction_hash output_index spent_by(node: "node-two") { transaction { hash } }
+          transaction_hash output_index spent_by(accepted_by: "node-two") { transaction { hash } }
+          all_spends: spent_by { transaction { hash } on_two: accepted(node: "node-two") }
         }
         blocks_by_hash(hashes: $blocks) { height }
         transaction_watermark
@@ -406,6 +436,14 @@ e2e(
        FROM input_v AS i WHERE i.transaction_hash IN (SELECT transaction_hash FROM tx_acceptance_v(node = ${env.nodes.node2}))`
     );
     const spentOnTwo = new Map(spends.map((row) => [row.key, row.spender]));
+    const allSpends = await sql<{ key: string; spender: string }>(
+      env,
+      `SELECT concat(lower(hex(i.outpoint_transaction_hash)), ':', toString(i.outpoint_index)) AS key, lower(hex(i.transaction_hash)) AS spender
+       FROM input_v AS i`
+    );
+    const spentAnywhere = new Map(
+      allSpends.map((row) => [row.key, row.spender])
+    );
     result.outputs_by_transaction_hash.forEach((row) => {
       const key = `${row.transaction_hash}:${row.output_index}`;
       t.deepEqual(
@@ -413,7 +451,20 @@ e2e(
         spentOnTwo.has(key) ? [spentOnTwo.get(key)] : [],
         key
       );
+      t.deepEqual(
+        row.all_spends.map((input) => [input.transaction.hash, input.on_two]),
+        spentAnywhere.has(key)
+          ? [[spentAnywhere.get(key), spentOnTwo.has(key)]]
+          : [],
+        `${key} (every stored spend)`
+      );
     });
+    t.true(
+      result.outputs_by_transaction_hash.some(
+        (row) => row.all_spends.length > 0 && row.spent_by.length === 0
+      ),
+      'a spend node-two does not accept is listed only without a node'
+    );
     const [watermark] = await sql<{ id: string }>(
       env,
       'SELECT toString(max(internal_id)) AS id FROM transaction_v'
@@ -422,16 +473,22 @@ e2e(
 
     // a per-node relationship below a node-agnostic root must name its node
     const refused = await env.gqlRaw(
-      `query($hashes: [Hex!]!) { transactions_by_hash(hashes: $hashes) { hash block_inclusions { transaction_index } } }`,
+      `query($hashes: [Hex!]!) { transactions_by_hash(hashes: $hashes) { hash node_validations { validated_at } } }`,
       { hashes: real }
     );
     t.regex(refused.errors?.[0]?.message ?? '', /name the node/u);
     // a node that is not named by the operation cannot be read
     const unnamed = await env.gqlRaw(
-      `query($hashes: [Hex!]!, $other: String!) { transactions_by_hash(hashes: $hashes) { hash block_inclusions(node: $other) { transaction_index } } }`,
+      `query($hashes: [Hex!]!, $other: String!) { transactions_by_hash(hashes: $hashes) { hash block_inclusions(accepted_by: $other) { transaction_index } } }`,
       { hashes: real, other: 'node-three' }
     );
     t.truthy(unnamed.errors?.[0]?.message);
+    // accepted(node:) requires its node (no "any node" answer)
+    const anyNode = await env.gqlRaw(
+      `query($hashes: [Hex!]!) { transactions_by_hash(hashes: $hashes) { hash accepted } }`,
+      { hashes: real }
+    );
+    t.regex(anyNode.errors?.[0]?.message ?? '', /node/u);
     // more than the cap is refused (visible, not cut)
     const tooMany = await env.gqlRaw(
       `query($hashes: [Hex!]!) { transactions_by_hash(hashes: $hashes) { hash } }`,
