@@ -240,3 +240,17 @@ node scripts/measure/large-aggregations.mjs . http://localhost:18123 \
 
 `run1` ran every form except the hash anti-joins. `run2` used the filter `hash`. The script is read-only: it sets
 `default_transaction_read_only` on Postgres and runs only `SELECT` and `SYSTEM DROP … CACHE` on ClickHouse.
+
+## Mainnet measurements on ClickHouse Cloud (2026-10-11)
+
+Run by the port session on the ClickHouse Cloud service "Chaingraph 1" (26.6, autoscaling), database `cg`: the 2026-10-09 golden mirror of production at tip ~971,863 (#83 mirror schema, not the current port schema), node 1 (`bchn-mainnet`). SQL files were kept locally in the session's scratch directory.
+
+| Query | Result | `cg.utxo` table | v1-style at query time |
+|---|---|---|---|
+| Total UTXO count and value | 125,659,151 UTXOs, 2,009,946,239,660,840 sats = 20,099,462.40 BCH | median 6.3 s (6.97 / 6.32 / 5.86) | timed out at 600 s (`output` LEFT ANTI JOIN `input`, grace hash) |
+| PUSD category `2469acc5…02544` | 3,955 UTXOs (2,554 FT, 1,411 NFT), 350,768,433,162 sats = 3,507.68 BCH, FT amount 9,223,372,036,854,773,316 | median 0.47 s, 49 K rows / 752 KiB read | 132.9 s, 3.73 B rows / 70.3 GiB read, 18.3 GiB peak memory |
+
+- The timed-out total was cross-checked on a 1/256 hash slice (`transaction_hash < 0x01`): both forms give 493,989 UTXOs / 6,231,605,591,366 sats (0.35 s vs 64.9 s; the v1-style slice read 2.96 B rows / 38.4 GiB).
+- `cg.utxo` for node 1 is fully collapsed (every key has sum(sign) = 1), so the grouped sum equals the live set.
+- The total is ~110 BCH below theoretical issuance at that height, consistent with burns and unclaimed rewards.
+- Both Cloud replicas were replaced mid-run (autoscaling or replacement); some `system.query_log` rows were lost, so rows/bytes for the total are not available.
