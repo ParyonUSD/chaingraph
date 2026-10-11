@@ -1,5 +1,6 @@
-/* eslint-disable max-lines */
+/* eslint-disable max-lines, @typescript-eslint/require-array-sort-compare */
 // cspell:ignore clickhouse
+import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -321,14 +322,29 @@ test.before(async () => {
   };
   node1.on('peerready', (peer) => {
     logPeerConnection(`node1`, peer);
+    // Pool does not forward `mempool`: listen on the peer itself
+    peer.on('mempool', () => {
+      // eslint-disable-next-line @typescript-eslint/no-use-before-define
+      respondToMempool('node1')(peer);
+    });
     if (!peer.subversion.includes('tx-broadcast')) peers.node1 = peer;
   });
   node2.on('peerready', (peer) => {
     logPeerConnection(`node2`, peer);
+    // Pool does not forward `mempool`: listen on the peer itself
+    peer.on('mempool', () => {
+      // eslint-disable-next-line @typescript-eslint/no-use-before-define
+      respondToMempool('node2')(peer);
+    });
     if (!peer.subversion.includes('tx-broadcast')) peers.node2 = peer;
   });
   node3.on('peerready', (peer) => {
     logPeerConnection(`node3`, peer);
+    // Pool does not forward `mempool`: listen on the peer itself
+    peer.on('mempool', () => {
+      // eslint-disable-next-line @typescript-eslint/no-use-before-define
+      respondToMempool('node3')(peer);
+    });
     if (!peer.subversion.includes('tx-broadcast')) peers.node3 = peer;
   });
 
@@ -440,9 +456,86 @@ node3.on('peergetheaders', respondWithChainState('node3', chainStates.node3));
 const invTestTx =
   'deadbeef00000000000000000000000000000000000000000000000000000000';
 
+/**
+ * The mock nodes' transactions by hash (display order, as Chaingraph shows
+ * them); `false`: never sent. Inventory hashes on the wire are in internal
+ * (reversed) byte order, as a real node sends them.
+ */
 const mempool: { [x: string]: string | false | undefined } = {
-  [swapEndianness(halTxSpent)]: halTxSpentRaw,
-  [swapEndianness(invTestTx)]: false,
+  [halTxSpent]: halTxSpentRaw,
+  [invTestTx]: false,
+};
+/** A `getdata` for one of these hashes is answered after the delay (ms). */
+const mempoolDelays: { [hash: string]: number } = {};
+
+/**
+ * Mempool fetch fixtures (pre-phase2-concurrency-mempool.md §2): chains of
+ * unconfirmed transactions, each spending the previous one's output 0.
+ */
+const mempoolChainSatoshis = 10_000;
+const mempoolChain = (label: string, length: number) =>
+  Array.from({ length }).reduce<InstanceType<typeof Transaction>[]>((chain) => {
+    const parent = chain[chain.length - 1];
+    return [
+      ...chain,
+      new Transaction({
+        inputs: [
+          {
+            outputIndex: 0,
+            prevTxId:
+              parent === undefined
+                ? createHash('sha256').update(label).digest('hex')
+                : parent.hash,
+            script: '51',
+            sequenceNumber: 0xffffffff,
+          },
+        ],
+        nLockTime: 0,
+        outputs: [
+          { satoshis: mempoolChainSatoshis - chain.length, script: '51' },
+        ],
+        version: 2,
+      }),
+    ];
+  }, []);
+/** node1's mempool at tracking start: A → B → C (C spends B:0, B spends A:0). */
+const fetchChainLength = 3;
+const fetchChain = mempoolChain('e2e-mempool-fetch-root', fetchChainLength);
+/** node2's mempool at tracking start: one unrelated transaction. */
+const [fetchNode2Tx] = mempoolChain('e2e-mempool-fetch-node2', 1);
+/** node1's mempool at the reconnect: E → F. */
+const reconnectChainLength = 2;
+const reconnectChain = mempoolChain(
+  'e2e-mempool-fetch-reconnect',
+  reconnectChainLength
+);
+[...fetchChain, fetchNode2Tx!, ...reconnectChain].forEach((tx) => {
+  mempool[tx.hash] = Buffer.from(tx.toBuffer()).toString('hex');
+});
+/**
+ * What each mock node announces when asked for its mempool (P2P `mempool`),
+ * in announcement order: children first, so the agent must reorder.
+ */
+const mempoolAnnouncements: { [node: string]: string[] } = {
+  node1: [...fetchChain].reverse().map((tx) => tx.hash),
+  node2: [fetchNode2Tx!.hash],
+  node3: [],
+};
+const respondToMempool = (nodeName: string) => (peer: Peer) => {
+  const hashes = mempoolAnnouncements[nodeName] ?? [];
+  logger.debug(
+    `e2e: ${nodeName} asked for its mempool, announcing ${hashes.length} transaction(s).`
+  );
+  if (hashes.length === 0) return;
+  peer.sendMessage(
+    // eslint-disable-next-line new-cap
+    peer.messages.Inventory(
+      hashes.map((hash) => ({
+        hash: Buffer.from(hash, 'hex').reverse(),
+        type: BitcoreInventoryType.MSG_TX,
+      }))
+    )
+  );
 };
 
 const respondToGetData = ({
@@ -458,7 +551,7 @@ const respondToGetData = ({
 }) => {
   // eslint-disable-next-line complexity
   message.inventory.forEach((inv) => {
-    const hash = inv.hash.slice().reverse().toString('hex');
+    const hash = Buffer.from(inv.hash).reverse().toString('hex');
     if (inv.type === BitcoreInventoryType.MSG_BLOCK) {
       const block = chain.find((b) => b.header.hash === hash);
       if (block === undefined) {
@@ -482,8 +575,14 @@ const respondToGetData = ({
         return;
       }
       const tx = new Transaction(txRaw);
-      logger.debug(`e2e: sending transaction with hash: ${tx.hash}`);
-      peer.sendMessage(new peer.messages.Transaction(tx));
+      const delayMs = mempoolDelays[hash] ?? 0;
+      logger.debug(
+        `e2e: sending transaction with hash: ${tx.hash} (after ${delayMs} ms)`
+      );
+      setTimeout(() => {
+        peer.sendMessage(new peer.messages.Transaction(tx));
+      }, delayMs);
+      return;
     }
     logger.warn(`Unhandled INV type in GetData from ${nodeName}.`);
   });
@@ -1020,6 +1119,109 @@ postgresTest.serial(
     ]);
     clearStdoutBuffer();
     t.pass();
+  }
+);
+
+const fetchedHashes = [...fetchChain, fetchNode2Tx!].map((tx) => tx.hash);
+const membershipOf = async (hashes: string[]) =>
+  Object.fromEntries(
+    await Promise.all(
+      ['node1', 'node2', 'node3'].map(async (node) => [
+        node,
+        [...(await checker.mempoolMembership(node, hashes))].sort(),
+      ])
+    )
+  ) as { [node: string]: string[] };
+const sortedHashes = (txs: { hash: string }[]) =>
+  txs.map((tx) => tx.hash).sort();
+
+/*
+ * pre-phase2-concurrency-mempool.md §2: when mempool tracking starts, the
+ * agent asks every node for its mempool (P2P `mempool`) and saves what each
+ * node announces for that node, parents first. node1 announced the chain
+ * child first (C, B, A); node2 one unrelated transaction; node3 nothing.
+ */
+serialTest(
+  '[e2e] fetches each node’s mempool when tracking starts (per node)',
+  async (t) => {
+    const expected = {
+      node1: sortedHashes(fetchChain),
+      node2: [fetchNode2Tx!.hash],
+      node3: [],
+    };
+    t.deepEqual(
+      await eventuallyEqual(async () => membershipOf(fetchedHashes), expected, {
+        timeoutMs: visibleTimeoutMs,
+      }),
+      expected
+    );
+    t.deepEqual(await checker.validatingNodes(fetchChain[0]!.hash), ['node1']);
+    t.deepEqual(await checker.validatingNodes(fetchNode2Tx!.hash), ['node2']);
+    t.deepEqual(
+      (await checker.inputsOfTx(fetchChain[2]!.hash)).map(
+        (input) => input.outpointTransactionHash
+      ),
+      [fetchChain[1]!.hash]
+    );
+    /* later tests expect the nodes' mempools without these */
+    mempoolAnnouncements.node1 = [];
+    mempoolAnnouncements.node2 = [];
+    await Promise.all([
+      ...fetchChain.map(async (tx) =>
+        checker.forgetNodeValidation('node1', tx.hash)
+      ),
+      checker.forgetNodeValidation('node2', fetchNode2Tx!.hash),
+    ]);
+    t.deepEqual(await membershipOf(fetchedHashes), {
+      node1: [],
+      node2: [],
+      node3: [],
+    });
+  }
+);
+
+/*
+ * …and again on a reconnect, from the reconnected node only. node1 announces
+ * E → F, child first, and sends E 400 ms late: F must wait for it.
+ */
+serialTest(
+  '[e2e] fetches a node’s mempool again on reconnect, parents before children',
+  async (t) => {
+    const [parent, child] = reconnectChain;
+    mempoolAnnouncements.node1 = [child!.hash, parent!.hash];
+    mempoolDelays[parent!.hash] = 400;
+    clearStdoutBuffer();
+    peers.node1.disconnect();
+    await waitForStdout('node1: disconnected');
+    await waitForStdout("node1: requested the node's mempool.");
+    await waitForStdout(`Inserting mempool tx ${child!.hash} for node node1`);
+    const parentSaved = stdoutBuffer.indexOf(
+      `Inserting mempool tx ${parent!.hash} for node node1`
+    );
+    const childSaved = stdoutBuffer.indexOf(
+      `Inserting mempool tx ${child!.hash} for node node1`
+    );
+    t.true(parentSaved !== -1, 'the parent was saved');
+    t.true(parentSaved < childSaved, 'the parent was saved first');
+    t.true(
+      stdoutBuffer.includes(
+        `node1: transaction ${
+          child!.hash
+        } waited for 1 parent(s) requested from the node.`
+      )
+    );
+    const hashes = reconnectChain.map((tx) => tx.hash);
+    const expected = { node1: [...hashes].sort(), node2: [], node3: [] };
+    t.deepEqual(
+      await eventuallyEqual(async () => membershipOf(hashes), expected, {
+        timeoutMs: visibleTimeoutMs,
+      }),
+      expected
+    );
+    mempoolAnnouncements.node1 = [];
+    await Promise.all(
+      hashes.map(async (hash) => checker.forgetNodeValidation('node1', hash))
+    );
   }
 );
 
@@ -1885,12 +2087,13 @@ serialTest(
         res(message.inventory);
       });
     });
-    const announcedHash = Buffer.from(invTestTx, 'hex');
     peers.node3.sendMessage(
-      peers.node3.messages.Inventory.forTransaction(announcedHash)
+      peers.node3.messages.Inventory.forTransaction(invTestTx)
     );
     const result = await node3RequestedTx;
-    t.deepEqual(result, [{ hash: announcedHash.reverse(), type: 1 }]);
+    t.deepEqual(result, [
+      { hash: Buffer.from(invTestTx, 'hex').reverse(), type: 1 },
+    ]);
   }
 );
 
@@ -1967,9 +2170,7 @@ serialTest(
   '[e2e] after initial sync is complete, requests and saves inbound transactions as they are announced',
   async (t) => {
     peers.node1.sendMessage(
-      peers.node1.messages.Inventory.forTransaction(
-        Buffer.from(halTxSpent, 'hex')
-      )
+      peers.node1.messages.Inventory.forTransaction(halTxSpent)
     );
     t.deepEqual(
       await eventuallyEqual(
@@ -2553,16 +2754,14 @@ serialTest(
   async (t) => {
     const tipStartIndex = 162;
     const [, tx1] = tipA[tipStartIndex]!.transactions;
-    mempool[swapEndianness(tx1!.hash)] = false;
+    mempool[tx1!.hash] = false;
     const node1RequestedTx = new Promise((res) => {
       node1.once('peergetdata', (_, message) => {
         res(message.inventory);
       });
     });
     peers.node1.sendMessage(
-      peers.node1.messages.Inventory.forTransaction(
-        Buffer.from(tx1!.hash, 'hex')
-      )
+      peers.node1.messages.Inventory.forTransaction(tx1!.hash)
     );
     await node1RequestedTx;
     logger.debug(

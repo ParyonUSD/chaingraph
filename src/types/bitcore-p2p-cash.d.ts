@@ -92,6 +92,7 @@ declare module '@chaingraph/bitcore-p2p-cash' {
     getdata: () => void;
     headers: (message: HeadersMessage) => void;
     inv: (message: InventoryMessage) => void;
+    mempool: (message: MemPoolMessage) => void;
     notfound: (message: NotFoundMessage) => void;
     ready: () => void;
     tx: (message: TransactionMessage) => void;
@@ -116,6 +117,7 @@ declare module '@chaingraph/bitcore-p2p-cash' {
       GetHeaders: typeof GetHeadersMessage;
       Headers: typeof HeadersMessage;
       Inventory: {
+        (inventory: BitcoreInventory[]): InventoryMessage;
         forBlock: (blockHash: Buffer | string) => InventoryMessage;
         forTransaction: (transactionHash: Buffer | string) => InventoryMessage;
       };
@@ -148,7 +150,6 @@ declare module '@chaingraph/bitcore-p2p-cash' {
     '*': (peer: Peer, message: Message, eventName: string) => void;
     peergetheaders: (peer: Peer, message: GetHeadersMessage) => void;
     peergetdata: (peer: Peer, message: GetDataMessage) => void;
-    peermempool: (peer: Peer, message: MemPoolMessage) => void;
     peerready: (peer: Peer, addr: any) => void;
     peerconnect: (peer: Peer, addr: any) => void;
   }

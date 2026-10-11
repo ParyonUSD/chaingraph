@@ -1,10 +1,12 @@
 /* eslint-disable max-lines */
+// cspell:ignore peerbloomfilters
 import { cpus, freemem, loadavg, totalmem } from 'os';
 import { inspect } from 'util';
 
 import type {
   BitcoreBlock,
   BitcoreBlockHeader,
+  BitcoreInventory,
   BitcoreTransaction,
   BlockMessage,
 } from '@chaingraph/bitcore-p2p-cash';
@@ -27,6 +29,7 @@ import {
   rawBlockHeader,
   rawPayloadOf,
 } from './components/raw-block-messages.js';
+import { RequestedTransactions } from './components/requested-transactions.js';
 import { SyncState } from './components/sync-state.js';
 import {
   formatBytes,
@@ -41,6 +44,7 @@ import {
   encodeWorkers,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
+  mempoolFetch,
   mempoolTransactionExpirationMs,
   mempoolTransactionExpirationScanIntervalMs,
   trustedNodes,
@@ -50,7 +54,10 @@ import type {
   ExpiringMempoolTransaction,
   IncompleteBlock,
 } from './store/types.js';
-import type { ChaingraphBlock } from './types/chaingraph.js';
+import type {
+  ChaingraphBlock,
+  ChaingraphTransaction,
+} from './types/chaingraph.js';
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
 const { internalBitcore, Peer } = bitcoreP2pCash;
@@ -103,6 +110,28 @@ const downloadRetryMs = (node: string | undefined) =>
 const maxPendingDownloads = 200;
 
 const transactionCacheSize = 100_000;
+
+/**
+ * How long a transaction requested from a node (`getdata`) holds back the
+ * node's transactions spending it, if the node never sends it.
+ */
+const requestedTransactionTimeoutMs = 10_000;
+
+/** The most inventory items in one `getdata` (the protocol's MAX_INV_SZ). */
+const maxInventoryItems = 50_000;
+
+/**
+ * A mempool fetch is summarized (logged) once the node has announced
+ * nothing more for this long.
+ */
+const mempoolFetchQuietMs = 2_000;
+
+/**
+ * A node that disconnects within this long of a `mempool` request, before
+ * announcing anything, refused it (no whitelist, bloom filters off): it is
+ * not asked again by this process.
+ */
+const mempoolFetchRefusalWindowMs = 10_000;
 
 export const cancelableDelay = (ms: number) => {
   // eslint-disable-next-line functional/no-let, @typescript-eslint/init-declarations
@@ -412,6 +441,25 @@ export class Agent {
    */
   blockWorkers: BlockWorkerPool | undefined;
 
+  /** Transactions requested from each node and not handled yet. */
+  requestedTransactions = new RequestedTransactions(
+    requestedTransactionTimeoutMs
+  );
+
+  /** Per node, the mempool fetch in progress (`requestMempool`). */
+  mempoolFetches = new Map<
+    string,
+    {
+      requestedAt: number;
+      announced: number;
+      requested: number;
+      quiet: ReturnType<typeof setTimeout>;
+    }
+  >();
+
+  /** Nodes that refused a `mempool` request (see `requestMempool`). */
+  mempoolFetchRefused = new Set<string>();
+
   constructor(config: {
     logger: pino.BaseLogger;
     onShutdown: () => void;
@@ -642,11 +690,17 @@ export class Agent {
             }
             nodeRegisteredResolver();
             this.requestHeaders(node.name);
+            if (this.saveInboundTransactions) {
+              /* a reconnect after tracking started: fetch the mempool again */
+              this.requestMempool(node.name);
+            }
           });
       });
 
       peer.on('disconnect', () => {
         this.logger.info(`${node.name}: disconnected`);
+        this.requestedTransactions.settleNode(node.name);
+        this.endMempoolFetch(node.name, true);
         if (connectionStatus.shouldRetryConnection) {
           this.rescheduleDownloadsForNode(node.name);
           this.logger.debug(
@@ -702,13 +756,13 @@ export class Agent {
         if (!this.saveInboundTransactions) {
           return;
         }
+        const getData: BitcoreInventory[] = [];
         message.inventory.forEach((inventoryItem) => {
           this.logger.trace(
             `${node.name}: inv message item - type: ${
               inventoryItem.type
             } hash: ${inventoryItem.hash.toString('hex')}`
           );
-          // TODO: clean up handling of endianness (bitcore tries to be clever here)
           if (inventoryItem.type !== BitcoreInventoryType.MSG_TX) {
             if (inventoryItem.type === BitcoreInventoryType.MSG_BLOCK) {
               this.logger.warn(
@@ -728,18 +782,25 @@ export class Agent {
             );
             return;
           }
-          const transactionHash = inventoryItem.hash.toString('hex');
+          /*
+           * Inventory hashes are in internal byte order; Chaingraph's
+           * transaction hashes are in display order (reversed).
+           */
+          const transactionHash = Buffer.from(inventoryItem.hash)
+            .reverse()
+            .toString('hex');
           this.recordTransactionAnnouncementFromNode(
             node.name,
-            inventoryItem.hash.toString('hex')
+            transactionHash
           );
           const isSavedTransaction =
             this.transactionCache.get(transactionHash)?.db;
-          if (isSavedTransaction !== true) {
+          if (
+            isSavedTransaction !== true &&
+            this.requestedTransactions.request(node.name, transactionHash)
+          ) {
             this.logger.trace(
-              `Requesting transaction from ${
-                node.name
-              } - hash: ${inventoryItem.hash.toString('hex')}`
+              `Requesting transaction from ${node.name} - hash: ${transactionHash}`
             );
             /**
              * Chaingraph immediately requests the contents of every unknown
@@ -750,10 +811,32 @@ export class Agent {
              * might be to request each transaction only from the first one or
              * two nodes which announce it.
              */
-            peer.sendMessage(
-              peer.messages.GetData.forTransaction(inventoryItem.hash)
-            );
+            getData.push(inventoryItem);
           }
+        });
+        this.noteMempoolFetchProgress(
+          node.name,
+          message.inventory.filter(
+            (item) => item.type === BitcoreInventoryType.MSG_TX
+          ).length,
+          getData.length
+        );
+        // eslint-disable-next-line functional/no-loop-statement, functional/no-let
+        for (let at = 0; at < getData.length; at += maxInventoryItems) {
+          peer.sendMessage(
+            // eslint-disable-next-line new-cap
+            peer.messages.GetData(getData.slice(at, at + maxInventoryItems))
+          );
+        }
+      });
+
+      peer.on('notfound', (message) => {
+        message.inventory.forEach((inventoryItem) => {
+          if (inventoryItem.type !== BitcoreInventoryType.MSG_TX) return;
+          this.requestedTransactions.settle(
+            node.name,
+            Buffer.from(inventoryItem.hash).reverse().toString('hex')
+          );
         });
       });
 
@@ -976,6 +1059,13 @@ export class Agent {
                     }
                     this.logger.info('Agent: enabled mempool tracking.');
                     this.saveInboundTransactions = true;
+                    /*
+                     * Transactions announced before now were ignored: ask
+                     * every node for its whole mempool.
+                     */
+                    Object.keys(this.nodes).forEach((nodeName) => {
+                      this.requestMempool(nodeName);
+                    });
                     this.scheduleIncompleteBlockRepair();
                     this.scheduleMempoolTransactionExpirationScan();
                   });
@@ -2110,6 +2200,33 @@ export class Agent {
     }
     const validatedAt = new Date();
     const tx = bitcoreTransactionToChaingraphTransaction(transaction);
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      /*
+       * Parents first: a parent this node announced and has not sent yet is
+       * saved before this transaction (e.g. a mempool fetch announcing a
+       * child before its parent).
+       */
+      const parents = await this.requestedTransactions.awaitParents(
+        nodeName,
+        tx
+      );
+      if (parents.length > 0) {
+        this.logger.debug(
+          `${nodeName}: transaction ${tx.hash} waited for ${parents.length} parent(s) requested from the node.`
+        );
+      }
+      await this.saveTransactionFromNode(nodeName, tx, validatedAt);
+    } finally {
+      this.requestedTransactions.settle(nodeName, tx.hash);
+    }
+  }
+
+  async saveTransactionFromNode(
+    nodeName: string,
+    tx: ChaingraphTransaction,
+    validatedAt: Date
+  ) {
     this.logger.trace(`${nodeName}: announced transaction hash: ${tx.hash}`);
     this.recordTransactionAnnouncementFromNode(nodeName, tx.hash);
     const txCacheItem = this.getCachedTransactionOrDefault(tx.hash);
@@ -2143,6 +2260,84 @@ export class Agent {
       );
       this.markTransactionSavedToDb(tx.hash);
     }
+  }
+
+  /**
+   * Ask `nodeName` for its whole mempool (P2P `mempool`; the node answers
+   * with `inv` messages, handled like any announcement: unknown transactions
+   * are requested and saved, parents first). Called when mempool tracking
+   * starts and on every reconnect after that: transactions the node accepted
+   * while they were not tracked would otherwise never be recorded. Each
+   * node's mempool comes from that node.
+   */
+  requestMempool(nodeName: string) {
+    if (mempoolFetch === 'off' || this.mempoolFetchRefused.has(nodeName)) {
+      return;
+    }
+    const node = this.nodes[nodeName]!;
+    if (node.peer.status !== 'ready' || node.internalId === undefined) {
+      /* the next (re)connect's registration asks again */
+      return;
+    }
+    this.endMempoolFetch(nodeName, false);
+    this.mempoolFetches.set(nodeName, {
+      announced: 0,
+      quiet: this.mempoolFetchQuietTimer(nodeName),
+      requested: 0,
+      requestedAt: Date.now(),
+    });
+    node.peer.sendMessage(new node.peer.messages.MemPool());
+    this.logger.info(`${nodeName}: requested the node's mempool.`);
+  }
+
+  mempoolFetchQuietTimer(nodeName: string) {
+    const timer = setTimeout(() => {
+      this.endMempoolFetch(nodeName, false);
+    }, mempoolFetchQuietMs);
+    timer.unref();
+    return timer;
+  }
+
+  noteMempoolFetchProgress(
+    nodeName: string,
+    announced: number,
+    requested: number
+  ) {
+    const fetch = this.mempoolFetches.get(nodeName);
+    if (fetch === undefined) return;
+    fetch.announced += announced;
+    fetch.requested += requested;
+    clearTimeout(fetch.quiet);
+    fetch.quiet = this.mempoolFetchQuietTimer(nodeName);
+  }
+
+  /**
+   * End `nodeName`'s mempool fetch (logs a summary). On a disconnect right
+   * after the request with nothing announced, the node refused the request:
+   * it is not asked again.
+   */
+  // eslint-disable-next-line complexity
+  endMempoolFetch(nodeName: string, disconnected: boolean) {
+    const fetch = this.mempoolFetches.get(nodeName);
+    if (fetch === undefined) return;
+    clearTimeout(fetch.quiet);
+    this.mempoolFetches.delete(nodeName);
+    if (
+      disconnected &&
+      fetch.announced === 0 &&
+      Date.now() - fetch.requestedAt < mempoolFetchRefusalWindowMs
+    ) {
+      this.mempoolFetchRefused.add(nodeName);
+      this.logger.warn(
+        `${nodeName}: disconnected right after the mempool request; not asking it again. Whitelist the agent on the node (whitelist=…) or enable bloom filters (peerbloomfilters=1) to fetch its mempool when tracking starts.`
+      );
+      return;
+    }
+    this.logger.info(
+      `${nodeName}: mempool fetch – the node announced ${fetch.announced.toLocaleString()} transaction(s), ${fetch.requested.toLocaleString()} requested${
+        disconnected ? ' (disconnected)' : ''
+      }.`
+    );
   }
 
   getDownloadCountByNode() {
