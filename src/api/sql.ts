@@ -1817,26 +1817,56 @@ export const outputFilterIsSelective = (
  * acceptance rows of a few thousand candidates by key costs a fraction of
  * reading all of them (chipnet: 95 ms vs 420 ms for a busy category).
  */
+/** Positive output-side candidate sets of a filter and its `_and` parts (index reads by script, category, hash). */
+const outputSideCandidates = (
+  sql: Sql,
+  filter: TransactionFilter,
+  node?: number
+): string[] => [
+  ...(hasSelectiveHex(filter.hash) && !given(filter.hash?._prefix)
+    ? [
+        `SELECT hash FROM ${sql.view('transaction_at')} WHERE ${all(
+          hexComparison(sql, 'hash', 'hash', filter.hash!, 'hash')
+        )}`,
+      ]
+    : []),
+  ...(outputFilterIsSelective(filter.has_output)
+    ? [
+        `SELECT transaction_hash FROM ${sql.view(
+          'output_at'
+        )} WHERE ${outputPredicate(
+          sql,
+          filter.has_output,
+          outputRowColumns,
+          node
+        )}`,
+      ]
+    : []),
+  ...(filter._and ?? []).flatMap((part) =>
+    given(part) ? outputSideCandidates(sql, part, node) : []
+  ),
+];
+
 export const transactionCandidates = (
   sql: Sql,
   filter: TransactionFilter | null | undefined,
   node?: number
 ): string | undefined => {
   if (!given(filter)) return undefined;
-  if (hasSelectiveHex(filter.hash) && !given(filter.hash?._prefix)) {
-    return `SELECT hash FROM ${sql.view('transaction_at')} WHERE ${all(
-      hexComparison(sql, 'hash', 'hash', filter.hash!, 'hash')
-    )}`;
-  }
-  if (outputFilterIsSelective(filter.has_output)) {
-    return `SELECT transaction_hash FROM ${sql.view(
-      'output_at'
-    )} WHERE ${outputPredicate(
-      sql,
-      filter.has_output,
-      outputRowColumns,
-      node
-    )}`;
+  /*
+   * Hash lists and output conjuncts (`has_output` by script, category,
+   * transaction) are cheap index reads: all of them are intersected (chipnet
+   * L1: 1,441 candidates of one conjunct, 7 of both, so the acceptance reads
+   * shrink accordingly). Otherwise the first positive selective conjunct.
+   * Spend-relation conjuncts are not intersected: one can be a large
+   * category (144k spends) that the semi-join reads restricted anyway.
+   */
+  const sets = outputSideCandidates(sql, filter, node);
+  if (sets.length === 1) return sets[0];
+  if (sets.length > 1) {
+    return `SELECT * FROM (${sets
+      .map((set) => `(${set})`)
+      .join(' INTERSECT ')})`;
   }
   if (given(filter.has_input) && requiresOutpoint(filter.has_input)) {
     return `SELECT transaction_hash FROM ${spendRelationSql(
@@ -1844,7 +1874,6 @@ export const transactionCandidates = (
       spendRowPredicate(sql, filter.has_input, node)
     )}`;
   }
-
   for (const part of filter._and ?? []) {
     const candidates = transactionCandidates(sql, part, node);
     if (candidates !== undefined) return candidates;
@@ -1859,6 +1888,24 @@ export const transactionCandidates = (
   }
   return undefined;
 };
+
+/**
+ * True when every transaction matching `filter` is accepted by the filter's
+ * node anyway (a positive `block_window`, `in_block` or `in_mempool`): the
+ * root's own acceptance check is then implied and left out (one read of the
+ * candidates' acceptance rows instead of two).
+ */
+export const impliesAcceptance = (
+  filter: TransactionFilter | null | undefined
+): boolean =>
+  given(filter) &&
+  (given(filter.block_window) ||
+    given(filter.in_block) ||
+    filter.in_mempool === true ||
+    (filter._and ?? []).some(impliesAcceptance) ||
+    (given(filter._or) &&
+      filter._or.length > 0 &&
+      filter._or.every(impliesAcceptance)));
 
 /**
  * A subquery of candidate block internal ids that every block matching

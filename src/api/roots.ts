@@ -44,6 +44,7 @@ import {
   blockCandidates,
   blockPredicate,
   hexComparison,
+  impliesAcceptance,
   inputPredicate,
   invalid,
   maxListChunk,
@@ -205,7 +206,9 @@ export const runTransactions = async (
     sql.view('transaction_at'),
     [
       ...(among === undefined ? [] : [`hash IN (${among})`]),
-      `hash IN (${sql.accepted(ctx.node, among)})`,
+      ...(impliesAcceptance(args.where)
+        ? []
+        : [`hash IN (${sql.accepted(ctx.node, among)})`]),
       ...bounds,
       transactionPredicate(sql, args.where, ctx.node, among),
     ],
@@ -716,7 +719,9 @@ export const rowSets = {
       source: viewSource(sql.view('transaction_at')),
       where: [
         ...(among === undefined ? [] : [`hash IN (${among})`]),
-        `hash IN (${sql.accepted(ctx.node, among)})`,
+        ...(impliesAcceptance(where)
+          ? []
+          : [`hash IN (${sql.accepted(ctx.node, among)})`]),
         transactionPredicate(sql, where, ctx.node, among),
       ],
     };
