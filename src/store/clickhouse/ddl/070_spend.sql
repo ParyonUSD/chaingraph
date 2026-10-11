@@ -86,8 +86,10 @@ SETTINGS non_replicated_deduplication_window = 10000,
          old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
          cleanup_delay_period_random_add = 5;
 
--- The spend index as of a reader's snapshot: rows of finished batches up to the spend watermark the snapshot read
+-- The spend index as of a reader's snapshot (generated text: view-ddl.ts; checked by view-ddl.spec.ts): rows of finished
+-- batches up to the spend watermark the snapshot read
 -- (`spend`, from readSnapshot). Every pair above it comes from the join (docs/clickhouse-port/spend-index.md).
 CREATE OR REPLACE VIEW cg.spend_at AS
-SELECT *, locking_bytecode_prefix, nonfungible_token_commitment_key FROM cg.spend
+SELECT *, locking_bytecode_prefix, nonfungible_token_commitment_key
+FROM cg.spend
 WHERE batch <= {spend:UInt64};

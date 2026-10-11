@@ -42,5 +42,6 @@ ALTER TABLE cg.authchain_link ADD PROJECTION IF NOT EXISTS p_tx
 
 -- The authchain index as of a reader's snapshot (rows of finished spend batches up to its spend watermark).
 CREATE OR REPLACE VIEW cg.authchain_link_at AS
-SELECT * FROM cg.authchain_link
+SELECT *
+FROM cg.authchain_link
 WHERE batch <= {spend:UInt64};

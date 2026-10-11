@@ -107,6 +107,7 @@
     "image:inspect:bchn": "docker save chaingraph/bitcoin-cash-node:dev-build > data/bitcoin-cash-node.tar",
     "build": "tsc",
     "clickhouse:ddl": "node bin/chaingraph-clickhouse-ddl.js",
+    "clickhouse:views:generate": "yarn build >/dev/null && node build/store/clickhouse/view-ddl-cli.js",
     "api:dev": "yarn build && node build/api/main.js",
     "api:schema": "yarn build >/dev/null && node build/api/print-schema.js",
     "api:schema:update": "yarn build >/dev/null && node build/api/print-schema.js > docs/clickhouse-port/v2-schema.graphql",

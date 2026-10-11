@@ -476,102 +476,247 @@ export const snapshotParams = (snapshot: VisibilitySnapshot) => ({
 });
 
 /**
- * The bodies of the pinned `*_at` views (mirror of ddl/050_views.sql and
- * 070_spend.sql): base table, select list, and for the membership views the
- * collapsing GROUP BY. `inlinePinnedView` builds a view's rows from them.
+ * The pinned `*_at` views (and their `*_v` convenience twins): base table,
+ * select list, and for the membership views the collapsing GROUP BY. This is
+ * the one definition of the gate: `inlinePinnedView` builds the API's inlined
+ * form from it, and `view-ddl.ts` generates `ddl/050_views.sql` (and the
+ * `spend_at` / `authchain_link_at` statements of 070/080) from it
+ * (`yarn clickhouse:views:generate`; `view-ddl.spec.ts` fails when the
+ * committed DDL differs from the generated text).
  */
-const pinnedViewBodies: {
-  [name: string]: {
-    table: string;
-    select: string;
-    kind: 'agnostic' | 'node' | 'spend';
-    groupBy?: string;
-  };
+export interface PinnedViewDefinition {
+  /** The base table (in the `cg` database). */
+  table: string;
+  /** Select list items (column names or `expr AS name`). */
+  select: readonly string[];
+  /** node: node-scoped gate; agnostic: visible(0) and the committed tail; spend: the spend watermark. */
+  kind: 'agnostic' | 'node' | 'spend';
+  /** Membership views: GROUP BY these key columns with a positive sum of signs. */
+  groupBy?: readonly string[];
+  /** The one-line comment above the view in the DDL. */
+  comment?: string;
+}
+
+const membershipSelect = (
+  keys: readonly string[],
+  values: readonly string[]
+): readonly string[] => [...keys, ...values];
+
+/** Every pinned view, in DDL order (node-scoped, node-agnostic, spend). */
+/* eslint-disable sort-keys */
+export const pinnedViewDefinitions: {
+  readonly [name: string]: PinnedViewDefinition;
 } = {
-  authchain_link_at: {
-    kind: 'spend',
-    select: '*',
-    table: 'authchain_link',
-  },
-  block_at: { kind: 'agnostic', select: '*', table: 'block' },
-  block_transaction_at: {
-    kind: 'agnostic',
-    select: '*',
-    table: 'block_transaction',
-  },
-  input_at: { kind: 'agnostic', select: '*', table: 'input' },
   node_block_at: {
-    groupBy: 'node_internal_id, block_internal_id',
+    comment: 'block-accepted(n, b)',
+    groupBy: ['node_internal_id', 'block_internal_id'],
     kind: 'node',
-    select: `node_internal_id, block_internal_id, any(block_hash) AS block_hash, any(height) AS height,
-    argMaxIf(accepted_at, version, sign > 0) AS accepted_at`,
+    select: membershipSelect(
+      ['node_internal_id', 'block_internal_id'],
+      [
+        'any(block_hash) AS block_hash',
+        'any(height) AS height',
+        'argMaxIf(accepted_at, version, sign > 0) AS accepted_at',
+      ]
+    ),
     table: 'node_block',
   },
-  node_block_history_at: {
-    kind: 'node',
-    select:
-      'node_internal_id, removed_at, block_internal_id, internal_id, accepted_at',
-    table: 'node_block_history',
-  },
   node_transaction_at: {
-    groupBy: 'node_internal_id, transaction_internal_id',
+    comment: "n's current mempool",
+    groupBy: ['node_internal_id', 'transaction_internal_id'],
     kind: 'node',
-    select: `node_internal_id, transaction_internal_id, any(transaction_hash) AS transaction_hash,
-    argMaxIf(validated_at, version, sign > 0) AS validated_at`,
+    select: membershipSelect(
+      ['node_internal_id', 'transaction_internal_id'],
+      [
+        'any(transaction_hash) AS transaction_hash',
+        'argMaxIf(validated_at, version, sign > 0) AS validated_at',
+      ]
+    ),
     table: 'node_transaction',
   },
-  node_transaction_history_at: {
-    kind: 'node',
-    select:
-      'node_internal_id, transaction_internal_id, internal_id, validated_at, replaced_at',
-    table: 'node_transaction_history',
-  },
-  output_at: {
-    kind: 'agnostic',
-    select: '*, locking_bytecode_prefix, nonfungible_token_commitment_key',
-    table: 'output',
-  },
-  spend_at: {
-    kind: 'spend',
-    select: '*, locking_bytecode_prefix, nonfungible_token_commitment_key',
-    table: 'spend',
-  },
-  transaction_at: { kind: 'agnostic', select: '*', table: 'transaction' },
   tx_acceptance_at: {
-    groupBy: 'transaction_hash, node_internal_id, block_internal_id',
+    comment:
+      "tx-accepted(n, t): one row per (tx, accepting block of n, or 0 = n's mempool)",
+    groupBy: ['transaction_hash', 'node_internal_id', 'block_internal_id'],
     kind: 'node',
-    select: `transaction_hash, node_internal_id, block_internal_id, any(transaction_internal_id) AS transaction_internal_id,
-    any(height) AS height, argMaxIf(accepted_at, version, sign > 0) AS accepted_at`,
+    select: membershipSelect(
+      ['transaction_hash', 'node_internal_id', 'block_internal_id'],
+      [
+        'any(transaction_internal_id) AS transaction_internal_id',
+        'any(height) AS height',
+        'argMaxIf(accepted_at, version, sign > 0) AS accepted_at',
+      ]
+    ),
     table: 'tx_acceptance',
   },
   utxo_at: {
-    groupBy:
-      'node_internal_id, token_category, nonfungible_token_commitment_key, transaction_hash, output_index',
+    comment: 'unspent(n, o), by category + commitment',
+    groupBy: [
+      'node_internal_id',
+      'token_category',
+      'nonfungible_token_commitment_key',
+      'transaction_hash',
+      'output_index',
+    ],
     kind: 'node',
-    select: `node_internal_id, token_category, nonfungible_token_commitment_key, transaction_hash, output_index,
-    any(transaction_internal_id) AS transaction_internal_id, any(created_height) AS created_height,
-    any(value_satoshis) AS value_satoshis, any(locking_bytecode) AS locking_bytecode,
-    any(fungible_token_amount) AS fungible_token_amount,
-    any(nonfungible_token_capability) AS nonfungible_token_capability,
-    any(nonfungible_token_commitment) AS nonfungible_token_commitment`,
+    select: membershipSelect(
+      [
+        'node_internal_id',
+        'token_category',
+        'nonfungible_token_commitment_key',
+        'transaction_hash',
+        'output_index',
+      ],
+      [
+        'any(transaction_internal_id) AS transaction_internal_id',
+        'any(created_height) AS created_height',
+        'any(value_satoshis) AS value_satoshis',
+        'any(locking_bytecode) AS locking_bytecode',
+        'any(fungible_token_amount) AS fungible_token_amount',
+        'any(nonfungible_token_capability) AS nonfungible_token_capability',
+        'any(nonfungible_token_commitment) AS nonfungible_token_commitment',
+      ]
+    ),
     table: 'utxo',
   },
   utxo_by_script_at: {
-    groupBy:
-      'node_internal_id, locking_bytecode_prefix, transaction_hash, output_index',
+    comment: 'unspent(n, o), by locking bytecode prefix',
+    groupBy: [
+      'node_internal_id',
+      'locking_bytecode_prefix',
+      'transaction_hash',
+      'output_index',
+    ],
     kind: 'node',
-    select: `node_internal_id, locking_bytecode_prefix, transaction_hash, output_index,
-    any(transaction_internal_id) AS transaction_internal_id, any(created_height) AS created_height,
-    any(value_satoshis) AS value_satoshis, any(locking_bytecode) AS locking_bytecode,
-    any(token_category) AS token_category, any(fungible_token_amount) AS fungible_token_amount,
-    any(nonfungible_token_capability) AS nonfungible_token_capability,
-    any(nonfungible_token_commitment) AS nonfungible_token_commitment`,
+    select: membershipSelect(
+      [
+        'node_internal_id',
+        'locking_bytecode_prefix',
+        'transaction_hash',
+        'output_index',
+      ],
+      [
+        'any(transaction_internal_id) AS transaction_internal_id',
+        'any(created_height) AS created_height',
+        'any(value_satoshis) AS value_satoshis',
+        'any(locking_bytecode) AS locking_bytecode',
+        'any(token_category) AS token_category',
+        'any(fungible_token_amount) AS fungible_token_amount',
+        'any(nonfungible_token_capability) AS nonfungible_token_capability',
+        'any(nonfungible_token_commitment) AS nonfungible_token_commitment',
+      ]
+    ),
     table: 'utxo_by_script',
   },
+  node_block_history_at: {
+    comment: 'per-node block history',
+    kind: 'node',
+    select: [
+      'node_internal_id',
+      'removed_at',
+      'block_internal_id',
+      'internal_id',
+      'accepted_at',
+    ],
+    table: 'node_block_history',
+  },
+  node_transaction_history_at: {
+    comment: 'per-node transaction history (replaced_at NULL = confirmed)',
+    kind: 'node',
+    select: [
+      'node_internal_id',
+      'transaction_internal_id',
+      'internal_id',
+      'validated_at',
+      'replaced_at',
+    ],
+    table: 'node_transaction_history',
+  },
+  block_at: { kind: 'agnostic', select: ['*'], table: 'block' },
+  transaction_at: { kind: 'agnostic', select: ['*'], table: 'transaction' },
+  block_transaction_at: {
+    kind: 'agnostic',
+    select: ['*'],
+    table: 'block_transaction',
+  },
+  output_at: {
+    kind: 'agnostic',
+    /* MATERIALIZED columns are not part of `*` */
+    select: [
+      '*',
+      'locking_bytecode_prefix',
+      'nonfungible_token_commitment_key',
+    ],
+    table: 'output',
+  },
+  input_at: { kind: 'agnostic', select: ['*'], table: 'input' },
+  spend_at: {
+    kind: 'spend',
+    select: [
+      '*',
+      'locking_bytecode_prefix',
+      'nonfungible_token_commitment_key',
+    ],
+    table: 'spend',
+  },
+  authchain_link_at: { kind: 'spend', select: ['*'], table: 'authchain_link' },
 };
+/* eslint-enable sort-keys */
 
 /** The views `inlinePinnedView` can inline. */
-export const inlinablePinnedViews = Object.keys(pinnedViewBodies);
+export const inlinablePinnedViews = Object.keys(pinnedViewDefinitions);
+
+/**
+ * The gate terms (AND-ed) of a pinned view of `kind`: the general form of
+ * the DDL views (`snapshot` undefined: every term, for any parameter
+ * values), or the inlined form for a snapshot, which leaves out terms that
+ * are constant for the arrays bound with it (the committed-tail term when
+ * `committedTail` is empty, the void terms when `void` is empty, the
+ * `commit_void` fallback unless `void` is the overflow sentinel). Both give
+ * the same rows for the parameters of that snapshot (visibility.spec.ts).
+ * `qualifier`: database prefix of `commit_void` (the DDL writes `cg.`).
+ */
+export const pinnedGateTerms = (
+  kind: PinnedViewDefinition['kind'],
+  {
+    params = { node: 'node', visible: 'visible' },
+    qualifier = '',
+    snapshot,
+  }: {
+    params?: { node: string; visible: string };
+    qualifier?: string;
+    snapshot?: Pick<VisibilitySnapshot, 'committedTail' | 'void'>;
+  } = {}
+): string[] => {
+  if (kind === 'spend') return ['batch <= {spend:UInt64}'];
+  const commitVoid = `commit_seq NOT IN (SELECT commit_seq FROM ${qualifier}commit_void)`;
+  const voidTerms =
+    snapshot === undefined
+      ? [
+          'NOT has({void:Array(UInt64)}, commit_seq)',
+          `(NOT has({void:Array(UInt64)}, ${voidOverflowSentinel.toString()}) OR ${commitVoid})`,
+        ]
+      : snapshot.void.length === 0
+      ? []
+      : [
+          'NOT has({void:Array(UInt64)}, commit_seq)',
+          ...(snapshot.void[0] === voidOverflowSentinel ? [commitVoid] : []),
+        ];
+  return [
+    ...(kind === 'node'
+      ? [
+          `node_internal_id = {${params.node}:UInt32}`,
+          `commit_seq <= {${params.visible}:UInt64}`,
+        ]
+      : [
+          snapshot !== undefined && snapshot.committedTail.length === 0
+            ? 'commit_seq <= {visible0:UInt64}'
+            : '(commit_seq <= {visible0:UInt64} OR has({tail:Array(UInt64)}, commit_seq))',
+        ]),
+    `bitAnd(commit_seq, ${counterMaskSeq.toString()}) <= arrayElement({fence:Array(UInt64)}, bitShiftRight(commit_seq, 40))`,
+    ...voidTerms,
+  ];
+};
 
 /**
  * The rows of the pinned view `name` as a subquery over its base table with
@@ -586,11 +731,9 @@ export const inlinablePinnedViews = Object.keys(pinnedViewBodies);
  * reading a row (phase2-api.md §6.1). The inlined form costs a fraction.
  *
  * The text depends on `snapshot` only to leave out terms that are constant
- * for the arrays bound with it: the committed-tail term when `committedTail`
- * is empty (`has([], seq)` is false), the void terms when `void` is empty,
- * and the `commit_void` fallback unless `void` is the overflow sentinel. The
- * fence term always stays (it also bounds a forged watermark, as in the
- * views). The parameters still come only from `readSnapshot(Multi)`.
+ * for the arrays bound with it (`pinnedGateTerms`). The fence term always
+ * stays (it also bounds a forged watermark, as in the views). The
+ * parameters still come only from `readSnapshot(Multi)`.
  *
  * `keyFilter`: a predicate on the view's key columns (for a membership view,
  * its GROUP BY columns), applied to the base rows before the gate. Same rows
@@ -607,48 +750,21 @@ export const inlinePinnedView = (
   },
   keyFilter?: string
 ) => {
-  const body = pinnedViewBodies[name];
+  const body = pinnedViewDefinitions[name];
   if (body === undefined) {
     // eslint-disable-next-line functional/no-throw-statement
     throw new RangeError(`No inline form for the pinned view ${name}.`);
   }
-  const filter = keyFilter === undefined ? [] : [`(${keyFilter})`];
-  if (body.kind === 'spend') {
-    return `(SELECT ${body.select} FROM ${body.table} WHERE ${[
-      'batch <= {spend:UInt64}',
-      ...filter,
-    ].join(' AND ')})`;
-  }
-  const voidTerms =
-    snapshot.void.length === 0
-      ? []
-      : [
-          'NOT has({void:Array(UInt64)}, commit_seq)',
-          ...(snapshot.void[0] === voidOverflowSentinel
-            ? ['commit_seq NOT IN (SELECT commit_seq FROM commit_void)']
-            : []),
-        ];
   const terms = [
-    ...filter,
-    ...(body.kind === 'node'
-      ? [
-          `node_internal_id = {${params.node}:UInt32}`,
-          `commit_seq <= {${params.visible}:UInt64}`,
-        ]
-      : [
-          snapshot.committedTail.length === 0
-            ? 'commit_seq <= {visible0:UInt64}'
-            : '(commit_seq <= {visible0:UInt64} OR has({tail:Array(UInt64)}, commit_seq))',
-        ]),
-    `bitAnd(commit_seq, ${counterMaskSeq.toString()}) <= arrayElement({fence:Array(UInt64)}, bitShiftRight(commit_seq, 40))`,
-    ...voidTerms,
+    ...(keyFilter === undefined ? [] : [`(${keyFilter})`]),
+    ...pinnedGateTerms(body.kind, { params, snapshot }),
   ];
-  return `(SELECT ${body.select} FROM ${body.table} WHERE ${terms.join(
-    ' AND '
-  )}${
+  return `(SELECT ${body.select.join(', ')} FROM ${
+    body.table
+  } WHERE ${terms.join(' AND ')}${
     body.groupBy === undefined
       ? ''
-      : ` GROUP BY ${body.groupBy} HAVING sum(sign) > 0`
+      : ` GROUP BY ${body.groupBy.join(', ')} HAVING sum(sign) > 0`
   })`;
 };
 /* eslint-enable max-params */
