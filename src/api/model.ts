@@ -561,7 +561,7 @@ export const authchainBranchesSql = (c: Ctx, link: string) => {
   /* per walk row: members at or after its position, sorted; a position holding two members is a conflict */
   const runs = `SELECT g_base, g_cur, g_len, g_pid, g_pos, g_sorted,
       arrayMap(x -> x.1, g_sorted) AS g_ps,
-      /* neighbours as shifted arrays: a lambda capturing g_ps would copy it per element */
+      /* adjacent positions as shifted arrays: a lambda capturing g_ps would copy it per element */
       arrayMap((p, before, after) -> p = before OR p = after, g_ps,
         arrayPushFront(arrayPopBack(g_ps), toUInt32(0)),
         arrayPushBack(arrayPopFront(g_ps), toUInt32(0))) AS g_dup,
