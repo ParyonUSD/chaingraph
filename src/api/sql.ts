@@ -13,8 +13,11 @@
  *   nodes) are set only from `readSnapshot(Multi)` (`Sql` constructor).
  *   Client values are always bound under `p0`, `p1`, …, so they cannot
  *   collide with or override a snapshot parameter.
- * - Every read goes through a pinned `*_at` view (`Sql.view`,
- *   `Sql.nodeView`).
+ * - Every read goes through the rows of a pinned `*_at` view (`Sql.view`,
+ *   `Sql.nodeView`), with the view's gate predicate inlined over its base
+ *   table (`inlinePinnedView`: same rows, same snapshot parameters; the
+ *   views themselves stay for ad-hoc readers). Phase 2 stage 2 contract
+ *   change: the API no longer names the views in its statements.
  * - Per-node predicates (acceptance, mempool, blocks, spends) name their node
  *   explicitly; a filter without a node is node-agnostic.
  */
@@ -22,8 +25,8 @@ import { GraphQLError } from 'graphql';
 
 import type { VisibilitySnapshot } from '../store/clickhouse/visibility.js';
 import {
+  inlinePinnedView,
   nodeAgnosticId,
-  pinnedView,
   snapshotParams,
 } from '../store/clickhouse/visibility.js';
 
@@ -118,10 +121,12 @@ export class Sql {
     return `{${name}:${type}}`;
   }
 
-  /** A node-agnostic pinned view (or the primary node's) bound to the snapshot. */
-  // eslint-disable-next-line class-methods-use-this
+  /**
+   * The rows of a node-agnostic pinned view (or the primary node's) at the
+   * snapshot, as a FROM item (the gate inlined: `inlinePinnedView`).
+   */
   view(name: string) {
-    return pinnedView(name);
+    return inlinePinnedView(name, this.snapshot);
   }
 
   /**
@@ -136,14 +141,17 @@ export class Sql {
         'This field reads per-node data: name the node (`node:` argument).'
       );
     }
-    if (id === this.snapshot.nodeId) return pinnedView(name);
+    if (id === this.snapshot.nodeId) return this.view(name);
     const visible = this.others.get(id);
     if (visible === undefined) {
       throw new GraphQLError(`Node ${id} is not pinned by this request.`);
     }
     this.params[`node_${id}`] = id;
     this.params[`visible_${id}`] = visible;
-    return `${name}(node = {node_${id}:UInt32}, visible = {visible_${id}:UInt64}, fence = {fence:Array(UInt64)}, void = {void:Array(UInt64)})`;
+    return inlinePinnedView(name, this.snapshot, {
+      node: `node_${id}`,
+      visible: `visible_${id}`,
+    });
   }
 
   /**

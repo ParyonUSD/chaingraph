@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-magic-numbers, camelcase, @typescript-eslint/naming-convention, complexity, functional/no-try-statement */
-// cspell:ignore randomised seqs unhex
+// cspell:ignore randomised seqs unhex inlinable
 import test from 'ava';
 
 import type { ClickHouseClient } from './client.js';
@@ -20,6 +20,8 @@ import {
   assertWatermarksBelowOpen,
   computeWatermarks,
   counterMaskSeq,
+  inlinablePinnedViews,
+  inlinePinnedView,
   nodeViewParams,
   pinnedView,
   readSnapshot,
@@ -231,6 +233,35 @@ const pinnedOfSave = async (client: ClickHouseClient, save: TestSave) => {
   };
 };
 
+/**
+ * Every pinned view and its inlined form (`inlinePinnedView`, what the API
+ * reads) return the same rows at `snapshot`: count and an order-free hash.
+ */
+const inlineEqualsViews = async (
+  t: { deepEqual: (a: unknown, b: unknown, message?: string) => void },
+  client: ClickHouseClient,
+  [snapshot, label]: [Awaited<ReturnType<typeof readSnapshot>>, string]
+) => {
+  const params = snapshotParams(snapshot);
+  const digest = async (from: string) =>
+    (
+      await client.query<{ c: string; h: string }>(
+        `SELECT toString(count()) AS c, toString(sum(cityHash64(*))) AS h FROM ${from}`,
+        params
+      )
+    )[0];
+  // eslint-disable-next-line functional/no-loop-statement
+  for (const view of inlinablePinnedViews) {
+    t.deepEqual(
+      // eslint-disable-next-line no-await-in-loop
+      await digest(inlinePinnedView(view, snapshot)),
+      // eslint-disable-next-line no-await-in-loop
+      await digest(pinnedView(view)),
+      `${label}: ${view}`
+    );
+  }
+};
+
 e2e(
   '[e2e] watermark advances only when all earlier commits for the node are terminal',
   async (t) => {
@@ -351,7 +382,10 @@ e2e(
     t.deepEqual(await pinnedRead(await readSnapshot(client, 1)), none);
     await log.markCommitted(commit.seq, testSaveRowCounts(save));
     // committed but not published: node facts hidden; the node-agnostic rows may show (committed tail)
-    const committedOnly = await pinnedRead(await readSnapshot(client, 1));
+    const tailSnapshot = await readSnapshot(client, 1);
+    const committedOnly = await pinnedRead(tailSnapshot);
+    t.deepEqual(tailSnapshot.committedTail, [commit.seq]);
+    await inlineEqualsViews(t, client, [tailSnapshot, 'committed tail']);
     t.is(committedOnly.acceptance, '0');
     t.is(committedOnly.utxo, '0');
     await publisher.publishWatermark();
@@ -442,6 +476,14 @@ e2e(
       pairs.forEach(([pinned, live]) => {
         t.deepEqual(pinned, live, label);
       });
+      await inlineEqualsViews(t, client, [
+        await readSnapshot(client, 1),
+        label,
+      ]);
+      await inlineEqualsViews(t, client, [
+        await readSnapshot(client, 2),
+        label,
+      ]);
     };
     await check('inline void');
 

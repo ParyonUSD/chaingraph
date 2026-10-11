@@ -1,5 +1,5 @@
 /* eslint-disable camelcase, @typescript-eslint/naming-convention, functional/no-mixed-type, functional/no-try-statement, @typescript-eslint/parameter-properties, max-classes-per-file, complexity */
-// cspell:ignore clickhouse seqs subquery subqueries
+// cspell:ignore clickhouse seqs subquery subqueries inlinable analysed
 /**
  * Per-node visibility watermarks (plan §3.2, WP4).
  *
@@ -474,6 +474,166 @@ export const snapshotParams = (snapshot: VisibilitySnapshot) => ({
   ...nodeViewParams(snapshot),
   spend: snapshot.spend,
 });
+
+/**
+ * The bodies of the pinned `*_at` views (mirror of ddl/050_views.sql and
+ * 070_spend.sql): base table, select list, and for the membership views the
+ * collapsing GROUP BY. `inlinePinnedView` builds a view's rows from them.
+ */
+const pinnedViewBodies: {
+  [name: string]: {
+    table: string;
+    select: string;
+    kind: 'agnostic' | 'node' | 'spend';
+    groupBy?: string;
+  };
+} = {
+  block_at: { kind: 'agnostic', select: '*', table: 'block' },
+  block_transaction_at: {
+    kind: 'agnostic',
+    select: '*',
+    table: 'block_transaction',
+  },
+  input_at: { kind: 'agnostic', select: '*', table: 'input' },
+  node_block_at: {
+    groupBy: 'node_internal_id, block_internal_id',
+    kind: 'node',
+    select: `node_internal_id, block_internal_id, any(block_hash) AS block_hash, any(height) AS height,
+    argMaxIf(accepted_at, version, sign > 0) AS accepted_at`,
+    table: 'node_block',
+  },
+  node_block_history_at: {
+    kind: 'node',
+    select:
+      'node_internal_id, removed_at, block_internal_id, internal_id, accepted_at',
+    table: 'node_block_history',
+  },
+  node_transaction_at: {
+    groupBy: 'node_internal_id, transaction_internal_id',
+    kind: 'node',
+    select: `node_internal_id, transaction_internal_id, any(transaction_hash) AS transaction_hash,
+    argMaxIf(validated_at, version, sign > 0) AS validated_at`,
+    table: 'node_transaction',
+  },
+  node_transaction_history_at: {
+    kind: 'node',
+    select:
+      'node_internal_id, transaction_internal_id, internal_id, validated_at, replaced_at',
+    table: 'node_transaction_history',
+  },
+  output_at: {
+    kind: 'agnostic',
+    select: '*, locking_bytecode_prefix, nonfungible_token_commitment_key',
+    table: 'output',
+  },
+  spend_at: {
+    kind: 'spend',
+    select: '*, locking_bytecode_prefix, nonfungible_token_commitment_key',
+    table: 'spend',
+  },
+  transaction_at: { kind: 'agnostic', select: '*', table: 'transaction' },
+  tx_acceptance_at: {
+    groupBy: 'transaction_hash, node_internal_id, block_internal_id',
+    kind: 'node',
+    select: `transaction_hash, node_internal_id, block_internal_id, any(transaction_internal_id) AS transaction_internal_id,
+    any(height) AS height, argMaxIf(accepted_at, version, sign > 0) AS accepted_at`,
+    table: 'tx_acceptance',
+  },
+  utxo_at: {
+    groupBy:
+      'node_internal_id, token_category, nonfungible_token_commitment_key, transaction_hash, output_index',
+    kind: 'node',
+    select: `node_internal_id, token_category, nonfungible_token_commitment_key, transaction_hash, output_index,
+    any(transaction_internal_id) AS transaction_internal_id, any(created_height) AS created_height,
+    any(value_satoshis) AS value_satoshis, any(locking_bytecode) AS locking_bytecode,
+    any(fungible_token_amount) AS fungible_token_amount,
+    any(nonfungible_token_capability) AS nonfungible_token_capability,
+    any(nonfungible_token_commitment) AS nonfungible_token_commitment`,
+    table: 'utxo',
+  },
+  utxo_by_script_at: {
+    groupBy:
+      'node_internal_id, locking_bytecode_prefix, transaction_hash, output_index',
+    kind: 'node',
+    select: `node_internal_id, locking_bytecode_prefix, transaction_hash, output_index,
+    any(transaction_internal_id) AS transaction_internal_id, any(created_height) AS created_height,
+    any(value_satoshis) AS value_satoshis, any(locking_bytecode) AS locking_bytecode,
+    any(token_category) AS token_category, any(fungible_token_amount) AS fungible_token_amount,
+    any(nonfungible_token_capability) AS nonfungible_token_capability,
+    any(nonfungible_token_commitment) AS nonfungible_token_commitment`,
+    table: 'utxo_by_script',
+  },
+};
+
+/** The views `inlinePinnedView` can inline. */
+export const inlinablePinnedViews = Object.keys(pinnedViewBodies);
+
+/**
+ * The rows of the pinned view `name` as a subquery over its base table with
+ * the gate predicate inlined: `(SELECT … FROM table WHERE <gate>)`. Same
+ * placeholders as `pinnedView` (bind `snapshotParams(snapshot)`; a further
+ * pinned node's view uses `params.node` / `params.visible` as its
+ * placeholder names), same rows as the view for any parameter values.
+ *
+ * Why: every view reference costs the analyzer about 3-4 ms on ClickHouse
+ * 26.8 (the view's query is analysed again per reference, with its array
+ * parameters), so a statement of 12-20 references paid 40-80 ms before
+ * reading a row (phase2-api.md §6.1). The inlined form costs a fraction.
+ *
+ * The text depends on `snapshot` only to leave out terms that are constant
+ * for the arrays bound with it: the committed-tail term when `committedTail`
+ * is empty (`has([], seq)` is false), the void terms when `void` is empty,
+ * and the `commit_void` fallback unless `void` is the overflow sentinel. The
+ * fence term always stays (it also bounds a forged watermark, as in the
+ * views). The parameters still come only from `readSnapshot(Multi)`.
+ */
+export const inlinePinnedView = (
+  name: string,
+  snapshot: Pick<VisibilitySnapshot, 'committedTail' | 'void'>,
+  params: { node: string; visible: string } = {
+    node: 'node',
+    visible: 'visible',
+  }
+) => {
+  const body = pinnedViewBodies[name];
+  if (body === undefined) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new RangeError(`No inline form for the pinned view ${name}.`);
+  }
+  if (body.kind === 'spend') {
+    return `(SELECT ${body.select} FROM ${body.table} WHERE batch <= {spend:UInt64})`;
+  }
+  const voidTerms =
+    snapshot.void.length === 0
+      ? []
+      : [
+          'NOT has({void:Array(UInt64)}, commit_seq)',
+          ...(snapshot.void[0] === voidOverflowSentinel
+            ? ['commit_seq NOT IN (SELECT commit_seq FROM commit_void)']
+            : []),
+        ];
+  const terms = [
+    ...(body.kind === 'node'
+      ? [
+          `node_internal_id = {${params.node}:UInt32}`,
+          `commit_seq <= {${params.visible}:UInt64}`,
+        ]
+      : [
+          snapshot.committedTail.length === 0
+            ? 'commit_seq <= {visible0:UInt64}'
+            : '(commit_seq <= {visible0:UInt64} OR has({tail:Array(UInt64)}, commit_seq))',
+        ]),
+    `bitAnd(commit_seq, ${counterMaskSeq.toString()}) <= arrayElement({fence:Array(UInt64)}, bitShiftRight(commit_seq, 40))`,
+    ...voidTerms,
+  ];
+  return `(SELECT ${body.select} FROM ${body.table} WHERE ${terms.join(
+    ' AND '
+  )}${
+    body.groupBy === undefined
+      ? ''
+      : ` GROUP BY ${body.groupBy} HAVING sum(sign) > 0`
+  })`;
+};
 
 /**
  * SQL fragments of the gate for ad-hoc readers that read base tables. They
