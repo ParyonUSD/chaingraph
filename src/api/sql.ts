@@ -391,6 +391,15 @@ export const any = (parts: readonly string[]) =>
 const given = <T>(value: T | null | undefined): value is T =>
   value !== undefined && value !== null;
 
+/**
+ * SQL's three-valued logic for a condition on a nullable column: NULL when
+ * the column is NULL (as Postgres, and so Chaingraph v1, evaluates `IN`,
+ * comparisons and their negations). ClickHouse's `NULL IN (…)` is 0, not
+ * NULL, which would make `_not: { … _in … }` match NULL rows.
+ */
+export const nullSafe = (column: string, condition: string) =>
+  `if(isNull(${column}), NULL, ${condition})`;
+
 /** ClickHouse integer column types and their ranges. */
 const integerRanges: { [type: string]: readonly [bigint, bigint] } = {
   Int32: [-(2n ** 31n), 2n ** 31n - 1n],
@@ -415,6 +424,8 @@ export const numericComparison = (
 ) => {
   const [min, max] = integerRanges[type] ?? [-(2n ** 127n), 2n ** 127n - 1n];
   const parts: string[] = [];
+  const nullableWrap = (condition: string) =>
+    nullable ? nullSafe(column, condition) : condition;
   const value = (raw: bigint | number) => BigInt(raw);
   const bindValue = (raw: bigint) => sql.bind(raw, type);
   if (given(comparison._eq)) {
@@ -449,9 +460,11 @@ export const numericComparison = (
     parts.push(
       values.length === 0
         ? '0'
-        : any(
-            chunks(values).map(
-              (chunk) => `${column} IN ${sql.bind(chunk, `Array(${type})`)}`
+        : nullableWrap(
+            any(
+              chunks(values).map(
+                (chunk) => `${column} IN ${sql.bind(chunk, `Array(${type})`)}`
+              )
             )
           )
     );
@@ -460,9 +473,11 @@ export const numericComparison = (
     const values = inRange(comparison._nin);
     if (values.length > 0) {
       parts.push(
-        all(
-          chunks(values).map(
-            (chunk) => `${column} NOT IN ${sql.bind(chunk, `Array(${type})`)}`
+        nullableWrap(
+          all(
+            chunks(values).map(
+              (chunk) => `${column} NOT IN ${sql.bind(chunk, `Array(${type})`)}`
+            )
           )
         )
       );
@@ -511,9 +526,16 @@ const hexList = (
       assertHashLength(hex, label);
     });
   const bound = chunks(values).map((chunk) => sql.bind(chunk, 'Array(String)'));
-  return `arrayMap(x -> ${
+  /*
+   * A subquery set, not `IN arrayMap(…, {param})`: ClickHouse turns the
+   * latter into has(), which no primary key or projection can use (chipnet:
+   * a full scan of `spend`, 6,491 granules, against 8 for the subquery set).
+   */
+  return `(SELECT ${
     fixed ? 'toFixedString(unhex(x), 32)' : 'unhex(x)'
-  }, ${bound.length === 1 ? bound[0]! : `arrayConcat(${bound.join(', ')})`})`;
+  } FROM (SELECT arrayJoin(${
+    bound.length === 1 ? bound[0]! : `arrayConcat(${bound.join(', ')})`
+  }) AS x))`;
 };
 
 /** Byte prefix: `startsWith` on a String column (`column` may be nullable). */
@@ -524,65 +546,106 @@ const prefixCondition = (
   prefix: string
 ) =>
   `startsWith(${
-    kind === 'bytes' ? column : `toString(assumeNotNull(${column}))`
-  }, unhex(${sql.bind(prefix, 'String')}))${
-    kind === 'nullableBytes' ? ` AND isNotNull(${column})` : ''
-  }`;
+    kind === 'bytes'
+      ? column
+      : kind === 'nullableBytes'
+      ? `toString(assumeNotNull(${column}))`
+      : `toString(${column})`
+  }, unhex(${sql.bind(prefix, 'String')}))`;
 
+/**
+ * Byte comparisons. v1 semantics (Postgres): a column without a value is
+ * NULL (an NFT commitment of an output without an NFT; token_category of an
+ * output without tokens, stored here as the zero category), and every value
+ * comparison on it is NULL. Under an even number of `_not`s NULL and false
+ * both exclude the row, so only conditions that could be true for an absent
+ * value get a guard and `_eq`/`_in` stay plain key conditions; under an odd
+ * number (`negated`) the exact NULL is produced.
+ */
 export const hexComparison = (
   sql: Sql,
   column: string,
   kind: HexColumnKind,
   comparison: HexComparison,
-  label: string
+  label: string,
+  negated = false
 ) => {
   const parts: string[] = [];
-  const binary = (key: keyof HexComparison, operator: string) => {
-    const value = comparison[key];
-    if (typeof value === 'string') {
-      parts.push(`${column} ${operator} ${hexValue(sql, kind, value, label)}`);
+  const absent =
+    kind === 'tokenCategory'
+      ? `${column} = ${zeroCategory}`
+      : kind === 'nullableBytes'
+      ? `isNull(${column})`
+      : undefined;
+  const zeroHex = '00'.repeat(hashBytes);
+  const value = (condition: string, plainWhenPositive: boolean) =>
+    absent === undefined
+      ? condition
+      : negated
+      ? `if(${absent}, NULL, ${condition})`
+      : plainWhenPositive
+      ? condition
+      : `NOT (${absent}) AND (${condition})`;
+  const binary = (
+    key: keyof HexComparison,
+    operator: string,
+    plainWhenPositive: boolean
+  ) => {
+    const operand = comparison[key];
+    if (typeof operand === 'string') {
+      parts.push(
+        value(
+          `${column} ${operator} ${hexValue(sql, kind, operand, label)}`,
+          plainWhenPositive && operand.toLowerCase() !== zeroHex
+        )
+      );
     }
   };
-  binary('_eq', '=');
-  binary('_neq', '!=');
-  binary('_gt', '>');
-  binary('_gte', '>=');
-  binary('_lt', '<');
-  binary('_lte', '<=');
+  binary('_eq', '=', true);
+  binary('_neq', '!=', false);
+  binary('_gt', '>', false);
+  binary('_gte', '>=', false);
+  binary('_lt', '<', false);
+  binary('_lte', '<=', false);
   if (given(comparison._in)) {
     parts.push(
       comparison._in.length === 0
         ? '0'
-        : `${column} IN ${hexList(sql, kind, comparison._in, label)}`
+        : value(
+            `${column} IN ${hexList(sql, kind, comparison._in, label)}`,
+            !comparison._in.some((hex) => hex.toLowerCase() === zeroHex)
+          )
     );
   }
   if (given(comparison._nin) && comparison._nin.length > 0) {
     parts.push(
-      `${column} NOT IN ${hexList(sql, kind, comparison._nin, label)}`
+      value(
+        `${column} NOT IN ${hexList(sql, kind, comparison._nin, label)}`,
+        false
+      )
     );
   }
   if (given(comparison._is_null)) {
-    if (kind === 'tokenCategory') {
-      parts.push(
-        `${column} ${comparison._is_null ? '=' : '!='} ${zeroCategory}`
-      );
-    } else if (kind === 'nullableBytes') {
-      parts.push(
-        comparison._is_null ? `isNull(${column})` : `isNotNull(${column})`
-      );
-    } else {
+    if (absent === undefined) {
       parts.push(comparison._is_null ? '0' : '1');
+    } else {
+      parts.push(comparison._is_null ? absent : `NOT (${absent})`);
     }
   }
   if (given(comparison._prefix)) {
-    parts.push(prefixCondition(sql, kind, column, comparison._prefix));
+    parts.push(
+      value(prefixCondition(sql, kind, column, comparison._prefix), false)
+    );
   }
   if (given(comparison._prefix_in)) {
     parts.push(
-      any(
-        comparison._prefix_in.map((prefix) =>
-          prefixCondition(sql, kind, column, prefix)
-        )
+      value(
+        any(
+          comparison._prefix_in.map((prefix) =>
+            prefixCondition(sql, kind, column, prefix)
+          )
+        ),
+        false
       )
     );
   }
@@ -599,25 +662,25 @@ export const capabilityComparison = (
     parts.push(`${column} = ${sql.bind(comparison._eq, 'String')}`);
   }
   if (given(comparison._neq)) {
-    /* v1 (SQL): NULL != 'x' is not true; an output without an NFT never matches */
-    parts.push(
-      `isNotNull(${column}) AND ${column} != ${sql.bind(
-        comparison._neq,
-        'String'
-      )}`
-    );
+    parts.push(`${column} != ${sql.bind(comparison._neq, 'String')}`);
   }
   if (given(comparison._in)) {
     parts.push(
-      `toString(${column}) IN ${sql.bind(comparison._in, 'Array(String)')}`
+      nullSafe(
+        column,
+        `toString(${column}) IN ${sql.bind(comparison._in, 'Array(String)')}`
+      )
     );
   }
   if (given(comparison._nin)) {
     parts.push(
-      `isNotNull(${column}) AND toString(${column}) NOT IN ${sql.bind(
-        comparison._nin,
-        'Array(String)'
-      )}`
+      nullSafe(
+        column,
+        `toString(${column}) NOT IN ${sql.bind(
+          comparison._nin,
+          'Array(String)'
+        )}`
+      )
     );
   }
   if (given(comparison._is_null)) {
@@ -812,9 +875,9 @@ const lockingBytecodePrefixKey = (sql: Sql, comparison: HexComparison) => {
       sql.bind(chunk, 'Array(String)')
     );
     parts.push(
-      `locking_bytecode_prefix IN arrayMap(x -> substring(unhex(x), 1, 25), ${
+      `locking_bytecode_prefix IN (SELECT substring(unhex(x), 1, 25) FROM (SELECT arrayJoin(${
         bound.length === 1 ? bound[0]! : `arrayConcat(${bound.join(', ')})`
-      })`
+      }) AS x))`
     );
   }
   const prefixKey = (prefix: string) =>
@@ -872,7 +935,8 @@ export const outputPredicate = (
   sql: Sql,
   filter: OutputFilter | null | undefined,
   columns: OutputColumns = outputRowColumns,
-  node?: number
+  node?: number,
+  negated = false
 ): string => {
   if (!given(filter)) return '1';
   const parts: string[] = [];
@@ -950,7 +1014,8 @@ export const outputPredicate = (
         'token_category',
         'tokenCategory',
         filter.token_category,
-        'token_category'
+        'token_category',
+        negated
       )
     );
   }
@@ -970,9 +1035,13 @@ export const outputPredicate = (
         'nonfungible_token_commitment',
         'nullableBytes',
         filter.nonfungible_token_commitment,
-        'nonfungible_token_commitment'
+        'nonfungible_token_commitment',
+        negated
       ),
-      ...commitmentKeyCondition(sql, filter.nonfungible_token_commitment)
+      /* a key condition, equivalent to the comparison only where NULL and false both exclude */
+      ...(negated
+        ? []
+        : commitmentKeyCondition(sql, filter.nonfungible_token_commitment))
     );
   }
   if (given(filter.transaction)) {
@@ -995,16 +1064,20 @@ export const outputPredicate = (
   }
   if (given(filter._and)) {
     parts.push(
-      ...filter._and.map((f) => outputPredicate(sql, f, columns, node))
+      ...filter._and.map((f) => outputPredicate(sql, f, columns, node, negated))
     );
   }
   if (given(filter._or)) {
     parts.push(
-      any(filter._or.map((f) => outputPredicate(sql, f, columns, node)))
+      any(
+        filter._or.map((f) => outputPredicate(sql, f, columns, node, negated))
+      )
     );
   }
   if (given(filter._not)) {
-    parts.push(`NOT (${outputPredicate(sql, filter._not, columns, node)})`);
+    parts.push(
+      `NOT (${outputPredicate(sql, filter._not, columns, node, !negated)})`
+    );
   }
   return all(parts);
 };
@@ -1102,21 +1175,38 @@ const inputOwnColumns = (sql: Sql, filter: InputFilter, node?: number) => {
 export const spendRowPredicate = (
   sql: Sql,
   filter: InputFilter | null | undefined,
-  node?: number
+  node?: number,
+  negated = false
 ): string => {
   if (!given(filter)) return '1';
   const parts = inputOwnColumns(sql, filter, node);
   if (given(filter.outpoint)) {
-    parts.push(outputPredicate(sql, filter.outpoint, spentOutputColumns, node));
+    /*
+     * v1: EXISTS a spent output matching, so true or false, never NULL. Under
+     * an even number of `_not`s a NULL here excludes the row as false would,
+     * and the plain predicate keeps the spend index key conditions; under an
+     * odd number it must be false.
+     */
+    const predicate = outputPredicate(
+      sql,
+      filter.outpoint,
+      spentOutputColumns,
+      node
+    );
+    parts.push(negated ? `ifNull((${predicate}), 0)` : predicate);
   }
   if (given(filter._and)) {
-    parts.push(...filter._and.map((f) => spendRowPredicate(sql, f, node)));
+    parts.push(
+      ...filter._and.map((f) => spendRowPredicate(sql, f, node, negated))
+    );
   }
   if (given(filter._or)) {
-    parts.push(any(filter._or.map((f) => spendRowPredicate(sql, f, node))));
+    parts.push(
+      any(filter._or.map((f) => spendRowPredicate(sql, f, node, negated)))
+    );
   }
   if (given(filter._not)) {
-    parts.push(`NOT (${spendRowPredicate(sql, filter._not, node)})`);
+    parts.push(`NOT (${spendRowPredicate(sql, filter._not, node, !negated)})`);
   }
   return all(parts);
 };

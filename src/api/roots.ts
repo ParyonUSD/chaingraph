@@ -203,7 +203,7 @@ export const runTransactions = async (
     sels,
     maxLimits.transactions,
     /* the spike's cursor: the last internal_id (pass as `after`/`before`) */
-    explicit === undefined ? (row) => String(row.internal_id ?? '') : undefined
+    explicit === undefined ? (_row, values) => values[0]! : undefined
   );
 };
 
