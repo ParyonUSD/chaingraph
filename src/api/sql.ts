@@ -1857,6 +1857,57 @@ export const transactionCandidates = (
 };
 
 /**
+ * A subquery of candidate block internal ids that every block matching
+ * `filter` is among (a positive conjunct on `hash` or `height`, both
+ * index-backed: the primary key and p_height), or undefined. The node's
+ * acceptance check then reads only these blocks' `node_block` rows (by key)
+ * instead of every block the node accepts (chipnet: 327k rows, 10-15 ms).
+ */
+export const blockCandidates = (
+  sql: Sql,
+  filter: BlockFilter | null | undefined
+): string | undefined => {
+  if (!given(filter)) return undefined;
+  if (hasSelectiveHex(filter.hash) && !given(filter.hash?._prefix)) {
+    return `SELECT internal_id FROM ${sql.view('block_at')} WHERE ${all(
+      hexComparison(sql, 'hash', 'hash', filter.hash!, 'hash')
+    )}`;
+  }
+  const { height } = filter;
+  if (
+    given(height) &&
+    (given(height._eq) ||
+      given(height._in) ||
+      given(height._gt) ||
+      given(height._gte) ||
+      given(height._lt) ||
+      given(height._lte))
+  ) {
+    return `SELECT internal_id FROM ${sql.view('block_at')} WHERE ${all(
+      numericComparison(sql, 'height', 'UInt32', {
+        _eq: height._eq,
+        _gt: height._gt,
+        _gte: height._gte,
+        _in: height._in,
+        _lt: height._lt,
+        _lte: height._lte,
+      })
+    )}`;
+  }
+  for (const part of filter._and ?? []) {
+    const candidates = blockCandidates(sql, part);
+    if (candidates !== undefined) return candidates;
+  }
+  if (given(filter._or) && filter._or.length > 0) {
+    const branches = filter._or.map((part) => blockCandidates(sql, part));
+    if (branches.every((branch) => branch !== undefined)) {
+      return branches.join(' UNION ALL ');
+    }
+  }
+  return undefined;
+};
+
+/**
  * Per-node unspent outputs at query time (UTXO tables off, Chaingraph v1's
  * definition): outputs of transactions the node accepts, minus outpoints
  * spent by an input of a transaction the node accepts. With a filter, the
@@ -1893,24 +1944,37 @@ export const unspentOutputPredicate = (
       )} WHERE (outpoint_transaction_hash, outpoint_index) IN (SELECT transaction_hash, output_index FROM ${sql.view(
         'output_at'
       )} WHERE ${outputPredicate(sql, filter, outputRowColumns, node)})`;
-  const created = selective
-    ? sql.accepted(
+  if (selective) {
+    /*
+     * One acceptance read for the transactions that created a matching
+     * output and those that spent one (a statement-level CTE): the two sets
+     * overlap and each costs a read of most of tx_acceptance's granules when
+     * large (hash order), so reading them together halves that (chipnet L12
+     * AllHolders: 6.2M -> 3.3M rows).
+     */
+    const spending = sql.cte('acc', spends);
+    const accepted = sql.cte(
+      'accepted',
+      sql.accepted(
         node,
         `SELECT transaction_hash FROM ${sql.view(
           'output_at'
-        )} WHERE ${outputPredicate(sql, filter, outputRowColumns, node)}`
+        )} WHERE ${outputPredicate(
+          sql,
+          filter,
+          outputRowColumns,
+          node
+        )} UNION ALL SELECT transaction_hash FROM ${spending}`
       )
-    : sql.accepted(node);
-  const spent = selective
-    ? sql.acceptedRows(
-        spends,
-        'outpoint_transaction_hash, outpoint_index',
-        node
-      )
-    : `SELECT outpoint_transaction_hash, outpoint_index FROM (${spends}) WHERE transaction_hash IN (${sql.accepted(
-        node
-      )})`;
-  return `transaction_hash IN (${created})
-  AND (transaction_hash, output_index) NOT IN (${spent})
+    );
+    return `transaction_hash IN (SELECT transaction_hash FROM ${accepted})
+  AND (transaction_hash, output_index) NOT IN (SELECT outpoint_transaction_hash, outpoint_index FROM ${spending}
+    WHERE transaction_hash IN (SELECT transaction_hash FROM ${accepted}))
+  AND (${matching})`;
+  }
+  return `transaction_hash IN (${sql.accepted(node)})
+  AND (transaction_hash, output_index) NOT IN (SELECT outpoint_transaction_hash, outpoint_index FROM (${spends}) WHERE transaction_hash IN (${sql.accepted(
+    node
+  )}))
   AND (${matching})`;
 };

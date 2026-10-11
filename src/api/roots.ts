@@ -41,6 +41,7 @@ import type {
   TransactionFilter,
 } from './sql.js';
 import {
+  blockCandidates,
   blockPredicate,
   hexComparison,
   inputPredicate,
@@ -347,12 +348,20 @@ export interface BlocksArgs extends PageArgs {
   where?: BlockFilter | null;
 }
 
-/** Blocks the node accepts. */
-const acceptedBlocks = (sql: Sql, node: number | undefined) =>
+/** Blocks the node accepts (among `candidates`, a subquery of block internal ids, when given). */
+const acceptedBlocks = (
+  sql: Sql,
+  node: number | undefined,
+  candidates?: string
+) =>
   `internal_id IN (SELECT block_internal_id FROM ${sql.nodeView(
     'node_block_at',
     node
-  )})`;
+  )}${
+    candidates === undefined
+      ? ''
+      : ` WHERE block_internal_id IN (${candidates})`
+  })`;
 
 export const runBlocks = async (
   env: RootEnv,
@@ -366,7 +375,10 @@ export const runBlocks = async (
     label,
     BlockEntity,
     sql.view('block_at'),
-    [acceptedBlocks(sql, ctx.node), blockPredicate(sql, args.where, ctx.node)],
+    [
+      acceptedBlocks(sql, ctx.node, blockCandidates(sql, args.where)),
+      blockPredicate(sql, args.where, ctx.node),
+    ],
     rootOrder(
       orderTerms(blockOrder, args.order_by),
       [term('height')],
@@ -621,7 +633,7 @@ export const rowSets = {
   blocks: (env: RootEnv, where: BlockFilter | null | undefined): RowSet => ({
     source: viewSource(env.sql.view('block_at')),
     where: [
-      acceptedBlocks(env.sql, env.ctx.node),
+      acceptedBlocks(env.sql, env.ctx.node, blockCandidates(env.sql, where)),
       blockPredicate(env.sql, where, env.ctx.node),
     ],
   }),
