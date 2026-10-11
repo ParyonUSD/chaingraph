@@ -1498,15 +1498,15 @@ export const transactionPredicate = (
     parts.push(...booleanComparison(sql, 'is_coinbase', filter.is_coinbase));
   }
   if (given(filter.has_output)) {
+    /* a selective output filter is read through its projection: the candidates only filter */
     parts.push(
       `hash IN (SELECT transaction_hash FROM ${sql.view(
         'output_at'
-      )} WHERE ${restrict('transaction_hash')}${outputPredicate(
-        sql,
-        filter.has_output,
-        outputRowColumns,
-        node
-      )})`
+      )} WHERE ${restrict(
+        outputFilterIsSelective(filter.has_output)
+          ? unindexed('transaction_hash')
+          : 'transaction_hash'
+      )}${outputPredicate(sql, filter.has_output, outputRowColumns, node)})`
     );
   }
   if (given(filter.has_input)) {
@@ -1959,6 +1959,16 @@ export const blockCandidates = (
 };
 
 /**
+ * `column` hidden from primary-key analysis (`identity(column)`, same
+ * value). For `output` rows selected by an index-backed predicate (a
+ * category or script projection), a further `transaction_hash IN (set)`
+ * would otherwise be analysed against every granule of output's primary key
+ * (granularity 128: 61k marks on chipnet) before the projection is chosen:
+ * L12 AllHolders spent 40 of 90 ms there.
+ */
+export const unindexed = (column: string) => `identity(${column})`;
+
+/**
  * Per-node unspent outputs at query time (UTXO tables off, Chaingraph v1's
  * definition): outputs of transactions the node accepts, minus outpoints
  * spent by an input of a transaction the node accepts. With a filter, the
@@ -2018,8 +2028,12 @@ export const unspentOutputPredicate = (
         )} UNION ALL SELECT transaction_hash FROM ${spending}`
       )
     );
-    return `transaction_hash IN (SELECT transaction_hash FROM ${accepted})
-  AND (transaction_hash, output_index) NOT IN (SELECT outpoint_transaction_hash, outpoint_index FROM ${spending}
+    return `${unindexed(
+      'transaction_hash'
+    )} IN (SELECT transaction_hash FROM ${accepted})
+  AND (${unindexed(
+    'transaction_hash'
+  )}, output_index) NOT IN (SELECT outpoint_transaction_hash, outpoint_index FROM ${spending}
     WHERE transaction_hash IN (SELECT transaction_hash FROM ${accepted}))
   AND (${matching})`;
   }

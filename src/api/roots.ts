@@ -58,6 +58,7 @@ import {
   spendRowPredicate,
   transactionCandidates,
   transactionPredicate,
+  unindexed,
   unspentOutputPredicate,
 } from './sql.js';
 
@@ -258,7 +259,14 @@ export const runOutputs = async (
     label,
     OutputEntity,
     sql.view('output_at'),
-    [`transaction_hash IN (${sql.accepted(ctx.node, candidates)})`, predicate],
+    [
+      `${
+        candidates === undefined
+          ? 'transaction_hash'
+          : unindexed('transaction_hash')
+      } IN (${sql.accepted(ctx.node, candidates)})`,
+      predicate,
+    ],
     rootOrder(
       orderTerms(outputOrder, args.order_by),
       outputDefaultOrder,
@@ -674,7 +682,11 @@ export const rowSets = {
     return {
       source: viewSource(sql.view('output_at')),
       where: [
-        `transaction_hash IN (${sql.accepted(ctx.node, candidates)})`,
+        `${
+          candidates === undefined
+            ? 'transaction_hash'
+            : unindexed('transaction_hash')
+        } IN (${sql.accepted(ctx.node, candidates)})`,
         outputPredicate(sql, where, outputRowColumns, ctx.node),
       ],
     };
