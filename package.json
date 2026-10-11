@@ -109,6 +109,7 @@
     "clickhouse:ddl": "node bin/chaingraph-clickhouse-ddl.js",
     "api:dev": "yarn build && node build/api/main.js",
     "api:schema": "yarn build >/dev/null && node build/api/print-schema.js",
+    "api:schema:update": "yarn build >/dev/null && node build/api/print-schema.js > docs/clickhouse-port/v2-schema.graphql",
     "gen:schema-md": "graphql-markdown http://localhost:8080/v1/graphql > docs/generated-schema.md",
     "gen:schemaspy": "docker run --rm -it -v \"$(pwd)/output\":/output --network host schemaspy/schemaspy:latest -t pgsql -db postgres -host host.docker.internal --port 5432 -s public -u chaingraph -p very_insecure_postgres_password -hq -imageformat svg",
     "log": "yarn log:base -c -l -t",

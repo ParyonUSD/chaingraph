@@ -1,0 +1,968 @@
+type Authchain {
+  """Transactions in the chain, the base included."""
+  authchain_length: Int!
+  authhead: Transaction!
+  authhead_transaction_hash: Hex!
+
+  """The chain, base first (migration_index 0)."""
+  migrations(limit: Int, offset: Int, order_by: [AuthchainMigrationOrderBy!]): [AuthchainMigration!]!
+
+  """False only if the chain exceeded the depth limit (100,000)."""
+  unspent_authhead: Boolean!
+}
+
+type AuthchainMigration {
+  migration_index: Int!
+  transaction: Transaction!
+  transaction_hash: Hex!
+}
+
+input AuthchainMigrationOrderBy {
+  migration_index: Order
+}
+
+"""64-bit integer, serialized as a decimal string."""
+scalar BigInt
+
+input BigIntComparison {
+  _eq: BigInt
+  _gt: BigInt
+  _gte: BigInt
+  _in: [BigInt!]
+  _is_null: Boolean
+  _lt: BigInt
+  _lte: BigInt
+  _neq: BigInt
+  _nin: [BigInt!]
+}
+
+type Block {
+  """
+  The node's acceptance of this block (per node; empty if it does not accept it).
+  """
+  accepted_by(
+    """
+    The node whose view this relationship reads (default: the node of the level above; required below a node-agnostic root). It must be pinned by the request: any `node:` argument of the operation is.
+    """
+    node: String
+    where: NodeBlockFilter
+  ): [NodeBlock!]!
+  bits: BigInt!
+
+  """The block in the P2P network format."""
+  encoded_hex: Hex!
+
+  """The fees of the transactions in the block."""
+  fee_satoshis: BigInt!
+
+  """Output value minus input value of the block."""
+  generated_value_satoshis: BigInt!
+  hash: Hex!
+
+  """The 80-byte block header."""
+  header: Hex!
+  height: Int!
+  input_count: BigInt!
+  input_value_satoshis: BigInt!
+  internal_id: BigInt!
+  merkle_root: Hex!
+  nonce: BigInt!
+  output_count: BigInt!
+  output_value_satoshis: BigInt!
+  previous_block_hash: Hex!
+  size_bytes: Int!
+  timestamp: BigInt!
+  transaction_count: Int!
+
+  """The transactions of the block, by transaction_index."""
+  transactions(limit: Int, offset: Int, order_by: [BlockTransactionOrderBy!], where: BlockTransactionFilter): [BlockTransaction!]!
+  version: Int!
+}
+
+input BlockFilter {
+  _and: [BlockFilter!]
+  _not: BlockFilter
+  _or: [BlockFilter!]
+  bits: BigIntComparison
+
+  """EXISTS a transaction of the block matching."""
+  has_transaction: TransactionFilter
+  hash: HexComparison
+  height: IntComparison
+  internal_id: BigIntComparison
+  merkle_root: HexComparison
+  nonce: BigIntComparison
+  previous_block_hash: HexComparison
+  size_bytes: IntComparison
+  timestamp: BigIntComparison
+  transaction_count: IntComparison
+  version: IntComparison
+}
+
+"""
+A block that includes the transaction and that the node accepts (per node).
+"""
+type BlockInclusion {
+  """
+  When the node accepted the block (null if known only from a historical sync).
+  """
+  accepted_at: Timestamp
+  block: Block!
+  block_internal_id: BigInt!
+  transaction_index: Int
+}
+
+input BlockInclusionFilter {
+  _and: [BlockInclusionFilter!]
+  _not: BlockInclusionFilter
+  _or: [BlockInclusionFilter!]
+  block: BlockFilter
+  transaction_index: IntComparison
+}
+
+input BlockInclusionOrderBy {
+  block: BlockKeyOrderBy
+  block_internal_id: Order
+  transaction_index: Order
+}
+
+"""
+Ordering through the block relationship (its key columns, stored on the row).
+"""
+input BlockKeyOrderBy {
+  hash: Order
+  height: Order
+  internal_id: Order
+}
+
+input BlockOrderBy {
+  hash: Order
+  height: Order
+  internal_id: Order
+  size_bytes: Order
+  timestamp: Order
+  transaction_count: Order
+}
+
+"""
+One page; `has_more` signals truncation (R33). Pass `end_cursor` as `after` (transactions: `after`/`before` for the default order, `cursor` for an `order_by` page) for the next page.
+"""
+type BlockPage {
+  end_cursor: String
+  has_more: Boolean!
+  nodes: [Block!]!
+}
+
+type BlockTransaction {
+  block: Block!
+  transaction: Transaction!
+  transaction_hash: Hex!
+  transaction_index: Int!
+  transaction_internal_id: BigInt!
+}
+
+input BlockTransactionFilter {
+  _and: [BlockTransactionFilter!]
+  _not: BlockTransactionFilter
+  _or: [BlockTransactionFilter!]
+  transaction: TransactionFilter
+  transaction_index: IntComparison
+}
+
+input BlockTransactionOrderBy {
+  transaction: TransactionKeyOrderBy
+  transaction_index: Order
+  transaction_internal_id: Order
+}
+
+"""
+Per node: in a block the root's node accepts with from_height <= height < to_height, or (include_mempool, default true) in its mempool.
+"""
+input BlockWindow {
+  from_height: Int
+  include_mempool: Boolean
+  to_height: Int
+}
+
+input BooleanComparison {
+  _eq: Boolean
+  _neq: Boolean
+}
+
+"""Bytes as lowercase hexadecimal (no prefix)."""
+scalar Hex
+
+"""
+Byte comparisons (lexicographic order). `_prefix` / `_prefix_in` match leading bytes; on locking bytecode and NFT commitments they use the sort-key projections. Lists may hold up to 10,000 values (bound in chunks of 1,000).
+"""
+input HexComparison {
+  _eq: Hex
+  _gt: Hex
+  _gte: Hex
+  _in: [Hex!]
+  _is_null: Boolean
+  _lt: Hex
+  _lte: Hex
+  _neq: Hex
+  _nin: [Hex!]
+  _prefix: Hex
+  _prefix_in: [Hex!]
+}
+
+type Input {
+  input_index: Int!
+
+  """
+  The output this input spends (null when it is not stored, e.g. for a coinbase input).
+  """
+  outpoint: Output
+
+  """BigInt: a coinbase input has 4294967295."""
+  outpoint_index: BigInt!
+  outpoint_transaction_hash: Hex!
+
+  """
+  If the last instruction of the unlocking bytecode is a push, the pattern of its contents (P2SH redeem bytecode); else null.
+  """
+  redeem_bytecode_pattern: Hex
+  sequence_number: BigInt!
+
+  """The spending transaction."""
+  transaction: Transaction!
+  transaction_hash: Hex!
+  transaction_internal_id: BigInt!
+  unlocking_bytecode: Hex!
+  unlocking_bytecode_pattern: Hex!
+
+  """
+  The value of the spent output (null when it is not stored, e.g. for a coinbase input).
+  """
+  value_satoshis: BigInt
+}
+
+"""
+Predicates on one input row; `outpoint` fields bind to the same row (same-row conjunction).
+"""
+input InputFilter {
+  _and: [InputFilter!]
+  _not: InputFilter
+  _or: [InputFilter!]
+  input_index: IntComparison
+
+  """The spent output matches (no match for a coinbase input)."""
+  outpoint: OutputFilter
+  outpoint_index: BigIntComparison
+  outpoint_transaction_hash: HexComparison
+  sequence_number: BigIntComparison
+
+  """The spending transaction matches."""
+  transaction: TransactionFilter
+  transaction_hash: HexComparison
+  transaction_internal_id: BigIntComparison
+}
+
+input InputOrderBy {
+  input_index: Order
+  outpoint_index: Order
+  outpoint_transaction_hash: Order
+  sequence_number: Order
+  transaction: TransactionKeyOrderBy
+  transaction_hash: Order
+  transaction_internal_id: Order
+}
+
+"""
+One page; `has_more` signals truncation (R33). Pass `end_cursor` as `after` (transactions: `after`/`before` for the default order, `cursor` for an `order_by` page) for the next page.
+"""
+type InputPage {
+  end_cursor: String
+  has_more: Boolean!
+  nodes: [Input!]!
+}
+
+input IntComparison {
+  _eq: Int
+  _gt: Int
+  _gte: Int
+  _in: [Int!]
+  _lt: Int
+  _lte: Int
+  _neq: Int
+  _nin: [Int!]
+}
+
+"""
+A node Chaingraph follows. Its mempool and accepted blocks are per node: select them under `node(node:)` (or a relationship naming the node).
+"""
+type Node {
+  accepted_blocks(limit: Int, offset: Int, order_by: [NodeBlockOrderBy!], where: NodeBlockFilter): [NodeBlock!]!
+  first_connected_at: Timestamp
+  latest_connection_began_at: Timestamp
+  name: String!
+  protocol_version: Int!
+  unconfirmed_transaction_count: BigInt!
+  unconfirmed_transactions(limit: Int, offset: Int, order_by: [NodeTransactionOrderBy!], where: NodeTransactionFilter): [NodeTransaction!]!
+  user_agent: String!
+}
+
+"""A node's acceptance of a block."""
+type NodeBlock {
+  """Null if the block is known only from a historical sync."""
+  accepted_at: Timestamp
+  block: Block!
+  block_hash: Hex!
+  block_internal_id: BigInt!
+  height: Int!
+  node: Node!
+  node_internal_id: Int!
+}
+
+"""A node's acceptance of a block."""
+input NodeBlockFilter {
+  _and: [NodeBlockFilter!]
+  _not: NodeBlockFilter
+  _or: [NodeBlockFilter!]
+  accepted_at: TimestampComparison
+  block: BlockFilter
+  block_internal_id: BigIntComparison
+  height: IntComparison
+}
+
+input NodeBlockOrderBy {
+  accepted_at: Order
+  block: BlockKeyOrderBy
+  block_internal_id: Order
+  height: Order
+}
+
+"""
+A node's validation of a transaction (the transaction is in its mempool).
+"""
+type NodeTransaction {
+  node: Node!
+  node_internal_id: Int!
+  transaction: Transaction!
+  transaction_hash: Hex!
+  transaction_internal_id: BigInt!
+  validated_at: Timestamp
+}
+
+"""A mempool entry: the node's validation of a transaction."""
+input NodeTransactionFilter {
+  _and: [NodeTransactionFilter!]
+  _not: NodeTransactionFilter
+  _or: [NodeTransactionFilter!]
+  transaction: TransactionFilter
+  transaction_hash: HexComparison
+  transaction_internal_id: BigIntComparison
+  validated_at: TimestampComparison
+}
+
+"""
+A past validation of a transaction by a node: replaced_at is when it left the node's mempool (null: confirmed).
+"""
+type NodeTransactionHistory {
+  node: Node!
+  replaced_at: Timestamp
+  transaction_internal_id: BigInt!
+  validated_at: Timestamp
+}
+
+input NodeTransactionHistoryOrderBy {
+  internal_id: Order
+  replaced_at: Order
+  validated_at: Order
+}
+
+input NodeTransactionOrderBy {
+  transaction: TransactionKeyOrderBy
+  transaction_internal_id: Order
+  validated_at: Order
+}
+
+"""
+One page; `has_more` signals truncation (R33). Pass `end_cursor` as `after` (transactions: `after`/`before` for the default order, `cursor` for an `order_by` page) for the next page.
+"""
+type NodeTransactionPage {
+  end_cursor: String
+  has_more: Boolean!
+  nodes: [NodeTransaction!]!
+}
+
+enum Order {
+  ASC
+  DESC
+}
+
+type Output {
+  fungible_token_amount: BigInt
+  locking_bytecode: Hex!
+
+  """
+  The first byte of each instruction of the locking bytecode (pushed data excluded).
+  """
+  locking_bytecode_pattern: Hex!
+  nonfungible_token_capability: TokenCapability
+  nonfungible_token_commitment: Hex
+  output_index: Int!
+
+  """
+  Inputs spending this output, in transactions the node accepts (per node; at most one unless the node accepts a double spend in its mempool view).
+  """
+  spent_by(
+    limit: Int
+
+    """
+    The node whose view this relationship reads (default: the node of the level above; required below a node-agnostic root). It must be pinned by the request: any `node:` argument of the operation is.
+    """
+    node: String
+    order_by: [InputOrderBy!]
+    where: InputFilter
+  ): [Input!]!
+  token_category: Hex
+
+  """The creating transaction."""
+  transaction: Transaction!
+  transaction_hash: Hex!
+  transaction_internal_id: BigInt!
+  value_satoshis: BigInt!
+}
+
+"""
+Predicates on one output row (or, as `outpoint`, on the spent output of one input row). All fields of one object bind to the same row.
+"""
+input OutputFilter {
+  _and: [OutputFilter!]
+  _not: OutputFilter
+  _or: [OutputFilter!]
+  fungible_token_amount: BigIntComparison
+  locking_bytecode: HexComparison
+  nonfungible_token_capability: TokenCapabilityComparison
+  nonfungible_token_commitment: HexComparison
+  output_index: IntComparison
+
+  """
+  EXISTS an input spending this output, in a transaction the node accepts, matching (per node).
+  """
+  spent_by: InputFilter
+  token_category: HexComparison
+
+  """The creating transaction matches."""
+  transaction: TransactionFilter
+  transaction_hash: HexComparison
+  transaction_internal_id: BigIntComparison
+  value_satoshis: BigIntComparison
+}
+
+type OutputGroup {
+  aggregate: OutputGroupAggregate!
+  key: OutputGroupKey!
+}
+
+type OutputGroupAggregate {
+  count: BigInt!
+  sum: OutputGroupSum!
+}
+
+enum OutputGroupColumn {
+  LOCKING_BYTECODE
+  TOKEN_CATEGORY
+}
+
+type OutputGroupKey {
+  locking_bytecode: Hex
+  token_category: Hex
+}
+
+input OutputGroupOrder {
+  by: OutputGroupOrderField!
+  direction: Order = DESC
+}
+
+enum OutputGroupOrderField {
+  COUNT
+  KEY
+  SUM_FUNGIBLE_TOKEN_AMOUNT
+  SUM_VALUE_SATOSHIS
+}
+
+type OutputGroupSum {
+  fungible_token_amount: BigInt!
+  value_satoshis: BigInt!
+}
+
+input OutputOrderBy {
+  fungible_token_amount: Order
+  locking_bytecode: Order
+  output_index: Order
+  token_category: Order
+  transaction: TransactionKeyOrderBy
+  transaction_hash: Order
+  transaction_internal_id: Order
+  value_satoshis: Order
+}
+
+"""
+One page; `has_more` signals truncation (R33). Pass `end_cursor` as `after` (transactions: `after`/`before` for the default order, `cursor` for an `order_by` page) for the next page.
+"""
+type OutputPage {
+  end_cursor: String
+  has_more: Boolean!
+  nodes: [Output!]!
+}
+
+type Query {
+  """
+  The node's tip: its accepted block with the greatest height (with previous_block_hash for re-org detection).
+  """
+  block_tip(node: String!): Block
+
+  """
+  Blocks the node accepts (default order: height). Tip: `order_by: { height: DESC }, limit: 1`; by height: `where: { height: { _eq } }`; range: `_gte`/`_lt`; checked heights: `_in`.
+  """
+  blocks(
+    """The end_cursor of the previous page (keyset)."""
+    after: String
+    limit: Int!
+    node: String!
+
+    """
+    Rows to skip (offset pagination: discouraged, capped at 100,000; prefer `after`).
+    """
+    offset: Int
+    order_by: [BlockOrderBy!]
+    where: BlockFilter
+  ): BlockPage!
+
+  """
+  Blocks by hash (node-agnostic: per-node relationships below need `node:`). Up to 10,000 hashes.
+  """
+  blocks_by_hash(hashes: [Hex!]!): [Block!]!
+
+  """
+  Inputs of transactions the node accepts (default keyset order: transaction_internal_id, input_index).
+  """
+  inputs(
+    """The end_cursor of the previous page (keyset)."""
+    after: String
+    limit: Int!
+    node: String!
+
+    """
+    Rows to skip (offset pagination: discouraged, capped at 100,000; prefer `after`).
+    """
+    offset: Int
+    order_by: [InputOrderBy!]
+    where: InputFilter
+  ): InputPage!
+
+  """
+  The node's mempool (node_transaction), e.g. `order_by: [{ validated_at: DESC }, { transaction_internal_id: DESC }]`.
+  """
+  mempool(
+    """The end_cursor of the previous page (keyset)."""
+    after: String
+    limit: Int!
+    node: String!
+
+    """
+    Rows to skip (offset pagination: discouraged, capped at 100,000; prefer `after`).
+    """
+    offset: Int
+    order_by: [NodeTransactionOrderBy!]
+    where: NodeTransactionFilter
+  ): NodeTransactionPage!
+
+  """One node: metadata, mempool, accepted blocks."""
+  node(node: String!): Node
+
+  """
+  Every node's metadata (node-agnostic; mempool and accepted blocks: `node(node:)`).
+  """
+  nodes: [Node!]!
+
+  """
+  Outputs of transactions the node accepts (search by locking bytecode set or prefix, category, commitment prefix …; default keyset order: transaction_internal_id, output_index).
+  """
+  outputs(
+    """The end_cursor of the previous page (keyset)."""
+    after: String
+    limit: Int!
+    node: String!
+
+    """
+    Rows to skip (offset pagination: discouraged, capped at 100,000; prefer `after`).
+    """
+    offset: Int
+    order_by: [OutputOrderBy!]
+    where: OutputFilter
+  ): OutputPage!
+
+  """
+  Outputs of transactions by hash (node-agnostic: no acceptance; per-node relationships below need `node:`). Up to 10,000 hashes.
+  """
+  outputs_by_transaction_hash(transaction_hashes: [Hex!]!, where: OutputFilter): [Output!]!
+
+  """
+  The newest transaction internal_id in the request snapshot (node-agnostic).
+  """
+  transaction_watermark: BigInt
+
+  """
+  Transactions the node accepts (in a block it accepts or in its mempool), keyset on internal_id: after < internal_id < before (or any `order_by` with `cursor`).
+  """
+  transactions(
+    """internal_id lower bound (exclusive); the default order’s end_cursor."""
+    after: BigInt
+
+    """internal_id upper bound (exclusive)."""
+    before: BigInt
+
+    """The end_cursor of the previous `order_by` page."""
+    cursor: String
+    limit: Int!
+    node: String!
+
+    """Rows to skip (discouraged; capped at 100,000)."""
+    offset: Int
+    order: Order = ASC
+    order_by: [TransactionOrderBy!]
+    where: TransactionFilter
+  ): TransactionPage!
+
+  """
+  Transactions by hash (node-agnostic: no acceptance; per-node relationships below need `node:`). Up to 10,000 hashes.
+  """
+  transactions_by_hash(hashes: [Hex!]!): [Transaction!]!
+
+  """
+  Group-by aggregate over the node's unspent outputs (computed at query time).
+  """
+  unspent_output_groups(group_by: [OutputGroupColumn!]!, limit: Int!, node: String!, order_by: OutputGroupOrder, where: OutputFilter): [OutputGroup!]!
+
+  """
+  The node's unspent outputs, computed at query time from outputs minus spending inputs (UTXO tables off), keyset on (transaction_internal_id, output_index).
+  """
+  unspent_outputs(
+    """The end_cursor of the previous page (keyset)."""
+    after: String
+    limit: Int!
+    node: String!
+
+    """
+    Rows to skip (offset pagination: discouraged, capped at 100,000; prefer `after`).
+    """
+    offset: Int
+    order_by: [OutputOrderBy!]
+    where: OutputFilter
+  ): OutputPage!
+
+  """
+  The visibility watermark the request reads for the node (R32; equal watermarks = equal results).
+  """
+  watermark(node: String!): Watermark!
+}
+
+"""
+Live queries: the full result, re-delivered when it changes after the node watermark advances (one snapshot and one statement per advance, shared by every subscriber of the same document and variables).
+"""
+type Subscription {
+  """
+  The node's tip: its accepted block with the greatest height (with previous_block_hash for re-org detection).
+  """
+  block_tip(node: String!): Block
+
+  """
+  Blocks the node accepts (default order: height). Tip: `order_by: { height: DESC }, limit: 1`; by height: `where: { height: { _eq } }`; range: `_gte`/`_lt`; checked heights: `_in`.
+  """
+  blocks(
+    """The end_cursor of the previous page (keyset)."""
+    after: String
+    limit: Int!
+    node: String!
+
+    """
+    Rows to skip (offset pagination: discouraged, capped at 100,000; prefer `after`).
+    """
+    offset: Int
+    order_by: [BlockOrderBy!]
+    where: BlockFilter
+  ): BlockPage!
+
+  """
+  Inputs of transactions the node accepts (default keyset order: transaction_internal_id, input_index).
+  """
+  inputs(
+    """The end_cursor of the previous page (keyset)."""
+    after: String
+    limit: Int!
+    node: String!
+
+    """
+    Rows to skip (offset pagination: discouraged, capped at 100,000; prefer `after`).
+    """
+    offset: Int
+    order_by: [InputOrderBy!]
+    where: InputFilter
+  ): InputPage!
+
+  """
+  The node's mempool (node_transaction), e.g. `order_by: [{ validated_at: DESC }, { transaction_internal_id: DESC }]`.
+  """
+  mempool(
+    """The end_cursor of the previous page (keyset)."""
+    after: String
+    limit: Int!
+    node: String!
+
+    """
+    Rows to skip (offset pagination: discouraged, capped at 100,000; prefer `after`).
+    """
+    offset: Int
+    order_by: [NodeTransactionOrderBy!]
+    where: NodeTransactionFilter
+  ): NodeTransactionPage!
+
+  """One node: metadata, mempool, accepted blocks."""
+  node(node: String!): Node
+
+  """
+  Outputs of transactions the node accepts (search by locking bytecode set or prefix, category, commitment prefix …; default keyset order: transaction_internal_id, output_index).
+  """
+  outputs(
+    """The end_cursor of the previous page (keyset)."""
+    after: String
+    limit: Int!
+    node: String!
+
+    """
+    Rows to skip (offset pagination: discouraged, capped at 100,000; prefer `after`).
+    """
+    offset: Int
+    order_by: [OutputOrderBy!]
+    where: OutputFilter
+  ): OutputPage!
+
+  """
+  Transactions the node accepts (in a block it accepts or in its mempool), keyset on internal_id: after < internal_id < before (or any `order_by` with `cursor`).
+  """
+  transactions(
+    """internal_id lower bound (exclusive); the default order’s end_cursor."""
+    after: BigInt
+
+    """internal_id upper bound (exclusive)."""
+    before: BigInt
+
+    """The end_cursor of the previous `order_by` page."""
+    cursor: String
+    limit: Int!
+    node: String!
+
+    """Rows to skip (discouraged; capped at 100,000)."""
+    offset: Int
+    order: Order = ASC
+    order_by: [TransactionOrderBy!]
+    where: TransactionFilter
+  ): TransactionPage!
+
+  """
+  The node's unspent outputs, computed at query time from outputs minus spending inputs (UTXO tables off), keyset on (transaction_internal_id, output_index).
+  """
+  unspent_outputs(
+    """The end_cursor of the previous page (keyset)."""
+    after: String
+    limit: Int!
+    node: String!
+
+    """
+    Rows to skip (offset pagination: discouraged, capped at 100,000; prefer `after`).
+    """
+    offset: Int
+    order_by: [OutputOrderBy!]
+    where: OutputFilter
+  ): OutputPage!
+}
+
+"""A point in time, ISO-8601 in UTC with milliseconds."""
+scalar Timestamp
+
+input TimestampComparison {
+  _eq: Timestamp
+  _gt: Timestamp
+  _gte: Timestamp
+  _is_null: Boolean
+  _lt: Timestamp
+  _lte: Timestamp
+  _neq: Timestamp
+}
+
+enum TokenCapability {
+  MINTING
+  MUTABLE
+  NONE
+}
+
+input TokenCapabilityComparison {
+  _eq: TokenCapability
+  _in: [TokenCapability!]
+  _is_null: Boolean
+  _neq: TokenCapability
+  _nin: [TokenCapability!]
+}
+
+type Transaction {
+  """
+  Per node: the authchain from this transaction (v1 `collect_authchains` at the node's view: output 0 followed through spends the node accepts, to the unspent authhead). At most one element.
+  """
+  authchains(
+    """
+    The node whose view this relationship reads (default: the node of the level above; required below a node-agnostic root). It must be pinned by the request: any `node:` argument of the operation is.
+    """
+    node: String
+  ): [Authchain!]!
+
+  """
+  Blocks that include the transaction and that the node accepts (per node).
+  """
+  block_inclusions(
+    limit: Int
+
+    """
+    The node whose view this relationship reads (default: the node of the level above; required below a node-agnostic root). It must be pinned by the request: any `node:` argument of the operation is.
+    """
+    node: String
+    offset: Int
+    order_by: [BlockInclusionOrderBy!]
+    where: BlockInclusionFilter
+  ): [BlockInclusion!]!
+
+  """Outputs with value 0 or a locking bytecode beginning with OP_RETURN."""
+  data_carrier_outputs(limit: Int, offset: Int, order: Order = ASC, order_by: [OutputOrderBy!], where: OutputFilter): [Output!]!
+
+  """The transaction in the P2P network format."""
+  encoded_hex: Hex!
+
+  """Input value minus output value (0 for a coinbase transaction)."""
+  fee_satoshis: BigInt!
+  hash: Hex!
+
+  """Output 0."""
+  identity_output(where: OutputFilter): Output
+  input_count: Int!
+
+  """
+  The value of the outputs the inputs spend (outputs not stored count 0).
+  """
+  input_value_satoshis: BigInt!
+  inputs(limit: Int, offset: Int, order: Order = ASC, order_by: [InputOrderBy!], where: InputFilter): [Input!]!
+  internal_id: BigInt!
+  is_coinbase: Boolean!
+  locktime: BigInt!
+
+  """
+  The node's past validations of the transaction (mempool history: replaced or confirmed).
+  """
+  node_validation_timeline(
+    limit: Int
+
+    """
+    The node whose view this relationship reads (default: the node of the level above; required below a node-agnostic root). It must be pinned by the request: any `node:` argument of the operation is.
+    """
+    node: String
+    offset: Int
+    order_by: [NodeTransactionHistoryOrderBy!]
+  ): [NodeTransactionHistory!]!
+
+  """The node's current validation (the transaction is in its mempool)."""
+  node_validations(
+    limit: Int
+
+    """
+    The node whose view this relationship reads (default: the node of the level above; required below a node-agnostic root). It must be pinned by the request: any `node:` argument of the operation is.
+    """
+    node: String
+    where: NodeTransactionFilter
+  ): [NodeTransaction!]!
+  output_count: Int!
+  output_value_satoshis: BigInt!
+  outputs(limit: Int, offset: Int, order: Order = ASC, order_by: [OutputOrderBy!], where: OutputFilter): [Output!]!
+
+  """Output 1 (null if there is none)."""
+  signing_output(where: OutputFilter): Output
+  size_bytes: Int!
+  version: Int!
+}
+
+"""
+Predicates on one transaction. `has_output` / `has_input` are EXISTS over one output/input row; `block_window`, `in_block` and `in_mempool` are per node.
+"""
+input TransactionFilter {
+  _and: [TransactionFilter!]
+  _not: TransactionFilter
+  _or: [TransactionFilter!]
+  block_window: BlockWindow
+
+  """EXISTS an input of the transaction matching the filter."""
+  has_input: InputFilter
+
+  """EXISTS an output of the transaction matching the filter."""
+  has_output: OutputFilter
+  hash: HexComparison
+
+  """In a block the node accepts that matches (per node)."""
+  in_block: BlockFilter
+
+  """In (true) or not in (false) the node's mempool."""
+  in_mempool: Boolean
+  input_count: IntComparison
+  internal_id: BigIntComparison
+  is_coinbase: BooleanComparison
+  locktime: BigIntComparison
+  output_count: IntComparison
+  output_value_satoshis: BigIntComparison
+  size_bytes: IntComparison
+  version: IntComparison
+}
+
+"""
+Ordering through the transaction relationship (its key columns, stored on the row).
+"""
+input TransactionKeyOrderBy {
+  hash: Order
+  internal_id: Order
+}
+
+input TransactionOrderBy {
+  hash: Order
+  input_count: Order
+  internal_id: Order
+  locktime: Order
+  output_count: Order
+  output_value_satoshis: Order
+  size_bytes: Order
+  version: Order
+}
+
+"""
+One page; `has_more` signals truncation (R33). Pass `end_cursor` as `after` (transactions: `after`/`before` for the default order, `cursor` for an `order_by` page) for the next page.
+"""
+type TransactionPage {
+  end_cursor: String
+  has_more: Boolean!
+  nodes: [Transaction!]!
+}
+
+"""
+The visibility watermark the request reads at (R32): it moves when the node's view changes (block, re-org, mempool).
+"""
+type Watermark {
+  node: String!
+
+  """
+  The node's watermark (a commit sequence; compare for equality / order only).
+  """
+  visible: BigInt!
+
+  """The node-agnostic watermark."""
+  visible0: BigInt!
+}

@@ -447,7 +447,7 @@ export const evalBlock = (
 const inWindow = (oracle: Oracle, hash: string, window: BlockWindow) =>
   (oracle.acceptance.get(hash) ?? []).some((blockId) => {
     if (blockId === 0n) return window.include_mempool !== false;
-    const {height} = oracle.blocks.get(blockId)!;
+    const { height } = oracle.blocks.get(blockId)!;
     return (
       (!given(window.from_height) || height >= BigInt(window.from_height)) &&
       (!given(window.to_height) || height < BigInt(window.to_height))

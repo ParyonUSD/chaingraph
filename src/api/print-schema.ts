@@ -1,7 +1,5 @@
-/** `yarn api:schema`: print the spike's SDL (for typed clients, R23). */
-import { printSchema } from 'graphql';
+/** `yarn api:schema`: print the v2 SDL (for typed clients, R23). */
+import { schemaSdl } from './sdl.js';
 
-import { schema } from './schema.js';
-
-// eslint-disable-next-line no-console
-console.log(printSchema(schema));
+ 
+process.stdout.write(schemaSdl());
