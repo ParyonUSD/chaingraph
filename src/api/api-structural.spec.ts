@@ -216,6 +216,42 @@ e2e(
       t.is(row.accepted_two, two, `${name}: accepted(node-two)`);
     }
 
+    /* heights are joined only when asked for (an order or a filter on them) */
+    const heights = await gql<{
+      transactions_by_hash: {
+        hash: string;
+        by_height: { block: { height: number } }[];
+        at_2: { block: { hash: string } }[];
+        at_3: { block: { hash: string } }[];
+      }[];
+    }>(
+      `query($hashes: [Hex!]!) {
+        transactions_by_hash(hashes: $hashes) {
+          hash
+          by_height: block_inclusions(order_by: { block: { height: DESC } }) { block { height } }
+          at_2: block_inclusions(where: { block: { height: { _eq: 2 } } }) { block { hash } }
+          at_3: block_inclusions(where: { block: { height: { _gte: 3 } } }) { block { hash } }
+        }
+      }`,
+      { hashes: [shared.hash, z.hash] }
+    );
+    const heightRows = new Map(
+      heights.transactions_by_hash.map((row) => [row.hash, row])
+    );
+    t.deepEqual(
+      heightRows.get(shared.hash)!.at_2.map((row) => row.block.hash),
+      [block2a.hash, block2b.hash]
+    );
+    t.deepEqual(heightRows.get(shared.hash)!.at_3, []);
+    t.deepEqual(
+      heightRows.get(z.hash)!.at_3.map((row) => row.block.hash),
+      [block3s.hash]
+    );
+    t.deepEqual(
+      heightRows.get(z.hash)!.by_height.map((row) => row.block.height),
+      [3]
+    );
+
     /* ---- spent_by ---- */
     interface Spend {
       transaction: { hash: string };
