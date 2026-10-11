@@ -2050,26 +2050,49 @@ export const blockCandidates = (
  */
 export const unindexed = (column: string) => `identity(${column})`;
 
+/** Outputs of `outputs` whose outpoint is not among `spent` (columns outpoint_transaction_hash, outpoint_index). */
+const antiJoined = (outputs: string, spent: string) =>
+  `SELECT o.* FROM (${outputs}) AS o
+  LEFT ANTI JOIN (${spent}) AS s
+    ON s.outpoint_transaction_hash = o.transaction_hash AND s.outpoint_index = o.output_index`;
+
 /**
  * Per-node unspent outputs at query time (UTXO tables off, Chaingraph v1's
  * definition): outputs of transactions the node accepts, minus outpoints
- * spent by an input of a transaction the node accepts. With a filter, the
- * spends of matching outputs come from the spend relation (spend index up to
- * the snapshot's spend watermark, the join above it), and the acceptance
- * checks read only the candidates' acceptance rows.
+ * spent by an input of a transaction the node accepts. A row source (output
+ * rows) and a predicate over it. With a filter, the spends of matching
+ * outputs come from the spend relation (spend index up to the snapshot's
+ * spend watermark, the join above it), and the acceptance checks read only
+ * the candidates' acceptance rows.
+ *
+ * The large forms (no filter, or a filter no index narrows) subtract the
+ * spent set with a hash anti-join (`LEFT ANTI JOIN`; the server's default
+ * join_algorithm `direct,parallel_hash,hash` takes parallel_hash): chipnet
+ * copy, the node's whole UTXO set 5.1 s with `NOT IN` → 1.6 s, a value
+ * filter 2.4 → 1.8 s (phase2-api.md §6.5; large-aggregations.md: 3–4×).
+ * A selective filter keeps `NOT IN` over its few thousand spends (the
+ * anti-join measured within noise there: L12, L13, L20, L25, L31, L32, L36,
+ * L37).
  */
-export const unspentOutputPredicate = (
+export const unspentOutputRows = (
   sql: Sql,
   filter: OutputFilter | null | undefined,
   node?: number
-) => {
+): { source: string; where: string } => {
+  const output = sql.view('output_at');
   const matching = outputPredicate(sql, filter, outputRowColumns, node);
   if (matching === '1') {
-    const spent = `SELECT outpoint_transaction_hash, outpoint_index FROM ${sql.view(
-      'input_at'
-    )} WHERE transaction_hash IN (${sql.accepted(node)})`;
-    return `transaction_hash IN (${sql.accepted(node)})
-  AND (transaction_hash, output_index) NOT IN (${spent})`;
+    return {
+      source: antiJoined(
+        `SELECT * FROM ${output} WHERE transaction_hash IN (${sql.accepted(
+          node
+        )})`,
+        `SELECT outpoint_transaction_hash, outpoint_index FROM ${sql.view(
+          'input_at'
+        )} WHERE transaction_hash IN (${sql.accepted(node)})`
+      ),
+      where: '1',
+    };
   }
   const selective = outputFilterIsSelective(filter);
   /*
@@ -2110,18 +2133,27 @@ export const unspentOutputPredicate = (
         )} UNION ALL SELECT transaction_hash FROM ${spending}`
       )
     );
-    return `${unindexed(
-      'transaction_hash'
-    )} IN (SELECT transaction_hash FROM ${accepted})
+    return {
+      source: output,
+      where: `${unindexed(
+        'transaction_hash'
+      )} IN (SELECT transaction_hash FROM ${accepted})
   AND (${unindexed(
     'transaction_hash'
   )}, output_index) NOT IN (SELECT outpoint_transaction_hash, outpoint_index FROM ${spending}
     WHERE transaction_hash IN (SELECT transaction_hash FROM ${accepted}))
-  AND (${matching})`;
+  AND (${matching})`,
+    };
   }
-  return `transaction_hash IN (${sql.accepted(node)})
-  AND (transaction_hash, output_index) NOT IN (SELECT outpoint_transaction_hash, outpoint_index FROM (${spends}) WHERE transaction_hash IN (${sql.accepted(
-    node
-  )}))
-  AND (${matching})`;
+  return {
+    source: antiJoined(
+      `SELECT * FROM ${output} WHERE transaction_hash IN (${sql.accepted(
+        node
+      )}) AND (${matching})`,
+      `SELECT outpoint_transaction_hash, outpoint_index FROM (${spends}) WHERE transaction_hash IN (${sql.accepted(
+        node
+      )})`
+    ),
+    where: '1',
+  };
 };

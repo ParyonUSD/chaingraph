@@ -11,7 +11,7 @@ import {
   snapshotParameterNames,
   Sql,
   transactionPredicate,
-  unspentOutputPredicate,
+  unspentOutputRows,
 } from './sql.js';
 
 const snapshot: VisibilitySnapshot = {
@@ -44,10 +44,10 @@ test('client values are bound as pN parameters, never in SQL text; snapshot para
       ],
       internal_id: { _gt: 10n },
     }),
-    unspentOutputPredicate(sql, {
+    unspentOutputRows(sql, {
       nonfungible_token_capability: { _eq: 'mutable' },
       token_category: { _eq: 'aa'.repeat(32) },
-    }),
+    }).where,
   ].join('\n');
   t.false(text.includes(hostileHex));
   t.false(text.includes('DROP'));
@@ -75,9 +75,7 @@ test('client values are bound as pN parameters, never in SQL text; snapshot para
 
 test('hash-typed comparisons reject values that are not 32 bytes', (t) => {
   const sql = new Sql(snapshot);
-  t.throws(() =>
-    unspentOutputPredicate(sql, { token_category: { _eq: 'aa' } })
-  );
+  t.throws(() => unspentOutputRows(sql, { token_category: { _eq: 'aa' } }));
 });
 
 test('operationNodeNames reads root node arguments from literals, variables and fragments', (t) => {

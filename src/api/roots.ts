@@ -59,7 +59,7 @@ import {
   transactionCandidates,
   transactionPredicate,
   unindexed,
-  unspentOutputPredicate,
+  unspentOutputRows,
 } from './sql.js';
 
 /** Page-size caps per root (R33); `limit` above the cap is rejected (never silently cut). */
@@ -333,13 +333,14 @@ export const runUnspentOutputs = async (
   label: string,
   args: OutputsArgs,
   sels: readonly Sel[]
-) =>
-  pageOf(
+) => {
+  const rows = unspentOutputRows(env.sql, args.where, env.ctx.node);
+  return pageOf(
     env,
     label,
     OutputEntity,
-    env.sql.view('output_at'),
-    [unspentOutputPredicate(env.sql, args.where, env.ctx.node)],
+    rows.source,
+    [rows.where],
     rootOrder(
       orderTerms(outputOrder, args.order_by),
       outputDefaultOrder,
@@ -349,6 +350,7 @@ export const runUnspentOutputs = async (
     sels,
     maxLimits.outputs
   );
+};
 
 /* ------------------------------------------------------------------ */
 /* inputs                                                               */
@@ -790,8 +792,8 @@ export const rowSets = {
   unspentOutputs: (
     env: RootEnv,
     where: OutputFilter | null | undefined
-  ): RowSet => ({
-    source: viewSource(env.sql.view('output_at')),
-    where: [unspentOutputPredicate(env.sql, where, env.ctx.node)],
-  }),
+  ): RowSet => {
+    const rows = unspentOutputRows(env.sql, where, env.ctx.node);
+    return { source: rows.source, where: [rows.where] };
+  },
 };

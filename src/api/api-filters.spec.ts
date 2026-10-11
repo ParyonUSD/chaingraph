@@ -43,16 +43,16 @@ const sorted = (values: readonly string[]) => [...values].sort();
 /** Every page of a root (keys of its rows). */
 const walk = async (
   env: Env,
-  root: 'inputs' | 'outputs' | 'transactions',
+  root: 'inputs' | 'outputs' | 'transactions' | 'unspent_outputs',
   node: string,
   where: unknown
 ) => {
   const select =
     root === 'transactions'
       ? 'hash'
-      : root === 'outputs'
-      ? 'transaction_hash output_index'
-      : 'transaction_hash input_index';
+      : root === 'inputs'
+      ? 'transaction_hash input_index'
+      : 'transaction_hash output_index';
   const keys: string[] = [];
   let after: string | null = null;
   for (let page = 0; page < 50; page += 1) {
@@ -66,9 +66,9 @@ const walk = async (
       `query($node: String!, $where: ${
         root === 'transactions'
           ? 'TransactionFilter'
-          : root === 'outputs'
-          ? 'OutputFilter'
-          : 'InputFilter'
+          : root === 'inputs'
+          ? 'InputFilter'
+          : 'OutputFilter'
       }, $after: ${root === 'transactions' ? 'BigInt' : 'String'}) {
         r: ${root}(node: $node, limit: 7, after: $after, where: $where) { has_more end_cursor nodes { ${select} } }
       }`,
@@ -90,6 +90,8 @@ const walk = async (
 };
 
 const outputFilters = (c0: string): OutputFilter[] => [
+  /* no condition: the unfiltered unspent form (anti-join over every spend) */
+  {},
   { output_index: { _eq: 1 } },
   { output_index: { _in: [0, 2, 4] }, value_satoshis: { _gte: 800n } },
   { output_index: { _nin: [0, 1, 2, 3] }, token_category: { _eq: paryon } },
@@ -313,6 +315,23 @@ e2e(
           sorted(actual),
           sorted(expectedOutputs(oracle, filter)),
           `${node} outputs ${JSON.stringify(variables(filter))}`
+        );
+        checked += 1;
+        /* unspent at query time: every path (no filter, selective NOT IN, the anti-join forms) */
+        const spent = new Set(
+          oracle.inputs
+            .filter((input) => accepted(oracle, input.transaction_hash))
+            .map(
+              (input) =>
+                `${input.outpoint_transaction_hash}:${input.outpoint_index}`
+            )
+        );
+        t.deepEqual(
+          sorted(await walk(env, 'unspent_outputs', node, variables(filter))),
+          sorted(
+            expectedOutputs(oracle, filter).filter((key) => !spent.has(key))
+          ),
+          `${node} unspent_outputs ${JSON.stringify(variables(filter))}`
         );
         checked += 1;
       }
