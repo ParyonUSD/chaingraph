@@ -1,7 +1,7 @@
 # X3 MonitorForPayments (v1: v1/X03-MonitorForPayments.graphql)
 # status: works
 # chipnet equality: equal (v1 39 rows in 1 pages, v2 39 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 148.8 ms; v1 Hasura/Postgres 297.1 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 55.7 ms; v1 Hasura/Postgres 294.7 ms
 subscription MonitorForPayments($node: String!, $lockingBytecodes: [Hex!]!) {
   search_output: outputs(node: $node, limit: 5000, where: { locking_bytecode: { _in: $lockingBytecodes } }, order_by: { locking_bytecode: ASC }) {
     has_more

@@ -1,7 +1,7 @@
 # X12 GetJonathan100CashAccount (v1: v1/X12-GetJonathan100CashAccount.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 190.4 ms; v1 Hasura/Postgres 2.9 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 116.0 ms; v1 Hasura/Postgres 2.8 ms
 query GetJonathan100CashAccount($node: String!, $prefix: Hex!, $height: Int!) {
   search_output_prefix: outputs(node: $node, limit: 5000, where: { locking_bytecode: { _prefix: $prefix }, transaction: { in_block: { height: { _eq: $height } } } }) {
     has_more

@@ -1,7 +1,7 @@
 # X2 MonitorSyncTips (v1: v1/X02-MonitorSyncTips.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 79.1 ms; v1 Hasura/Postgres 1.6 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 28.3 ms; v1 Hasura/Postgres 1.6 ms
 subscription MonitorSyncTips($node: String!) {
   node(node: $node) {
     name

@@ -40,7 +40,11 @@ const header = (result: CatalogueResult, expect: string | undefined) => {
   const latency =
     result.v2P50 === undefined
       ? ''
-      : `\n# latency (chipnet_ch_pp2, p50 warm, first page): v2 ${result.v2P50.toFixed(
+      : `\n# latency (${
+          process.env.CHAINGRAPH_API_CATALOGUE_LABEL ??
+          process.env.CHAINGRAPH_CLICKHOUSE_DATABASE ??
+          'chipnet'
+        }, p50 warm, first page): v2 ${result.v2P50.toFixed(
           1
         )} ms; v1 Hasura/Postgres ${result.v1P50?.toFixed(1) ?? '?'} ms`;
   return `# status: ${status}\n# chipnet equality: ${result.equality} (v1 ${

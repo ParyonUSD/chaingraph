@@ -1,7 +1,7 @@
 # L32 RedemptionContractUtxos (v1: v1/L32-RedemptionContractUtxos.graphql)
 # status: works
 # chipnet equality: equal (v1 0 rows in 1 pages, v2 0 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 117.4 ms; v1 Hasura/Postgres 2.9 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 48.6 ms; v1 Hasura/Postgres 3.6 ms
 query RedemptionContractUtxos($redemptionTokenId: Hex!, $redemptionContractLockingBytecode: Hex!, $node: String!, $limit: Int!, $after: String) {
   output: unspent_outputs(node: $node, limit: $limit, after: $after, where: {
     token_category: { _eq: $redemptionTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $redemptionContractLockingBytecode }

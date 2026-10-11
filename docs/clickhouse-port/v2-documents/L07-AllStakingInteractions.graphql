@@ -1,7 +1,7 @@
 # L7 AllStakingInteractions (v1: v1/L07-AllStakingInteractions.graphql)
 # status: works
 # chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 192 rows in 1 pages, v2 192 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 244.7 ms; v1 Hasura/Postgres 15.7 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 153.2 ms; v1 Hasura/Postgres 16.4 ms
 query AllStakingInteractions($poolTokenId: Hex, $poolLockingBytecode: Hex, $fromBlockHeight: Int, $toBlockHeight: Int, $node: String!, $limit: Int!, $after: BigInt) {
   transaction: transactions(node: $node, limit: $limit, after: $after, where: {
     has_input: { outpoint: { token_category: { _eq: $poolTokenId }, locking_bytecode: { _eq: $poolLockingBytecode }, nonfungible_token_capability: { _eq: MINTING } } }

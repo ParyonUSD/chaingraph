@@ -1,7 +1,7 @@
 # L17 finalizedRedemptions (v1: v1/L17-finalizedRedemptions.graphql)
 # status: works
 # chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 5 rows in 1 pages, v2 5 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 115.7 ms; v1 Hasura/Postgres 85.7 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 63.1 ms; v1 Hasura/Postgres 86.3 ms
 query finalizedRedemptions($paryonTokenId: Hex, $node: String!, $limit: Int!, $after: String) {
   input: inputs(node: $node, limit: $limit, after: $after, where: {
     outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _eq: "03" } }

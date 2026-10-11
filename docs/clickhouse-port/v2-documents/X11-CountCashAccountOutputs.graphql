@@ -1,7 +1,7 @@
 # X11 CountCashAccountOutputs (v1: v1/X11-CountCashAccountOutputs.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 54.8 ms; v1 Hasura/Postgres 2.0 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 27.1 ms; v1 Hasura/Postgres 2.7 ms
 query CountCashAccountOutputs($node: String!, $prefix: Hex!) {
   search_output_prefix_aggregate: outputs_aggregate(node: $node, where: { locking_bytecode: { _prefix: $prefix } }) {
     aggregate { count }

@@ -1,8 +1,8 @@
-<!-- cspell:ignore chipnet paryon authchain authchains authhead bytecode pushdata unhex subquery denormalised setof normalisation pothos materialised unreviewed bitjson optimisation -->
+<!-- cspell:ignore chipnet paryon authchain authchains authhead bytecode pushdata unhex subquery denormalised setof normalisation pothos materialised unreviewed bitjson optimisation analysed backfill backfilled chipcopy -->
 
-# Phase 2 stage 1: the Chaingraph v2 GraphQL API
+# Phase 2: the Chaingraph v2 GraphQL API (stage 1: requirements; stage 2: performance)
 
-Date 2026-10-11. GraphQL Yoga + Pothos over the ClickHouse store (owner decision D-2), local only. Inputs:
+Date 2026-10-11 (stage 2: §6, the same day). GraphQL Yoga + Pothos over the ClickHouse store (owner decision D-2), local only. Inputs:
 `paryon_kubernetes-consolidation/docs/chaingraph/plans/clickhouse-api-requirements-inventory.md` (R1–R40, documents
 L1–L47, X1–X16), `clickhouse-api-options.md` (spike criteria), [phase2-spike.md](phase2-spike.md),
 [fix-pass-3.md](fix-pass-3.md) §4–5, [spend-index.md](spend-index.md),
@@ -23,6 +23,16 @@ query time, spent-output attributes from the output join or the spend index).
 | G5 live and ops (R31–R34, R37, R38) | `eaef874` |
 | Candidates materialised per statement; authchain acceptance once | `d4ecdb0` |
 | This document, catalogue headers with latency | docs commit |
+| **Stage 2 (performance, §6):** gate inlined into the compiled SQL | `f52536c` |
+| Levels as scalar subqueries, nested in TypeScript | `0147973` |
+| Block candidates; one acceptance read for unspent outputs | `8b971f6` |
+| block_inclusions joins block_transaction only for transaction_index | `6f34476` |
+| Nested limits as `LIMIT n BY` | `b8f1206` |
+| Acceptance filters below the collapsing GROUP BY | `1d152f4` |
+| Authchain index (080) and the segment walk | `00d6267` |
+| Intersected output-side candidates; implied acceptance | `f0f0bd4` |
+| Acceptance sets out of output primary-key analysis | `1433bcc` |
+| Stage 2 docs, catalogue headers | docs commit |
 
 **Result.** Every MUST requirement is implemented with a test that compares it with an independent computation. All
 **63 catalogue documents (L1–L47, X1–X16) run on chipnet and equal Chaingraph v1** (Hasura over the Postgres reference
@@ -44,6 +54,8 @@ rows in v2's own internal-id order (the two stores were synced independently, so
 | send_transaction (through the agent) | `src/api/send.ts` |
 | Request snapshot (multi-node), statement environments | `src/api/db.ts` |
 | Live-query hub (unchanged from the spike) | `src/api/live.ts` |
+| Inlined pinned-view gate (stage 2) | `src/store/clickhouse/visibility.ts` `inlinePinnedView` |
+| Authchain index (stage 2): table, filler step, backfill | `ddl/080_authchain.sql`, `src/store/clickhouse/authchain-index.ts`, `bin/chaingraph-clickhouse-authchain-backfill.js` |
 | Catalogue (63 documents), runner, chipnet spec | [`v2-documents/`](v2-documents), `src/api/catalogue.ts`, `catalogue-run.ts`, `catalogue.spec.ts` |
 | Specs | `api-roots.spec.ts` (G1), `api-filters.spec.ts` + `spec-oracle.ts` (G2), `api-shape.spec.ts` (G3), `api-values.spec.ts` + `bytecode.spec.ts` (G4), `api-ops.spec.ts` (G5), `catalogue.spec.ts` (chipnet), spike `api.spec.ts`, `sql.spec.ts`, `schema.spec.ts` |
 
@@ -51,23 +63,38 @@ No new npm packages: the plugins are small Yoga/envelop plugins of our own.
 
 ### 1.1 The compiler
 
-The spike joined fixed relationships onto the root page. It now handles any selection:
+The spike joined fixed relationships onto the root page. It now handles any selection, in one statement per root
+field (stage 2 shape, §6.1):
 
-- The root page is a `MATERIALIZED` CTE (`page`). Each selected relationship is a further `MATERIALIZED` CTE (a
-  *level*) that reads a pinned view restricted to the parent level's keys (`… WHERE transaction_hash IN (SELECT hash
-  FROM page)`), applies the relationship's `where`, and orders and limits per parent with
-  `row_number() OVER (PARTITION BY parent key ORDER BY …)`.
-- Levels fold back bottom-up: each groups its rows by parent key into `arraySort(x -> x.1, groupArray(tuple(rn, …)))`
-  and is `LEFT JOIN`ed onto its parent. One statement returns one tuple per root row with everything nested; resolvers
-  only read prefetched data, so a live query result is computed once and fanned out.
+- The root page and each selected relationship (a *level*) are scalar subqueries of the statement's `WITH` clause,
+  each returning all its rows as one array of tuples (`groupArray(tuple(…))`). A level reads its source restricted to
+  its parent level's keys (`… IN (SELECT tupleElement(__r, i) FROM (SELECT arrayJoin(<parent array>) AS __r))`),
+  applies the relationship's `where`, keeps the top `offset + limit` rows per parent with `ORDER BY … LIMIT n BY
+  parent key`, and numbers them (`row_number() OVER (PARTITION BY parent key ORDER BY …)`). The statement returns the
+  arrays in one row; `decode` nests the rows in TypeScript (parent and child keys matched as `hex(toString(key))`,
+  children in row-number order, the page in its `ORDER BY` order). Resolvers only read prefetched data, so a live
+  query result is computed once and fanned out.
+- A relationship whose source runs a recursive CTE (authchains) and every level below it are evaluated in the
+  statement's pipeline instead: their rows are `MATERIALIZED` CTEs and their arrays cross-joined one-row subqueries
+  of the final `SELECT` (a scalar subquery containing a recursion is re-evaluated at every reference).
+- `MATERIALIZED` CTEs (candidates, `acceptedRows`, the authchain walk) are always statement-level `WITH` items
+  (`Sql.cte`), never nested in a subquery.
 - Computed fields (`encoded_hex`, `fee_satoshis`, `locking_bytecode_pattern`, `header`, …) declare hidden selections
-  (e.g. `__enc_inputs`) that the compiler adds; their resolvers compute the value in TypeScript.
+  (e.g. `__enc_inputs`) that the compiler adds; their resolvers compute the value in TypeScript. A relationship
+  source receives the raw columns its level reads, so it can leave out a join nothing selected needs
+  (`block_inclusions` joins `block_transaction` only for `transaction_index`).
 - A per-node relationship takes `node:` (default: the node of the level above). Under a node-agnostic root it must name
   one; `Sql.nodeView` refuses otherwise. Every `node:` argument of the operation, at any depth, is pinned by the one
   request snapshot; a relationship naming another node reads that node's `visible(n)` (`node_<id>`/`visible_<id>`
   parameters) in the same statement.
 - Rows of all levels of one root statement are capped (`maxResultRows`, default 500,000): above it the request fails
   with `RESULT_TOO_LARGE`, never a silent cut.
+- **Snapshot contract (stage 2 change).** The statements no longer name the pinned `*_at` views: they read each
+  view's base table with the view's gate predicate inlined (`visibility.ts` `inlinePinnedView`, a mirror of
+  `050_views.sql`/`070_spend.sql`/`080_authchain.sql`; `visibility.spec.ts` proves view = inlined form for every
+  view with fences, inline and overflow voids and a committed tail). The parameters are unchanged and still come
+  only from `readSnapshot(Multi)`; the text leaves out terms that are constant for the bound arrays (an empty tail or
+  void, no void overflow). The views stay for ad-hoc readers; a change to a view must be made in both places.
 
 ### 1.2 Acceptance without reading a node's whole acceptance set
 
@@ -85,6 +112,21 @@ outputs by script/category/transaction, an EXISTS over spends), that conjunct is
 
 Chipnet, busy category (128,695 transactions): unrestricted 420 ms, restricted 95 ms. The block-window documents
 (L1, L4–L8, L10, L11) were 500–800 ms before the candidates were materialised and passed into the semi-joins (§6).
+
+Stage 2 additions:
+- The candidate filter is applied to the base `tx_acceptance` rows, below the collapsing `GROUP BY`
+  (`inlinePinnedView`'s key filter; same rows), so the primary key is used even inside a recursive CTE step, where
+  ClickHouse does not push the outer filter down.
+- Transactions: every hash-list and `has_output` conjunct is a candidate set and they are intersected (L1: 1,441
+  candidates of one conjunct, 7 of both). Spend-relation conjuncts stay first-found only (intersecting a 144k-spend
+  category cost more than it saved). A positive `block_window` / `in_block` / `in_mempool` implies acceptance: the
+  root's own acceptance check is left out.
+- Blocks: a positive conjunct on `hash` or `height` restricts the node's `node_block` read to those blocks.
+- Unspent outputs with a selective filter: one acceptance read for the transactions that created a matching output
+  and those that spent one (L12: 6.2M → 3.3M rows read).
+- Where output rows come through a category or script projection, the acceptance / candidate sets on
+  `transaction_hash` are written on `identity(transaction_hash)`: otherwise ClickHouse analyses them against all
+  61k marks of output's primary key (granularity 128) before choosing the projection (L12: 40 of 90 ms).
 
 ### 1.3 Filters
 
@@ -201,7 +243,7 @@ and discouraged; unbounded lists need a `limit` or hit the row cap.
 | R26 computed | done | §2 | G4 vs raw rows; X1, X6, X7 equal v1 |
 | R27 patterns | done | TS port, shared vectors | 32 vectors (and the Postgres macros now read them); X5, X6 equal v1 |
 | R28 encodings | done | TS encoders | libauth, genesis; chipnet: sha256d(encoded) = hash for 20 tx, 3 blocks; X6–X8, X13 equal v1 |
-| R29 authchains | done | recursive CTE per node | G4 (node-two shorter); X6 (776-long chain), X13 equal v1 |
+| R29 authchains | done | authchain index (080, heavy-path segments) + segment walk per node (§6.3) | G4 (node-two shorter); `authchain-index.spec.ts` (vs a link-by-link walk: merges, a conflict, a lagging node, tail above the spend watermark, every spend watermark, backfill, no index); X6 (776-long chain), X13 equal v1 |
 | R30 search | done | `outputs` + `outputs_aggregate` | X3, X9–X13 equal v1 |
 | R31 live queries | done | all per-node roots are subscriptions, on the shared hub | G5: the 12 live documents, pushes only on change, 1 run per topic per advance |
 | R32 signals | done | `watermark(node)`, signal documents | G5; L40–L47 equal v1 |
@@ -240,6 +282,11 @@ docker run -d --name ch1-api-hasura -p 18080:8080 --entrypoint graphql-engine \
 docker exec ch1-api-hasura hasura-cli metadata apply --endpoint http://localhost:8080 --admin-secret … --project /hasura-data --skip-update-check
 ```
 
+The ClickHouse database needs the current DDL (`bin/chaingraph-clickhouse-ddl.js`, incl. `080_authchain.sql`) and,
+if its spend index predates the authchain index, the backfill (`bin/chaingraph-clickhouse-authchain-backfill.js`);
+the stage-2 run used `ch1_api_chipcopy`, a scratch copy of the read-only `chipnet_ch_pp2` prepared that way (§6),
+and `CHAINGRAPH_API_CATALOGUE_LABEL` names the database in the headers.
+
 The runner walks every page on both sides (v1 as the library does: keyset, composite keyset,
 offset), normalises (no `\x`; integers as strings; internal ids and per-sync timestamps dropped; nested lists as sets;
 v1's single-row lists unwrapped) and compares.
@@ -270,99 +317,211 @@ scratch specs cover the two-node differences (node-two lacks a block and the mem
 
 ## 6. Latency (chipnet, p50 of 9 warm requests, first page)
 
-Host: MacBook Pro (Apple M5 Pro), Docker VM 14 CPUs, ClickHouse 26.8 (`ch1-local`, database `chipnet_ch_pp2`,
-UTXO off, spend index caught up), Postgres 14 (`ch1-pg`, `chipnet_pg`) behind Hasura v2.49.5 (admin role, no row
-limits). Both at height 327,396, 2,847,058 transactions, 16 mempool transactions. v2 is in process (`yoga.fetch`,
-request snapshot included, response cache off); v1 over HTTP to Hasura. p50 of 9 sequential runs after 2 warm-ups;
-"first page" for paged documents (the equality run walks every page). Classes as the inventory: A < 20 ms, B 20–200,
-C 200 ms–1 s, D 1–3 s, E > 3 s. Raw results: `/tmp/chaingraph-v2-catalogue.json` (not committed).
+Host: MacBook Pro (Apple M5 Pro), Docker VM 14 CPUs, ClickHouse 26.8 (`ch1-local`, UTXO off, spend index caught up),
+Postgres 14 (`ch1-pg`, `chipnet_pg`) behind Hasura v2.49.5 (admin role, no row limits). Both at height 327,396,
+2,847,058 transactions, 16 mempool transactions. v2 is in process (`yoga.fetch`, request snapshot included,
+response cache off); v1 over HTTP to Hasura. p50 of 9 sequential runs after 2 warm-ups; "first page" for paged
+documents (the equality run walks every page). Classes as the inventory: A < 20 ms, B 20–200, C 200 ms–1 s,
+D 1–3 s, E > 3 s. Raw results stay local (`/tmp/chaingraph-v2-catalogue.json`, not committed).
 
-Summary: median v2 136 ms, v1 83 ms; v2 classes B 50, C 12, E 1 (X6); v1 classes A 26, B 25, C 10, D 2. v2 is faster
-on 20 of 63, mostly the heavy ones (L30 MonitorLoansWindow, L33 ContractUtxoActivity, L12 AllHolders, the block tip
-and aggregate documents). On this small dataset Postgres answers point lookups in 2–10 ms where v2 pays a fixed
-80–150 ms per multi-level statement (§7). Golden/mainnet numbers are Phase 2 stage 2 work.
+- **Before** = stage 1 (`2182f5f`), re-measured on `chipnet_ch_pp2` the same day (median 136 ms, as in stage 1).
+- **After** = stage 2 (`1433bcc`) on `ch1_api_chipcopy`: a scratch copy of `chipnet_ch_pp2` (same rows, `INSERT …
+  SELECT` of every table) with `080_authchain.sql` applied and the authchain index backfilled, because
+  `chipnet_ch_pp2` is read-only and the API now needs `authchain_link`. The 61 documents without authchains measured
+  on `chipnet_ch_pp2` itself are within run-to-run noise of the copy (median 68 vs 69 ms in one pair of v2-only runs).
+  Single runs vary by ±5–10 % (L12 was 137 ms in the full run and 71 ms re-run alone; the table has the re-run).
 
-| Doc | Name | v2 rows | v2 p50 ms | class | v1 p50 ms (Hasura/Postgres) | equality |
-|---|---|---:|---:|---|---:|---|
-| L1 | LoanBorrowingTxs | 7 | 206 | C | 10 | equal |
-| L2 | LoanCompletedRedemptions | 1 | 108 | B | 86 | equal |
-| L3 | LoanInterestPayments | 695 | 184 | B | 120 | equal-unordered |
-| L4 | UserLoanInteractions | 707 | 342 | C | 69 | equal-unordered |
-| L5 | UserLoanInteractionsExcludingInterest | 12 | 215 | C | 236 | equal |
-| L6 | UserStakingInteractions | 28 | 184 | B | 8 | equal |
-| L7 | AllStakingInteractions | 192 | 245 | C | 16 | equal-unordered |
-| L8 | RedemptionInteractions | 10 | 125 | B | 176 | equal-unordered |
-| L9 | UserRedemptionSidecarCommitments | 6 | 120 | B | 160 | equal |
-| L10 | UserRedemptionInteractions | 6 | 157 | B | 218 | equal |
-| L11 | AllLiquidations | 10 | 139 | B | 84 | equal |
-| L12 | AllHolders | 1536 | 136 | B | 368 | equal-unordered |
-| L13 | allStakingReceipts | 6 | 70 | B | 4 | equal |
-| L14 | finalizedUserRedemptions | 3 | 203 | C | 85 | equal |
-| L15 | startedAndSwappedRedemptions | 5 | 118 | B | 3 | equal-unordered |
-| L16 | UserStartedAndSwappedRedemptions | 3 | 177 | B | 3 | equal |
-| L17 | finalizedRedemptions | 5 | 116 | B | 86 | equal-unordered |
-| L18 | BorrowingTxsInPeriod | 1 | 60 | B | 83 | equal |
-| L19 | FinalizedRedemptionsInPeriod | 0 | 38 | B | 84 | equal |
-| L20 | InterestManager | 2 | 60 | B | 3 | equal |
-| L21 | LoanClosure | 1 | 126 | B | 2 | equal |
-| L22 | LoanClosures | 7 | 188 | B | 24 | equal |
-| L23 | AllLoanClosures | 20 | 184 | B | 109 | equal-unordered |
-| L24 | UserInitiatedLoanClosures | 8 | 109 | B | 102 | equal-unordered |
-| L25 | LoanKeyOwner | 1 | 34 | B | 2 | equal |
-| L26 | AllNewPeriodPoolTxs | 176 | 196 | B | 11 | equal |
-| L27 | LoanBorrowingTx | 16 | 146 | B | 104 | equal-unordered |
-| L28 | AllLoanClosureSummaries | 20 | 197 | B | 104 | equal-unordered |
-| L29 | LoanBorrowingSummaries | 7 | 173 | B | 9 | equal |
-| L30 | MonitorLoansWindow | 1000 | 317 | C | 2373 | equal-unordered |
-| L31 | PriceContractUtxos | 5 | 189 | B | 111 | equal-unordered |
-| L32 | RedemptionContractUtxos | 0 | 117 | B | 3 | equal |
-| L33 | ContractUtxoActivity | 2305 | 383 | C | 2659 | equal-unordered |
-| L34 | ContractOutputsByHash | 5 | 199 | B | 5 | equal |
-| L35 | MonitorLoans | 1040 | 315 | C | 154 | equal |
-| L36 | MonitorPriceContractUTXOs | 5 | 192 | B | 111 | equal-unordered |
-| L37 | MonitorRedemptionContractUTXOs | 0 | 118 | B | 3 | equal |
-| L38 | StabilityPool | 1 | 94 | B | 4 | equal |
-| L39 | newPeriodPool | 1 | 143 | B | 5 | equal |
-| L40 | MonitorLoansSignal | 1 | 94 | B | 99 | equal |
-| L41 | ChaingraphBlockTipSignal | 1 | 29 | B | 350 | equal |
-| L42 | MonitorLoansSignalPoll | 1 | 96 | B | 108 | equal |
-| L43 | ChaingraphBlockTipSignalPoll | 1 | 24 | B | 349 | equal |
-| L44 | MonitorLoansMempoolSignal | 0 | 28 | B | 1 | equal |
-| L45 | MonitorContractUtxosMempoolSignal | 5 | 35 | B | 39 | equal |
-| L46 | MonitorLoansMempoolSignalPoll | 0 | 27 | B | 1 | equal |
-| L47 | MonitorContractUtxosMempoolSignalPoll | 5 | 35 | B | 40 | equal |
-| X1 | MonitorMempools | 1 | 26 | B | 91 | equal |
-| X2 | MonitorSyncTips | 1 | 79 | B | 2 | equal |
-| X3 | MonitorForPayments | 39 | 149 | B | 297 | equal |
-| X4 | ShowDuplicateTransactions | 2 | 55 | B | 16 | equal |
-| X5 | GetSpendingTransactions | 1 | 259 | C | 9 | equal |
-| X6 | GetTransactionDetails | 1 | 7475 | E | 83 | equal |
-| X7 | GetBlockDetails | 1 | 200 | B | 20 | equal |
-| X8 | GenesisBlockInfo | 1 | 78 | B | 9 | equal |
-| X9 | SearchOutputsByLockingBytecodePrefix | 3548 | 333 | C | 54 | equal |
-| X10 | SearchOutputsByLockingBytecode | 71 | 88 | B | 8 | equal |
-| X11 | CountCashAccountOutputs | 1 | 55 | B | 2 | equal |
-| X12 | GetJonathan100CashAccount | 1 | 190 | B | 3 | equal |
-| X13 | GetBitjson100Authchain | 1 | 473 | C | 333 | equal |
-| X14 | BlockchainSize | 1 | 34 | B | 342 | equal |
-| X15 | BlockSizeStatsSince2021 | 1 | 33 | B | 343 | equal |
-| X16 | TransactionStats2021Q1 | 1 | 557 | C | 591 | equal |
+| | median | classes | faster than v1 | worst 5 |
+|---|---:|---|---:|---|
+| v2 before | 136 ms | B 49, C 13, E 1 | 19 / 63 | X6 7,768, X16 519, X13 465, L33 376, L4 335 |
+| **v2 after** | **63 ms** | **A 4, B 53, C 6** | **29 / 63** | X6 393, X13 392, L33 365, L35 315, L30 278 |
+| v1 (Hasura/Postgres) | 82 ms | A 26, B 25, C 10, D 2 | | L33 2,912, L30 2,502, X16 722 |
+
+Equality after: 63 / 63 (48 in order, 15 as row sets, as before). Point lookups (by hash, height, node; no
+relationship fan-out): X1 18, L43 17, L44 16, L46 17 ms (class A); X4 25, L25 22, L41 21, X2 28, X8 35, X11 27,
+X14/X15 27–28 ms. Gate items on chipnet: every library document < 1 s (max L35 315 ms); AllHolders (L12) 71 ms
+(G2 wants < 50 ms warm on golden, §6.4).
+
+| Doc | Name | v2 rows | before p50 ms | after p50 ms | class after | v1 p50 ms | equality |
+|---|---|---:|---:|---:|---|---:|---|
+| L1 | LoanBorrowingTxs | 7 | 209 | 79 | B | 12 | equal |
+| L2 | LoanCompletedRedemptions | 1 | 111 | 63 | B | 86 | equal |
+| L3 | LoanInterestPayments | 695 | 182 | 146 | B | 124 | equal-unordered |
+| L4 | UserLoanInteractions | 707 | 335 | 272 | C | 68 | equal-unordered |
+| L5 | UserLoanInteractionsExcludingInterest | 12 | 209 | 105 | B | 220 | equal |
+| L6 | UserStakingInteractions | 28 | 187 | 87 | B | 8 | equal |
+| L7 | AllStakingInteractions | 192 | 241 | 153 | B | 16 | equal-unordered |
+| L8 | RedemptionInteractions | 10 | 123 | 59 | B | 176 | equal-unordered |
+| L9 | UserRedemptionSidecarCommitments | 6 | 117 | 62 | B | 154 | equal |
+| L10 | UserRedemptionInteractions | 6 | 154 | 70 | B | 216 | equal |
+| L11 | AllLiquidations | 10 | 137 | 67 | B | 88 | equal |
+| L12 | AllHolders | 1536 | 136 | 71 | B | 374 | equal-unordered |
+| L13 | allStakingReceipts | 6 | 69 | 33 | B | 5 | equal |
+| L14 | finalizedUserRedemptions | 3 | 201 | 113 | B | 93 | equal |
+| L15 | startedAndSwappedRedemptions | 5 | 118 | 60 | B | 4 | equal-unordered |
+| L16 | UserStartedAndSwappedRedemptions | 3 | 172 | 74 | B | 3 | equal |
+| L17 | finalizedRedemptions | 5 | 117 | 63 | B | 86 | equal-unordered |
+| L18 | BorrowingTxsInPeriod | 1 | 60 | 50 | B | 100 | equal |
+| L19 | FinalizedRedemptionsInPeriod | 0 | 38 | 26 | B | 85 | equal |
+| L20 | InterestManager | 2 | 59 | 30 | B | 3 | equal |
+| L21 | LoanClosure | 1 | 125 | 66 | B | 2 | equal |
+| L22 | LoanClosures | 7 | 187 | 98 | B | 22 | equal |
+| L23 | AllLoanClosures | 20 | 178 | 99 | B | 103 | equal-unordered |
+| L24 | UserInitiatedLoanClosures | 8 | 106 | 63 | B | 104 | equal-unordered |
+| L25 | LoanKeyOwner | 1 | 33 | 22 | B | 3 | equal |
+| L26 | AllNewPeriodPoolTxs | 176 | 189 | 127 | B | 11 | equal |
+| L27 | LoanBorrowingTx | 16 | 144 | 44 | B | 114 | equal-unordered |
+| L28 | AllLoanClosureSummaries | 20 | 195 | 106 | B | 108 | equal-unordered |
+| L29 | LoanBorrowingSummaries | 7 | 171 | 76 | B | 8 | equal |
+| L30 | MonitorLoansWindow | 1000 | 314 | 278 | C | 2502 | equal-unordered |
+| L31 | PriceContractUtxos | 5 | 189 | 76 | B | 126 | equal-unordered |
+| L32 | RedemptionContractUtxos | 0 | 115 | 49 | B | 4 | equal |
+| L33 | ContractUtxoActivity | 2305 | 376 | 364 | C | 2912 | equal-unordered |
+| L34 | ContractOutputsByHash | 5 | 211 | 77 | B | 5 | equal |
+| L35 | MonitorLoans | 1040 | 326 | 315 | C | 170 | equal |
+| L36 | MonitorPriceContractUTXOs | 5 | 192 | 76 | B | 115 | equal-unordered |
+| L37 | MonitorRedemptionContractUTXOs | 0 | 116 | 48 | B | 3 | equal |
+| L38 | StabilityPool | 1 | 93 | 56 | B | 4 | equal |
+| L39 | newPeriodPool | 1 | 143 | 73 | B | 6 | equal |
+| L40 | MonitorLoansSignal | 1 | 93 | 59 | B | 98 | equal |
+| L41 | ChaingraphBlockTipSignal | 1 | 27 | 21 | B | 354 | equal |
+| L42 | MonitorLoansSignalPoll | 1 | 95 | 60 | B | 95 | equal |
+| L43 | ChaingraphBlockTipSignalPoll | 1 | 23 | 17 | A | 342 | equal |
+| L44 | MonitorLoansMempoolSignal | 0 | 26 | 16 | A | 2 | equal |
+| L45 | MonitorContractUtxosMempoolSignal | 5 | 34 | 24 | B | 39 | equal |
+| L46 | MonitorLoansMempoolSignalPoll | 0 | 28 | 17 | A | 2 | equal |
+| L47 | MonitorContractUtxosMempoolSignalPoll | 5 | 35 | 24 | B | 41 | equal |
+| X1 | MonitorMempools | 1 | 25 | 18 | A | 89 | equal |
+| X2 | MonitorSyncTips | 1 | 79 | 28 | B | 2 | equal |
+| X3 | MonitorForPayments | 39 | 152 | 56 | B | 295 | equal |
+| X4 | ShowDuplicateTransactions | 2 | 54 | 25 | B | 16 | equal |
+| X5 | GetSpendingTransactions | 1 | 257 | 80 | B | 9 | equal |
+| X6 | GetTransactionDetails | 1 | 7768 | 392 | C | 82 | equal |
+| X7 | GetBlockDetails | 1 | 200 | 133 | B | 19 | equal |
+| X8 | GenesisBlockInfo | 1 | 73 | 35 | B | 8 | equal |
+| X9 | SearchOutputsByLockingBytecodePrefix | 3548 | 324 | 194 | B | 59 | equal |
+| X10 | SearchOutputsByLockingBytecode | 71 | 84 | 58 | B | 7 | equal |
+| X11 | CountCashAccountOutputs | 1 | 54 | 27 | B | 3 | equal |
+| X12 | GetJonathan100CashAccount | 1 | 183 | 116 | B | 3 | equal |
+| X13 | GetBitjson100Authchain | 1 | 465 | 392 | C | 359 | equal |
+| X14 | BlockchainSize | 1 | 36 | 28 | B | 367 | equal |
+| X15 | BlockSizeStatsSince2021 | 1 | 34 | 27 | B | 370 | equal |
+| X16 | TransactionStats2021Q1 | 1 | 519 | 77 | B | 620 | equal |
+
+### 6.1 Where the fixed cost went (profile)
+
+Method: every catalogue statement captured from the API and replayed with a `log_comment`; `system.query_log`
+(`query_duration_ms`, ProfileEvents `QueryParseMicroseconds`, `QueryAnalysisMicroseconds`,
+`QueryPlanBuildMicroseconds`, `QueryPlanOptimizeMicroseconds`, `read_rows`), `system.processors_profile_log` per
+step, and server trace timelines (`send_logs_level`) for single statements. Scripts and raw numbers stayed in
+`/tmp` (not committed).
+
+Stage-1 statements: analysis was 45–60 % of a multi-level statement (L21 59 of 122 ms, X5 188 of 260, X13 238 of
+476, L34 81 of 188); execution was small (L21: ~25 ms of processor time in total, the page 20 ms). Two causes:
+
+1. **Every pinned view reference costs ~3–4 ms of analysis** (the parameterised view's query is analysed again per
+   reference). A 12–20 reference statement paid 40–80 ms. Inlining the gate (§1.1): L21 analysis 57 → 40 ms, plan
+   build 19 → 6 ms, 121 → 92 ms; catalogue median 136 → 117 ms.
+2. **A `MATERIALIZED` CTE's definition is analysed again at every reference, recursively.** `IN (SELECT hash FROM
+   page)` costs the page's own analysis (+2 ms per reference: 1 → 8 references = +14 ms), and a level referencing a
+   level referencing the page pays for both. Scalar subqueries are analysed and evaluated once; their references are
+   constants (8 references of one scalar: +0.6 ms). Levels as scalars (§1.1): L21 92 → 58 ms on the same SQL;
+   catalogue median 117 → 88 ms.
+
+Found on the way (each fixed, §1.1–1.2):
+- `has(constant array, key)` uses the primary key but is linear per row: 28 s for 10k keys against 10M rows (`IN
+  (SELECT arrayJoin(array))`: 46 ms). Links stay `IN` subqueries.
+- A scalar subquery containing a `MATERIALIZED` CTE or a recursive CTE is re-evaluated at every reference; a
+  `MATERIALIZED` CTE referenced from two scalars is evaluated once per scalar. Hence statement-level CTEs only, and
+  pipeline levels for the authchain walk (X6: 6 evaluations of the walk → 1).
+- The window function numbering 327k blocks for `Node.accepted_blocks(limit: 1)`: 65 → 27 ms with `LIMIT n BY`.
+- The `block_transaction` join under every `block_inclusions`: ~5 ms per statement, now only for `transaction_index`.
+- Primary-key analysis of `transaction_hash IN (6,674 hashes)` against output's 61k marks: 74 ms of CPU (~40 ms wall)
+  before the category projection was chosen anyway (L12); `identity(transaction_hash)` keeps such sets out.
+
+Tried and not taken:
+- (c) Settings: `enable_analyzer = 0` is 25–150× slower (materialized CTEs are re-executed); `max_threads` 1/2/4,
+  `optimize_use_projections = 0`, `use_query_condition_cache = 0`, `optimize_move_to_prewhere = 0`,
+  `use_skip_indexes = 0`: within noise or worse; `query_plan_enable_optimizations = 0`: 4× slower.
+- (d) Cached statements: ClickHouse 26.8 has no plan or analysis cache (every statement is analysed); the query
+  result cache refuses these statements (window functions are non-deterministic) and, forced, would only duplicate
+  the R37 response cache.
+- (e) Node lookups: node names → ids are cached per process (unchanged). Node metadata (`node { name user_agent … }`)
+  stays a level (2–5 ms): an in-process copy would serve stale connection times, which R37 deliberately never caches.
+- Overlapping the cached snapshot's watermark check with the data query would save its round trip (2.7 ms of the
+  ~4.5 ms API overhead here; Docker Desktop HTTP costs ~2.3 ms per round trip) but re-runs every in-flight request
+  after each watermark advance (every mempool commit): not done.
+
+What remains per statement: each level is one serial pipeline of ~1–1.5 ms when trivial and 3–9 ms typically
+(collapsing `GROUP BY` of a membership table, a join, numbering); X4 (5 levels) 22 ms of SQL, X5 (9 levels) ~70 ms.
+Acceptance checks over thousands of candidates read most of `tx_acceptance`'s hash-ordered granules (L4: 707 rows
+with nested inputs/outputs, 8.3M rows read, 272 ms; v1 68 ms). On chipnet's small data Postgres' index nested loops
+still win most 1–10-row documents (v1 2–10 ms).
+
+### 6.2 Point lookups
+
+Target ≤ 20 ms p50: met by X1, L43, L44, L46 (16–18 ms); X4 25, L25 22, L41 21, X2 28, X11 27, X8 35 ms. The floor
+here is the two HTTP round trips (snapshot check, data statement: ~2.3 ms each on Docker Desktop) plus one serial
+pipeline per level; X5 (output → spends → transaction → validations, timeline, inclusions → block → accepted_by →
+node: 9 levels) is 80 ms and X7 (a block's 264 transactions' inputs for fees and `encoded_hex`) 133 ms.
+
+### 6.3 Authchains (X6)
+
+Chipnet's identity-output chains (spends of output 0): 2,378,928 such spends by 1,407,324 transactions; chains up to
+**56,904 links**, median 3,999 from a random transaction, 811,120 transactions with a chain over 10,000. A per-link
+walk (stage 1: ~9 ms per link, X6's 776 links 7.5 s) or iterative rounds that resolve one link per round per chain
+cannot answer these in < 1 s, so the chain structure is precomputed (`080_authchain.sql`, `authchain-index.ts`):
+
+- **Index.** Every transaction spending an output 0 gets one row placing it on the segment of its heaviest output-0
+  parent (size = transactions whose chain passes through it) at the parent's position + 1; a transaction without a
+  row starts its own segment. Heavy-path placement bounds the segment ends on any chain by log2 of the transactions:
+  chipnet **at most 6 over every chain** (p99 3; X6: 2; the longest chain: 0). Following the first output-0 input
+  instead would give up to 245 (p99 44; X6: 72). Filled by the spend index filler with each batch (same `batch` tag,
+  same restart cleanup, visible up to the snapshot's spend watermark); existing databases run
+  `bin/chaingraph-clickhouse-authchain-backfill.js` (chipnet: 1,407,324 rows from 1,181 batches in 51 s).
+  Size on chipnet: 115 MiB (91 MiB uncompressed), of which the `p_tx` projection 65 MiB; ~11 % of `spend` (1.06 GiB).
+- **Walk** (`model.ts`). One recursive CTE alternating per base: a keyed read of the current segment (members the node
+  accepts, in position order while contiguous) and the accepted spender of the last member's output 0 from the input
+  table. The rows only place transactions; what the node accepts is decided at read time, so conflicts (two spenders
+  of one output in two nodes' views), stale placement and the tail above the spend watermark cost extra steps, never
+  a wrong chain. `authchain-index.spec.ts` checks the walk against a link-by-link TypeScript walk per node at every
+  spend watermark, after a backfill and with an empty index.
+- **Result** (copy of chipnet, backfilled): X6 7,768 → **393 ms** (equal to v1), X13 465 → 392 ms; the longest chain
+  (56,904 links) with X6's whole selection 452 ms of SQL; the walk alone 157 ms for X6's chain.
+
+### 6.4 Unselective per-node roots (owner question 1): measured
+
+`transactions(node)` with only an internal-id range (`after`/`before`) or only `after`, chipnet copy, SQL p50 of 9:
+
+| Plan | id window (1,000 ids) | keyset after (100 rows) | rows read |
+|---|---:|---:|---|
+| Today (acceptance collapsed in full, then filtered) | 365 ms | 300–370 ms | 2.85M |
+| Id range applied to the base `tx_acceptance` rows (no store change) | 9 ms | 14 ms (bound the window by the 202nd raw row after the cursor) | 0.69M / 1.55M |
+| Same with a projection `p_node_tx ORDER BY (node_internal_id, transaction_internal_id)` | 5 ms | 8 ms | 7k / 80k |
+| Projection size (chipnet) | 102.7 MiB, +43 % of `tx_acceptance` (as `p_node_height`); materialised in seconds | | |
+
+Without the projection the id-range plan relies on part-level pruning (chipnet's parts are id-ordered by insertion);
+on mainnet's merged parts it would read far more. The keyset-after plan returns, exactly, the accepted transactions
+in (cursor, bound], so a page can be shorter than `limit` while `has_more` is true (a contract change). The same
+projection would also serve acceptance checks by internal id: AllHolders' acceptance read 3.2M → 1.7M rows, but its
+latency only 96 → 90 ms (the rest is the category reads and the primary-key analysis fixed above). Not decided here.
 
 
 ## 7. Known gaps and open questions
 
-Known gaps (no owner decision needed, Phase 2 stage 2):
+Known gaps (no owner decision needed):
 
-1. **Fixed cost per statement.** A multi-level document costs 80–150 ms on chipnet even for 0–5 rows (L15, L21,
-   L32, L37 against 2–5 ms on Postgres). `system.query_log` attributes it to analysis and plan optimisation of large
-   statements (every level is a `MATERIALIZED` CTE over pinned views with array parameters; L36: 62 ms analysis), not
-   to rows read. Candidates: fewer view references per statement (one acceptance CTE), the gate as a row policy,
-   lighter levels for 1:1 relationships, the materialised CTE setting (still Experimental in 26.8, spike §4.1).
-2. **Long authchains.** The recursive CTE costs ~9 ms per link (X6: a 776-long chain, 7.4 s; v1 83 ms). Options:
-   a stored authhead index, or batching several links per iteration.
+1. **Fixed cost per statement** (stage 2: reduced, §6.1). Analysis no longer dominates; each level is one serial
+   pipeline of ~1–9 ms, and acceptance checks over thousands of candidates read most of `tx_acceptance`'s
+   hash-ordered granules. Documents of 1–10 rows cost 16–80 ms on chipnet (Postgres 2–10 ms); X5 (9 levels) 80 ms,
+   L4 (707 rows with nested lists) 272 ms against v1 68 ms. Next candidates: fusing many-to-one levels into their
+   parent, input/output reads of many random transaction hashes (X7, L4).
+2. **Authchains** (stage 2: done, §6.3). Existing databases need the backfill once
+   (`bin/chaingraph-clickhouse-authchain-backfill.js`, after the DDL); without it the walk is still exact but goes
+   link by link (`max_recursive_cte_evaluation_depth` covers v1's 100,000 links).
 3. **Unselective per-node roots** (e.g. `transactions(node)` with only an internal-id range, `transaction_groups`
-   without a filter, `spends_aggregate` without a filter) read the node's whole acceptance set: 0.4 s on chipnet,
-   not viable on mainnet. Selective filters are restricted to their candidates (§1.2).
+   without a filter, `spends_aggregate` without a filter) read the node's whole acceptance set: 0.3–0.4 s on chipnet,
+   not viable on mainnet. Measured options in §6.4 (owner question 1).
 4. `inputs_aggregate` is not offered: inputs have no numeric field of their own; `spends_aggregate` /
    `spend_groups` aggregate the spent outputs (coinbase inputs excluded).
 5. Timestamps of acceptance/validation and node connection metadata are store-local; the response cache never
@@ -374,6 +533,9 @@ Open questions for the owner:
 
 1. **Unselective per-node roots on mainnet (gap 3):** refuse them (require a selective filter or an internal-id
    window below a cap), or add a per-node acceptance projection ordered by internal id so they page in order?
+   Numbers in §6.4: an id window costs 365 ms today, 9 ms with the id range applied below the acceptance collapse
+   (no store change, relies on part pruning), 5 ms with `p_node_tx` (+102.7 MiB on chipnet, +43 % of
+   `tx_acceptance`); keyset-after pages 8–14 ms if pages may be shorter than `limit` (`has_more` still exact).
 2. **Per-node semantic changes for release notes:** `block_inclusions`, `spent_by` and authchains are per node (v1:
    any node). Confirm, or keep node-agnostic variants for explorers (e.g. `spent_by(node: null)` = any spend)?
 3. **send_transaction** relays through the agent's internal API (as v1's Hasura action did), so the API holds no P2P
@@ -381,17 +543,26 @@ Open questions for the owner:
 4. **Response cache default:** on in `api:dev`/`main.ts` (`CHAINGRAPH_API_RESPONSE_CACHE=off` disables), off in
    `createApi`. A hit costs one watermark read instead of the request's snapshot read: confirm this counts as
    compatible with "exactly one readSnapshot per request" (it reads no snapshot at all).
+5. **Authchain index on mainnet** (§6.3): one row per transaction that spends an output 0 (chipnet: 49 % of
+   transactions, ~86 bytes per row with its `p_tx` projection, ~11 % of `spend`). Accept the storage and a one-off
+   backfill per database (chipnet 51 s; mainnet proportionally hours, run alongside the agent)? Keying the rows by
+   transaction internal id instead of hash would roughly halve it at the cost of id lookups in the walk.
+6. **Inlined gate (contract change, §1.1):** the API reads base tables with the pinned views' predicate inlined
+   (mirrored in `visibility.ts`, equality-tested) instead of naming the views. Confirm this reading of "every read
+   through the pinned views"; the views remain the definition for ad-hoc readers.
 
 
-## 8. Suites (final code)
+## 8. Suites (final code, stage 2)
 
 | Suite | Result |
 |---|---|
 | `yarn build`, eslint, prettier, cspell (`src`) | clean |
-| unit (`ava --match='!*[e2e]*'`) | 171 passed, 1 todo (incl. 36 bytecode/encoding, SDL check) |
-| API specs `build/api/*.spec.js` (scratch `ch1_api_*`, dropped) | 61 passed, 3 skipped (the chipnet spec without its env), incl. the spike's S1–S6 and overhead (S5 API p50 51 ms, 6 ms above the same SQL) |
-| chipnet spec (`CHAINGRAPH_API_CHIPNET_DATABASE=chipnet_ch_pp2`, Hasura) | 3 passed: 63/63 documents equal; R13/R14 EXPLAIN; R25 holders, R28 hashes |
-| ClickHouse store specs `build/store/clickhouse/*.spec.js` | 162 passed |
+| unit (`ava --match='!*[e2e]*'`) | 171 passed, 1 todo |
+| API specs `build/api/*.spec.js` (scratch `ch1_api_*`, dropped) | 61 passed, 3 skipped (the chipnet spec without its env) |
+| chipnet spec (`CHAINGRAPH_API_CHIPNET_DATABASE=ch1_api_chipcopy`, Hasura) | 3 passed: 63/63 documents equal; R13/R14 EXPLAIN; R25 holders, R28 hashes |
+| ClickHouse store specs `build/store/clickhouse/*.spec.js` | 163 passed (incl. `authchain-index.spec.ts`; `visibility.spec.ts` view = inlined gate) |
 | e2e ClickHouse, UTXO on / off | 47 / 47 passed (47 `[postgres]` skipped) |
-| e2e Postgres (ch1-pg; the bytecode macros now read the shared vectors) | 102 passed |
+| e2e Postgres (ch1-pg) | 102 passed |
 
+The scratch databases (`ch1_api_chipcopy`, `ch1_api_authscan`, `ch1_api_hasura_meta`) and the v1 oracle container
+were removed after the runs.

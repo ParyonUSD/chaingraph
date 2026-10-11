@@ -1,7 +1,7 @@
 # L26 AllNewPeriodPoolTxs (v1: v1/L26-AllNewPeriodPoolTxs.graphql)
 # status: works
 # chipnet equality: equal (v1 176 rows in 1 pages, v2 176 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 196.4 ms; v1 Hasura/Postgres 10.9 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 126.9 ms; v1 Hasura/Postgres 10.7 ms
 query AllNewPeriodPoolTxs($poolTokenId: Hex, $poolLockingBytecode: Hex, $node: String!, $limit: Int!, $offset: Int) {
   transaction: transactions(node: $node, limit: $limit, offset: $offset,
     order_by: [{ locktime: DESC }, { internal_id: DESC }],

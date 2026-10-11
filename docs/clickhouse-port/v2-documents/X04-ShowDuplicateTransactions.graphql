@@ -1,7 +1,7 @@
 # X4 ShowDuplicateTransactions (v1: v1/X04-ShowDuplicateTransactions.graphql)
 # status: works
 # chipnet equality: equal (v1 2 rows in 1 pages, v2 2 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 55.0 ms; v1 Hasura/Postgres 15.6 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 25.2 ms; v1 Hasura/Postgres 15.9 ms
 query ShowDuplicateTransactions($hashes: [Hex!]!, $node: String!) {
   transaction: transactions_by_hash(hashes: $hashes) {
     hash

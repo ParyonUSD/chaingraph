@@ -1,7 +1,7 @@
 # L13 allStakingReceipts (v1: v1/L13-allStakingReceipts.graphql)
 # status: works
 # chipnet equality: equal (v1 6 rows in 1 pages, v2 6 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 70.2 ms; v1 Hasura/Postgres 4.4 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 33.2 ms; v1 Hasura/Postgres 4.7 ms
 query allStakingReceipts($poolTokenId: Hex, $node: String!, $limit: Int!, $after: String) {
   output: unspent_outputs(node: $node, limit: $limit, after: $after,
     order_by: [{ transaction: { internal_id: ASC } }, { output_index: ASC }],

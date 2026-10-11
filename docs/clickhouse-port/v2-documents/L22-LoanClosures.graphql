@@ -1,7 +1,7 @@
 # L22 LoanClosures (v1: v1/L22-LoanClosures.graphql)
 # status: works
 # chipnet equality: equal (v1 7 rows in 1 pages, v2 7 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 188.4 ms; v1 Hasura/Postgres 24.0 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 98.0 ms; v1 Hasura/Postgres 22.0 ms
 query LoanClosures($paryonTokenId: Hex, $loanTokenIds: [Hex!], $node: String!, $limit: Int!, $after: BigInt) {
   transaction: transactions(node: $node, limit: $limit, after: $after, where: {
     has_input: { outpoint: { token_category: { _in: $loanTokenIds }, nonfungible_token_capability: { _eq: NONE } } }

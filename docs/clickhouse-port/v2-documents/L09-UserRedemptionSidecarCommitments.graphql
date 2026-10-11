@@ -1,7 +1,7 @@
 # L9 UserRedemptionSidecarCommitments (v1: v1/L09-UserRedemptionSidecarCommitments.graphql)
 # status: works
 # chipnet equality: equal (v1 6 rows in 1 pages, v2 6 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 120.3 ms; v1 Hasura/Postgres 159.8 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 62.3 ms; v1 Hasura/Postgres 154.1 ms
 query UserRedemptionSidecarCommitments($redeemerTokenId: Hex, $userLockingBytecodes: [Hex!], $node: String!, $limit: Int!, $after: BigInt) {
   transaction: transactions(node: $node, limit: $limit, after: $after, where: {
     has_input: { outpoint: { token_category: { _eq: $redeemerTokenId } } }

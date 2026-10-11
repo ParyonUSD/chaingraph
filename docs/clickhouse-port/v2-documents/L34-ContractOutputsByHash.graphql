@@ -1,7 +1,7 @@
 # L34 ContractOutputsByHash (v1: v1/L34-ContractOutputsByHash.graphql)
 # status: works
 # chipnet equality: equal (v1 5 rows in 1 pages, v2 5 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 198.8 ms; v1 Hasura/Postgres 4.6 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 77.3 ms; v1 Hasura/Postgres 4.9 ms
 query ContractOutputsByHash($tokenId: Hex!, $lockingBytecode: Hex!, $transactionHashes: [Hex!]!, $node: String!) {
   output: outputs_by_transaction_hash(transaction_hashes: $transactionHashes, where: { token_category: { _eq: $tokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecode } }) {
     output_index transaction_hash

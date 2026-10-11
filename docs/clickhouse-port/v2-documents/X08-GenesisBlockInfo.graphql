@@ -1,7 +1,7 @@
 # X8 GenesisBlockInfo (v1: v1/X08-GenesisBlockInfo.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 77.9 ms; v1 Hasura/Postgres 8.6 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 34.7 ms; v1 Hasura/Postgres 8.4 ms
 query GenesisBlockInfo($node: String!) {
   block: blocks(node: $node, limit: 1, where: { height: { _eq: 0 } }) {
     nodes { hash height header encoded_hex accepted_by { node { name user_agent } } }

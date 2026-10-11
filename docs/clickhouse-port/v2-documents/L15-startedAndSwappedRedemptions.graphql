@@ -1,7 +1,7 @@
 # L15 startedAndSwappedRedemptions (v1: v1/L15-startedAndSwappedRedemptions.graphql)
 # status: works
 # chipnet equality: equal-unordered (root order: by store-local ids, not selected) (v1 5 rows in 1 pages, v2 5 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 118.2 ms; v1 Hasura/Postgres 2.6 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 60.4 ms; v1 Hasura/Postgres 3.8 ms
 query startedAndSwappedRedemptions($redeemerTokenId: Hex, $node: String!, $limit: Int!, $after: String) {
   output: outputs(node: $node, limit: $limit, after: $after,
     order_by: [{ transaction: { internal_id: ASC } }, { output_index: ASC }],

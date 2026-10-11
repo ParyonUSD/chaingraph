@@ -1,7 +1,7 @@
 # L41 ChaingraphBlockTipSignal (v1: v1/L41-ChaingraphBlockTipSignal.graphql)
 # status: works
 # chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
-# latency (chipnet_ch_pp2, p50 warm, first page): v2 28.8 ms; v1 Hasura/Postgres 350.1 ms
+# latency (chipnet: chipnet_ch_pp2 data + authchain index, p50 warm, first page): v2 21.0 ms; v1 Hasura/Postgres 353.6 ms
 subscription ChaingraphBlockTipSignal($node: String!) {
   block: block_tip(node: $node) { hash height previous_block_hash }
 }
