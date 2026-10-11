@@ -505,10 +505,25 @@ const planLevel = (
     const rowNumber = `row_number() OVER (PARTITION BY ${field.childKeys.join(
       ', '
     )}${order.length === 0 ? '' : ` ORDER BY ${orderSql(order)}`}) AS __rn`;
+    /*
+     * A per-parent limit is applied first with `LIMIT n BY` (a top-n per key,
+     * cheaper than numbering every row: Node.accepted_blocks(limit: 1)
+     * numbered all 327k chipnet blocks, 65 -> 27 ms); the row number is then
+     * computed over the kept rows only.
+     */
+    const kept =
+      limit === undefined
+        ? undefined
+        : sql.bind(limit + (offset ?? 0), 'UInt64');
+    const rows =
+      kept === undefined
+        ? `SELECT * FROM (${source}) WHERE ${where}`
+        : `SELECT * FROM (${source}) WHERE ${where} ORDER BY ${[
+            ...field.childKeys,
+            ...(order.length === 0 ? [] : [orderSql(order)]),
+          ].join(', ')} LIMIT ${kept} BY ${field.childKeys.join(', ')}`;
     const bounds = [
-      ...(limit === undefined
-        ? []
-        : [`__rn <= ${sql.bind(limit + (offset ?? 0), 'UInt64')}`]),
+      ...(kept === undefined ? [] : [`__rn <= ${kept}`]),
       ...(offset === undefined ? [] : [`__rn > ${sql.bind(offset, 'UInt64')}`]),
     ];
     const childTuple = [
@@ -520,7 +535,7 @@ const planLevel = (
       ...added,
       `(SELECT groupArray(tuple(${childTuple.join(', ')})) FROM (SELECT ${pk}${
         childNeeds.length === 0 ? '' : `, ${childNeeds.join(', ')}`
-      }, ${rowNumber} FROM (${source}) WHERE ${where})${
+      }, ${rowNumber} FROM (${rows}))${
         bounds.length === 0 ? '' : ` WHERE ${bounds.join(' AND ')}`
       }) AS ${child}`,
     ].join(',\n');
