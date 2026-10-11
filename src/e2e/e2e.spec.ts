@@ -837,6 +837,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'transaction_hash_key',
     'transaction_pkey',
     'unspent_tracking_events_pkey',
+    'unspent_tracking_nodes_pkey',
     'unspent_tracking_progress_pkey',
     'unspent_tracking_settings_pkey',
     'unspent_tracking_skipped_pkey',
@@ -3280,6 +3281,27 @@ test.serial(
       ]);
       await preSaveBlock(preStale);
       await setup.removeStaleBlocksForNode(preNode, [preStale.hash]);
+      /*
+       * A mempool child saved and dropped before tracking starts, spending an
+       * output of a parent saved after it started (see below).
+       */
+      await setup.saveTransactionForNodes(
+        preTransaction('c1', [[preHash('a0'), 0]]),
+        [{ nodeInternalId: preNode, validatedAt: new Date() }]
+      );
+      const preChildId = Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+            [hexToBin(preHash('c1'))]
+          )
+        ).rows[0]!.id
+      );
+      await setup.archiveMempoolTransaction({
+        nodeInternalId: preNode,
+        replacedAt: new Date(),
+        transactionInternalId: preChildId,
+      });
       // the job starts tracking at the current tip: the e2e chain stays unprocessed (NULL)
       await setup.drainUnspentNodeIdsJob(120_000);
       trackingStart =
@@ -3292,6 +3314,59 @@ test.serial(
         ) + 1;
       await client.query('ANALYZE;');
       await compareDeferredQueryRoot(t, 'e2e chain state');
+      /*
+       * Released before tracking started, re-accepted after: the dropped
+       * child is in the watch set (the watch pass reads pre-tracking release
+       * events), its parent is saved after tracking started, then the child is
+       * accepted again through a path that writes no event: the parent's
+       * output becomes spent for the node.
+       */
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(
+              /* sql */ `SELECT count(*) AS n FROM unspent_tracking_watch WHERE transaction_internal_id = $1;`,
+              [preChildId]
+            )
+          ).rows[0]!.n
+        ),
+        1,
+        'child released before tracking started is watched'
+      );
+      await preSaveBlock(
+        preBlock('b2', [preTransaction('a0', [[preHash('fd'), 0]], 1)])
+      );
+      await drainDeferred(t, setup, 'parent saved after tracking started');
+      await client.query(
+        /* sql */ `INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at) VALUES ($1, $2, now());`,
+        [preNode, preChildId]
+      );
+      await drainDeferred(t, setup, 'pre-tracking release re-accepted');
+      const parentId = Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+            [hexToBin(preHash('a0'))]
+          )
+        ).rows[0]!.id
+      );
+      await compareDeferredStored(
+        t,
+        'pre-tracking release re-accepted',
+        parentId,
+        (outpoint) => outpoint.startsWith(preHash('a0'))
+      );
+      t.deepEqual(
+        (
+          await client.query<{ ids: number[] }>(
+            /* sql */ `SELECT unspent_node_ids AS ids FROM output WHERE transaction_hash = $1;`,
+            [hexToBin(preHash('a0'))]
+          )
+        ).rows.map((row) => row.ids),
+        [[]],
+        'parent output spent by the re-accepted child'
+      );
+      await compareDeferredQueryRoot(t, 'pre-tracking release re-accepted');
     } finally {
       await setup.pool.end();
       await setup.unspentNodeIdsJobPool.end();
@@ -3807,7 +3882,12 @@ test.serial(
       });
       await compareDeferredQueryRoot(t, 'tracking stopped', ours);
       await stopTriggers(true);
-      await db.runUnspentNodeIdsJobPass({ maxMs: 60_000, settleWaitMs: 2_000 });
+      // restart without the rebuild (an explicit no-backfill pass), to observe the pending state
+      await db.runUnspentNodeIdsJobPass({
+        backfill: false,
+        maxMs: 60_000,
+        settleWaitMs: 2_000,
+      });
       t.true(
         (
           await client.query<{ rebuild: boolean }>(
@@ -3817,7 +3897,22 @@ test.serial(
       );
       t.is(await readTier(), 'fallback', 'rebuild pending: F1g');
       await compareDeferredQueryRoot(t, 'tracking restarted, rebuild pending');
-      await backfillPass(50);
+      // the default pass runs the rebuild whatever CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL says
+      const rebuildPass = async (remaining: number): Promise<void> => {
+        await db.runUnspentNodeIdsJobPass({
+          maxMs: 60_000,
+          settleWaitMs: 2_000,
+        });
+        const rebuilding = (
+          await client.query<{ rebuild: boolean }>(
+            `SELECT rebuild_required AS rebuild FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.rebuild;
+        if (rebuilding && remaining > 0) {
+          await rebuildPass(remaining - 1);
+        }
+      };
+      await rebuildPass(50);
       t.false(
         (
           await client.query<{ rebuild: boolean }>(
@@ -4086,6 +4181,77 @@ test.serial(
         ),
         'idle pass: no event, no output checked'
       );
+      // cspell:ignore indisvalid indexrelid relname
+      /*
+       * A node registered after tracking started: answered by the live
+       * predicate until its three indexes are valid (built concurrently) and
+       * the events recorded before then are consumed. An index left INVALID
+       * by an interrupted build is dropped and rebuilt.
+       */
+      const lateNode = Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `INSERT INTO node (name, protocol_version, user_agent) VALUES ('unspent-late-node', 70012, '/late/') RETURNING internal_id AS id;`
+          )
+        ).rows[0]!.id
+      );
+      await client.query(`SELECT unspent_node_ids_build_root();`);
+      const storedPath = async (name: string) =>
+        (
+          await client.query<{ stored: boolean }>(
+            `SELECT unspent_node_ids_stored_path($1) AS stored;`,
+            [name]
+          )
+        ).rows[0]!.stored;
+      const nodeAName = (await deferredNodes())[0]!.name;
+      t.false(
+        await storedPath('unspent-late-node'),
+        'late node: live predicate'
+      );
+      t.true(await storedPath(nodeAName), 'node A: stored set');
+      await db.acceptBlocksViaHeaders(
+        lateNode,
+        [{ hash: hash('b0'), height: 999_600 }],
+        new Date()
+      );
+      await compareDeferredQueryRoot(t, 'late node, no indexes yet', ours);
+      await client.query(
+        `UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'output_unspent_node_${nodeA}_search_index'::regclass;`
+      );
+      const indexStatements = await db.ensureUnspentNodeIdsIndexes();
+      t.true(
+        indexStatements.includes(
+          `DROP INDEX CONCURRENTLY IF EXISTS output_unspent_node_${nodeA}_search_index;`
+        ),
+        indexStatements.join(' ')
+      );
+      t.is(
+        indexStatements.filter((statement) =>
+          statement.startsWith('CREATE INDEX CONCURRENTLY')
+        ).length,
+        4,
+        indexStatements.join(' ')
+      );
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(/* sql */ `
+            SELECT count(*) AS n FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+              WHERE c.relname LIKE 'output_unspent_node_%' AND i.indisvalid`)
+          ).rows[0]!.n
+        ),
+        (await deferredNodes()).length * 3,
+        'every per-node index valid'
+      );
+      await drainDeferred(t, db, 'late node indexed');
+      t.true(await storedPath('unspent-late-node'), 'late node: stored set');
+      await compareDeferredStored(
+        t,
+        'late node indexed',
+        await transactionId('f0'),
+        ours
+      );
+      await compareDeferredQueryRoot(t, 'late node indexed', ours);
     } finally {
       await holder.end();
       await db.pool.end();

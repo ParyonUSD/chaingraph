@@ -95,6 +95,14 @@ CREATE TABLE unspent_tracking_watch (
 );
 COMMENT ON TABLE unspent_tracking_watch IS 'Transactions some node stopped accepting recently (re-org, mempool drop or replacement; not a mempool row removed on confirmation), with the nodes accepting them when last checked; re-checked once per pass (unspent_node_ids_watch_pass) for 100 blocks after the release, so a re-acceptance through a path that writes no event still becomes an "accepted" event. Not tracked by Hasura.';
 
+CREATE TABLE unspent_tracking_nodes (
+  node_internal_id integer NOT NULL,
+  ready_after_event_id bigint NOT NULL,
+  indexed_at timestamp NOT NULL DEFAULT now(),
+  CONSTRAINT unspent_tracking_nodes_pkey PRIMARY KEY (node_internal_id)
+);
+COMMENT ON TABLE unspent_tracking_nodes IS 'Nodes the query root may serve from the stored set: a row is written by the agent once the node''s three per-node partial indexes are valid (and removed while they are rebuilt); the node is served from the stored set once every partition has consumed the events up to ready_after_event_id (the acceptance changes recorded before its indexes existed). Other nodes are answered by the live F1g predicate. Not tracked by Hasura.';
+
 CREATE TABLE unspent_tracking_skipped (
   outpoint_transaction_hash bytea NOT NULL,
   outpoint_index bigint NOT NULL,
@@ -497,10 +505,15 @@ $$;
 -- Start tracking (no-op if already started) with `part_count` partitions; the
 -- watermarks start at the given settled sequence values. Outputs of earlier
 -- transactions stay NULL (pre-tracking) until backfilled; from genesis (0, 0)
--- there is nothing to backfill. Events up to `event_watermark` (settled) are
--- not consumed: they predate tracking, and every output they concern is
--- either unprocessed (NULL: answered live, then backfilled with the current
--- state) or processed later from the current state.
+-- there is nothing to backfill. The partitions do not consume the events up
+-- to `event_watermark` (settled): they predate tracking, and every output they
+-- concern is either unprocessed (NULL: answered live, then backfilled with
+-- the current state) or processed later from the current state. The watch
+-- pass does read them: a transaction released before tracking started (from
+-- when the agent enabled the release-event triggers) is watched like any
+-- other, so a later re-acceptance through a path that writes no event still
+-- reaches outputs processed after the start (e.g. the output of a parent saved
+-- after tracking started, spent by a released child saved before).
 -- there is nothing to backfill. After a stop (rebuild_required), values
 -- written before the stop may be stale: rebuild_through is set to the highest
 -- transaction id now, and reads use F1g until the job has passed it and the
@@ -521,7 +534,7 @@ BEGIN
         backfill_complete = (input_watermark = 0),
         rebuild_through_transaction_internal_id = CASE WHEN rebuild_required
           THEN GREATEST(input_watermark, (SELECT COALESCE(max(internal_id), 0) FROM transaction)) END,
-        watch_consumed_event_id = event_watermark;
+        watch_consumed_event_id = 0;
   INSERT INTO unspent_tracking_progress (partition_index, partition_count, input_transaction_internal_id,
       block_internal_id, consumed_event_id, backfill_transaction_internal_id)
     SELECT p, part_count, input_watermark, block_watermark, event_watermark, 0 FROM generate_series(0, part_count - 1) p;
@@ -764,6 +777,21 @@ CREATE FUNCTION unspent_node_ids_rebuild_pending ()
     FROM unspent_tracking_settings s
 $$;
 
+-- Whether the query root serves `node_name` from the stored set: the read tier
+-- is not "fallback", the node's per-node indexes are valid
+-- (unspent_tracking_nodes) and every partition has consumed the events
+-- recorded before they were. Otherwise (a node registered after tracking
+-- started, before its indexes exist; an unknown name) the root answers with
+-- the live F1g predicate only.
+CREATE FUNCTION unspent_node_ids_stored_path (node_name text)
+  RETURNS boolean LANGUAGE sql STABLE AS $$
+  SELECT unspent_node_ids_read_tier() <> 'fallback'
+     AND EXISTS (SELECT 1 FROM node n JOIN unspent_tracking_nodes r ON r.node_internal_id = n.internal_id
+                   WHERE n.name = node_name
+                     AND r.ready_after_event_id
+                         <= (SELECT COALESCE(min(p.consumed_event_id), -1) FROM unspent_tracking_progress p))
+$$;
+
 -- Transactions whose acceptance may have changed after a partition's snapshot:
 -- those of events not yet deleted and of blocks above the minimum block
 -- watermark. (These helpers force custom plans: a generic plan for
@@ -939,13 +967,16 @@ $$;
 --        caller's own index: token_category_index, output_search_index);
 --   (d1) outputs spent by released transactions the node no longer accepts;
 --   (d2) outputs of transactions the node started accepting;
---   (f)  fallback (backlog over the threshold): F1g;
---   (n)  a node registered after the last build: F1g.
+--   (f)  F1g, instead of every other arm, when the read tier is "fallback" or
+--        the node is not served from the stored set yet
+--        (unspent_node_ids_stored_path: its per-node indexes are not valid,
+--        or the events recorded before they were are not consumed, or the
+--        name is unknown). Every arm is gated by that one per-query value,
+--        so the arms never overlap.
 CREATE FUNCTION unspent_node_ids_build_root ()
   RETURNS void LANGUAGE plpgsql AS $build$
 DECLARE
   arms text := '';
-  names text := '';
   node record;
   f1g_literal text;
   f1g_shared constant text := $f$CASE
@@ -973,7 +1004,7 @@ DECLARE
     END$f$;
   stored_arm constant text := $t$  SELECT o.* FROM output o
   WHERE node_name = %1$L AND %2$s = ANY (o.unspent_node_ids) AND %3$s
-    AND (SELECT unspent_node_ids_read_tier()) <> 'fallback'
+    AND (SELECT unspent_node_ids_stored_path(node_name))
     AND CASE
       WHEN CASE WHEN (SELECT unspent_node_ids_read_tier()) = 'hash'
              THEN (o.transaction_hash, o.output_index) IN (
@@ -995,30 +1026,31 @@ BEGIN
   -- migration): concurrent CREATE OR REPLACE of the same function fails with
   -- "tuple concurrently updated"; the lock is held until the caller commits
   PERFORM pg_advisory_xact_lock(1970172787);
-  FOR node IN SELECT internal_id, name FROM node ORDER BY internal_id LOOP
+  -- stored arms only for nodes whose per-node indexes are valid (the others
+  -- are answered by F1g; unspent_node_ids_stored_path gates every arm at run time)
+  FOR node IN SELECT n.internal_id, n.name FROM node n
+                JOIN unspent_tracking_nodes r ON r.node_internal_id = n.internal_id
+                ORDER BY n.internal_id LOOP
     f1g_literal := replace(f1g_shared, '(SELECT n.internal_id FROM node n WHERE n.name = node_name)', node.internal_id::text);
     arms := arms
       || format(stored_arm, node.name, node.internal_id,
            'o.token_category IS NOT NULL AND octet_length(o.locking_bytecode) <= 1000', f1g_literal)
       || format(stored_arm, node.name, node.internal_id,
            '(o.token_category IS NULL OR octet_length(o.locking_bytecode) > 1000)', f1g_literal);
-    names := names || CASE WHEN names = '' THEN '' ELSE ', ' END || quote_literal(node.name);
   END LOOP;
-  -- a node registered after this build is answered by F1g until the next build
-  names := CASE WHEN names = '' THEN 'true' ELSE format('node_name NOT IN (%s)', names) END;
   EXECUTE 'CREATE OR REPLACE FUNCTION unspent_output_stored (node_name text) RETURNS SETOF output LANGUAGE sql STABLE AS $root$'
     || chr(10) || arms
     || format($shared$  SELECT o.* FROM unspent_node_ids_backlog_transactions() b
   CROSS JOIN LATERAL (
     SELECT * FROM output WHERE output.transaction_hash = b.hash OFFSET 0) o
   WHERE o.unspent_node_ids IS NULL
-    AND (SELECT unspent_node_ids_read_tier()) <> 'fallback'
+    AND (SELECT unspent_node_ids_stored_path(node_name))
     AND %1$s
   UNION ALL
   SELECT o.* FROM output o
   WHERE o.unspent_node_ids IS NULL
     AND (SELECT unspent_node_ids_backfill_pending())
-    AND (SELECT unspent_node_ids_read_tier()) <> 'fallback'
+    AND (SELECT unspent_node_ids_stored_path(node_name))
     AND NOT (o.transaction_hash IN (SELECT b.hash FROM unspent_node_ids_backlog_transactions() b))
     AND %1$s
   UNION ALL
@@ -1027,7 +1059,7 @@ BEGIN
     SELECT * FROM output
       WHERE output.transaction_hash = r.outpoint_transaction_hash AND output.output_index = r.outpoint_index OFFSET 0) o
   WHERE NOT ((SELECT n.internal_id FROM node n WHERE n.name = node_name)::integer = ANY (o.unspent_node_ids))
-    AND (SELECT unspent_node_ids_read_tier()) <> 'fallback'
+    AND (SELECT unspent_node_ids_stored_path(node_name))
     AND %1$s
   UNION ALL
   SELECT o.* FROM unspent_node_ids_gained_creators((SELECT n.internal_id FROM node n WHERE n.name = node_name)) c
@@ -1037,13 +1069,13 @@ BEGIN
     AND NOT ((o.transaction_hash, o.output_index) IN (
       SELECT r.outpoint_transaction_hash, r.outpoint_index
         FROM unspent_node_ids_released_spends((SELECT n.internal_id FROM node n WHERE n.name = node_name)) r))
-    AND (SELECT unspent_node_ids_read_tier()) <> 'fallback'
+    AND (SELECT unspent_node_ids_stored_path(node_name))
     AND %1$s
   UNION ALL
   SELECT o.* FROM output o
-  WHERE (%2$s OR (SELECT unspent_node_ids_read_tier()) = 'fallback')
+  WHERE NOT (SELECT unspent_node_ids_stored_path(node_name))
     AND %1$s
-$shared$, f1g_shared, names) || '$root$';
+$shared$, f1g_shared) || '$root$';
   EXECUTE $c$COMMENT ON FUNCTION unspent_output_stored (text) IS 'The outputs unspent according to the named node: created by a transaction the node accepts (in a block it accepts or in its mempool) and not spent by any transaction the node accepts. Same rows as unspent_output(node_name); served from the stored per-node set (output.unspent_node_ids) with a live correction for anything the tracking job has not processed yet. Filter by token_category (and nonfungible_token_capability) or use a 25-byte locking bytecode prefix; a call filtered only by locking_bytecode scans every output.'$c$;
 END;
 $build$;

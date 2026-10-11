@@ -19,12 +19,15 @@ import {
   batchReachedLimits,
   blockReacceptedEventsSql,
   buildRootSql,
+  clearNodeIndexedSql,
+  concurrentIndexDefinition,
   configurationLockKey,
   configureTrackingTriggersSql,
   deleteConsumedEventsSql,
   formatBatchLog,
   headersAcceptedEventsSql,
   initializeSql,
+  markNodeIndexedSql,
   nextSkipThrough,
   nextStallState,
   nextTransactionIdSql,
@@ -33,6 +36,7 @@ import {
   parseWatchPassResult,
   progressSql,
   readSequencesSql,
+  rebuildRequiredSql,
   repartitionSql,
   runBatchSql,
   snapshotSettledSql,
@@ -1358,11 +1362,17 @@ export const configureUnspentNodeIds = async () => {
 };
 
 /**
- * Create the per-node partial indexes that are missing (after the initial
- * sync and the managed indexes, so the initial sync does not maintain them),
- * then rebuild the query root for the registered nodes. Serialized across
- * agents by a session advisory lock (each index build commits on its own);
- * the existing indexes are listed once the lock is held. Returns the
+ * Create the per-node partial indexes that are missing or invalid (after the
+ * initial sync and the managed indexes, so the initial sync does not maintain
+ * them), with `CREATE INDEX CONCURRENTLY`, so `output` writes are not blocked
+ * during the builds. An index left INVALID by an interrupted build
+ * (`pg_index.indisvalid`) is dropped and rebuilt; while any of a node's three
+ * indexes is missing or invalid, the node is removed from
+ * `unspent_tracking_nodes` and the query root answers it with the live
+ * predicate. Once all three are valid the node is recorded (served from the
+ * stored set once the events recorded before then are consumed) and the root
+ * is rebuilt. Serialized across agents by a session advisory lock (held across
+ * the concurrent builds, which run outside any transaction). Returns the
  * statements run.
  */
 export const ensureUnspentNodeIdsIndexes = async () => {
@@ -1377,22 +1387,56 @@ export const ensureUnspentNodeIdsIndexes = async () => {
     ]);
     // eslint-disable-next-line functional/no-try-statement
     try {
-      const existingIndexes = (
-        await client.query<{ name: string }>(
-          /* sql */ `SELECT indexname AS name FROM pg_indexes WHERE schemaname = 'public';`
-        )
-      ).rows.map((row) => row.name);
+      // cspell:ignore indisvalid indisready indexrelid relname relnamespace nspname
+      const indexValidity = new Map(
+        (
+          await client.query<{ name: string; valid: boolean }>(/* sql */ `
+            SELECT c.relname AS name, i.indisvalid AND i.indisready AS valid
+              FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+              JOIN pg_namespace ns ON ns.oid = c.relnamespace
+              WHERE ns.nspname = 'public' AND c.relname LIKE 'output_unspent_node_%';`)
+        ).rows.map((row) => [row.name, row.valid])
+      );
       const nodeIds = (
         await client.query<{ id: string }>(
           /* sql */ `SELECT internal_id AS id FROM node ORDER BY internal_id;`
         )
       ).rows.map((row) => Number(row.id));
-      const statements = nodeIds.flatMap((id) =>
-        Object.entries(nodeIndexDefinitions(id))
-          .filter(([name]) => !existingIndexes.includes(name))
-          .map(([, definition]) => definition)
+      const pending = nodeIds.map((id) => ({
+        id,
+        indexes: Object.entries(nodeIndexDefinitions(id)).filter(
+          ([name]) => indexValidity.get(name) !== true
+        ),
+      }));
+      const statements = pending.flatMap(({ id, indexes }) =>
+        indexes.length === 0
+          ? []
+          : [
+              clearNodeIndexedSql(id),
+              ...indexes.flatMap(([name, definition]) => [
+                ...(indexValidity.has(name)
+                  ? [`DROP INDEX CONCURRENTLY IF EXISTS ${name};`]
+                  : []),
+                concurrentIndexDefinition(definition),
+              ]),
+            ]
       );
-      await runStatements(client, statements);
+      const clearStatements = statements.filter((statement) =>
+        statement.startsWith('DELETE')
+      );
+      if (clearStatements.length > 0) {
+        // stop serving these nodes from the stored set before rebuilding
+        await runStatements(client, clearStatements);
+        await client.query(buildRootSql);
+      }
+      await runStatements(
+        client,
+        statements.filter((statement) => !statement.startsWith('DELETE'))
+      );
+      await runStatements(
+        client,
+        nodeIds.map((id) => markNodeIndexedSql(id))
+      );
       await client.query(buildRootSql);
       return statements;
     } finally {
@@ -1413,6 +1457,8 @@ export const ensureUnspentNodeIdsIndexes = async () => {
 let settledLimits: SettledLimits | undefined;
 // eslint-disable-next-line functional/no-let
 let settleCandidate: SettleCandidate | undefined;
+// eslint-disable-next-line functional/no-let
+let rebuildWarned = false;
 const partitionStalls = new Map<number, StallState | undefined>();
 const partitionSkipThrough = new Map<number, number>();
 // eslint-disable-next-line functional/no-let
@@ -1637,6 +1683,11 @@ const ensureInitialized = async (
           : `transaction ${limits.transactionLimit} / block ${limits.blockLimit}; earlier outputs stay unprocessed (NULL) until backfilled`
       } (${partitionCount} partitions).`
     );
+    if (!unspentNodeIds.startAtGenesis && !unspentNodeIds.backfill) {
+      unspentTrackingLog.warn(
+        'Unspent tracking job: CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false, so outputs saved before tracking started stay NULL, and unspent_output_stored answers them with the live predicate (exact, but as slow as unspent_output) until a backfill completes (unspent_tracking_settings.backfill_complete).'
+      );
+    }
     return;
   }
   const repartitioned =
@@ -1776,8 +1827,20 @@ export const runUnspentNodeIdsJobPass = async (
         (p) => p.last?.stalledAt !== null && p.last?.stalledAt !== undefined
       );
       await coordinator.query(deleteConsumedEventsSql);
+      const rebuildRequired =
+        (
+          await coordinator.query<{ rebuildRequired: boolean }>(
+            rebuildRequiredSql
+          )
+        ).rows[0]?.rebuildRequired === true;
+      if (rebuildRequired && !unspentNodeIds.backfill && !rebuildWarned) {
+        rebuildWarned = true;
+        unspentTrackingLog.warn(
+          'Unspent tracking job: a rebuild after a stop is pending; it runs although CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false (until it completes, unspent_output_stored answers with the live predicate).'
+        );
+      }
       if (
-        (options.backfill ?? unspentNodeIds.backfill) &&
+        (options.backfill ?? (unspentNodeIds.backfill || rebuildRequired)) &&
         summary.caughtUp &&
         Date.now() - start < maxMs
       ) {

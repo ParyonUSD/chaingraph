@@ -41,6 +41,26 @@ export const nodeIndexDefinitions = (nodeInternalId: number) => ({
   [`output_unspent_node_${nodeInternalId}_search_index`]: /* sql */ `CREATE INDEX output_unspent_node_${nodeInternalId}_search_index ON output USING btree (substring(locking_bytecode, 0, 26)) WHERE ${nodeInternalId} = ANY (unspent_node_ids);`,
 });
 
+/**
+ * The `CREATE INDEX CONCURRENTLY` form of a per-node index definition (the
+ * agent builds them while blocks and transactions are being saved).
+ */
+export const concurrentIndexDefinition = (definition: string) =>
+  definition.replace(/^CREATE INDEX /u, 'CREATE INDEX CONCURRENTLY ');
+
+/**
+ * Record that a node's three per-node indexes are valid: the query root serves
+ * it from the stored set once the events recorded until now are consumed.
+ */
+export const markNodeIndexedSql = (nodeInternalId: number) =>
+  /* sql */ `INSERT INTO unspent_tracking_nodes (node_internal_id, ready_after_event_id) SELECT ${nodeInternalId}, CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq ON CONFLICT ON CONSTRAINT unspent_tracking_nodes_pkey DO NOTHING;`;
+
+/**
+ * Stop serving a node from the stored set (its per-node indexes are rebuilt).
+ */
+export const clearNodeIndexedSql = (nodeInternalId: number) =>
+  /* sql */ `DELETE FROM unspent_tracking_nodes WHERE node_internal_id = ${nodeInternalId};`;
+
 export const nodeIndexNamePattern = /^output_unspent_node_\d+_/u;
 
 export const trackingTriggers = [
@@ -112,7 +132,10 @@ SELECT count(*)::text AS partitions,
        min(block_internal_id)::text AS "blockWatermark",
        min(consumed_event_id)::text AS "consumedEventId",
        min(backfill_transaction_internal_id)::text AS "backfillWatermark",
-       (SELECT backfill_complete FROM unspent_tracking_settings) AS "backfillComplete"
+       (SELECT backfill_complete FROM unspent_tracking_settings) AS "backfillComplete",
+       unspent_node_ids_backfill_pending() AS "backfillPending",
+       (SELECT rebuild_required FROM unspent_tracking_settings) AS "rebuildRequired",
+       unspent_node_ids_read_tier() AS "readTier"
   FROM unspent_tracking_progress;`;
 export const runBatchSql = /* sql */ `SELECT unspent_node_ids_run_batch($1::integer, $2::integer, $3::bigint, $4::bigint, $5::bigint, $6::integer, $7::integer, $8::integer, $9::bigint) AS result;`;
 export const watchPassSql = /* sql */ `SELECT unspent_node_ids_watch_pass($1::bigint) AS result;`;
@@ -142,6 +165,12 @@ export const parseWatchPassResult = (raw: {
   watched: Number(raw.watched ?? 0),
 });
 export const backfillBatchSql = /* sql */ `SELECT unspent_node_ids_backfill_batch($1::integer, $2::integer, $3::integer) AS result;`;
+/**
+ * Whether the job must backfill whatever CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL
+ * says: a rebuild after a stop (until it completes, reads use the live
+ * predicate, so the rebuild always runs).
+ */
+export const rebuildRequiredSql = /* sql */ `SELECT rebuild_required AS "rebuildRequired" FROM unspent_tracking_settings;`;
 export const deleteConsumedEventsSql = /* sql */ `SELECT unspent_node_ids_delete_consumed_events()::text AS deleted;`;
 /**
  * Backlog seen by the job (logs, metrics, tests): highest transaction id,

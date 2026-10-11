@@ -6,6 +6,7 @@ DROP FUNCTION IF EXISTS unspent_node_ids_backlog_transactions ();
 DROP FUNCTION IF EXISTS unspent_node_ids_dirty_creators ();
 DROP FUNCTION IF EXISTS unspent_node_ids_recent_spends ();
 DROP FUNCTION IF EXISTS unspent_node_ids_dirty_transactions ();
+DROP FUNCTION IF EXISTS unspent_node_ids_stored_path (text);
 DROP FUNCTION IF EXISTS unspent_node_ids_rebuild_pending ();
 DROP FUNCTION IF EXISTS unspent_node_ids_backfill_pending ();
 DROP FUNCTION IF EXISTS unspent_node_ids_read_tier ();
@@ -29,6 +30,7 @@ DROP TRIGGER IF EXISTS trigger_unspent_tracking_node_transaction_delete ON node_
 DROP FUNCTION IF EXISTS trigger_unspent_tracking_node_block_delete ();
 DROP FUNCTION IF EXISTS trigger_unspent_tracking_node_transaction_delete ();
 DROP TABLE IF EXISTS unspent_tracking_skipped;
+DROP TABLE IF EXISTS unspent_tracking_nodes;
 DROP TABLE IF EXISTS unspent_tracking_watch;
 DROP TABLE IF EXISTS unspent_tracking_settings;
 DROP TABLE IF EXISTS unspent_tracking_progress;
