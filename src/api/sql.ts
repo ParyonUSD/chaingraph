@@ -149,8 +149,8 @@ export class Sql {
    * The rows of a node-agnostic pinned view (or the primary node's) at the
    * snapshot, as a FROM item (the gate inlined: `inlinePinnedView`).
    */
-  view(name: string) {
-    return inlinePinnedView(name, this.snapshot);
+  view(name: string, keyFilter?: string) {
+    return inlinePinnedView(name, this.snapshot, undefined, keyFilter);
   }
 
   /**
@@ -158,37 +158,41 @@ export class Sql {
    * other than the primary one must be pinned by the request snapshot; its
    * `node_<id>` / `visible_<id>` parameters come from that snapshot.
    */
-  nodeView(name: string, node?: number) {
+  nodeView(name: string, node?: number, keyFilter?: string) {
     const id = node ?? this.primaryNode;
     if (id === undefined || id === nodeAgnosticId) {
       throw invalid(
         'This field reads per-node data: name the node (`node:` argument).'
       );
     }
-    if (id === this.snapshot.nodeId) return this.view(name);
+    if (id === this.snapshot.nodeId) return this.view(name, keyFilter);
     const visible = this.others.get(id);
     if (visible === undefined) {
       throw new GraphQLError(`Node ${id} is not pinned by this request.`);
     }
     this.params[`node_${id}`] = id;
     this.params[`visible_${id}`] = visible;
-    return inlinePinnedView(name, this.snapshot, {
-      node: `node_${id}`,
-      visible: `visible_${id}`,
-    });
+    return inlinePinnedView(
+      name,
+      this.snapshot,
+      { node: `node_${id}`, visible: `visible_${id}` },
+      keyFilter
+    );
   }
 
   /**
    * ACC: `SELECT transaction_hash` of transactions the node accepts (a block
    * it accepts or its mempool). With `among` (a subquery of transaction
-   * hashes), only those are checked: the acceptance view is then read by its
-   * primary key, not in full.
+   * hashes), only those are checked: the acceptance rows are then read by
+   * the primary key (the filter applies to the base rows, below the
+   * collapsing GROUP BY), not in full.
    */
   accepted(node?: number, among?: string) {
     return `SELECT transaction_hash FROM ${this.nodeView(
       'tx_acceptance_at',
-      node
-    )}${among === undefined ? '' : ` WHERE transaction_hash IN (${among})`}`;
+      node,
+      among === undefined ? undefined : `transaction_hash IN (${among})`
+    )}`;
   }
 }
 

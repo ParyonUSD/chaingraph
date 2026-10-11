@@ -445,7 +445,7 @@ export const agnosticPinnedViews: readonly string[] = [
  */
 export const pinnedView = (name: string, qualifier = '') =>
   `${qualifier === '' ? '' : `${qualifier}.`}${name}(${
-    name === 'spend_at'
+    name === 'spend_at' || name === 'authchain_link_at'
       ? spendViewArgs
       : agnosticPinnedViews.includes(name)
       ? agnosticViewArgs
@@ -488,6 +488,11 @@ const pinnedViewBodies: {
     groupBy?: string;
   };
 } = {
+  authchain_link_at: {
+    kind: 'spend',
+    select: '*',
+    table: 'authchain_link',
+  },
   block_at: { kind: 'agnostic', select: '*', table: 'block' },
   block_transaction_at: {
     kind: 'agnostic',
@@ -586,22 +591,33 @@ export const inlinablePinnedViews = Object.keys(pinnedViewBodies);
  * and the `commit_void` fallback unless `void` is the overflow sentinel. The
  * fence term always stays (it also bounds a forged watermark, as in the
  * views). The parameters still come only from `readSnapshot(Multi)`.
+ *
+ * `keyFilter`: a predicate on the view's key columns (for a membership view,
+ * its GROUP BY columns), applied to the base rows before the gate. Same rows
+ * as filtering the view, but the primary key is used even where ClickHouse
+ * does not push a filter below the GROUP BY (a recursive CTE step).
  */
+/* eslint-disable max-params */
 export const inlinePinnedView = (
   name: string,
   snapshot: Pick<VisibilitySnapshot, 'committedTail' | 'void'>,
   params: { node: string; visible: string } = {
     node: 'node',
     visible: 'visible',
-  }
+  },
+  keyFilter?: string
 ) => {
   const body = pinnedViewBodies[name];
   if (body === undefined) {
     // eslint-disable-next-line functional/no-throw-statement
     throw new RangeError(`No inline form for the pinned view ${name}.`);
   }
+  const filter = keyFilter === undefined ? [] : [`(${keyFilter})`];
   if (body.kind === 'spend') {
-    return `(SELECT ${body.select} FROM ${body.table} WHERE batch <= {spend:UInt64})`;
+    return `(SELECT ${body.select} FROM ${body.table} WHERE ${[
+      'batch <= {spend:UInt64}',
+      ...filter,
+    ].join(' AND ')})`;
   }
   const voidTerms =
     snapshot.void.length === 0
@@ -613,6 +629,7 @@ export const inlinePinnedView = (
             : []),
         ];
   const terms = [
+    ...filter,
     ...(body.kind === 'node'
       ? [
           `node_internal_id = {${params.node}:UInt32}`,
@@ -634,6 +651,7 @@ export const inlinePinnedView = (
       : ` GROUP BY ${body.groupBy} HAVING sum(sign) > 0`
   })`;
 };
+/* eslint-enable max-params */
 
 /**
  * SQL fragments of the gate for ad-hoc readers that read base tables. They
