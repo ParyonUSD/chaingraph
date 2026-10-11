@@ -4701,8 +4701,13 @@ test.serial(
         // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
         rollback().then(async () => Promise.reject(error))
     );
+    /*
+     * Either copy: the two are identical, and once Postgres has auto-analyzed
+     * `output` the managed index has expression statistics the fresh copy
+     * lacks, which tips the planner's tie towards it.
+     */
     plans.forEach((plan) => {
-      t.true(plan.includes('test_output_search_index'), plan);
+      t.true(/\b(?:test_)?output_search_index\b/u.test(plan), plan);
       t.false(plan.includes('Seq Scan'), plan);
     });
   }
