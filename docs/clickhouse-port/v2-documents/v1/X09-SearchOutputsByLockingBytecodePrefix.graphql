@@ -1,0 +1,31 @@
+# X9 v1 (chaingraph.cash 3bacf3c examples.tsx: Search Outputs (By Prefix))
+query SearchOutputsByLockingBytecodePrefix {
+  search_output_prefix(
+    args: { locking_bytecode_prefix_hex: "4104ae1a62fe09c5f51b13905f07f06b99" }
+  ) {
+    locking_bytecode
+    output_index
+    transaction_hash
+    value_satoshis
+    transaction {
+      block_inclusions {
+        block {
+          hash
+          height
+        }
+      }
+    }
+    spent_by {
+      input_index
+      transaction {
+        hash
+        block_inclusions {
+        block {
+          hash
+          height
+        }
+      }
+      }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+# L20 v1 (paryon_library-integration 7c36376, gqlQueryInterestManager)
+query InterestManager($loanTokenId: bytea, $interestManagerCommitment: bytea, $node: String!) {
+  output(
+    where: {token_category: {_eq: $loanTokenId}, _and: {nonfungible_token_commitment: {_eq: $interestManagerCommitment}}, transaction: {_or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}, _not: {spent_by: {transaction: {_or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}}}}
+  ) {
+    transaction_hash
+    locking_bytecode
+  }
+}

@@ -1,0 +1,12 @@
+# L18 v1 (paryon_library-integration 7c36376, gqlQueryBorrowingTxsInPeriod)
+query BorrowingTxsInPeriod($periodCommitment: bytea, $paryonTokenId: bytea, $node: String!) {
+  transaction(
+    where: {outputs: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "minting"}, nonfungible_token_commitment: {_eq: $periodCommitment}}}, _and: {outputs: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}}}, inputs: {outpoint: {token_category: {_eq: $paryonTokenId}}}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+  ) {
+    hash
+    outputs {
+      value_satoshis
+      fungible_token_amount
+    }
+  }
+}

@@ -1,0 +1,19 @@
+# X2 v1 (chaingraph.cash 3bacf3c examples.tsx: Monitor Sync Status)
+subscription MonitorSyncTips {
+  node {
+    name
+    user_agent
+    latest_tip: accepted_blocks(
+      limit: 1
+      order_by: { block_internal_id: desc }
+    ) {
+      accepted_at
+      block {
+        hash
+        height
+        transaction_count
+        size_bytes
+      }
+    }
+  }
+}

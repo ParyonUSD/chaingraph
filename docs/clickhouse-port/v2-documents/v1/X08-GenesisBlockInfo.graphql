@@ -1,0 +1,15 @@
+# X8 v1 (chaingraph.cash 3bacf3c examples.tsx: Get Raw Blocks)
+query GenesisBlockInfo {
+  block(where: { height: { _eq: "0" } }) {
+    hash
+    height
+    header
+    encoded_hex
+    accepted_by {
+      node {
+        name
+        user_agent
+      }
+    }
+  }
+}

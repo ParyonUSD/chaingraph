@@ -1,0 +1,1899 @@
+[
+ {
+  "id": "L1",
+  "name": "LoanBorrowingTxs",
+  "kind": "query",
+  "file": "L01-LoanBorrowingTxs.graphql",
+  "v1": {
+   "file": "v1/L01-LoanBorrowingTxs.graphql",
+   "variables": {
+    "userLoanKeys": [
+     "\\xeb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "\\xbe79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "\\x6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "\\x3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "\\xc40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "\\xb3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "\\xb7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "fromBlockHeight": "0",
+    "toBlockHeight": "1000000000",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "userLoanKeys": [
+     "eb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "be79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "c40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "b3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "b7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "fromBlockHeight": 0,
+    "toBlockHeight": 1000000000,
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L2",
+  "name": "LoanCompletedRedemptions",
+  "kind": "query",
+  "file": "L02-LoanCompletedRedemptions.graphql",
+  "v1": {
+   "file": "v1/L02-LoanCompletedRedemptions.graphql",
+   "variables": {
+    "userLoanKeys": [
+     "\\xeb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "\\xbe79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "\\x6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "\\x3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "\\xc40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "\\xb3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "\\xb7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "userLoanKeys": [
+     "eb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "be79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "c40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "b3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "b7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L3",
+  "name": "LoanInterestPayments",
+  "kind": "query",
+  "file": "L03-LoanInterestPayments.graphql",
+  "v1": {
+   "file": "v1/L03-LoanInterestPayments.graphql",
+   "variables": {
+    "userLoanKeys": [
+     "\\xeb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "\\xbe79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "\\x6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "\\x3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "\\xc40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "\\xb3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "\\xb7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "userLoanKeys": [
+     "eb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "be79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "c40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "b3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "b7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L4",
+  "name": "UserLoanInteractions",
+  "kind": "query",
+  "file": "L04-UserLoanInteractions.graphql",
+  "v1": {
+   "file": "v1/L04-UserLoanInteractions.graphql",
+   "variables": {
+    "userLoanKeys": [
+     "\\xeb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "\\xbe79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "\\x6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "\\x3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "\\xc40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "\\xb3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "\\xb7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "fromBlockHeight": "0",
+    "toBlockHeight": "1000000000",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "userLoanKeys": [
+     "eb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "be79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "c40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "b3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "b7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "fromBlockHeight": 0,
+    "toBlockHeight": 1000000000,
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L5",
+  "name": "UserLoanInteractionsExcludingInterest",
+  "kind": "query",
+  "file": "L05-UserLoanInteractionsExcludingInterest.graphql",
+  "v1": {
+   "file": "v1/L05-UserLoanInteractionsExcludingInterest.graphql",
+   "variables": {
+    "userLoanKeys": [
+     "\\xeb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "\\xbe79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "\\x6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "\\x3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "\\xc40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "\\xb3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "\\xb7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "fromBlockHeight": "0",
+    "toBlockHeight": "1000000000",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "userLoanKeys": [
+     "eb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "be79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "c40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "b3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "b7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "fromBlockHeight": 0,
+    "toBlockHeight": 1000000000,
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L6",
+  "name": "UserStakingInteractions",
+  "kind": "query",
+  "file": "L06-UserStakingInteractions.graphql",
+  "v1": {
+   "file": "v1/L06-UserStakingInteractions.graphql",
+   "variables": {
+    "poolTokenId": "\\x8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "userLockingBytecodes": [
+     "\\x76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac"
+    ],
+    "fromBlockHeight": "0",
+    "toBlockHeight": "1000000000",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "poolTokenId": "8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "userLockingBytecodes": [
+     "76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac"
+    ],
+    "fromBlockHeight": 0,
+    "toBlockHeight": 1000000000,
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L7",
+  "name": "AllStakingInteractions",
+  "kind": "query",
+  "file": "L07-AllStakingInteractions.graphql",
+  "v1": {
+   "file": "v1/L07-AllStakingInteractions.graphql",
+   "variables": {
+    "poolTokenId": "\\x8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "poolLockingBytecode": "\\xaa202f822154922e5b23e4ba0d5378487e3f858bb5c2f0e8fa37eff197c433242f3c87",
+    "fromBlockHeight": "0",
+    "toBlockHeight": "1000000000",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "poolTokenId": "8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "poolLockingBytecode": "aa202f822154922e5b23e4ba0d5378487e3f858bb5c2f0e8fa37eff197c433242f3c87",
+    "fromBlockHeight": 0,
+    "toBlockHeight": 1000000000,
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L8",
+  "name": "RedemptionInteractions",
+  "kind": "query",
+  "file": "L08-RedemptionInteractions.graphql",
+  "v1": {
+   "file": "v1/L08-RedemptionInteractions.graphql",
+   "variables": {
+    "redeemerTokenId": "\\xa2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "fromBlockHeight": "0",
+    "toBlockHeight": "1000000000",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "redeemerTokenId": "a2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "fromBlockHeight": 0,
+    "toBlockHeight": 1000000000,
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L9",
+  "name": "UserRedemptionSidecarCommitments",
+  "kind": "query",
+  "file": "L09-UserRedemptionSidecarCommitments.graphql",
+  "v1": {
+   "file": "v1/L09-UserRedemptionSidecarCommitments.graphql",
+   "variables": {
+    "redeemerTokenId": "\\xa2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "userLockingBytecodes": [
+     "\\x76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac"
+    ],
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "redeemerTokenId": "a2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "userLockingBytecodes": [
+     "76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac"
+    ],
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L10",
+  "name": "UserRedemptionInteractions",
+  "kind": "query",
+  "file": "L10-UserRedemptionInteractions.graphql",
+  "v1": {
+   "file": "v1/L10-UserRedemptionInteractions.graphql",
+   "variables": {
+    "redeemerTokenId": "\\xa2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "sidecarCommitments": [
+     "\\x8ee26d6c9f58369f94864dc3630cdeb17fae2f2d7faf0000",
+     "\\x8ee26d6c9f58369f94864dc3630cdeb17fae2f2d8bad0000",
+     "\\x8ee26d6c9f58369f94864dc3630cdeb17fae2f2da4af0000"
+    ],
+    "fromBlockHeight": "0",
+    "toBlockHeight": "1000000000",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "redeemerTokenId": "a2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "sidecarCommitments": [
+     "8ee26d6c9f58369f94864dc3630cdeb17fae2f2d7faf0000",
+     "8ee26d6c9f58369f94864dc3630cdeb17fae2f2d8bad0000",
+     "8ee26d6c9f58369f94864dc3630cdeb17fae2f2da4af0000"
+    ],
+    "fromBlockHeight": 0,
+    "toBlockHeight": 1000000000,
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L11",
+  "name": "AllLiquidations",
+  "kind": "query",
+  "file": "L11-AllLiquidations.graphql",
+  "v1": {
+   "file": "v1/L11-AllLiquidations.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "fromBlockHeight": "0",
+    "toBlockHeight": "1000000000",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "fromBlockHeight": 0,
+    "toBlockHeight": 1000000000,
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L12",
+  "name": "AllHolders",
+  "kind": "query",
+  "file": "L12-AllHolders.graphql",
+  "v1": {
+   "file": "v1/L12-AllHolders.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 5000,
+    "offset": 0
+   },
+   "root": "output",
+   "paginate": "offset"
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 5000
+   },
+   "root": "output",
+   "paginate": "cursor"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L13",
+  "name": "allStakingReceipts",
+  "kind": "query",
+  "file": "L13-allStakingReceipts.graphql",
+  "v1": {
+   "file": "v1/L13-allStakingReceipts.graphql",
+   "variables": {
+    "poolTokenId": "\\x8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "node": "chipnet-local",
+    "limit": 5000,
+    "offset": 0
+   },
+   "root": "output",
+   "paginate": "offset"
+  },
+  "v2": {
+   "variables": {
+    "poolTokenId": "8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "node": "chipnet-local",
+    "limit": 5000
+   },
+   "root": "output",
+   "paginate": "cursor"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L14",
+  "name": "finalizedUserRedemptions",
+  "kind": "query",
+  "file": "L14-finalizedUserRedemptions.graphql",
+  "v1": {
+   "file": "v1/L14-finalizedUserRedemptions.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "userLockingBytecodes": [
+     "\\x76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac"
+    ],
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "userLockingBytecodes": [
+     "76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac"
+    ],
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L15",
+  "name": "startedAndSwappedRedemptions",
+  "kind": "query",
+  "file": "L15-startedAndSwappedRedemptions.graphql",
+  "v1": {
+   "file": "v1/L15-startedAndSwappedRedemptions.graphql",
+   "variables": {
+    "redeemerTokenId": "\\xa2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "node": "chipnet-local",
+    "limit": 5000,
+    "offset": 0
+   },
+   "root": "output",
+   "paginate": "offset"
+  },
+  "v2": {
+   "variables": {
+    "redeemerTokenId": "a2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "node": "chipnet-local",
+    "limit": 5000
+   },
+   "root": "output",
+   "paginate": "cursor"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L16",
+  "name": "UserStartedAndSwappedRedemptions",
+  "kind": "query",
+  "file": "L16-UserStartedAndSwappedRedemptions.graphql",
+  "v1": {
+   "file": "v1/L16-UserStartedAndSwappedRedemptions.graphql",
+   "variables": {
+    "redeemerTokenId": "\\xa2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "sidecarCommitments": [
+     "\\x8ee26d6c9f58369f94864dc3630cdeb17fae2f2d7faf0000",
+     "\\x8ee26d6c9f58369f94864dc3630cdeb17fae2f2d8bad0000",
+     "\\x8ee26d6c9f58369f94864dc3630cdeb17fae2f2da4af0000"
+    ],
+    "node": "chipnet-local",
+    "limit": 5000,
+    "offset": 0
+   },
+   "root": "output",
+   "paginate": "offset"
+  },
+  "v2": {
+   "variables": {
+    "redeemerTokenId": "a2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "sidecarCommitments": [
+     "8ee26d6c9f58369f94864dc3630cdeb17fae2f2d7faf0000",
+     "8ee26d6c9f58369f94864dc3630cdeb17fae2f2d8bad0000",
+     "8ee26d6c9f58369f94864dc3630cdeb17fae2f2da4af0000"
+    ],
+    "node": "chipnet-local",
+    "limit": 5000
+   },
+   "root": "output",
+   "paginate": "cursor"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L17",
+  "name": "finalizedRedemptions",
+  "kind": "query",
+  "file": "L17-finalizedRedemptions.graphql",
+  "v1": {
+   "file": "v1/L17-finalizedRedemptions.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 1000,
+    "afterInternalId": "-1",
+    "afterInputIndex": "-1"
+   },
+   "root": "input",
+   "paginate": "inputKeyset"
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 1000
+   },
+   "root": "input",
+   "paginate": "cursor"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L18",
+  "name": "BorrowingTxsInPeriod",
+  "kind": "query",
+  "file": "L18-BorrowingTxsInPeriod.graphql",
+  "v1": {
+   "file": "v1/L18-BorrowingTxsInPeriod.graphql",
+   "variables": {
+    "periodCommitment": "\\xad000000",
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "periodCommitment": "ad000000",
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "L19",
+  "name": "FinalizedRedemptionsInPeriod",
+  "kind": "query",
+  "file": "L19-FinalizedRedemptionsInPeriod.graphql",
+  "v1": {
+   "file": "v1/L19-FinalizedRedemptionsInPeriod.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "fromBlockHeight": "326890",
+    "toBlockHeight": "327034",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "fromBlockHeight": 326890,
+    "toBlockHeight": 327034,
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "L20",
+  "name": "InterestManager",
+  "kind": "query",
+  "file": "L20-InterestManager.graphql",
+  "v1": {
+   "file": "v1/L20-InterestManager.graphql",
+   "variables": {
+    "loanTokenId": "\\xbe79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+    "interestManagerCommitment": "\\x01",
+    "node": "chipnet-local"
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "loanTokenId": "be79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+    "interestManagerCommitment": "01",
+    "node": "chipnet-local",
+    "limit": 5000
+   },
+   "root": "output",
+   "paginate": "cursor"
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "L21",
+  "name": "LoanClosure",
+  "kind": "query",
+  "file": "L21-LoanClosure.graphql",
+  "v1": {
+   "file": "v1/L21-LoanClosure.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanTokenId": "\\x322dc32298ae839854ae053611510502e64fa7f8d4207dc43b3454f5e504b724",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanTokenId": "322dc32298ae839854ae053611510502e64fa7f8d4207dc43b3454f5e504b724",
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "L22",
+  "name": "LoanClosures",
+  "kind": "query",
+  "file": "L22-LoanClosures.graphql",
+  "v1": {
+   "file": "v1/L22-LoanClosures.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanTokenIds": [
+     "\\x322dc32298ae839854ae053611510502e64fa7f8d4207dc43b3454f5e504b724",
+     "\\x2efd5f094a1fc0dbc2f879a34128cdc83c11a5117ecdab138556dbad10c5f95d",
+     "\\x0d0f93fcfcbf77be1f079b771ea2c1cd28cfea43fa1fdd73ec5acc22589ef12c",
+     "\\xb14e4423986335ed93c1a4ed99468130dbcddd83854d934280e865b9e7d27246",
+     "\\xb315e2f14184a39e4355bdbcd28d2a25978f2499748f119b3fc847e68f21939f"
+    ],
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanTokenIds": [
+     "322dc32298ae839854ae053611510502e64fa7f8d4207dc43b3454f5e504b724",
+     "2efd5f094a1fc0dbc2f879a34128cdc83c11a5117ecdab138556dbad10c5f95d",
+     "0d0f93fcfcbf77be1f079b771ea2c1cd28cfea43fa1fdd73ec5acc22589ef12c",
+     "b14e4423986335ed93c1a4ed99468130dbcddd83854d934280e865b9e7d27246",
+     "b315e2f14184a39e4355bdbcd28d2a25978f2499748f119b3fc847e68f21939f"
+    ],
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L23",
+  "name": "AllLoanClosures",
+  "kind": "query",
+  "file": "L23-AllLoanClosures.graphql",
+  "v1": {
+   "file": "v1/L23-AllLoanClosures.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecodeLoan": "\\xaa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecodeLoan": "aa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L24",
+  "name": "UserInitiatedLoanClosures",
+  "kind": "query",
+  "file": "L24-UserInitiatedLoanClosures.graphql",
+  "v1": {
+   "file": "v1/L24-UserInitiatedLoanClosures.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecodeLoan": "\\xaa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "userLockingBytecodes": [
+     "\\x76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac"
+    ],
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecodeLoan": "aa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "userLockingBytecodes": [
+     "76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac"
+    ],
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L25",
+  "name": "LoanKeyOwner",
+  "kind": "query",
+  "file": "L25-LoanKeyOwner.graphql",
+  "v1": {
+   "file": "v1/L25-LoanKeyOwner.graphql",
+   "variables": {
+    "loanKey": "\\xeb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+    "node": "chipnet-local"
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "loanKey": "eb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+    "node": "chipnet-local",
+    "limit": 5000
+   },
+   "root": "output",
+   "paginate": "cursor"
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "L26",
+  "name": "AllNewPeriodPoolTxs",
+  "kind": "query",
+  "file": "L26-AllNewPeriodPoolTxs.graphql",
+  "v1": {
+   "file": "v1/L26-AllNewPeriodPoolTxs.graphql",
+   "variables": {
+    "poolTokenId": "\\x8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "poolLockingBytecode": "\\xaa202f822154922e5b23e4ba0d5378487e3f858bb5c2f0e8fa37eff197c433242f3c87",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "offset": 0
+   },
+   "root": "transaction",
+   "paginate": "offset"
+  },
+  "v2": {
+   "variables": {
+    "poolTokenId": "8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "poolLockingBytecode": "aa202f822154922e5b23e4ba0d5378487e3f858bb5c2f0e8fa37eff197c433242f3c87",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "offset": 0
+   },
+   "root": "transaction",
+   "paginate": "offset"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L27",
+  "name": "LoanBorrowingTx",
+  "kind": "query",
+  "file": "L27-LoanBorrowingTx.graphql",
+  "v1": {
+   "file": "v1/L27-LoanBorrowingTx.graphql",
+   "variables": {
+    "userLockingBytecodes": [
+     "\\x76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac"
+    ],
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "userLockingBytecodes": [
+     "76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac"
+    ],
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L28",
+  "name": "AllLoanClosureSummaries",
+  "kind": "query",
+  "file": "L28-AllLoanClosureSummaries.graphql",
+  "v1": {
+   "file": "v1/L28-AllLoanClosureSummaries.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecodeLoan": "\\xaa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecodeLoan": "aa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L29",
+  "name": "LoanBorrowingSummaries",
+  "kind": "query",
+  "file": "L29-LoanBorrowingSummaries.graphql",
+  "v1": {
+   "file": "v1/L29-LoanBorrowingSummaries.graphql",
+   "variables": {
+    "userLoanKeys": [
+     "\\xeb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "\\xbe79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "\\x6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "\\x3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "\\xc40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "\\xb3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "\\xb7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "afterInternalId": "-1"
+   },
+   "root": "transaction",
+   "paginate": "keyset"
+  },
+  "v2": {
+   "variables": {
+    "userLoanKeys": [
+     "eb623c6d4c1a8f58f25fd0254388cb9fdf01109cce2b1c93b8a42a211e74d462",
+     "be79d89926d21e37215cc7c4b1433fa563a6c35dd5ec28011e746dd33436b132",
+     "6192d4cc8c3b56e3ca1c46877fbf5d83ec34825b53f9859ade1819385d2aaeb4",
+     "3d8dc66496fc3b832531ee819f48956a810ebd9f46cae03f44416acf506bfb38",
+     "c40eb95033f02bc5d003d5e51b11ac91b2cbeb3dcaf95f938824e8dea31553f3",
+     "b3aca92115e1ef84fa2efaba4b9f4cb1dd87ed6023cf2dfba8940e2ce9425099",
+     "b7f3e49a675de81b0fc1053e031f29e9b03397b650bf9677c59fecf4c649295a"
+    ],
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L30",
+  "name": "MonitorLoansWindow",
+  "kind": "query",
+  "file": "L30-MonitorLoansWindow.graphql",
+  "v1": {
+   "file": "v1/L30-MonitorLoansWindow.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "\\xaa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local",
+    "afterInternalId": "-1",
+    "beforeInternalId": "9223372036854775807",
+    "orderBy": "desc",
+    "limit": 1000
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "aa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local",
+    "limit": 1000,
+    "after": "-1",
+    "before": "9223372036854775807",
+    "order": "DESC"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L31",
+  "name": "PriceContractUtxos",
+  "kind": "query",
+  "file": "L31-PriceContractUtxos.graphql",
+  "v1": {
+   "file": "v1/L31-PriceContractUtxos.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "priceContractLockingBytecode": "\\xaa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local"
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "priceContractLockingBytecode": "aa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local",
+    "limit": 5000
+   },
+   "root": "output",
+   "paginate": "cursor"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L32",
+  "name": "RedemptionContractUtxos",
+  "kind": "query",
+  "file": "L32-RedemptionContractUtxos.graphql",
+  "v1": {
+   "file": "v1/L32-RedemptionContractUtxos.graphql",
+   "variables": {
+    "redemptionTokenId": "\\xa2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "redemptionContractLockingBytecode": "\\xaa2010f280cba71e5db1a1646ff69320cb62dae0d0f6856e5b512cf38740884bd25e87",
+    "node": "chipnet-local"
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "redemptionTokenId": "a2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "redemptionContractLockingBytecode": "aa2010f280cba71e5db1a1646ff69320cb62dae0d0f6856e5b512cf38740884bd25e87",
+    "node": "chipnet-local",
+    "limit": 5000
+   },
+   "root": "output",
+   "paginate": "cursor"
+  },
+  "compare": {}
+ },
+ {
+  "id": "L33",
+  "name": "ContractUtxoActivity",
+  "kind": "query",
+  "file": "L33-ContractUtxoActivity.graphql",
+  "v1": {
+   "file": "v1/L33-ContractUtxoActivity.graphql",
+   "variables": {
+    "tokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecode": "\\xaa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local",
+    "afterInternalId": "-1",
+    "limit": 10000,
+    "orderBy": "asc"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "tokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecode": "aa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local",
+    "limit": 10000,
+    "order": "ASC",
+    "after": "-1"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "compare": {
+   "ignoreRoots": [
+    "transactionWatermark"
+   ]
+  }
+ },
+ {
+  "id": "L34",
+  "name": "ContractOutputsByHash",
+  "kind": "query",
+  "file": "L34-ContractOutputsByHash.graphql",
+  "v1": {
+   "file": "v1/L34-ContractOutputsByHash.graphql",
+   "variables": {
+    "tokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecode": "\\xaa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local",
+    "transactionHashes": [
+     "\\x0659f32d2b699ec2dd94fba15676ac16b3ede542e6c171e44af214b69a5c3d05",
+     "\\x78a10f3636314e93d7351de231e62a89d008ad0ac671bad7b28fdf8d0ed901ad",
+     "\\x7e7f2f8b3369c6ce55e3b60827c335a3e777b10ebb7ce1e9ed071d3a4bbd7c04",
+     "\\x97bdb744428ccd3e0de85f184db9823f0b4a396990ae834d58ee58368f688621",
+     "\\xd42a2e922e6c7130479c9bc826d24910dd01f4403dc7ff1830cfc135adcb9320"
+    ]
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "tokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecode": "aa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local",
+    "transactionHashes": [
+     "0659f32d2b699ec2dd94fba15676ac16b3ede542e6c171e44af214b69a5c3d05",
+     "78a10f3636314e93d7351de231e62a89d008ad0ac671bad7b28fdf8d0ed901ad",
+     "7e7f2f8b3369c6ce55e3b60827c335a3e777b10ebb7ce1e9ed071d3a4bbd7c04",
+     "97bdb744428ccd3e0de85f184db9823f0b4a396990ae834d58ee58368f688621",
+     "d42a2e922e6c7130479c9bc826d24910dd01f4403dc7ff1830cfc135adcb9320"
+    ]
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "L35",
+  "name": "MonitorLoans",
+  "kind": "subscription",
+  "file": "L35-MonitorLoans.graphql",
+  "v1": {
+   "file": "v1/L35-MonitorLoans.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "\\xaa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "aa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local",
+    "limit": 10000
+   },
+   "root": "transaction",
+   "paginate": "afterInternalId"
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "L36",
+  "name": "MonitorPriceContractUTXOs",
+  "kind": "subscription",
+  "file": "L36-MonitorPriceContractUTXOs.graphql",
+  "v1": {
+   "file": "v1/L36-MonitorPriceContractUTXOs.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "priceContractLockingBytecode": "\\xaa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local"
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "priceContractLockingBytecode": "aa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local",
+    "limit": 5000
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L37",
+  "name": "MonitorRedemptionContractUTXOs",
+  "kind": "subscription",
+  "file": "L37-MonitorRedemptionContractUTXOs.graphql",
+  "v1": {
+   "file": "v1/L37-MonitorRedemptionContractUTXOs.graphql",
+   "variables": {
+    "redemptionTokenId": "\\xa2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "redemptionContractLockingBytecode": "\\xaa2010f280cba71e5db1a1646ff69320cb62dae0d0f6856e5b512cf38740884bd25e87",
+    "node": "chipnet-local"
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "redemptionTokenId": "a2d3711c910fd83d37e2983f5dd876b7b62d371d6740733a3804b2d4d6ab6916",
+    "redemptionContractLockingBytecode": "aa2010f280cba71e5db1a1646ff69320cb62dae0d0f6856e5b512cf38740884bd25e87",
+    "node": "chipnet-local",
+    "limit": 5000
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L38",
+  "name": "StabilityPool",
+  "kind": "subscription",
+  "file": "L38-StabilityPool.graphql",
+  "v1": {
+   "file": "v1/L38-StabilityPool.graphql",
+   "variables": {
+    "poolTokenId": "\\x8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "poolLockingBytecode": "\\xaa202f822154922e5b23e4ba0d5378487e3f858bb5c2f0e8fa37eff197c433242f3c87",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "poolTokenId": "8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "poolLockingBytecode": "aa202f822154922e5b23e4ba0d5378487e3f858bb5c2f0e8fa37eff197c433242f3c87",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L39",
+  "name": "newPeriodPool",
+  "kind": "subscription",
+  "file": "L39-newPeriodPool.graphql",
+  "v1": {
+   "file": "v1/L39-newPeriodPool.graphql",
+   "variables": {
+    "poolTokenId": "\\x8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "poolLockingBytecode": "\\xaa202f822154922e5b23e4ba0d5378487e3f858bb5c2f0e8fa37eff197c433242f3c87",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "poolTokenId": "8636d17312a330f1962cba910a76b5de895d6ff83be91c9fc1f40bfd6bdb4f8d",
+    "poolLockingBytecode": "aa202f822154922e5b23e4ba0d5378487e3f858bb5c2f0e8fa37eff197c433242f3c87",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L40",
+  "name": "MonitorLoansSignal",
+  "kind": "subscription",
+  "file": "L40-MonitorLoansSignal.graphql",
+  "v1": {
+   "file": "v1/L40-MonitorLoansSignal.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "\\xaa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "aa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L41",
+  "name": "ChaingraphBlockTipSignal",
+  "kind": "subscription",
+  "file": "L41-ChaingraphBlockTipSignal.graphql",
+  "v1": {
+   "file": "v1/L41-ChaingraphBlockTipSignal.graphql",
+   "variables": {
+    "node": "chipnet-local"
+   },
+   "root": "block",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local"
+   },
+   "root": "block",
+   "paginate": null
+  },
+  "compare": {
+   "wrapObject": true
+  }
+ },
+ {
+  "id": "L42",
+  "name": "MonitorLoansSignalPoll",
+  "kind": "query",
+  "file": "L42-MonitorLoansSignalPoll.graphql",
+  "v1": {
+   "file": "v1/L42-MonitorLoansSignalPoll.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "\\xaa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "aa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L43",
+  "name": "ChaingraphBlockTipSignalPoll",
+  "kind": "query",
+  "file": "L43-ChaingraphBlockTipSignalPoll.graphql",
+  "v1": {
+   "file": "v1/L43-ChaingraphBlockTipSignalPoll.graphql",
+   "variables": {
+    "node": "chipnet-local"
+   },
+   "root": "block",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local"
+   },
+   "root": "block",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L44",
+  "name": "MonitorLoansMempoolSignal",
+  "kind": "subscription",
+  "file": "L44-MonitorLoansMempoolSignal.graphql",
+  "v1": {
+   "file": "v1/L44-MonitorLoansMempoolSignal.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "\\xaa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local"
+   },
+   "root": "node_transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "aa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local"
+   },
+   "root": "node_transaction",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L45",
+  "name": "MonitorContractUtxosMempoolSignal",
+  "kind": "subscription",
+  "file": "L45-MonitorContractUtxosMempoolSignal.graphql",
+  "v1": {
+   "file": "v1/L45-MonitorContractUtxosMempoolSignal.graphql",
+   "variables": {
+    "tokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecode": "\\xaa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local"
+   },
+   "root": "node_transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "tokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecode": "aa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local"
+   },
+   "root": "node_transaction",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L46",
+  "name": "MonitorLoansMempoolSignalPoll",
+  "kind": "query",
+  "file": "L46-MonitorLoansMempoolSignalPoll.graphql",
+  "v1": {
+   "file": "v1/L46-MonitorLoansMempoolSignalPoll.graphql",
+   "variables": {
+    "paryonTokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "\\xaa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local"
+   },
+   "root": "node_transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "paryonTokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "loanContractLockingBytecode": "aa200e21a4c1f868fe858109296e53720c50045825ab58e49d5f43e0ba8576a7509287",
+    "node": "chipnet-local"
+   },
+   "root": "node_transaction",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "L47",
+  "name": "MonitorContractUtxosMempoolSignalPoll",
+  "kind": "query",
+  "file": "L47-MonitorContractUtxosMempoolSignalPoll.graphql",
+  "v1": {
+   "file": "v1/L47-MonitorContractUtxosMempoolSignalPoll.graphql",
+   "variables": {
+    "tokenId": "\\xdfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecode": "\\xaa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local"
+   },
+   "root": "node_transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "tokenId": "dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b",
+    "lockingBytecode": "aa2009c8ebc4166055aa7c401317bb910a2c2a455b0c90605f45c65fb85c7169fe3387",
+    "node": "chipnet-local"
+   },
+   "root": "node_transaction",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "X1",
+  "name": "MonitorMempools",
+  "kind": "subscription",
+  "file": "X01-MonitorMempools.graphql",
+  "v1": {
+   "file": "v1/X01-MonitorMempools.graphql",
+   "query": "subscription MonitorMempools {\n  node {\n    name\n    user_agent\n    unconfirmed_transaction_count\n    unconfirmed_transactions(\n      limit: 100,\n      order_by: { validated_at: desc }\n    ) {\n      validated_at\n      transaction {\n        hash\n        input_count\n        output_count\n        output_value_satoshis\n        size_bytes\n      }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "node",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "limit": 100
+   },
+   "root": "node",
+   "paginate": null
+  },
+  "compare": {
+   "wrapObject": true,
+   "unorderedPaths": [
+    "unconfirmed_transactions"
+   ]
+  }
+ },
+ {
+  "id": "X2",
+  "name": "MonitorSyncTips",
+  "kind": "subscription",
+  "file": "X02-MonitorSyncTips.graphql",
+  "v1": {
+   "file": "v1/X02-MonitorSyncTips.graphql",
+   "query": "subscription MonitorSyncTips {\n  node {\n    name\n    user_agent\n    latest_tip: accepted_blocks(\n      limit: 1\n      order_by: { block_internal_id: desc }\n    ) {\n      accepted_at\n      block {\n        hash\n        height\n        transaction_count\n        size_bytes\n      }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "node",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local"
+   },
+   "root": "node",
+   "paginate": null
+  },
+  "compare": {
+   "wrapObject": true
+  }
+ },
+ {
+  "id": "X3",
+  "name": "MonitorForPayments",
+  "kind": "subscription",
+  "file": "X03-MonitorForPayments.graphql",
+  "v1": {
+   "file": "v1/X03-MonitorForPayments.graphql",
+   "query": "subscription MonitorForPayments {\n  search_output(\n    args: {\n      locking_bytecode_hex: \"{76a914001b9e8d2a5e4f75f5a58cad60f33c56da7a1b8c88ac}\"\n    }\n  ) {\n    transaction_hash\n    output_index\n    value_satoshis\n    transaction {\n      node_validations {\n        validated_at\n        node {\n          name\n        }\n      }\n      node_validation_timeline {\n        replaced_at\n        validated_at\n        node {\n          name\n        }\n      }\n      block_inclusions {\n        block {\n          hash\n          height\n          accepted_by {\n            accepted_at\n            node {\n              name\n            }\n          }\n        }\n      }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "search_output",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "lockingBytecodes": [
+     "76a914001b9e8d2a5e4f75f5a58cad60f33c56da7a1b8c88ac"
+    ]
+   },
+   "root": "search_output",
+   "paginate": null
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "X4",
+  "name": "ShowDuplicateTransactions",
+  "kind": "query",
+  "file": "X04-ShowDuplicateTransactions.graphql",
+  "v1": {
+   "file": "v1/X04-ShowDuplicateTransactions.graphql",
+   "query": "query ShowDuplicateTransactions {\n  transaction( where: { hash: { _in: [\n    \"\\\\x1e6ac1e5b03f122fb9e8703d2cfbf94a641a980b25ae73718eda78ff51e8bf4e\"\n    \"\\\\x867e08c20a241c6179e0676e184d85ed940db7cb0c3067fbdea507df14d76fd2\"\n  ] } } ) {\n    hash\n    is_coinbase\n    output_value_satoshis\n    block_inclusions {\n      block {\n        hash\n        height\n        timestamp\n        size_bytes\n        version\n        nonce\n        merkle_root\n        bits\n        accepted_by {\n          node {\n            name\n            user_agent\n          }\n        }\n      }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "hashes": [
+     "1e6ac1e5b03f122fb9e8703d2cfbf94a641a980b25ae73718eda78ff51e8bf4e",
+     "867e08c20a241c6179e0676e184d85ed940db7cb0c3067fbdea507df14d76fd2"
+    ]
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "X5",
+  "name": "GetSpendingTransactions",
+  "kind": "query",
+  "file": "X05-GetSpendingTransactions.graphql",
+  "v1": {
+   "file": "v1/X05-GetSpendingTransactions.graphql",
+   "query": "query GetSpendingTransactions {\n  output(\n    where: {\n      transaction_hash: {\n        _eq: \"\\\\x867e08c20a241c6179e0676e184d85ed940db7cb0c3067fbdea507df14d76fd2\"\n      }\n      output_index: { _eq: \"0\" }\n    }\n  ) {\n    transaction_hash\n    output_index\n    value_satoshis\n    locking_bytecode_pattern\n    spent_by {\n      unlocking_bytecode_pattern\n      outpoint_index\n      transaction {\n        hash\n        node_validations {\n          validated_at\n          node {\n            name\n          }\n        }\n        node_validation_timeline {\n          node {\n            name\n          }\n          validated_at\n          replaced_at\n        }\n        block_inclusions {\n          transaction_index\n          block {\n            hash\n            height\n            accepted_by {\n              accepted_at\n              node {\n                name\n                user_agent\n              }\n            }\n          }\n        }\n      }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "output",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "hash": "867e08c20a241c6179e0676e184d85ed940db7cb0c3067fbdea507df14d76fd2"
+   },
+   "root": "output",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "X6",
+  "name": "GetTransactionDetails",
+  "kind": "query",
+  "file": "X06-GetTransactionDetails.graphql",
+  "v1": {
+   "file": "v1/X06-GetTransactionDetails.graphql",
+   "query": "query GetTransactionDetails {\n  transaction(where: { hash: { _eq:\n  \"\\\\x867e08c20a241c6179e0676e184d85ed940db7cb0c3067fbdea507df14d76fd2\"\n  } } ) {\n    authchains {\n      authchain_length\n      authhead_transaction_hash\n      authhead {\n        block_inclusions {\n          block {\n            height\n          }\n        }\n      }\n      migrations {\n        migration_index\n        transaction {\n          hash\n        }\n      }\n      unspent_authhead\n    }\n    block_inclusions {\n      transaction_index\n      block {\n        height # etc.\n      }\n    }\n    data_carrier_outputs {\n      locking_bytecode # etc.\n    }\n    encoded_hex\n    fee_satoshis\n    hash\n    identity_output {\n      spent_by {\n        input_index # etc.\n        transaction {\n          hash\n        }\n      }\n    }\n    input_count\n    input_value_satoshis\n    inputs {\n      input_index\n      outpoint_index\n      outpoint_transaction_hash\n      redeem_bytecode_pattern\n      sequence_number\n      unlocking_bytecode\n      unlocking_bytecode_pattern\n      value_satoshis\n    }\n    is_coinbase\n    locktime\n    node_validation_timeline {\n      validated_at\n      replaced_at\n      node {\n        name # etc.\n      }\n    }\n    node_validations {\n      validated_at\n      node {\n        name\n      }\n    }\n    output_count\n    output_value_satoshis\n    outputs {\n      locking_bytecode\n      locking_bytecode_pattern\n      output_index\n      spent_by {\n        input_index\n        transaction {\n          hash\n        }\n      }\n    }\n    signing_output {\n      spent_by {\n        input_index # etc.\n        transaction {\n          hash\n        }\n      }\n    }\n    size_bytes\n    version\n  }\n}\n",
+   "variables": {},
+   "root": "transaction",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "hash": "867e08c20a241c6179e0676e184d85ed940db7cb0c3067fbdea507df14d76fd2"
+   },
+   "root": "transaction",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "X7",
+  "name": "GetBlockDetails",
+  "kind": "query",
+  "file": "X07-GetBlockDetails.graphql",
+  "v1": {
+   "file": "v1/X07-GetBlockDetails.graphql",
+   "query": "query GetBlockDetails {\n  block(where: {height:{_eq: 327000}}){\n    accepted_by {\n      accepted_at # \"null\" if only known via historical sync\n      node {\n        first_connected_at\n        latest_connection_began_at\n        name\n        protocol_version\n        unconfirmed_transaction_count\n        user_agent\n      }\n    }\n    bits\n    encoded_hex\n    fee_satoshis\n    generated_value_satoshis\n    hash\n    header\n    height\n    input_count\n    input_value_satoshis\n    merkle_root\n    nonce\n    output_count\n    output_value_satoshis\n    previous_block_hash\n    size_bytes\n    timestamp\n    transaction_count\n    version\n  }\n}\n",
+   "variables": {},
+   "root": "block",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "height": 327000
+   },
+   "root": "block",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "X8",
+  "name": "GenesisBlockInfo",
+  "kind": "query",
+  "file": "X08-GenesisBlockInfo.graphql",
+  "v1": {
+   "file": "v1/X08-GenesisBlockInfo.graphql",
+   "query": "query GenesisBlockInfo {\n  block(where: { height: { _eq: \"0\" } }) {\n    hash\n    height\n    header\n    encoded_hex\n    accepted_by {\n      node {\n        name\n        user_agent\n      }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "block",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local"
+   },
+   "root": "block",
+   "paginate": null
+  },
+  "compare": {}
+ },
+ {
+  "id": "X9",
+  "name": "SearchOutputsByLockingBytecodePrefix",
+  "kind": "query",
+  "file": "X09-SearchOutputsByLockingBytecodePrefix.graphql",
+  "v1": {
+   "file": "v1/X09-SearchOutputsByLockingBytecodePrefix.graphql",
+   "query": "query SearchOutputsByLockingBytecodePrefix {\n  search_output_prefix(\n    args: { locking_bytecode_prefix_hex: \"6a142c7c8066\" }\n  ) {\n    locking_bytecode\n    output_index\n    transaction_hash\n    value_satoshis\n    transaction {\n      block_inclusions {\n        block {\n          hash\n          height\n        }\n      }\n    }\n    spent_by {\n      input_index\n      transaction {\n        hash\n        block_inclusions {\n        block {\n          hash\n          height\n        }\n      }\n      }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "search_output_prefix",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "prefix": "6a142c7c8066",
+    "limit": 5000
+   },
+   "root": "search_output_prefix",
+   "paginate": "cursor"
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "X10",
+  "name": "SearchOutputsByLockingBytecode",
+  "kind": "query",
+  "file": "X10-SearchOutputsByLockingBytecode.graphql",
+  "v1": {
+   "file": "v1/X10-SearchOutputsByLockingBytecode.graphql",
+   "query": "query SearchOutputsByLockingBytecode {\n  search_output(\n    args: {\n      locking_bytecode_hex: \"{76a914001b9e8d2a5e4f75f5a58cad60f33c56da7a1b8c88ac, 76a914004e71214db4a32e208be29ba0e17484d7ecfe9888ac}\"\n    }\n  ) {\n    locking_bytecode\n    output_index\n    transaction_hash\n    value_satoshis\n    spent_by {\n      input_index\n      transaction {\n        hash\n      }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "search_output",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "lockingBytecodes": [
+     "76a914001b9e8d2a5e4f75f5a58cad60f33c56da7a1b8c88ac",
+     "76a914004e71214db4a32e208be29ba0e17484d7ecfe9888ac"
+    ],
+    "limit": 5000
+   },
+   "root": "search_output",
+   "paginate": "cursor"
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "X11",
+  "name": "CountCashAccountOutputs",
+  "kind": "query",
+  "file": "X11-CountCashAccountOutputs.graphql",
+  "v1": {
+   "file": "v1/X11-CountCashAccountOutputs.graphql",
+   "query": "query CountCashAccountOutputs {\n  search_output_prefix_aggregate(\n    args: { locking_bytecode_prefix_hex: \"6a142c7c8066\" }\n  ) {\n    aggregate {\n      count\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "search_output_prefix_aggregate",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "prefix": "6a142c7c8066"
+   },
+   "root": "search_output_prefix_aggregate",
+   "paginate": null
+  },
+  "compare": {},
+  "expect": "not compared: v2 error"
+ },
+ {
+  "id": "X12",
+  "name": "GetJonathan100CashAccount",
+  "kind": "query",
+  "file": "X12-GetJonathan100CashAccount.graphql",
+  "v1": {
+   "file": "v1/X12-GetJonathan100CashAccount.graphql",
+   "query": "query GetJonathan100CashAccount {\n  search_output_prefix(\n    args: { locking_bytecode_prefix_hex: \"6a142c7c8066\" }\n    where: {\n      transaction: { block_inclusions: { block: { height: { _eq: 208500 } } } }\n    }\n  ) {\n    transaction {\n      hash\n      data_carrier_outputs {\n        locking_bytecode\n        output_index\n      }\n      block_inclusions {\n        block {\n          hash\n          height\n        }\n      }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "search_output_prefix",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "prefix": "6a142c7c8066",
+    "height": 208500
+   },
+   "root": "search_output_prefix",
+   "paginate": null
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "X13",
+  "name": "GetBitjson100Authchain",
+  "kind": "query",
+  "file": "X13-GetBitjson100Authchain.graphql",
+  "v1": {
+   "file": "v1/X13-GetBitjson100Authchain.graphql",
+   "query": "query GetBitjson100Authchain {\n  search_output_prefix(\n    args: { locking_bytecode_prefix_hex: \"6a142c7c8066\" }\n    where: {\n      transaction: { block_inclusions: { block: { height: { _eq: 208500 } } } }\n    }\n  ) {\n    transaction {\n      hash\n      block_inclusions {\n        block {\n          hash\n          height\n        }\n      }\n      authchains {\n        authchain_length\n        authhead {\n          hash\n          identity_output {\n            locking_bytecode\n            value_satoshis\n          }\n          signing_output {\n            locking_bytecode\n            value_satoshis\n          }\n          data_carrier_outputs {\n            locking_bytecode\n            value_satoshis\n            output_index\n          }\n        }\n        migrations {\n          migration_index\n          transaction {\n            hash\n            encoded_hex\n          }\n        }\n      }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "search_output_prefix",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "prefix": "6a142c7c8066",
+    "height": 208500
+   },
+   "root": "search_output_prefix",
+   "paginate": null
+  },
+  "compare": {
+   "unorderedRoot": true
+  }
+ },
+ {
+  "id": "X14",
+  "name": "BlockchainSize",
+  "kind": "query",
+  "file": "X14-BlockchainSize.graphql",
+  "v1": {
+   "file": "v1/X14-BlockchainSize.graphql",
+   "query": "query BlockchainSize {\n  bchn_blocks: block_aggregate(\n    where: { accepted_by: { node: { name: { _eq: \"chipnet-local\" } } } }\n    ) {\n    aggregate {\n      sum {\n        size_bytes\n      } \n    }\n  }\n}\n",
+   "variables": {},
+   "root": "bchn_blocks",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local"
+   },
+   "root": "bchn_blocks",
+   "paginate": null
+  },
+  "compare": {},
+  "expect": "not compared: v2 error"
+ },
+ {
+  "id": "X15",
+  "name": "BlockSizeStatsSince2021",
+  "kind": "query",
+  "file": "X15-BlockSizeStatsSince2021.graphql",
+  "v1": {
+   "file": "v1/X15-BlockSizeStatsSince2021.graphql",
+   "query": "query BlockSizeStatsSince2021 {\n    block_aggregate(\n      where: {\n        accepted_by: { node: { name: { _eq: \"chipnet-local\" } } }\n        timestamp: { _gt: \"1700000000\" }\n      }\n    ) {\n      aggregate {\n        count\n        max { size_bytes }\n        min { size_bytes }\n        avg { size_bytes }\n        sum { size_bytes }\n      }\n    }\n  }\n",
+   "variables": {},
+   "root": "block_aggregate",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "since": "1700000000"
+   },
+   "root": "block_aggregate",
+   "paginate": null
+  },
+  "compare": {},
+  "expect": "not compared: v2 error"
+ },
+ {
+  "id": "X16",
+  "name": "TransactionStats2021Q1",
+  "kind": "query",
+  "file": "X16-TransactionStats2021Q1.graphql",
+  "v1": {
+   "file": "v1/X16-TransactionStats2021Q1.graphql",
+   "query": "query TransactionStats2021Q1 {\n  transaction_aggregate(\n    where: {\n      block_inclusions: {\n        block: {\n          accepted_by: { node: { name: { _eq: \"chipnet-local\" } } }\n          timestamp: { _gt: \"1700000000\", _lt: \"1710000000\" }\n        }\n      }\n    }\n  ) {\n    aggregate {\n      count\n      max { size_bytes }\n      min { size_bytes }\n      avg { size_bytes }\n      sum { size_bytes }\n    }\n  }\n}\n",
+   "variables": {},
+   "root": "transaction_aggregate",
+   "paginate": null
+  },
+  "v2": {
+   "variables": {
+    "node": "chipnet-local",
+    "from": "1700000000",
+    "to": "1710000000"
+   },
+   "root": "transaction_aggregate",
+   "paginate": null
+  },
+  "compare": {},
+  "expect": "not compared: v2 error"
+ }
+]

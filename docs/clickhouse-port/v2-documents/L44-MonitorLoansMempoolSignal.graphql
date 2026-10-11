@@ -1,0 +1,9 @@
+# L44 MonitorLoansMempoolSignal (v1: v1/L44-MonitorLoansMempoolSignal.graphql)
+# status: works
+# chipnet equality: equal (v1 0 rows in 1 pages, v2 0 rows in 1 pages)
+subscription MonitorLoansMempoolSignal($paryonTokenId: Hex!, $loanContractLockingBytecode: Hex!, $node: String!) {
+  node_transaction: mempool(node: $node, limit: 100, order_by: [{ validated_at: DESC }, { transaction_internal_id: DESC }],
+    where: { transaction: { has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $loanContractLockingBytecode } } } } }) {
+    nodes { transaction_internal_id validated_at transaction { hash } }
+  }
+}

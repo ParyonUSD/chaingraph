@@ -1,0 +1,17 @@
+# L14 finalizedUserRedemptions (v1: v1/L14-finalizedUserRedemptions.graphql)
+# status: works
+# chipnet equality: equal (v1 3 rows in 1 pages, v2 3 rows in 1 pages)
+query finalizedUserRedemptions($paryonTokenId: Hex, $userLockingBytecodes: [Hex!], $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _eq: "03" } } }
+    has_output: { locking_bytecode: { _in: $userLockingBytecodes } }
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      outputs(where: { output_index: { _in: [0, 1, 3] } }, order_by: { output_index: ASC }) { output_index token_category fungible_token_amount value_satoshis }
+      inputs(where: { input_index: { _in: [0, 3, 4, 5] } }, order_by: { input_index: ASC }) { input_index outpoint { nonfungible_token_commitment fungible_token_amount value_satoshis } }
+      block_inclusions { block { timestamp height } }
+    }
+  }
+}

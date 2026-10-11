@@ -1,0 +1,23 @@
+# L11 v1 (paryon_library-integration 7c36376, gqlQueryAllLiquidations)
+query AllLiquidations($paryonTokenId: bytea, $fromBlockHeight: bigint, $toBlockHeight: bigint, $node: String!, $limit: Int!, $afterInternalId: bigint!) {
+  transaction(
+    limit: $limit
+    order_by: {internal_id: asc}
+    where: {internal_id: {_gt: $afterInternalId}, outputs: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "none"}, nonfungible_token_commitment: {_eq: "\\x01"}}}, inputs: {outpoint: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "none"}, nonfungible_token_commitment: {_eq: "\\x01"}}}}, _and: [{_or: [{block_inclusions: {block: {height: {_gte: $fromBlockHeight, _lt: $toBlockHeight}}}}, {_not: {block_inclusions: {}}}]}], _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+  ) {
+    internal_id
+    hash
+    inputs {
+      outpoint {
+        nonfungible_token_commitment
+        value_satoshis
+      }
+    }
+    block_inclusions {
+      block {
+        timestamp
+        height
+      }
+    }
+  }
+}

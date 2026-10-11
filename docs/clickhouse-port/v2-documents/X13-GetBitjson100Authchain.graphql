@@ -1,0 +1,24 @@
+# X13 GetBitjson100Authchain (v1: v1/X13-GetBitjson100Authchain.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query GetBitjson100Authchain($node: String!, $prefix: Hex!, $height: Int!) {
+  search_output_prefix: outputs(node: $node, limit: 5000, where: { locking_bytecode: { _prefix: $prefix }, transaction: { in_block: { height: { _eq: $height } } } }) {
+    has_more
+    nodes {
+      transaction {
+        hash
+        block_inclusions { block { hash height } }
+        authchains {
+          authchain_length
+          authhead {
+            hash
+            identity_output { locking_bytecode value_satoshis }
+            signing_output { locking_bytecode value_satoshis }
+            data_carrier_outputs { locking_bytecode value_satoshis output_index }
+          }
+          migrations { migration_index transaction { hash encoded_hex } }
+        }
+      }
+    }
+  }
+}

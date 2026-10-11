@@ -1,0 +1,11 @@
+# L12 AllHolders (v1: v1/L12-AllHolders.graphql)
+# status: works
+# chipnet equality: equal-unordered (root order: by store-local ids, not selected) (v1 1536 rows in 1 pages, v2 1536 rows in 1 pages)
+query AllHolders($paryonTokenId: Hex, $node: String!, $limit: Int!, $after: String) {
+  output: unspent_outputs(node: $node, limit: $limit, after: $after,
+    order_by: [{ transaction: { internal_id: ASC } }, { output_index: ASC }],
+    where: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _is_null: true }, locking_bytecode: { _neq: "6a" } }) {
+    has_more end_cursor
+    nodes { transaction_hash output_index locking_bytecode fungible_token_amount value_satoshis }
+  }
+}

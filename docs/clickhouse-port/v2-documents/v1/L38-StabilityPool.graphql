@@ -1,0 +1,26 @@
+# L38 v1 (paryon_library-integration 7c36376, subscriptionStabilityPool)
+subscription StabilityPool($poolTokenId: bytea!, $poolLockingBytecode: bytea!, $node: String!) {
+  transaction(
+    where: {inputs: {outpoint: {token_category: {_eq: $poolTokenId}, _and: {nonfungible_token_capability: {_eq: "minting"}, locking_bytecode: {_eq: $poolLockingBytecode}}}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+    order_by: {locktime: desc}
+    limit: 1
+  ) {
+    hash
+    outputs {
+      value_satoshis
+      fungible_token_amount
+      nonfungible_token_commitment
+      nonfungible_token_capability
+      token_category
+    }
+    inputs {
+      outpoint {
+        value_satoshis
+        fungible_token_amount
+        nonfungible_token_commitment
+        nonfungible_token_capability
+        token_category
+      }
+    }
+  }
+}

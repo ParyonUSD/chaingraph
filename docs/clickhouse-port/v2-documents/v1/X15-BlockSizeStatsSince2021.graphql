@@ -1,0 +1,17 @@
+# X15 v1 (chaingraph.cash 3bacf3c examples.tsx: Aggregate Blockchain Stats After Date)
+query BlockSizeStatsSince2021 {
+    block_aggregate(
+      where: {
+        accepted_by: { node: { name: { _eq: "bchn" } } }
+        timestamp: { _gt: "1609459200" }
+      }
+    ) {
+      aggregate {
+        count
+        max { size_bytes }
+        min { size_bytes }
+        avg { size_bytes }
+        sum { size_bytes }
+      }
+    }
+  }

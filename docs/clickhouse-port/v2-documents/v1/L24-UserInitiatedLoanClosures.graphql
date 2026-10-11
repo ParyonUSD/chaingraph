@@ -1,0 +1,16 @@
+# L24 v1 (paryon_library-integration 7c36376, gqlQueryUserInitiatedLoanClosures)
+query UserInitiatedLoanClosures($paryonTokenId: bytea, $lockingBytecodeLoan: bytea, $userLockingBytecodes: [bytea!], $node: String!, $limit: Int!, $afterInternalId: bigint!) {
+  transaction(
+    limit: $limit
+    order_by: {internal_id: asc}
+    where: {internal_id: {_gt: $afterInternalId}, inputs: {outpoint: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $lockingBytecodeLoan}}}}, _and: {inputs: {input_index: {_eq: "4"}, outpoint: {locking_bytecode: {_in: $userLockingBytecodes}}}}, _not: {outputs: {locking_bytecode: {_eq: $lockingBytecodeLoan}}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+  ) {
+    internal_id
+    hash
+    inputs(where: {input_index: {_eq: "4"}}) {
+      outpoint {
+        token_category
+      }
+    }
+  }
+}

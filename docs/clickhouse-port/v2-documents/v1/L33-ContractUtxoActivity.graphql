@@ -1,0 +1,40 @@
+# L33 v1 (paryon_library-integration 7c36376, gqlQueryContractUtxoActivity)
+query ContractUtxoActivity($tokenId: bytea!, $lockingBytecode: bytea!, $afterInternalId: bigint!, $node: String!, $limit: Int!, $orderBy: order_by!) {
+  transaction(
+    where: {internal_id: {_gt: $afterInternalId}, _or: [{outputs: {token_category: {_eq: $tokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $lockingBytecode}}}}, {inputs: {outpoint: {token_category: {_eq: $tokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $lockingBytecode}}}}}], _and: {_or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}}
+    order_by: {internal_id: $orderBy}
+    limit: $limit
+  ) {
+    internal_id
+    hash
+    block_inclusions {
+      block {
+        timestamp
+        height
+      }
+    }
+    outputs {
+      output_index
+      locking_bytecode
+      value_satoshis
+      fungible_token_amount
+      nonfungible_token_commitment
+      nonfungible_token_capability
+      token_category
+    }
+    inputs {
+      outpoint_transaction_hash
+      outpoint_index
+      outpoint {
+        value_satoshis
+        fungible_token_amount
+        nonfungible_token_commitment
+        nonfungible_token_capability
+        token_category
+      }
+    }
+  }
+  transactionWatermark: transaction(order_by: {internal_id: desc}, limit: 1) {
+    internal_id
+  }
+}

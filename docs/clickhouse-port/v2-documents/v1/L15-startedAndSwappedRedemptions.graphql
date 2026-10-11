@@ -1,0 +1,35 @@
+# L15 v1 (paryon_library-integration 7c36376, gqlQueryStartedAndSwappedRedemptions)
+query startedAndSwappedRedemptions($redeemerTokenId: bytea, $node: String!, $limit: Int!, $offset: Int!) {
+  output(
+    limit: $limit
+    offset: $offset
+    order_by: [{transaction: {internal_id: asc}}, {output_index: asc}]
+    where: {token_category: {_eq: $redeemerTokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}}, transaction: {_or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}}
+  ) {
+    transaction_hash
+    output_index
+    nonfungible_token_commitment
+    spent_by(
+      where: {transaction: {_or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}}
+    ) {
+      transaction {
+        hash
+      }
+    }
+    transaction {
+      outputs(where: {output_index: {_lt: "8"}}, order_by: {output_index: asc}) {
+        token_category
+        nonfungible_token_commitment
+        nonfungible_token_capability
+        fungible_token_amount
+        value_satoshis
+      }
+      block_inclusions {
+        block {
+          timestamp
+          height
+        }
+      }
+    }
+  }
+}

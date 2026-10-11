@@ -1,0 +1,19 @@
+# L29 LoanBorrowingSummaries (v1: v1/L29-LoanBorrowingSummaries.graphql)
+# status: works
+# chipnet equality: equal (v1 7 rows in 1 pages, v2 7 rows in 1 pages)
+query LoanBorrowingSummaries($userLoanKeys: [Hex!], $paryonTokenId: Hex, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_output: { token_category: { _in: $userLoanKeys }, nonfungible_token_capability: { _eq: NONE } }
+    _and: [{ has_output: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MINTING } } }]
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id
+      block_inclusions { block { timestamp } }
+      outputs(where: { _or: [{ output_index: { _in: [0, 2] } }, { token_category: { _in: $userLoanKeys }, nonfungible_token_capability: { _eq: NONE } }] }, order_by: { output_index: ASC }) {
+        output_index token_category nonfungible_token_capability fungible_token_amount nonfungible_token_commitment
+      }
+      inputs(where: { input_index: { _eq: 0 } }) { input_index outpoint { fungible_token_amount } }
+    }
+  }
+}

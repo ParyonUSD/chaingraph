@@ -1,0 +1,16 @@
+# L3 LoanInterestPayments (v1: v1/L03-LoanInterestPayments.graphql)
+# status: works
+# chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 695 rows in 1 pages, v2 695 rows in 1 pages)
+query LoanInterestPayments($userLoanKeys: [Hex!], $paryonTokenId: Hex, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _in: $userLoanKeys }, nonfungible_token_capability: { _eq: NONE } } }
+    _and: [{ has_input: { outpoint: { nonfungible_token_commitment: { _eq: "07" }, nonfungible_token_capability: { _eq: NONE }, token_category: { _eq: $paryonTokenId } } } }]
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      outputs(where: { output_index: { _eq: 1 } }) { output_index value_satoshis }
+      inputs(where: { input_index: { _in: [1, 2] } }, order_by: { input_index: ASC }) { input_index outpoint { value_satoshis token_category } }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+# L37 MonitorRedemptionContractUTXOs (v1: v1/L37-MonitorRedemptionContractUTXOs.graphql)
+# status: works
+# chipnet equality: equal (v1 0 rows in 1 pages, v2 0 rows in 1 pages)
+subscription MonitorRedemptionContractUTXOs($redemptionTokenId: Hex!, $redemptionContractLockingBytecode: Hex!, $node: String!, $limit: Int!) {
+  output: unspent_outputs(node: $node, limit: $limit, where: {
+    token_category: { _eq: $redemptionTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $redemptionContractLockingBytecode }
+  }) {
+    has_more end_cursor
+    nodes {
+      output_index
+      transaction {
+        block_inclusions { block { timestamp height } }
+        hash
+        outputs { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+        inputs { outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+      }
+    }
+  }
+}

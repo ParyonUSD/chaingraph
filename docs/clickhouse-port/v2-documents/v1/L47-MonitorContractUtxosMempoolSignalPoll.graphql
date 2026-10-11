@@ -1,0 +1,14 @@
+# L47 v1 (paryon_library-integration 7c36376, queryContractUtxosMempoolSignalPoll)
+query MonitorContractUtxosMempoolSignalPoll($tokenId: bytea!, $lockingBytecode: bytea!, $node: String!) {
+  node_transaction(
+    where: {node: {name: {_eq: $node}}, transaction: {_or: [{outputs: {token_category: {_eq: $tokenId}, nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $lockingBytecode}}}, {inputs: {outpoint: {token_category: {_eq: $tokenId}, nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $lockingBytecode}}}}]}}
+    order_by: [{validated_at: desc}, {transaction_internal_id: desc}]
+    limit: 100
+  ) {
+    transaction_internal_id
+    validated_at
+    transaction {
+      hash
+    }
+  }
+}

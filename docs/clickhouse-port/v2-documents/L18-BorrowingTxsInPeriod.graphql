@@ -1,0 +1,12 @@
+# L18 BorrowingTxsInPeriod (v1: v1/L18-BorrowingTxsInPeriod.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query BorrowingTxsInPeriod($periodCommitment: Hex, $paryonTokenId: Hex, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_output: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MINTING }, nonfungible_token_commitment: { _eq: $periodCommitment } }
+    _and: [{ has_output: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE } }, has_input: { outpoint: { token_category: { _eq: $paryonTokenId } } } }]
+  }) {
+    has_more end_cursor
+    nodes { hash outputs { value_satoshis fungible_token_amount } }
+  }
+}

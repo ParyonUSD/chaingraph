@@ -1,0 +1,19 @@
+# L42 v1 (paryon_library-integration 7c36376, queryLoansSignalPoll)
+query MonitorLoansSignalPoll($paryonTokenId: bytea!, $loanContractLockingBytecode: bytea!, $node: String!) {
+  transaction(
+    where: {inputs: {outpoint: {token_category: {_eq: $paryonTokenId}, nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $loanContractLockingBytecode}}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+    order_by: {internal_id: desc}
+    limit: 1
+  ) {
+    internal_id
+    hash
+    inputs(
+      where: {outpoint: {token_category: {_eq: $paryonTokenId}, locking_bytecode: {_eq: $loanContractLockingBytecode}}}
+      limit: 1
+    ) {
+      outpoint {
+        nonfungible_token_capability
+      }
+    }
+  }
+}

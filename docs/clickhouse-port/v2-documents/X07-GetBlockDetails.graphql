@@ -1,0 +1,31 @@
+# X7 GetBlockDetails (v1: v1/X07-GetBlockDetails.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query GetBlockDetails($node: String!, $height: Int!) {
+  block: blocks(node: $node, limit: 1, where: { height: { _eq: $height } }) {
+    nodes {
+      accepted_by {
+        accepted_at
+        node { first_connected_at latest_connection_began_at name protocol_version unconfirmed_transaction_count user_agent }
+      }
+      bits
+      encoded_hex
+      fee_satoshis
+      generated_value_satoshis
+      hash
+      header
+      height
+      input_count
+      input_value_satoshis
+      merkle_root
+      nonce
+      output_count
+      output_value_satoshis
+      previous_block_hash
+      size_bytes
+      timestamp
+      transaction_count
+      version
+    }
+  }
+}

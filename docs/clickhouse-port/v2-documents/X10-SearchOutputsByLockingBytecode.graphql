@@ -1,0 +1,10 @@
+# X10 SearchOutputsByLockingBytecode (v1: v1/X10-SearchOutputsByLockingBytecode.graphql)
+# status: works
+# chipnet equality: equal (v1 71 rows in 1 pages, v2 71 rows in 1 pages)
+query SearchOutputsByLockingBytecode($node: String!, $lockingBytecodes: [Hex!]!, $limit: Int!, $after: String) {
+  search_output: outputs(node: $node, limit: $limit, after: $after, where: { locking_bytecode: { _in: $lockingBytecodes } }, order_by: { locking_bytecode: ASC }) {
+    has_more
+    end_cursor
+    nodes { locking_bytecode output_index transaction_hash value_satoshis spent_by { input_index transaction { hash } } }
+  }
+}

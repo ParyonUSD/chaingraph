@@ -1,0 +1,19 @@
+# L17 finalizedRedemptions (v1: v1/L17-finalizedRedemptions.graphql)
+# status: works
+# chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 5 rows in 1 pages, v2 5 rows in 1 pages)
+query finalizedRedemptions($paryonTokenId: Hex, $node: String!, $limit: Int!, $after: String) {
+  input: inputs(node: $node, limit: $limit, after: $after, where: {
+    outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _eq: "03" } }
+  }) {
+    has_more end_cursor
+    nodes {
+      transaction_internal_id input_index
+      transaction {
+        hash
+        outputs(where: { output_index: { _in: [0, 1, 3] } }, order_by: { output_index: ASC }) { output_index token_category fungible_token_amount value_satoshis }
+        inputs(where: { input_index: { _in: [0, 3, 4, 5] } }, order_by: { input_index: ASC }) { input_index outpoint { nonfungible_token_commitment fungible_token_amount value_satoshis } }
+        block_inclusions { block { timestamp height } }
+      }
+    }
+  }
+}

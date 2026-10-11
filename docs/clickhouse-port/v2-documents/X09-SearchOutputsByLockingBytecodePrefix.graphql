@@ -1,0 +1,17 @@
+# X9 SearchOutputsByLockingBytecodePrefix (v1: v1/X09-SearchOutputsByLockingBytecodePrefix.graphql)
+# status: works
+# chipnet equality: equal (v1 3548 rows in 1 pages, v2 3548 rows in 1 pages)
+query SearchOutputsByLockingBytecodePrefix($node: String!, $prefix: Hex!, $limit: Int!, $after: String) {
+  search_output_prefix: outputs(node: $node, limit: $limit, after: $after, where: { locking_bytecode: { _prefix: $prefix } }, order_by: { locking_bytecode: ASC }) {
+    has_more
+    end_cursor
+    nodes {
+      locking_bytecode
+      output_index
+      transaction_hash
+      value_satoshis
+      transaction { block_inclusions { block { hash height } } }
+      spent_by { input_index transaction { hash block_inclusions { block { hash height } } } }
+    }
+  }
+}

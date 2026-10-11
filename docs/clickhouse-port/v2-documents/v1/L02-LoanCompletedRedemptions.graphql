@@ -1,0 +1,25 @@
+# L2 v1 (paryon_library-integration 7c36376, gqlQueryLoanCompletedRedemptions)
+query LoanCompletedRedemptions($userLoanKeys: [bytea!], $paryonTokenId: bytea, $node: String!, $limit: Int!, $afterInternalId: bigint!) {
+  transaction(
+    limit: $limit
+    order_by: {internal_id: asc}
+    where: {internal_id: {_gt: $afterInternalId}, inputs: {outpoint: {token_category: {_eq: $paryonTokenId}, nonfungible_token_capability: {_eq: "none"}, nonfungible_token_commitment: {_eq: "\\x03"}}}, outputs: {token_category: {_in: $userLoanKeys}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+  ) {
+    internal_id
+    outputs(
+      where: {_or: [{output_index: {_in: ["0", "3"]}}, {token_category: {_in: $userLoanKeys}}]}
+      order_by: {output_index: asc}
+    ) {
+      output_index
+      value_satoshis
+      fungible_token_amount
+      token_category
+    }
+    inputs(where: {input_index: {_eq: "0"}}) {
+      input_index
+      outpoint {
+        value_satoshis
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+# L34 ContractOutputsByHash (v1: v1/L34-ContractOutputsByHash.graphql)
+# status: works
+# chipnet equality: equal (v1 5 rows in 1 pages, v2 5 rows in 1 pages)
+query ContractOutputsByHash($tokenId: Hex!, $lockingBytecode: Hex!, $transactionHashes: [Hex!]!, $node: String!) {
+  output: outputs_by_transaction_hash(transaction_hashes: $transactionHashes, where: { token_category: { _eq: $tokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecode } }) {
+    output_index transaction_hash
+    spent_by(node: $node) {
+      transaction {
+        node_validations(node: $node) { node_internal_id }
+        accepted_block_inclusions: block_inclusions(node: $node) { block_internal_id }
+      }
+    }
+    transaction {
+      internal_id hash
+      node_validations(node: $node) { node_internal_id }
+      accepted_block_inclusions: block_inclusions(node: $node) { block_internal_id }
+      block_inclusions(node: $node) { block { timestamp height } }
+      outputs { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+    }
+  }
+}

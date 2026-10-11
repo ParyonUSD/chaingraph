@@ -1,0 +1,17 @@
+# L33 ContractUtxoActivity (v1: v1/L33-ContractUtxoActivity.graphql)
+# status: works
+# chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 2305 rows in 1 pages, v2 2305 rows in 1 pages)
+query ContractUtxoActivity($tokenId: Hex!, $lockingBytecode: Hex!, $after: BigInt, $node: String!, $limit: Int!, $order: Order!) {
+  transaction: transactions(node: $node, after: $after, order: $order, limit: $limit, where: {
+    _or: [{ has_output: { token_category: { _eq: $tokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecode } } }, { has_input: { outpoint: { token_category: { _eq: $tokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecode } } } }]
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      block_inclusions { block { timestamp height } }
+      outputs { output_index locking_bytecode value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint_transaction_hash outpoint_index outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+    }
+  }
+  transactionWatermark: transaction_watermark
+}

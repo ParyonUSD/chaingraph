@@ -1,0 +1,18 @@
+# L2 LoanCompletedRedemptions (v1: v1/L02-LoanCompletedRedemptions.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query LoanCompletedRedemptions($userLoanKeys: [Hex!], $paryonTokenId: Hex, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _eq: "03" } } }
+    has_output: { token_category: { _in: $userLoanKeys } }
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id
+      outputs(where: { _or: [{ output_index: { _in: [0, 3] } }, { token_category: { _in: $userLoanKeys } }] }, order_by: { output_index: ASC }) {
+        output_index value_satoshis fungible_token_amount token_category
+      }
+      inputs(where: { input_index: { _eq: 0 } }) { input_index outpoint { value_satoshis } }
+    }
+  }
+}

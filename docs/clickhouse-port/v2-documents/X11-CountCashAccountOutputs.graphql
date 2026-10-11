@@ -1,0 +1,8 @@
+# X11 CountCashAccountOutputs (v1: v1/X11-CountCashAccountOutputs.graphql)
+# status: blocked (v2 error: v2: Cannot query field "outputs_aggregate" on type "Query".)
+# chipnet equality: not compared: v2 error (v1 0 rows in 0 pages, v2 0 rows in 0 pages); expected: not compared: v2 error
+query CountCashAccountOutputs($node: String!, $prefix: Hex!) {
+  search_output_prefix_aggregate: outputs_aggregate(node: $node, where: { locking_bytecode: { _prefix: $prefix } }) {
+    aggregate { count }
+  }
+}

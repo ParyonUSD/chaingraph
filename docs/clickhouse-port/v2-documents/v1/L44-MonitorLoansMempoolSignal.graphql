@@ -1,0 +1,14 @@
+# L44 v1 (paryon_library-integration 7c36376, subscriptionLoansMempoolSignal)
+subscription MonitorLoansMempoolSignal($paryonTokenId: bytea!, $loanContractLockingBytecode: bytea!, $node: String!) {
+  node_transaction(
+    where: {node: {name: {_eq: $node}}, transaction: {inputs: {outpoint: {token_category: {_eq: $paryonTokenId}, nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $loanContractLockingBytecode}}}}}
+    order_by: [{validated_at: desc}, {transaction_internal_id: desc}]
+    limit: 100
+  ) {
+    transaction_internal_id
+    validated_at
+    transaction {
+      hash
+    }
+  }
+}

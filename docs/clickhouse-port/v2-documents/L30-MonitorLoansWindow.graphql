@@ -1,0 +1,16 @@
+# L30 MonitorLoansWindow (v1: v1/L30-MonitorLoansWindow.graphql)
+# status: works
+# chipnet equality: equal-unordered (v2 rows descending by v2 internal ids) (v1 1000 rows in 1 pages, v2 1000 rows in 1 pages)
+query MonitorLoansWindow($paryonTokenId: Hex!, $loanContractLockingBytecode: Hex!, $after: BigInt, $before: BigInt, $order: Order!, $node: String!, $limit: Int!) {
+  transaction: transactions(node: $node, after: $after, before: $before, order: $order, limit: $limit, where: {
+    has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $loanContractLockingBytecode } } }
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      block_inclusions { block { timestamp height } }
+      outputs(where: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $loanContractLockingBytecode } }, order_by: { output_index: ASC }) { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs(where: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $loanContractLockingBytecode } } }, order_by: { input_index: ASC }) { outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+    }
+  }
+}

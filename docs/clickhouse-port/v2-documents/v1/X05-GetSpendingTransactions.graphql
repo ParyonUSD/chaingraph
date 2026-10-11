@@ -1,0 +1,50 @@
+# X5 v1 (chaingraph.cash 3bacf3c examples.tsx: Get Spending Transactions)
+query GetSpendingTransactions {
+  output(
+    where: {
+      transaction_hash: {
+        _eq: "\\xf4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16"
+      }
+      output_index: { _eq: "0" }
+    }
+  ) {
+    transaction_hash
+    output_index
+    value_satoshis
+    locking_bytecode_pattern
+    spent_by {
+      unlocking_bytecode_pattern
+      outpoint_index
+      transaction {
+        hash
+        node_validations {
+          validated_at
+          node {
+            name
+          }
+        }
+        node_validation_timeline {
+          node {
+            name
+          }
+          validated_at
+          replaced_at
+        }
+        block_inclusions {
+          transaction_index
+          block {
+            hash
+            height
+            accepted_by {
+              accepted_at
+              node {
+                name
+                user_agent
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

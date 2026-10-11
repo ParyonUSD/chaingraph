@@ -1,0 +1,12 @@
+# L41 v1 (paryon_library-integration 7c36376, subscriptionBlockTipSignal)
+subscription ChaingraphBlockTipSignal($node: String!) {
+  block(
+    where: {accepted_by: {node: {name: {_eq: $node}}}}
+    order_by: {height: desc}
+    limit: 1
+  ) {
+    hash
+    height
+    previous_block_hash
+  }
+}

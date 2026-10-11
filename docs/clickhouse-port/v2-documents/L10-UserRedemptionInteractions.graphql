@@ -1,0 +1,21 @@
+# L10 UserRedemptionInteractions (v1: v1/L10-UserRedemptionInteractions.graphql)
+# status: works
+# chipnet equality: equal (v1 6 rows in 1 pages, v2 6 rows in 1 pages)
+query UserRedemptionInteractions($redeemerTokenId: Hex, $sidecarCommitments: [Hex!], $fromBlockHeight: Int, $toBlockHeight: Int, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $redeemerTokenId } } }
+    block_window: { from_height: $fromBlockHeight, to_height: $toBlockHeight }
+    _or: [
+      { has_output: { token_category: { _eq: $redeemerTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _in: $sidecarCommitments } } }
+      { has_input: { outpoint: { token_category: { _eq: $redeemerTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _in: $sidecarCommitments } } } }
+    ]
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      block_inclusions { block { timestamp height } }
+      outputs { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint_transaction_hash outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+    }
+  }
+}

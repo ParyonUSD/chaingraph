@@ -1,0 +1,6 @@
+# L43 ChaingraphBlockTipSignalPoll (v1: v1/L43-ChaingraphBlockTipSignalPoll.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query ChaingraphBlockTipSignalPoll($node: String!) {
+  block: blocks(node: $node, limit: 1, order_by: { height: DESC }) { nodes { hash height previous_block_hash } }
+}

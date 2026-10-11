@@ -1,0 +1,12 @@
+# X14 v1 (chaingraph.cash 3bacf3c examples.tsx: Aggregate Blockchain Size)
+query BlockchainSize {
+  bchn_blocks: block_aggregate(
+    where: { accepted_by: { node: { name: { _eq: "bchn" } } } }
+    ) {
+    aggregate {
+      sum {
+        size_bytes
+      } 
+    }
+  }
+}

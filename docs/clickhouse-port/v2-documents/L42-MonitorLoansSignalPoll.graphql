@@ -1,0 +1,11 @@
+# L42 MonitorLoansSignalPoll (v1: v1/L42-MonitorLoansSignalPoll.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query MonitorLoansSignalPoll($paryonTokenId: Hex!, $loanContractLockingBytecode: Hex!, $node: String!) {
+  transaction: transactions(node: $node, limit: 1, order: DESC, where: { has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $loanContractLockingBytecode } } } }) {
+    nodes {
+      internal_id hash
+      inputs(where: { outpoint: { token_category: { _eq: $paryonTokenId }, locking_bytecode: { _eq: $loanContractLockingBytecode } } }, limit: 1) { outpoint { nonfungible_token_capability } }
+    }
+  }
+}

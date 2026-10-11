@@ -1,0 +1,11 @@
+# L19 v1 (paryon_library-integration 7c36376, gqlQueryFinalizedRedemptionsInPeriod)
+query FinalizedRedemptionsInPeriod($paryonTokenId: bytea, $fromBlockHeight: bigint, $toBlockHeight: bigint, $node: String!) {
+  transaction(
+    where: {inputs: {outpoint: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "none"}, nonfungible_token_commitment: {_eq: "\\x03"}}}}, block_inclusions: {block: {height: {_gte: $fromBlockHeight, _lt: $toBlockHeight}}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+  ) {
+    hash
+    outputs {
+      fungible_token_amount
+    }
+  }
+}

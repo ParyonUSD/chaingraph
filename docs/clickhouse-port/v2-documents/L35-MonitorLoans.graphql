@@ -1,0 +1,16 @@
+# L35 MonitorLoans (v1: v1/L35-MonitorLoans.graphql)
+# status: works
+# chipnet equality: equal (v1 1040 rows in 1 pages, v2 1040 rows in 1 pages)
+subscription MonitorLoans($paryonTokenId: Hex!, $loanContractLockingBytecode: Hex!, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $loanContractLockingBytecode } } }
+  }) {
+    has_more end_cursor
+    nodes {
+      hash
+      block_inclusions { block { timestamp height } }
+      outputs { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+    }
+  }
+}

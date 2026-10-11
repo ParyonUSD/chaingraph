@@ -1,0 +1,20 @@
+# L21 LoanClosure (v1: v1/L21-LoanClosure.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query LoanClosure($paryonTokenId: Hex, $loanTokenId: Hex, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $loanTokenId }, nonfungible_token_capability: { _eq: NONE } } }
+    _and: [{
+      has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE } } }
+      _not: { has_output: { token_category: { _eq: $loanTokenId } } }
+    }]
+  }) {
+    has_more end_cursor
+    nodes {
+      hash
+      block_inclusions { block { timestamp height } }
+      outputs { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint { value_satoshis locking_bytecode fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+    }
+  }
+}

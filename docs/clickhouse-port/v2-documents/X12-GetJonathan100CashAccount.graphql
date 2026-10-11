@@ -1,0 +1,15 @@
+# X12 GetJonathan100CashAccount (v1: v1/X12-GetJonathan100CashAccount.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query GetJonathan100CashAccount($node: String!, $prefix: Hex!, $height: Int!) {
+  search_output_prefix: outputs(node: $node, limit: 5000, where: { locking_bytecode: { _prefix: $prefix }, transaction: { in_block: { height: { _eq: $height } } } }) {
+    has_more
+    nodes {
+      transaction {
+        hash
+        data_carrier_outputs { locking_bytecode output_index }
+        block_inclusions { block { hash height } }
+      }
+    }
+  }
+}

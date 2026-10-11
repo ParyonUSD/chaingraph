@@ -1,0 +1,26 @@
+# L26 v1 (paryon_library-integration 7c36376, gqlQueryAllNewPeriodPoolTxs)
+query AllNewPeriodPoolTxs($poolTokenId: bytea, $poolLockingBytecode: bytea, $node: String!, $limit: Int!, $offset: Int!) {
+  transaction(
+    where: {inputs: {outpoint: {token_category: {_eq: $poolTokenId}, _and: {nonfungible_token_capability: {_eq: "minting"}, locking_bytecode: {_eq: $poolLockingBytecode}}}}, _and: {inputs: {outpoint: {token_category: {_eq: $poolTokenId}, _and: {nonfungible_token_capability: {_eq: "none"}, nonfungible_token_commitment: {_eq: "\\x03"}}}}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+    order_by: [{locktime: desc}, {internal_id: desc}]
+    limit: $limit
+    offset: $offset
+  ) {
+    hash
+    block_inclusions {
+      block {
+        timestamp
+        height
+      }
+    }
+    inputs {
+      outpoint {
+        value_satoshis
+        fungible_token_amount
+        token_category
+        nonfungible_token_capability
+        nonfungible_token_commitment
+      }
+    }
+  }
+}

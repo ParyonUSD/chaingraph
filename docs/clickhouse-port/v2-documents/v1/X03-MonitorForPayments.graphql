@@ -1,0 +1,39 @@
+# X3 v1 (chaingraph.cash 3bacf3c examples.tsx: Monitor Address for Payments)
+subscription MonitorForPayments {
+  search_output(
+    args: {
+      locking_bytecode_hex: "{76a914f77f2d9ab6cc90f2e2bef66c78c7c0a33475be5688ac}"
+    }
+  ) {
+    transaction_hash
+    output_index
+    value_satoshis
+    transaction {
+      node_validations {
+        validated_at
+        node {
+          name
+        }
+      }
+      node_validation_timeline {
+        replaced_at
+        validated_at
+        node {
+          name
+        }
+      }
+      block_inclusions {
+        block {
+          hash
+          height
+          accepted_by {
+            accepted_at
+            node {
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}

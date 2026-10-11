@@ -1,0 +1,21 @@
+# X16 v1 (chaingraph.cash 3bacf3c examples.tsx: Aggregate Transaction Stats Between Two Dates)
+query TransactionStats2021Q1 {
+  transaction_aggregate(
+    where: {
+      block_inclusions: {
+        block: {
+          accepted_by: { node: { name: { _eq: "bchn" } } }
+          timestamp: { _gt: "1609459200", _lt: "1617249600" }
+        }
+      }
+    }
+  ) {
+    aggregate {
+      count
+      max { size_bytes }
+      min { size_bytes }
+      avg { size_bytes }
+      sum { size_bytes }
+    }
+  }
+}

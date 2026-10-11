@@ -1,0 +1,16 @@
+# L39 newPeriodPool (v1: v1/L39-newPeriodPool.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+subscription newPeriodPool($poolTokenId: Hex!, $poolLockingBytecode: Hex!, $node: String!) {
+  transaction: transactions(node: $node, limit: 1, order_by: [{ locktime: DESC }], where: {
+    has_input: { outpoint: { token_category: { _eq: $poolTokenId }, nonfungible_token_capability: { _eq: MINTING }, locking_bytecode: { _eq: $poolLockingBytecode } } }
+    _and: [{ has_input: { outpoint: { token_category: { _eq: $poolTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _eq: "03" } } } }]
+  }) {
+    nodes {
+      block_inclusions { block { timestamp height } }
+      hash
+      outputs { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+# X4 ShowDuplicateTransactions (v1: v1/X04-ShowDuplicateTransactions.graphql)
+# status: works
+# chipnet equality: equal (v1 2 rows in 1 pages, v2 2 rows in 1 pages)
+query ShowDuplicateTransactions($hashes: [Hex!]!, $node: String!) {
+  transaction: transactions_by_hash(hashes: $hashes) {
+    hash
+    is_coinbase
+    output_value_satoshis
+    block_inclusions(node: $node) {
+      block { hash height timestamp size_bytes version nonce merkle_root bits accepted_by { node { name user_agent } } }
+    }
+  }
+}

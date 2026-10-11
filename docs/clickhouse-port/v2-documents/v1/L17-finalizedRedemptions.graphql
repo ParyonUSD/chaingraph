@@ -1,0 +1,40 @@
+# L17 v1 (paryon_library-integration 7c36376, gqlQueryFinalizedRedemptions)
+query finalizedRedemptions($paryonTokenId: bytea, $node: String!, $limit: Int!, $afterInternalId: bigint!, $afterInputIndex: bigint!) {
+  input(
+    limit: $limit
+    order_by: [{transaction_internal_id: asc}, {input_index: asc}]
+    where: {_or: [{transaction_internal_id: {_gt: $afterInternalId}}, {transaction_internal_id: {_eq: $afterInternalId}, input_index: {_gt: $afterInputIndex}}], outpoint: {token_category: {_eq: $paryonTokenId}, nonfungible_token_capability: {_eq: "none"}, nonfungible_token_commitment: {_eq: "\\x03"}}, transaction: {_or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}}
+  ) {
+    transaction_internal_id
+    input_index
+    transaction {
+      hash
+      outputs(
+        where: {output_index: {_in: ["0", "1", "3"]}}
+        order_by: {output_index: asc}
+      ) {
+        output_index
+        token_category
+        fungible_token_amount
+        value_satoshis
+      }
+      inputs(
+        where: {input_index: {_in: ["0", "3", "4", "5"]}}
+        order_by: {input_index: asc}
+      ) {
+        input_index
+        outpoint {
+          nonfungible_token_commitment
+          fungible_token_amount
+          value_satoshis
+        }
+      }
+      block_inclusions {
+        block {
+          timestamp
+          height
+        }
+      }
+    }
+  }
+}

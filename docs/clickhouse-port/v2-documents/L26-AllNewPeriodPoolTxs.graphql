@@ -1,0 +1,18 @@
+# L26 AllNewPeriodPoolTxs (v1: v1/L26-AllNewPeriodPoolTxs.graphql)
+# status: works
+# chipnet equality: equal (v1 176 rows in 1 pages, v2 176 rows in 1 pages)
+query AllNewPeriodPoolTxs($poolTokenId: Hex, $poolLockingBytecode: Hex, $node: String!, $limit: Int!, $offset: Int) {
+  transaction: transactions(node: $node, limit: $limit, offset: $offset,
+    order_by: [{ locktime: DESC }, { internal_id: DESC }],
+    where: {
+      has_input: { outpoint: { token_category: { _eq: $poolTokenId }, nonfungible_token_capability: { _eq: MINTING }, locking_bytecode: { _eq: $poolLockingBytecode } } }
+      _and: [{ has_input: { outpoint: { token_category: { _eq: $poolTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _eq: "03" } } } }]
+    }) {
+    has_more end_cursor
+    nodes {
+      hash
+      block_inclusions { block { timestamp height } }
+      inputs { outpoint { value_satoshis fungible_token_amount token_category nonfungible_token_capability nonfungible_token_commitment } }
+    }
+  }
+}

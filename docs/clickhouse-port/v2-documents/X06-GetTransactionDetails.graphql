@@ -1,0 +1,44 @@
+# X6 GetTransactionDetails (v1: v1/X06-GetTransactionDetails.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query GetTransactionDetails($hash: Hex!, $node: String!) {
+  transaction: transactions(node: $node, limit: 1, where: { hash: { _eq: $hash } }) {
+    nodes {
+      authchains {
+        authchain_length
+        authhead_transaction_hash
+        authhead { block_inclusions { block { height } } }
+        migrations { migration_index transaction { hash } }
+        unspent_authhead
+      }
+      block_inclusions { transaction_index block { height } }
+      data_carrier_outputs { locking_bytecode }
+      encoded_hex
+      fee_satoshis
+      hash
+      identity_output { spent_by { input_index transaction { hash } } }
+      input_count
+      input_value_satoshis
+      inputs {
+        input_index
+        outpoint_index
+        outpoint_transaction_hash
+        redeem_bytecode_pattern
+        sequence_number
+        unlocking_bytecode
+        unlocking_bytecode_pattern
+        value_satoshis
+      }
+      is_coinbase
+      locktime
+      node_validation_timeline { validated_at replaced_at node { name } }
+      node_validations { validated_at node { name } }
+      output_count
+      output_value_satoshis
+      outputs { locking_bytecode locking_bytecode_pattern output_index spent_by { input_index transaction { hash } } }
+      signing_output { spent_by { input_index transaction { hash } } }
+      size_bytes
+      version
+    }
+  }
+}

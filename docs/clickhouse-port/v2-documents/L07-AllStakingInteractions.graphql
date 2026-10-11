@@ -1,0 +1,17 @@
+# L7 AllStakingInteractions (v1: v1/L07-AllStakingInteractions.graphql)
+# status: works
+# chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 192 rows in 1 pages, v2 192 rows in 1 pages)
+query AllStakingInteractions($poolTokenId: Hex, $poolLockingBytecode: Hex, $fromBlockHeight: Int, $toBlockHeight: Int, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $poolTokenId }, locking_bytecode: { _eq: $poolLockingBytecode }, nonfungible_token_capability: { _eq: MINTING } } }
+    block_window: { from_height: $fromBlockHeight, to_height: $toBlockHeight }
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      block_inclusions { block { timestamp height } }
+      outputs { output_index value_satoshis locking_bytecode fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint_transaction_hash outpoint_index outpoint { value_satoshis locking_bytecode fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+# L9 UserRedemptionSidecarCommitments (v1: v1/L09-UserRedemptionSidecarCommitments.graphql)
+# status: works
+# chipnet equality: equal (v1 6 rows in 1 pages, v2 6 rows in 1 pages)
+query UserRedemptionSidecarCommitments($redeemerTokenId: Hex, $userLockingBytecodes: [Hex!], $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $redeemerTokenId } } }
+    _or: [
+      { has_input: { outpoint: { locking_bytecode: { _in: $userLockingBytecodes } } } }
+      { has_output: { locking_bytecode: { _in: $userLockingBytecodes } } }
+    ]
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      outputs(where: { token_category: { _eq: $redeemerTokenId }, nonfungible_token_capability: { _eq: NONE } }) { nonfungible_token_commitment }
+      inputs(where: { outpoint: { token_category: { _eq: $redeemerTokenId }, nonfungible_token_capability: { _eq: NONE } } }) { outpoint { nonfungible_token_commitment } }
+    }
+  }
+}

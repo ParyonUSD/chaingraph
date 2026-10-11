@@ -1,0 +1,39 @@
+# L30 v1 (paryon_library-integration 7c36376, gqlQueryLoanTransactionsWindow)
+query MonitorLoansWindow($paryonTokenId: bytea!, $loanContractLockingBytecode: bytea!, $afterInternalId: bigint!, $beforeInternalId: bigint!, $orderBy: order_by!, $node: String!, $limit: Int!) {
+  transaction(
+    where: {internal_id: {_gt: $afterInternalId, _lt: $beforeInternalId}, inputs: {outpoint: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $loanContractLockingBytecode}}}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+    order_by: {internal_id: $orderBy}
+    limit: $limit
+  ) {
+    internal_id
+    hash
+    block_inclusions {
+      block {
+        timestamp
+        height
+      }
+    }
+    outputs(
+      where: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $loanContractLockingBytecode}}}
+      order_by: {output_index: asc}
+    ) {
+      value_satoshis
+      fungible_token_amount
+      nonfungible_token_commitment
+      nonfungible_token_capability
+      token_category
+    }
+    inputs(
+      where: {outpoint: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $loanContractLockingBytecode}}}}
+      order_by: {input_index: asc}
+    ) {
+      outpoint {
+        value_satoshis
+        fungible_token_amount
+        nonfungible_token_commitment
+        nonfungible_token_capability
+        token_category
+      }
+    }
+  }
+}

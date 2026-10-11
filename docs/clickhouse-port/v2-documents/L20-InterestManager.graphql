@@ -1,0 +1,10 @@
+# L20 InterestManager (v1: v1/L20-InterestManager.graphql)
+# status: works
+# chipnet equality: equal (v1 2 rows in 1 pages, v2 2 rows in 1 pages)
+query InterestManager($loanTokenId: Hex, $interestManagerCommitment: Hex, $node: String!, $limit: Int!, $after: String) {
+  output: unspent_outputs(node: $node, limit: $limit, after: $after,
+    where: { token_category: { _eq: $loanTokenId }, nonfungible_token_commitment: { _eq: $interestManagerCommitment } }) {
+    has_more end_cursor
+    nodes { transaction_hash locking_bytecode }
+  }
+}

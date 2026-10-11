@@ -1,0 +1,21 @@
+# X5 GetSpendingTransactions (v1: v1/X05-GetSpendingTransactions.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query GetSpendingTransactions($hash: Hex!, $node: String!) {
+  output: outputs_by_transaction_hash(transaction_hashes: [$hash], where: { output_index: { _eq: 0 } }) {
+    transaction_hash
+    output_index
+    value_satoshis
+    locking_bytecode_pattern
+    spent_by(node: $node) {
+      unlocking_bytecode_pattern
+      outpoint_index
+      transaction {
+        hash
+        node_validations { validated_at node { name } }
+        node_validation_timeline { node { name } validated_at replaced_at }
+        block_inclusions { transaction_index block { hash height accepted_by { accepted_at node { name user_agent } } } }
+      }
+    }
+  }
+}

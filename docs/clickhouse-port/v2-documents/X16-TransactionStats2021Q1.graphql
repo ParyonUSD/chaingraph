@@ -1,0 +1,14 @@
+# X16 TransactionStats2021Q1 (v1: v1/X16-TransactionStats2021Q1.graphql)
+# status: blocked (v2 error: v2: Cannot query field "transactions_aggregate" on type "Query". Did you mean "transaction_watermark" or "transactions_by_hash"?)
+# chipnet equality: not compared: v2 error (v1 0 rows in 0 pages, v2 0 rows in 0 pages); expected: not compared: v2 error
+query TransactionStats2021Q1($node: String!, $from: BigInt!, $to: BigInt!) {
+  transaction_aggregate: transactions_aggregate(node: $node, where: { in_block: { timestamp: { _gt: $from, _lt: $to } } }) {
+    aggregate {
+      count
+      max { size_bytes }
+      min { size_bytes }
+      avg { size_bytes }
+      sum { size_bytes }
+    }
+  }
+}

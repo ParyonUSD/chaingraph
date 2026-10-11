@@ -1,0 +1,19 @@
+# L28 AllLoanClosureSummaries (v1: v1/L28-AllLoanClosureSummaries.graphql)
+# status: works
+# chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 20 rows in 1 pages, v2 20 rows in 1 pages)
+query AllLoanClosureSummaries($paryonTokenId: Hex, $lockingBytecodeLoan: Hex, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecodeLoan } } }
+    _not: { has_output: { locking_bytecode: { _eq: $lockingBytecodeLoan } } }
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      block_inclusions { block { timestamp } }
+      inputs(where: { outpoint: { nonfungible_token_capability: { _in: [NONE, MUTABLE] } } }, order_by: { input_index: ASC }) {
+        input_index
+        outpoint { value_satoshis locking_bytecode nonfungible_token_commitment nonfungible_token_capability token_category }
+      }
+    }
+  }
+}

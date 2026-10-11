@@ -1,0 +1,14 @@
+# L38 StabilityPool (v1: v1/L38-StabilityPool.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+subscription StabilityPool($poolTokenId: Hex!, $poolLockingBytecode: Hex!, $node: String!) {
+  transaction: transactions(node: $node, limit: 1, order_by: [{ locktime: DESC }], where: {
+    has_input: { outpoint: { token_category: { _eq: $poolTokenId }, nonfungible_token_capability: { _eq: MINTING }, locking_bytecode: { _eq: $poolLockingBytecode } } }
+  }) {
+    nodes {
+      hash
+      outputs { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+    }
+  }
+}

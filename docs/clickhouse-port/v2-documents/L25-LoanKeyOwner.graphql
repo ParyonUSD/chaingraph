@@ -1,0 +1,10 @@
+# L25 LoanKeyOwner (v1: v1/L25-LoanKeyOwner.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+query LoanKeyOwner($loanKey: Hex, $node: String!, $limit: Int!, $after: String) {
+  output: unspent_outputs(node: $node, limit: $limit, after: $after,
+    where: { token_category: { _eq: $loanKey }, nonfungible_token_capability: { _eq: MINTING } }) {
+    has_more end_cursor
+    nodes { locking_bytecode transaction_hash }
+  }
+}

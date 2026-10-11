@@ -1,0 +1,32 @@
+# L22 v1 (paryon_library-integration 7c36376, gqlQueryLoanClosures)
+query LoanClosures($paryonTokenId: bytea, $loanTokenIds: [bytea!], $node: String!, $limit: Int!, $afterInternalId: bigint!) {
+  transaction(
+    limit: $limit
+    order_by: {internal_id: asc}
+    where: {internal_id: {_gt: $afterInternalId}, inputs: {outpoint: {token_category: {_in: $loanTokenIds}, _and: {nonfungible_token_capability: {_eq: "none"}}}}, _and: {inputs: {outpoint: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}}}}, _not: {inputs: {outpoint: {nonfungible_token_commitment: {_eq: "\\x07"}, nonfungible_token_capability: {_eq: "none"}, token_category: {_eq: $paryonTokenId}}}}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+  ) {
+    internal_id
+    hash
+    block_inclusions {
+      block {
+        timestamp
+      }
+    }
+    outputs(where: {token_category: {_in: $loanTokenIds}}) {
+      token_category
+    }
+    inputs(
+      where: {outpoint: {nonfungible_token_capability: {_in: ["none", "mutable"]}}}
+      order_by: {input_index: asc}
+    ) {
+      input_index
+      outpoint {
+        value_satoshis
+        locking_bytecode
+        nonfungible_token_commitment
+        nonfungible_token_capability
+        token_category
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+# X2 MonitorSyncTips (v1: v1/X02-MonitorSyncTips.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+subscription MonitorSyncTips($node: String!) {
+  node(node: $node) {
+    name
+    user_agent
+    latest_tip: accepted_blocks(limit: 1, order_by: { block_internal_id: DESC }) {
+      accepted_at
+      block { hash height transaction_count size_bytes }
+    }
+  }
+}

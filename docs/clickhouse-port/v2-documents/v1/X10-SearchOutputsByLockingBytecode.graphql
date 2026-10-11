@@ -1,0 +1,19 @@
+# X10 v1 (chaingraph.cash 3bacf3c examples.tsx: Search Outputs (Grouped))
+query SearchOutputsByLockingBytecode {
+  search_output(
+    args: {
+      locking_bytecode_hex: "{76a9148d1ec2350813b2a071353e16b41e884647405d3d88ac, 76a914047a813bf93223971cf6f8ff7479a7b36fefe1f888ac}"
+    }
+  ) {
+    locking_bytecode
+    output_index
+    transaction_hash
+    value_satoshis
+    spent_by {
+      input_index
+      transaction {
+        hash
+      }
+    }
+  }
+}

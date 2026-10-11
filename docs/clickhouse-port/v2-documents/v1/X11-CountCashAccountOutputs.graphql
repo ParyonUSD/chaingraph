@@ -1,0 +1,10 @@
+# X11 v1 (chaingraph.cash 3bacf3c examples.tsx: Count CashAccounts)
+query CountCashAccountOutputs {
+  search_output_prefix_aggregate(
+    args: { locking_bytecode_prefix_hex: "6a0401010101" }
+  ) {
+    aggregate {
+      count
+    }
+  }
+}

@@ -1,0 +1,20 @@
+# L32 RedemptionContractUtxos (v1: v1/L32-RedemptionContractUtxos.graphql)
+# status: works
+# chipnet equality: equal (v1 0 rows in 1 pages, v2 0 rows in 1 pages)
+query RedemptionContractUtxos($redemptionTokenId: Hex!, $redemptionContractLockingBytecode: Hex!, $node: String!, $limit: Int!, $after: String) {
+  output: unspent_outputs(node: $node, limit: $limit, after: $after, where: {
+    token_category: { _eq: $redemptionTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $redemptionContractLockingBytecode }
+  }) {
+    has_more end_cursor
+    nodes {
+      output_index
+      transaction {
+        internal_id
+        block_inclusions { block { timestamp height } }
+        hash
+        outputs { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+        inputs { outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+# L27 LoanBorrowingTx (v1: v1/L27-LoanBorrowingTx.graphql)
+# status: works
+# chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 16 rows in 1 pages, v2 16 rows in 1 pages)
+query LoanBorrowingTx($userLockingBytecodes: [Hex!], $paryonTokenId: Hex, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_output: { locking_bytecode: { _in: $userLockingBytecodes } }
+    _and: [{ has_output: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MINTING } } }]
+  }) {
+    has_more end_cursor
+    nodes { internal_id outputs(where: { output_index: { _eq: 3 } }) { output_index token_category } }
+  }
+}

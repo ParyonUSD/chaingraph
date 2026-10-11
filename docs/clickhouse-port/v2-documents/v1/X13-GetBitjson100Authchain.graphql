@@ -1,0 +1,45 @@
+# X13 v1 (chaingraph.cash 3bacf3c examples.tsx: CashAccount Bitauth Lookup)
+query GetBitjson100Authchain {
+  search_output_prefix(
+    args: { locking_bytecode_prefix_hex: "6a0401010101076269746a736f6e" }
+    where: {
+      transaction: { block_inclusions: { block: { height: { _eq: 563720 } } } }
+    }
+  ) {
+    transaction {
+      hash
+      block_inclusions {
+        block {
+          hash
+          height
+        }
+      }
+      authchains {
+        authchain_length
+        authhead {
+          hash
+          identity_output {
+            locking_bytecode
+            value_satoshis
+          }
+          signing_output {
+            locking_bytecode
+            value_satoshis
+          }
+          data_carrier_outputs {
+            locking_bytecode
+            value_satoshis
+            output_index
+          }
+        }
+        migrations {
+          migration_index
+          transaction {
+            hash
+            encoded_hex
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+# L40 MonitorLoansSignal (v1: v1/L40-MonitorLoansSignal.graphql)
+# status: works
+# chipnet equality: equal (v1 1 rows in 1 pages, v2 1 rows in 1 pages)
+subscription MonitorLoansSignal($paryonTokenId: Hex!, $loanContractLockingBytecode: Hex!, $node: String!) {
+  transaction: transactions(node: $node, limit: 1, order: DESC, where: { has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, locking_bytecode: { _eq: $loanContractLockingBytecode } } } }) {
+    nodes {
+      internal_id hash
+      inputs(where: { outpoint: { token_category: { _eq: $paryonTokenId }, locking_bytecode: { _eq: $loanContractLockingBytecode } } }, limit: 1) { outpoint { nonfungible_token_capability } }
+    }
+  }
+}

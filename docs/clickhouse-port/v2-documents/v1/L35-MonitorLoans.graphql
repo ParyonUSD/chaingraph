@@ -1,0 +1,30 @@
+# L35 v1 (paryon_library-integration 7c36376, subscriptionAllLoans)
+subscription MonitorLoans($paryonTokenId: bytea!, $loanContractLockingBytecode: bytea!, $node: String!) {
+  transaction(
+    where: {inputs: {outpoint: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $loanContractLockingBytecode}}}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+  ) {
+    hash
+    block_inclusions {
+      block {
+        timestamp
+        height
+      }
+    }
+    outputs {
+      value_satoshis
+      fungible_token_amount
+      nonfungible_token_commitment
+      nonfungible_token_capability
+      token_category
+    }
+    inputs {
+      outpoint {
+        value_satoshis
+        fungible_token_amount
+        nonfungible_token_commitment
+        nonfungible_token_capability
+        token_category
+      }
+    }
+  }
+}

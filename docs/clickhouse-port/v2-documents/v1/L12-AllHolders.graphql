@@ -1,0 +1,15 @@
+# L12 v1 (paryon_library-integration 7c36376, gqlQueryAllHolders)
+query AllHolders($paryonTokenId: bytea, $node: String!, $limit: Int!, $offset: Int!) {
+  output(
+    limit: $limit
+    offset: $offset
+    order_by: [{transaction: {internal_id: asc}}, {output_index: asc}]
+    where: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_is_null: true}}, locking_bytecode: {_neq: "\\x6a"}, transaction: {_or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}, _not: {spent_by: {transaction: {_or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}}}}
+  ) {
+    transaction_hash
+    output_index
+    locking_bytecode
+    fungible_token_amount
+    value_satoshis
+  }
+}

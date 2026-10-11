@@ -1,0 +1,12 @@
+# L19 FinalizedRedemptionsInPeriod (v1: v1/L19-FinalizedRedemptionsInPeriod.graphql)
+# status: works
+# chipnet equality: equal (v1 0 rows in 1 pages, v2 0 rows in 1 pages)
+query FinalizedRedemptionsInPeriod($paryonTokenId: Hex, $fromBlockHeight: Int, $toBlockHeight: Int, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _eq: "03" } } }
+    in_block: { height: { _gte: $fromBlockHeight, _lt: $toBlockHeight } }
+  }) {
+    has_more end_cursor
+    nodes { hash outputs { fungible_token_amount } }
+  }
+}

@@ -1,0 +1,13 @@
+# L24 UserInitiatedLoanClosures (v1: v1/L24-UserInitiatedLoanClosures.graphql)
+# status: works
+# chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 8 rows in 1 pages, v2 8 rows in 1 pages)
+query UserInitiatedLoanClosures($paryonTokenId: Hex, $lockingBytecodeLoan: Hex, $userLockingBytecodes: [Hex!], $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $lockingBytecodeLoan } } }
+    _and: [{ has_input: { input_index: { _eq: 4 }, outpoint: { locking_bytecode: { _in: $userLockingBytecodes } } } }]
+    _not: { has_output: { locking_bytecode: { _eq: $lockingBytecodeLoan } } }
+  }) {
+    has_more end_cursor
+    nodes { internal_id hash inputs(where: { input_index: { _eq: 4 } }) { outpoint { token_category } } }
+  }
+}

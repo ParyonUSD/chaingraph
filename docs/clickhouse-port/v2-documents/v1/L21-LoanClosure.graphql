@@ -1,0 +1,31 @@
+# L21 v1 (paryon_library-integration 7c36376, gqlQueryLoanClosure)
+query LoanClosure($paryonTokenId: bytea, $loanTokenId: bytea, $node: String!) {
+  transaction(
+    where: {inputs: {outpoint: {token_category: {_eq: $loanTokenId}, _and: {nonfungible_token_capability: {_eq: "none"}}}}, _and: {inputs: {outpoint: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}}}}, _not: {outputs: {token_category: {_eq: $loanTokenId}}}}, _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+  ) {
+    hash
+    block_inclusions {
+      block {
+        timestamp
+        height
+      }
+    }
+    outputs {
+      value_satoshis
+      fungible_token_amount
+      nonfungible_token_commitment
+      nonfungible_token_capability
+      token_category
+    }
+    inputs {
+      outpoint {
+        value_satoshis
+        locking_bytecode
+        fungible_token_amount
+        nonfungible_token_commitment
+        nonfungible_token_capability
+        token_category
+      }
+    }
+  }
+}

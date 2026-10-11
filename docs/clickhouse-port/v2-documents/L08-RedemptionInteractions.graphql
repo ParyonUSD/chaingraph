@@ -1,0 +1,17 @@
+# L8 RedemptionInteractions (v1: v1/L08-RedemptionInteractions.graphql)
+# status: works
+# chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 10 rows in 1 pages, v2 10 rows in 1 pages)
+query RedemptionInteractions($redeemerTokenId: Hex, $fromBlockHeight: Int, $toBlockHeight: Int, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _eq: $redeemerTokenId } } }
+    block_window: { from_height: $fromBlockHeight, to_height: $toBlockHeight }
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      block_inclusions { block { timestamp height } }
+      outputs { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint_transaction_hash outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+    }
+  }
+}

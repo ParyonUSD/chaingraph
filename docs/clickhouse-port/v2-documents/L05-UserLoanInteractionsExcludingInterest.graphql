@@ -1,0 +1,19 @@
+# L5 UserLoanInteractionsExcludingInterest (v1: v1/L05-UserLoanInteractionsExcludingInterest.graphql)
+# status: works
+# chipnet equality: equal (v1 12 rows in 1 pages, v2 12 rows in 1 pages)
+query UserLoanInteractionsExcludingInterest($userLoanKeys: [Hex!], $paryonTokenId: Hex, $fromBlockHeight: Int, $toBlockHeight: Int, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _in: $userLoanKeys }, nonfungible_token_capability: { _eq: NONE } } }
+    _and: [{ has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE } } } }]
+    block_window: { from_height: $fromBlockHeight, to_height: $toBlockHeight }
+    _not: { has_input: { outpoint: { nonfungible_token_commitment: { _eq: "07" }, nonfungible_token_capability: { _eq: NONE }, token_category: { _eq: $paryonTokenId } } } }
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      block_inclusions { block { timestamp height } }
+      outputs { value_satoshis locking_bytecode fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category locking_bytecode } }
+    }
+  }
+}

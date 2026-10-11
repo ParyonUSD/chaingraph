@@ -1,0 +1,18 @@
+# L4 UserLoanInteractions (v1: v1/L04-UserLoanInteractions.graphql)
+# status: works
+# chipnet equality: equal-unordered (v2 rows ascending by v2 internal ids) (v1 707 rows in 1 pages, v2 707 rows in 1 pages)
+query UserLoanInteractions($userLoanKeys: [Hex!], $paryonTokenId: Hex, $fromBlockHeight: Int, $toBlockHeight: Int, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_input: { outpoint: { token_category: { _in: $userLoanKeys }, nonfungible_token_capability: { _eq: NONE } } }
+    _and: [{ has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE } } } }]
+    block_window: { from_height: $fromBlockHeight, to_height: $toBlockHeight }
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      block_inclusions { block { timestamp height } }
+      outputs { value_satoshis locking_bytecode fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+      inputs { outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category locking_bytecode } }
+    }
+  }
+}

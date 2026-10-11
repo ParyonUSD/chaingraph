@@ -1,0 +1,18 @@
+# X3 MonitorForPayments (v1: v1/X03-MonitorForPayments.graphql)
+# status: works
+# chipnet equality: equal (v1 39 rows in 1 pages, v2 39 rows in 1 pages)
+subscription MonitorForPayments($node: String!, $lockingBytecodes: [Hex!]!) {
+  search_output: outputs(node: $node, limit: 5000, where: { locking_bytecode: { _in: $lockingBytecodes } }, order_by: { locking_bytecode: ASC }) {
+    has_more
+    nodes {
+      transaction_hash
+      output_index
+      value_satoshis
+      transaction {
+        node_validations { validated_at node { name } }
+        node_validation_timeline { replaced_at validated_at node { name } }
+        block_inclusions { block { hash height accepted_by { accepted_at node { name } } } }
+      }
+    }
+  }
+}

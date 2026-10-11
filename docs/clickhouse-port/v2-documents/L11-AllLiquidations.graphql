@@ -1,0 +1,17 @@
+# L11 AllLiquidations (v1: v1/L11-AllLiquidations.graphql)
+# status: works
+# chipnet equality: equal (v1 10 rows in 1 pages, v2 10 rows in 1 pages)
+query AllLiquidations($paryonTokenId: Hex, $fromBlockHeight: Int, $toBlockHeight: Int, $node: String!, $limit: Int!, $after: BigInt) {
+  transaction: transactions(node: $node, limit: $limit, after: $after, where: {
+    has_output: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _eq: "01" } }
+    has_input: { outpoint: { token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: NONE }, nonfungible_token_commitment: { _eq: "01" } } }
+    block_window: { from_height: $fromBlockHeight, to_height: $toBlockHeight }
+  }) {
+    has_more end_cursor
+    nodes {
+      internal_id hash
+      inputs { outpoint { nonfungible_token_commitment value_satoshis } }
+      block_inclusions { block { timestamp height } }
+    }
+  }
+}

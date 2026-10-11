@@ -1,0 +1,18 @@
+# L36 MonitorPriceContractUTXOs (v1: v1/L36-MonitorPriceContractUTXOs.graphql)
+# status: works
+# chipnet equality: equal-unordered (root order: by store-local ids, not selected) (v1 5 rows in 1 pages, v2 5 rows in 1 pages)
+subscription MonitorPriceContractUTXOs($paryonTokenId: Hex!, $priceContractLockingBytecode: Hex!, $node: String!, $limit: Int!) {
+  output: unspent_outputs(node: $node, limit: $limit, where: {
+    token_category: { _eq: $paryonTokenId }, nonfungible_token_capability: { _eq: MUTABLE }, locking_bytecode: { _eq: $priceContractLockingBytecode }
+  }) {
+    has_more end_cursor
+    nodes {
+      output_index transaction_hash
+      transaction {
+        block_inclusions { block { timestamp height } }
+        outputs { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category }
+        inputs { outpoint { value_satoshis fungible_token_amount nonfungible_token_commitment nonfungible_token_capability token_category } }
+      }
+    }
+  }
+}

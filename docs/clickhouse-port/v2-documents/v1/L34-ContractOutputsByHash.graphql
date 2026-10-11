@@ -1,0 +1,55 @@
+# L34 v1 (paryon_library-integration 7c36376, gqlQueryContractOutputsByHash)
+query ContractOutputsByHash($tokenId: bytea!, $lockingBytecode: bytea!, $transactionHashes: [bytea!]!, $node: String!) {
+  output(
+    where: {transaction_hash: {_in: $transactionHashes}, token_category: {_eq: $tokenId}, _and: {nonfungible_token_capability: {_eq: "mutable"}, locking_bytecode: {_eq: $lockingBytecode}}}
+  ) {
+    output_index
+    transaction_hash
+    spent_by {
+      transaction {
+        node_validations(where: {node: {name: {_eq: $node}}}) {
+          node_internal_id
+        }
+        accepted_block_inclusions: block_inclusions(
+          where: {block: {accepted_by: {node: {name: {_eq: $node}}}}}
+        ) {
+          block_internal_id
+        }
+      }
+    }
+    transaction {
+      internal_id
+      hash
+      node_validations(where: {node: {name: {_eq: $node}}}) {
+        node_internal_id
+      }
+      accepted_block_inclusions: block_inclusions(
+        where: {block: {accepted_by: {node: {name: {_eq: $node}}}}}
+      ) {
+        block_internal_id
+      }
+      block_inclusions {
+        block {
+          timestamp
+          height
+        }
+      }
+      outputs {
+        value_satoshis
+        fungible_token_amount
+        nonfungible_token_commitment
+        nonfungible_token_capability
+        token_category
+      }
+      inputs {
+        outpoint {
+          value_satoshis
+          fungible_token_amount
+          nonfungible_token_commitment
+          nonfungible_token_capability
+          token_category
+        }
+      }
+    }
+  }
+}

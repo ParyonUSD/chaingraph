@@ -1,0 +1,11 @@
+# L13 allStakingReceipts (v1: v1/L13-allStakingReceipts.graphql)
+# status: works
+# chipnet equality: equal (v1 6 rows in 1 pages, v2 6 rows in 1 pages)
+query allStakingReceipts($poolTokenId: Hex, $node: String!, $limit: Int!, $after: String) {
+  output: unspent_outputs(node: $node, limit: $limit, after: $after,
+    order_by: [{ transaction: { internal_id: ASC } }, { output_index: ASC }],
+    where: { token_category: { _eq: $poolTokenId }, nonfungible_token_capability: { _eq: NONE } }) {
+    has_more end_cursor
+    nodes { transaction_hash output_index locking_bytecode nonfungible_token_commitment }
+  }
+}

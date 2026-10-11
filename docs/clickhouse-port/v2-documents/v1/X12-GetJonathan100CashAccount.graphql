@@ -1,0 +1,23 @@
+# X12 v1 (chaingraph.cash 3bacf3c examples.tsx: CashAccount Lookup)
+query GetJonathan100CashAccount {
+  search_output_prefix(
+    args: { locking_bytecode_prefix_hex: "6a0401010101084a6f6e617468616e" }
+    where: {
+      transaction: { block_inclusions: { block: { height: { _eq: 563720 } } } }
+    }
+  ) {
+    transaction {
+      hash
+      data_carrier_outputs {
+        locking_bytecode
+        output_index
+      }
+      block_inclusions {
+        block {
+          hash
+          height
+        }
+      }
+    }
+  }
+}

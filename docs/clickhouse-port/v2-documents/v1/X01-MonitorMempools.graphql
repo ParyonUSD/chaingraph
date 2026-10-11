@@ -1,0 +1,21 @@
+# X1 v1 (chaingraph.cash 3bacf3c examples.tsx: Monitor Mempools)
+subscription MonitorMempools {
+  node {
+    name
+    user_agent
+    unconfirmed_transaction_count
+    unconfirmed_transactions(
+      limit: 5,
+      order_by: { validated_at: desc }
+    ) {
+      validated_at
+      transaction {
+        hash
+        input_count
+        output_count
+        output_value_satoshis
+        size_bytes
+      }
+    }
+  }
+}

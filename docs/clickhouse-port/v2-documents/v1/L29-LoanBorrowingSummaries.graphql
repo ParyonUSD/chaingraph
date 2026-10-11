@@ -1,0 +1,31 @@
+# L29 v1 (paryon_library-integration 7c36376, gqlQueryLoanBorrowingSummaries)
+query LoanBorrowingSummaries($userLoanKeys: [bytea!], $paryonTokenId: bytea, $node: String!, $limit: Int!, $afterInternalId: bigint!) {
+  transaction(
+    limit: $limit
+    order_by: {internal_id: asc}
+    where: {internal_id: {_gt: $afterInternalId}, outputs: {token_category: {_in: $userLoanKeys}, _and: {nonfungible_token_capability: {_eq: "none"}}}, _and: [{outputs: {token_category: {_eq: $paryonTokenId}, _and: {nonfungible_token_capability: {_eq: "minting"}}}}], _or: [{node_validations: {node: {name: {_eq: $node}}}}, {block_inclusions: {block: {accepted_by: {node: {name: {_eq: $node}}}}}}]}
+  ) {
+    internal_id
+    block_inclusions {
+      block {
+        timestamp
+      }
+    }
+    outputs(
+      where: {_or: [{output_index: {_in: ["0", "2"]}}, {token_category: {_in: $userLoanKeys}, nonfungible_token_capability: {_eq: "none"}}]}
+      order_by: {output_index: asc}
+    ) {
+      output_index
+      token_category
+      nonfungible_token_capability
+      fungible_token_amount
+      nonfungible_token_commitment
+    }
+    inputs(where: {input_index: {_eq: "0"}}) {
+      input_index
+      outpoint {
+        fungible_token_amount
+      }
+    }
+  }
+}

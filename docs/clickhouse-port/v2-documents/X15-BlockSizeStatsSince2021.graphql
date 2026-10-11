@@ -1,0 +1,14 @@
+# X15 BlockSizeStatsSince2021 (v1: v1/X15-BlockSizeStatsSince2021.graphql)
+# status: blocked (v2 error: v2: Cannot query field "blocks_aggregate" on type "Query".)
+# chipnet equality: not compared: v2 error (v1 0 rows in 0 pages, v2 0 rows in 0 pages); expected: not compared: v2 error
+query BlockSizeStatsSince2021($node: String!, $since: BigInt!) {
+  block_aggregate: blocks_aggregate(node: $node, where: { timestamp: { _gt: $since } }) {
+    aggregate {
+      count
+      max { size_bytes }
+      min { size_bytes }
+      avg { size_bytes }
+      sum { size_bytes }
+    }
+  }
+}

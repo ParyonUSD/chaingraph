@@ -1,0 +1,95 @@
+# X6 v1 (chaingraph.cash 3bacf3c examples.tsx: Get Transaction Details)
+query GetTransactionDetails {
+  transaction(where: { hash: { _eq:
+  "\\x978306aa4e02fd06e251b38d2e961f78f4af2ea6524a3e4531126776276a6af1"
+  } } ) {
+    authchains {
+      authchain_length
+      authhead_transaction_hash
+      authhead {
+        block_inclusions {
+          block {
+            height
+          }
+        }
+      }
+      migrations {
+        migration_index
+        transaction {
+          hash
+        }
+      }
+      unspent_authhead
+    }
+    block_inclusions {
+      transaction_index
+      block {
+        height # etc.
+      }
+    }
+    data_carrier_outputs {
+      locking_bytecode # etc.
+    }
+    encoded_hex
+    fee_satoshis
+    hash
+    identity_output {
+      spent_by {
+        input_index # etc.
+        transaction {
+          hash
+        }
+      }
+    }
+    input_count
+    input_value_satoshis
+    inputs {
+      input_index
+      outpoint_index
+      outpoint_transaction_hash
+      redeem_bytecode_pattern
+      sequence_number
+      unlocking_bytecode
+      unlocking_bytecode_pattern
+      value_satoshis
+    }
+    is_coinbase
+    locktime
+    node_validation_timeline {
+      validated_at
+      replaced_at
+      node {
+        name # etc.
+      }
+    }
+    node_validations {
+      validated_at
+      node {
+        name
+      }
+    }
+    output_count
+    output_value_satoshis
+    outputs {
+      locking_bytecode
+      locking_bytecode_pattern
+      output_index
+      spent_by {
+        input_index
+        transaction {
+          hash
+        }
+      }
+    }
+    signing_output {
+      spent_by {
+        input_index # etc.
+        transaction {
+          hash
+        }
+      }
+    }
+    size_bytes
+    version
+  }
+}

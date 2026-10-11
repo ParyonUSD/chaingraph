@@ -1,0 +1,34 @@
+# X7 v1 (chaingraph.cash 3bacf3c examples.tsx: Get Block Details)
+query GetBlockDetails {
+  block(where: {height:{_eq: 0}}){
+    accepted_by {
+      accepted_at # "null" if only known via historical sync
+      node {
+        first_connected_at
+        latest_connection_began_at
+        name
+        protocol_version
+        unconfirmed_transaction_count
+        user_agent
+      }
+    }
+    bits
+    encoded_hex
+    fee_satoshis
+    generated_value_satoshis
+    hash
+    header
+    height
+    input_count
+    input_value_satoshis
+    merkle_root
+    nonce
+    output_count
+    output_value_satoshis
+    previous_block_hash
+    size_bytes
+    timestamp
+    transaction_count
+    version
+  }
+}
