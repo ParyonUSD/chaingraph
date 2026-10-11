@@ -526,8 +526,17 @@ export const authchainBranchesSql = (c: Ctx, link: string) => {
   const zero = `toFixedString(unhex(repeat('00', 32)), 32)`;
   const links = c.sql.view('authchain_link_at');
   const max = String(maxAuthchainDepth);
+  /*
+   * A walk row is identified by (base, sipHash64(path)): the steps join and
+   * group by that, never by the path itself, and take the path back once
+   * per row (`paths`): carrying a 56,904-link path through a join with
+   * every member of a segment, or through the members of its own run,
+   * would copy it once per row (~100 GB on chipnet's longest chain).
+   */
+  const paths = (phase: number) =>
+    `SELECT base AS p_base, sipHash64(path) AS p_pid, path AS p_path FROM walk WHERE phase = ${phase}`;
   /* phase 0: the current transaction's segment and position (no row: it starts its own) */
-  const here = `SELECT w.base AS h_base, w.cur AS h_cur, w.len AS h_len, w.path AS h_path,
+  const here = `SELECT w.base AS h_base, w.cur AS h_cur, w.len AS h_len, sipHash64(w.path) AS h_pid,
       if(l.transaction_hash = ${zero}, t.t_id, l.l_segment) AS h_seg,
       if(l.transaction_hash = ${zero}, toUInt32(0), l.l_position) AS h_pos
     FROM walk AS w
@@ -541,48 +550,54 @@ export const authchainBranchesSql = (c: Ctx, link: string) => {
   const members = `SELECT segment AS m_seg, position AS m_pos, transaction_hash AS m_hash FROM ${links}
     WHERE segment IN (SELECT h_seg FROM (${here}))`;
   /* per walk row: members at or after its position, sorted; a position holding two members is a conflict */
-  const runs = `SELECT g_base, g_cur, g_len, g_path, g_pos, g_sorted,
+  const runs = `SELECT g_base, g_cur, g_len, g_pid, g_pos, g_sorted,
       arrayMap(x -> x.1, g_sorted) AS g_ps,
       arrayMap((p, i) -> (i > 1 AND g_ps[i - 1] = p) OR (i < length(g_ps) AND g_ps[i + 1] = p),
         g_ps, arrayEnumerate(g_ps)) AS g_dup,
       arrayFilter(x -> tupleElement(x.1, 1) > g_pos, arrayZip(g_sorted, g_dup)) AS g_after,
       arrayFirstIndex((x, i) -> tupleElement(x.1, 1) != g_pos + i OR x.2, g_after, arrayEnumerate(g_after)) AS g_fail,
       g_pos = 0 OR countEqual(g_ps, g_pos) = 1 AS g_unique
-    FROM (SELECT h_base AS g_base, any(h_cur) AS g_cur, any(h_len) AS g_len, h_path AS g_path,
+    FROM (SELECT h_base AS g_base, any(h_cur) AS g_cur, any(h_len) AS g_len, h_pid AS g_pid,
         any(h_pos) AS g_pos,
         arraySort(groupUniqArrayIf((m_pos, m_hash), m_pos >= h_pos)) AS g_sorted
       FROM (${here}) AS h LEFT JOIN (${members}) AS m ON m.m_seg = h.h_seg
-      GROUP BY h_base, h_path)`;
+      GROUP BY h_base, h_pid)`;
   const along = `SELECT g_base, if(empty(g_next), g_cur, g_next[-1]), g_len + length(g_next),
-      arrayConcat(g_path, g_next), toUInt8(1), g_len
-    FROM (SELECT g_base, g_cur, g_len, g_path,
+      arrayConcat(p.p_path, g_next), toUInt8(1), g_len
+    FROM (SELECT g_base, g_cur, g_len, g_pid,
         if(g_unique, arraySlice(arrayMap(x -> tupleElement(x.1, 2), arraySlice(g_after, 1,
           toInt64(if(g_fail = 0, length(g_after), g_fail - 1)))), 1,
           toInt64(${max}) - toInt64(g_len)), []) AS g_next
-      FROM (${runs}))`;
+      FROM (${runs})) AS g
+    INNER JOIN (${paths(0)}) AS p ON p.p_base = g.g_base AND p.p_pid = g.g_pid`;
   /* phase 1: every spender of output 0 of the members added since `start` */
   const spenders = `SELECT outpoint_transaction_hash AS s_parent, groupUniqArray(transaction_hash) AS s_kids
     FROM ${c.sql.view('input_at')}
     WHERE (outpoint_transaction_hash, outpoint_index) IN (
-      SELECT arrayJoin(arraySlice(path, start)), toUInt32(0) FROM walk WHERE phase = 1)
+      SELECT member, toUInt32(0) FROM (SELECT arraySlice(path, start) AS added FROM walk WHERE phase = 1)
+        ARRAY JOIN added AS member)
     GROUP BY outpoint_transaction_hash`;
-  const items = `SELECT x.x_base AS x_base, x.x_path AS x_path, x.x_j AS x_j, x.x_next AS x_next,
+  /* (j, member j, member j + 1) of each row's added members; the path itself stays behind */
+  const items = `SELECT x.x_base AS x_base, x.x_pid AS x_pid, x.x_j AS x_j, x.x_next AS x_next,
       s.s_kids AS x_kids
-    FROM (SELECT base AS x_base, path AS x_path, j AS x_j, path[j] AS x_m,
-        if(j < len, path[j + 1], ${zero}) AS x_next
-      FROM walk ARRAY JOIN range(start, len + 1) AS j WHERE phase = 1) AS x
+    FROM (SELECT x_base, x_pid, e.1 AS x_j, e.2 AS x_m, e.3 AS x_next
+      FROM (SELECT base AS x_base, sipHash64(path) AS x_pid,
+          arrayMap(j -> (j, path[j], if(j < len, path[j + 1], ${zero})), range(start, len + 1)) AS x_list
+        FROM walk WHERE phase = 1)
+      ARRAY JOIN x_list AS e) AS x
     LEFT JOIN (${spenders}) AS s ON s.s_parent = x.x_m`;
   /* the path holds while each next member spends the previous one's output 0 */
-  const ends = `SELECT y_base, y_path,
+  const ends = `SELECT y_base, p.p_path AS y_path,
       if(y_fail = 0, length(y_items), y_fail) AS y_c,
       arrayFlatten(arrayMap(x -> arrayMap(k -> (x.1, k, toUInt8(0)), arrayFilter(k -> k != x.2, x.3)),
         arraySlice(y_items, 1, y_c))) AS y_branches,
       if(empty(y_items[y_c].3), [(y_items[y_c].1, ${zero}, toUInt8(2))], []) AS y_end
-    FROM (SELECT y_base, y_path, y_items,
+    FROM (SELECT y_base, y_pid, y_items,
         arrayFirstIndex(x -> x.2 != ${zero} AND NOT has(x.3, x.2), y_items) AS y_fail
-      FROM (SELECT x_base AS y_base, x_path AS y_path,
+      FROM (SELECT x_base AS y_base, x_pid AS y_pid,
           arraySort(x -> x.1, groupArray((x_j, x_next, x_kids))) AS y_items
-        FROM (${items}) GROUP BY x_base, x_path))`;
+        FROM (${items}) GROUP BY x_base, x_pid)) AS y
+    INNER JOIN (${paths(1)}) AS p ON p.p_base = y.y_base AND p.p_pid = y.y_pid`;
   const across = `SELECT y_base, if(e.3 = 2, y_path[e.1], e.2), if(e.3 = 2, e.1, e.1 + 1),
       if(e.3 = 2, arraySlice(y_path, 1, e.1), arrayPushBack(arraySlice(y_path, 1, e.1), e.2)),
       toUInt8(if(e.3 = 2 OR e.1 + 1 >= ${max}, 2, 0)), toUInt64(1)
