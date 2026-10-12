@@ -85,6 +85,7 @@ import type {
   NodeBlockFilter,
   NodeTransactionFilter,
   OutputFilter,
+  SpentByFilter,
   TimestampComparison,
   TransactionFilter,
 } from './sql.js';
@@ -279,6 +280,7 @@ const TimestampComparisonInput = builder
 
 const OutputFilterInput = builder.inputRef<OutputFilter>('OutputFilter');
 const InputFilterInput = builder.inputRef<InputFilter>('InputFilter');
+const SpentByFilterInput = builder.inputRef<SpentByFilter>('SpentByFilter');
 const TransactionFilterInput =
   builder.inputRef<TransactionFilter>('TransactionFilter');
 const BlockFilterInput = builder.inputRef<BlockFilter>('BlockFilter');
@@ -297,8 +299,8 @@ OutputFilterInput.implement({
     output_index: t.field({ type: IntComparisonInput }),
     spent_by: t.field({
       description:
-        'EXISTS a stored input spending this output (node-agnostic: conflicting spends included), matching. For a spend a node accepts, add `transaction: { block_window: {} }` (the node of the level).',
-      type: InputFilterInput,
+        'EXISTS a stored input spending this output, matching. Node-agnostic (conflicting spends included) unless `accepted_by` names a node.',
+      type: SpentByFilterInput,
     }),
     token_category: t.field({ type: HexComparisonInput }),
     transaction: t.field({
@@ -311,27 +313,47 @@ OutputFilterInput.implement({
   }),
 });
 
+/** The fields of `InputFilter` (shared with `SpentByFilter`). */
+/* eslint-disable @typescript-eslint/no-magic-numbers */
+type InputFilterFieldBuilder = Parameters<
+  Parameters<typeof InputFilterInput.implement>[0]['fields']
+>[0];
+/* eslint-enable @typescript-eslint/no-magic-numbers */
+const inputFilterFields = (t: InputFilterFieldBuilder) => ({
+  _and: t.field({ type: [InputFilterInput] }),
+  _not: t.field({ type: InputFilterInput }),
+  _or: t.field({ type: [InputFilterInput] }),
+  input_index: t.field({ type: IntComparisonInput }),
+  outpoint: t.field({
+    description: 'The spent output matches (no match for a coinbase input).',
+    type: OutputFilterInput,
+  }),
+  outpoint_index: t.field({ type: BigIntComparisonInput }),
+  outpoint_transaction_hash: t.field({ type: HexComparisonInput }),
+  sequence_number: t.field({ type: BigIntComparisonInput }),
+  transaction: t.field({
+    description: 'The spending transaction matches.',
+    type: TransactionFilterInput,
+  }),
+  transaction_hash: t.field({ type: HexComparisonInput }),
+  transaction_internal_id: t.field({ type: BigIntComparisonInput }),
+});
+
 InputFilterInput.implement({
   description:
     'Predicates on one input row; `outpoint` fields bind to the same row (same-row conjunction).',
+  fields: inputFilterFields,
+});
+
+SpentByFilterInput.implement({
+  description:
+    'Predicates on a spending input (as `InputFilter`), plus opt-in acceptance.',
   fields: (t) => ({
-    _and: t.field({ type: [InputFilterInput] }),
-    _not: t.field({ type: InputFilterInput }),
-    _or: t.field({ type: [InputFilterInput] }),
-    input_index: t.field({ type: IntComparisonInput }),
-    outpoint: t.field({
-      description: 'The spent output matches (no match for a coinbase input).',
-      type: OutputFilterInput,
+    ...inputFilterFields(t),
+    accepted_by: t.string({
+      description:
+        'Opt-in acceptance: only inputs of transactions the named node accepts (a block it accepts or its mempool) at the request snapshot, as `spent_by(accepted_by:)`. Default: every stored spending input, node-agnostic. The node is pinned by the request like any `accepted_by:` argument.',
     }),
-    outpoint_index: t.field({ type: BigIntComparisonInput }),
-    outpoint_transaction_hash: t.field({ type: HexComparisonInput }),
-    sequence_number: t.field({ type: BigIntComparisonInput }),
-    transaction: t.field({
-      description: 'The spending transaction matches.',
-      type: TransactionFilterInput,
-    }),
-    transaction_hash: t.field({ type: HexComparisonInput }),
-    transaction_internal_id: t.field({ type: BigIntComparisonInput }),
   }),
 });
 

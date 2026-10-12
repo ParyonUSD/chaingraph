@@ -121,6 +121,20 @@ export class Sql {
   }
 
   /**
+   * A node's internal id by name, for filter-level `accepted_by` (the
+   * statement environment sets it to the request's pinned nodes).
+   */
+  nodeIdOf: ((name: string) => number) | undefined;
+
+  /** `nodeIdOf`, failing when the statement has no node resolver. */
+  resolveNode(name: string) {
+    if (this.nodeIdOf === undefined) {
+      throw invalid(`Node ${name} is not pinned by this statement.`);
+    }
+    return this.nodeIdOf(name);
+  }
+
+  /**
    * True when unspent outputs of `node` (default: the primary node) are read
    * from the stored UTXO set: the snapshot carries the node's mark (the
    * store has a set and the API reads it), the policy allows it and the lag
@@ -416,8 +430,21 @@ export interface OutputFilter {
   nonfungible_token_commitment?: HexComparison | null;
   /** The creating transaction matches (same output row). */
   transaction?: TransactionFilter | null;
-  /** EXISTS a stored input spending the output (node-agnostic), matching. */
-  spent_by?: InputFilter | null;
+  /**
+   * EXISTS a stored input spending the output (node-agnostic), matching;
+   * with `accepted_by`, only inputs of transactions that node accepts.
+   */
+  spent_by?: SpentByFilter | null;
+}
+
+/**
+ * The `spent_by` filter: an `InputFilter` on the spending input plus the
+ * opt-in `accepted_by: node` (owner decision 2026-10-12): only spends whose
+ * spending transaction the node accepts (a block it accepts or its mempool) at
+ * the request snapshot, as the `spent_by(accepted_by:)` field.
+ */
+export interface SpentByFilter extends InputFilter {
+  accepted_by?: string | null;
 }
 
 export interface InputFilter {
@@ -1244,15 +1271,22 @@ export const outputPredicate = (
     );
   }
   if (given(filter.spent_by)) {
-    /* node-agnostic, as the `spent_by` relationship: any stored spending input */
+    /*
+     * node-agnostic, as the `spent_by` relationship: any stored spending
+     * input; `accepted_by` keeps the inputs of transactions that node accepts
+     * (`Sql.acceptedRows`, as the field's `accepted_by`)
+     */
+    const { accepted_by: acceptedBy, ...spendFilter } = filter.spent_by;
+    const rows = inputRowsSql(sql, spendFilter, node);
+    const spends = given(acceptedBy)
+      ? sql.acceptedRows(
+          rows,
+          'outpoint_transaction_hash, outpoint_index',
+          sql.resolveNode(acceptedBy)
+        )
+      : `SELECT outpoint_transaction_hash, outpoint_index FROM (${rows})`;
     parts.push(
-      `(${columns.transaction_hash}, ${
-        columns.output_index
-      }) IN (SELECT outpoint_transaction_hash, outpoint_index FROM (${inputRowsSql(
-        sql,
-        filter.spent_by,
-        node
-      )}))`
+      `(${columns.transaction_hash}, ${columns.output_index}) IN (${spends})`
     );
   }
   if (given(filter._and)) {

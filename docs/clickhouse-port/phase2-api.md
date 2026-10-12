@@ -855,6 +855,13 @@ and X4 26 → 32 (now 117 and 24). Headers of the document files hold the stage-
    `block_inclusions(accepted_by: node) { block { accepted_by(node:) { accepted_at } } }`.
 3. **The `spent_by` filter** is node-agnostic like the relationship; acceptance through `transaction: { block_window:
    {} }` at the level's node. Confirm, or add an explicit filter-level `accepted_by`?
+   **Owner decision 2026-10-12:** add it. `spent_by: { accepted_by: node, … }` (input type `SpentByFilter`: the
+   `InputFilter` fields plus `accepted_by`) keeps only spends whose spending transaction the node accepts (a block it
+   accepts or its mempool) at the request snapshot, per node exactly, as the `spent_by(accepted_by:)` field; the node
+   is pinned by the request like any `accepted_by:` argument (also when named only inside a variable's filter).
+   Without it the filter stays node-agnostic and structural. Equal to `transaction: { block_window: {} }` at the
+   node's own root (`api-structural.spec.ts`: fork, stale and conflicting mempool spends). See
+   [fix-pass-4.md](fix-pass-4.md) §2.
 4. **`p_node_tx` on mainnet:** the GKE session can measure it by applying the DDL with and without
    `CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL=p_node_tx` (or `--optional p_node_tx`; the API notices it within 60 s) and
    paging `transactions(node:, limit: 100, after: …)` from a few cursors. The plan relies on

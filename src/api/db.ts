@@ -389,19 +389,21 @@ export const singleNodeEnv = (
   utxoSetPolicy?: UtxoSetPolicy
 ): StatementEnv => {
   const sql = new Sql(snapshot, new Map(), utxoSetPolicy);
+  const nodeId = (name: string) => {
+    if (name !== nodeName) {
+      throw new GraphQLError(
+        'A subscription pins one node: every `node:` argument of it must name the same node.',
+        { extensions: { code: 'BAD_USER_INPUT' } }
+      );
+    }
+    return snapshot.nodeId;
+  };
+  sql.nodeIdOf = nodeId;
   return {
     ctx: {
       maxRows,
       node: snapshot.nodeId === nodeAgnosticId ? undefined : snapshot.nodeId,
-      nodeId: (name) => {
-        if (name !== nodeName) {
-          throw new GraphQLError(
-            'A subscription pins one node: every `node:` argument of it must name the same node.',
-            { extensions: { code: 'BAD_USER_INPUT' } }
-          );
-        }
-        return snapshot.nodeId;
-      },
+      nodeId,
       sql,
     },
     sql,
@@ -476,15 +478,17 @@ export class PinnedSnapshot {
       [...multi.visibleByNode].filter(([id]) => id !== snapshot.nodeId)
     );
     const sql = new Sql(snapshot, others, this.db.utxoSetPolicy);
+    const nodeId = (name: string) => {
+      const id = this.ids.get(name);
+      if (id === undefined) throw unknownNode(name);
+      return id;
+    };
+    sql.nodeIdOf = nodeId;
     return {
       ctx: {
         maxRows: this.db.maxResultRows,
         node: snapshot.nodeId === nodeAgnosticId ? undefined : snapshot.nodeId,
-        nodeId: (name) => {
-          const id = this.ids.get(name);
-          if (id === undefined) throw unknownNode(name);
-          return id;
-        },
+        nodeId,
         sql,
       },
       sql,

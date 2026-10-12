@@ -597,9 +597,9 @@ input OutputFilter {
   output_index: IntComparison
 
   """
-  EXISTS a stored input spending this output (node-agnostic: conflicting spends included), matching. For a spend a node accepts, add `transaction: { block_window: {} }` (the node of the level).
+  EXISTS a stored input spending this output, matching. Node-agnostic (conflicting spends included) unless `accepted_by` names a node.
   """
-  spent_by: InputFilter
+  spent_by: SpentByFilter
   token_category: HexComparison
 
   """The creating transaction matches."""
@@ -960,6 +960,32 @@ enum SpendGroupOrderField {
 type SpendGroupPage {
   has_more: Boolean!
   nodes: [SpendGroup!]!
+}
+
+"""
+Predicates on a spending input (as `InputFilter`), plus opt-in acceptance.
+"""
+input SpentByFilter {
+  _and: [InputFilter!]
+  _not: InputFilter
+  _or: [InputFilter!]
+
+  """
+  Opt-in acceptance: only inputs of transactions the named node accepts (a block it accepts or its mempool) at the request snapshot, as `spent_by(accepted_by:)`. Default: every stored spending input, node-agnostic. The node is pinned by the request like any `accepted_by:` argument.
+  """
+  accepted_by: String
+  input_index: IntComparison
+
+  """The spent output matches (no match for a coinbase input)."""
+  outpoint: OutputFilter
+  outpoint_index: BigIntComparison
+  outpoint_transaction_hash: HexComparison
+  sequence_number: BigIntComparison
+
+  """The spending transaction matches."""
+  transaction: TransactionFilter
+  transaction_hash: HexComparison
+  transaction_internal_id: BigIntComparison
 }
 
 """

@@ -1,4 +1,4 @@
-/* eslint-disable functional/no-throw-statement, @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-loop-statement, no-await-in-loop, @typescript-eslint/require-array-sort-compare */
+/* eslint-disable functional/no-throw-statement, @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-loop-statement, no-await-in-loop, @typescript-eslint/require-array-sort-compare, complexity, camelcase */
 // cspell:ignore clickhouse authchain authchains
 /**
  * Structural facts vs acceptance (owner decision 2026-10-11, item 1):
@@ -396,6 +396,110 @@ e2e(
       scoped.spent_accepted.nodes.map((row) => row.output_index),
       [1, 2, 3],
       'opt-in: spends the root node accepts'
+    );
+
+    /*
+     * ---- the spent_by filter's opt-in accepted_by (owner decision 2026-10-12) ----
+     * Exactly the spends whose spending transaction the named node accepts at
+     * the request snapshot: per node, any root node, equal to the explicit
+     * `transaction: { block_window: {} }` form at that node's own root.
+     */
+    const nodeNames = ['node-one', 'node-two'] as const;
+    const acceptedSpends = (node: (typeof nodeNames)[number]) =>
+      [...spendExpected.entries()].flatMap(([key, spenders]) =>
+        spenders
+          .filter((spender) => (node === 'node-one' ? spender[1] : spender[2]))
+          .map((spender) => ({ key, spender: spender[0] }))
+      );
+    const keysOf = (
+      rows: { transaction_hash: string; output_index: number }[]
+    ) =>
+      rows.map((row) => `${row.transaction_hash}:${row.output_index}`).sort();
+    interface Keys {
+      nodes: { transaction_hash: string; output_index: number }[];
+    }
+    for (const node of nodeNames) {
+      const other = node === 'node-one' ? 'node-two' : 'node-one';
+      const wanted = [
+        ...new Set(acceptedSpends(node).map((row) => row.key)),
+      ].sort();
+      const unspentWanted = [
+        ...spendExpected.keys(),
+        `${shared.hash}:1`,
+        `${c0.hash}:0`,
+      ]
+        .filter((key) => !wanted.includes(key))
+        .sort();
+      const forms = await gql<{
+        filter: Keys;
+        window: Keys;
+        cross: Keys;
+        by_variable: Keys;
+        not_spent: Keys;
+      }>(
+        `query($hashes: [Hex!]!, $where: OutputFilter!) {
+          filter: outputs(node: "${node}", limit: 100, where: { transaction_hash: { _in: $hashes }, spent_by: { accepted_by: "${node}" } }) { nodes { transaction_hash output_index } }
+          window: outputs(node: "${node}", limit: 100, where: { transaction_hash: { _in: $hashes }, spent_by: { transaction: { block_window: {} } } }) { nodes { transaction_hash output_index } }
+          cross: outputs(node: "${other}", limit: 100, where: { transaction_hash: { _in: $hashes }, spent_by: { accepted_by: "${node}" } }) { nodes { transaction_hash output_index } }
+          by_variable: outputs(node: "${other}", limit: 100, where: $where) { nodes { transaction_hash output_index } }
+          not_spent: outputs(node: "${node}", limit: 100, where: { transaction_hash: { _in: $hashes }, _not: { spent_by: { accepted_by: "${node}" } } }) { nodes { transaction_hash output_index } }
+        }`,
+        {
+          hashes: [c0.hash, shared.hash],
+          where: {
+            spent_by: { _and: [{}], accepted_by: node },
+            transaction_hash: { _in: [c0.hash, shared.hash] },
+          },
+        }
+      );
+      t.deepEqual(
+        keysOf(forms.filter.nodes),
+        wanted,
+        `${node}: accepted spends`
+      );
+      t.deepEqual(
+        keysOf(forms.filter.nodes),
+        keysOf(forms.window.nodes),
+        `${node}: equal to spent_by: { transaction: { block_window: {} } }`
+      );
+      t.deepEqual(
+        keysOf(forms.cross.nodes),
+        wanted,
+        `${node}: the same below a root of ${other}`
+      );
+      t.deepEqual(
+        keysOf(forms.by_variable.nodes),
+        wanted,
+        `${node}: named only inside a variable's filter (pinned by the request)`
+      );
+      t.deepEqual(
+        keysOf(forms.not_spent.nodes),
+        unspentWanted,
+        `${node}: _not spent_by accepted_by = no spend the node accepts`
+      );
+      /* per spender: a mempool spend (m1 / m2) and a fork spend (x / y) only for its node; the stale z for none */
+      for (const spender of [m1, m2, x, y, z]) {
+        const one = await gql<{ rows: Keys }>(
+          `query($hashes: [Hex!]!, $spender: Hex!) {
+            rows: outputs(node: "${node}", limit: 100, where: { transaction_hash: { _in: $hashes }, spent_by: { accepted_by: "${node}", transaction_hash: { _eq: $spender } } }) { nodes { transaction_hash output_index } }
+          }`,
+          { hashes: [c0.hash, shared.hash], spender: spender.hash }
+        );
+        t.deepEqual(
+          keysOf(one.rows.nodes),
+          acceptedSpends(node)
+            .filter((row) => row.spender === spender.hash)
+            .map((row) => row.key)
+            .sort(),
+          `${node}: spends by ${spender.hash.slice(0, 8)}`
+        );
+      }
+    }
+    await t.throwsAsync(
+      gql(
+        `{ outputs(node: "node-one", limit: 1, where: { spent_by: { accepted_by: "node-nine" } }) { nodes { output_index } } }`
+      ),
+      { message: /Unknown node: node-nine/u }
     );
 
     /* ---- authchains: per node by default, every branch without a node ---- */

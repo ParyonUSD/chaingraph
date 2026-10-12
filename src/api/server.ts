@@ -56,10 +56,55 @@ const argumentValue = (
 };
 
 /**
+ * Node names inside an input value: every `accepted_by` field of an input
+ * object at any depth (the `spent_by` filter's opt-in acceptance), in a
+ * literal or in a variable's value.
+ */
+const inputNodeNames = (
+  value: unknown,
+  names: Set<string>,
+  variables: { [name: string]: unknown } | null | undefined
+): void => {
+  if (value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    value.forEach((item) => {
+      inputNodeNames(item, names, variables);
+    });
+    return;
+  }
+  const node = value as ValueNode;
+  if (typeof node.kind === 'string' && 'loc' in node) {
+    if (node.kind === Kind.VARIABLE) {
+      inputNodeNames(variables?.[node.name.value], names, variables);
+    } else if (node.kind === Kind.LIST) {
+      inputNodeNames(node.values, names, variables);
+    } else if (node.kind === Kind.OBJECT) {
+      node.fields.forEach((field) => {
+        if (field.name.value === 'accepted_by') {
+          const name = argumentValue(field.value, variables);
+          if (typeof name === 'string') names.add(name);
+        } else {
+          inputNodeNames(field.value, names, variables);
+        }
+      });
+    }
+    return;
+  }
+  Object.entries(value as { [key: string]: unknown }).forEach(([key, item]) => {
+    if (key === 'accepted_by') {
+      if (typeof item === 'string') names.add(item);
+    } else {
+      inputNodeNames(item, names, variables);
+    }
+  });
+};
+
+/**
  * The node names of an operation: every `node:` and `accepted_by:` argument
  * of every field at any depth (root fields, per-node relationships, opt-in
- * acceptance), with fragments flattened. The request snapshot pins exactly
- * these nodes.
+ * acceptance), and every `accepted_by` inside an argument's input value
+ * (the `spent_by` filter), with fragments flattened. The request snapshot
+ * pins exactly these nodes.
  */
 export const operationNodeNames = (
   document: DocumentNode,
@@ -90,6 +135,7 @@ export const operationNodeNames = (
             argument.name.value !== 'node' &&
             argument.name.value !== 'accepted_by'
           ) {
+            inputNodeNames(argument.value, names, variables);
             return;
           }
           const value = argumentValue(argument.value, variables);
