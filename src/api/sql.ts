@@ -25,6 +25,7 @@
 import { GraphQLError } from 'graphql';
 
 import { utxoSetRowsSql } from '../store/clickhouse/utxo-set.js';
+import { notCoinbaseOutpointSql } from '../store/clickhouse/utxo.js';
 import type { VisibilitySnapshot } from '../store/clickhouse/visibility.js';
 import {
   inlinePinnedView,
@@ -983,8 +984,6 @@ export const spentOutputColumns: OutputColumns = {
   transaction_internal_id: undefined,
 };
 
-const zeroHashSql = `toFixedString(unhex(repeat('00', 32)), 32)`;
-
 const spendRelationColumns =
   'transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index, value_satoshis, ' +
   'locking_bytecode, locking_bytecode_prefix, token_category, fungible_token_amount, nonfungible_token_capability, ' +
@@ -1040,7 +1039,7 @@ export const spendRelationSql = (sql: Sql, predicate: string) => {
     SELECT ${spendRelationColumns} FROM (
       SELECT ${joinedSpendColumns}
       FROM (SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index FROM ${input}
-            WHERE commit_seq > {spend:UInt64} AND outpoint_transaction_hash != ${zeroHashSql}) AS i
+            WHERE commit_seq > {spend:UInt64} AND ${notCoinbaseOutpointSql()}) AS i
       INNER JOIN (SELECT ${spentOutputSelect} FROM ${output}
                   WHERE (transaction_hash, output_index) IN (
                     SELECT outpoint_transaction_hash, outpoint_index FROM ${input}
