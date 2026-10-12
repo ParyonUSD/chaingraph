@@ -52,10 +52,57 @@ export interface AdmissionOptions {
   retryAfterSeconds: number;
   /** Shapes remembered (least recently used dropped). */
   maxShapes: number;
+  /**
+   * The cores the lane sizes were derived from and where that number came
+   * from (`env`: CHAINGRAPH_API_CLICKHOUSE_CORES, `clickhouse`: the
+   * server's `max_threads` for the API user, `default`: neither, the
+   * static defaults); for the startup log.
+   */
+  sizing?: {
+    cores: number | undefined;
+    source: 'clickhouse' | 'default' | 'env';
+  };
 }
 
+/** Light statements at once per core of the ClickHouse server. */
+export const lightConcurrentPerCore = 0.5;
+
+/** The light lane never gets fewer slots than this (small servers). */
+export const minLightConcurrent = 8;
+
+/** Heavy statements' `max_threads` unless CHAINGRAPH_API_HEAVY_MAX_THREADS says otherwise. */
+export const defaultHeavyMaxThreads = 8;
+
 /**
- * Defaults (per API process): 24 light and 6 heavy statements at once;
+ * Lane sizes from the ClickHouse server's cores (owner decision 2026-10-12,
+ * fix-pass-4.md §8): heavy = max(1, floor(cores / heavy max_threads)), so
+ * the heavy lane at full occupancy asks for about every core once and no
+ * more (a heavy statement is CPU bound and uses all its threads); light =
+ * max(8, floor(cores × 0.5)): light statements are point and range lookups
+ * of ~40–60 ms, mostly one thread and partly waiting on marks and reads, so
+ * half a slot per core keeps them below the core count while heavy ones run
+ * (they also have the higher `priority`). At 48 cores: 24 light, 6 heavy ×
+ * 8 threads, the measured defaults. `heavyMaxThreads` 0 (the server's
+ * default, i.e. every core) gives one heavy slot.
+ */
+export const laneConcurrencyForCores = (
+  cores: number,
+  heavyMaxThreads: number
+) => {
+  const usableCores = Math.max(1, Math.floor(cores));
+  const threads = heavyMaxThreads > 0 ? heavyMaxThreads : usableCores;
+  return {
+    heavy: Math.max(1, Math.floor(usableCores / threads)),
+    light: Math.max(
+      minLightConcurrent,
+      Math.floor(usableCores * lightConcurrentPerCore)
+    ),
+  };
+};
+
+/**
+ * Defaults (per API process) when the server's cores are unknown: those of
+ * a 48-core server (`laneConcurrencyForCores(48, 8)`): 24 light and 6 heavy statements at once;
  * queues of 256 / 24 waiting at most 5 s / 10 s. Heavy statements run with
  * at most 8 threads and a lower priority than light ones. A shape is heavy
  * from 1 M rows read on average (the F3 restatement of 2026-10-12: key
@@ -67,7 +114,7 @@ export const defaultAdmissionOptions: AdmissionOptions = {
     maxConcurrent: 6,
     maxQueued: 24,
     maxWaitMs: 10_000,
-    settings: { max_threads: 8, priority: 2 },
+    settings: { max_threads: defaultHeavyMaxThreads, priority: 2 },
   },
   heavyRows: 1_000_000,
   light: {
@@ -125,20 +172,67 @@ const laneSettingsFromEnv = (
 /**
  * From the environment (all optional):
  * CHAINGRAPH_API_ADMISSION (`on` | `off`, default on);
- * CHAINGRAPH_API_LIGHT_… / CHAINGRAPH_API_HEAVY_…: MAX_CONCURRENT, MAX_QUEUED, MAX_WAIT_MS;
+ * CHAINGRAPH_API_CLICKHOUSE_CORES: the cores the lane sizes are derived
+ * from (default: `serverCores`, the ClickHouse server's `max_threads` for
+ * the API user, read at startup; without either the static defaults);
+ * CHAINGRAPH_API_LIGHT_… / CHAINGRAPH_API_HEAVY_…: MAX_CONCURRENT (default
+ * derived from the cores, `laneConcurrencyForCores`), MAX_QUEUED, MAX_WAIT_MS;
  * MAX_THREADS (0: the server's default),
  * _PRIORITY (0: none), _WORKLOAD (a ClickHouse workload name);
  * CHAINGRAPH_API_HEAVY_ROWS; CHAINGRAPH_API_RETRY_AFTER_SECONDS.
  */
 export const admissionOptionsFromEnv = (
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  serverCores?: number
 ): AdmissionOptions => {
   const flag = env.CHAINGRAPH_API_ADMISSION ?? 'on';
   if (flag !== 'on' && flag !== 'off' && flag !== '') {
     throw new Error(`CHAINGRAPH_API_ADMISSION must be 'on' or 'off'.`);
   }
-  const lane = (name: 'HEAVY' | 'LIGHT', fallback: LaneLimits) => {
+  const envCores = nonNegativeInteger(
+    env,
+    'CHAINGRAPH_API_CLICKHOUSE_CORES',
+    0
+  );
+  const knownServerCores =
+    serverCores !== undefined &&
+    Number.isInteger(serverCores) &&
+    serverCores > 0
+      ? serverCores
+      : undefined;
+  const cores = envCores > 0 ? envCores : knownServerCores;
+  const sizing: NonNullable<AdmissionOptions['sizing']> = {
+    cores,
+    source:
+      envCores > 0
+        ? 'env'
+        : knownServerCores === undefined
+        ? 'default'
+        : 'clickhouse',
+  };
+  const heavySettings = laneSettingsFromEnv(
+    env,
+    'CHAINGRAPH_API_HEAVY',
+    defaultAdmissionOptions.heavy.settings
+  );
+  const derived =
+    cores === undefined
+      ? undefined
+      : laneConcurrencyForCores(
+          cores,
+          typeof heavySettings.max_threads === 'number'
+            ? heavySettings.max_threads
+            : 0
+        );
+  const lane = (name: 'HEAVY' | 'LIGHT', defaults: LaneLimits) => {
     const prefix = `CHAINGRAPH_API_${name}`;
+    const fallback: LaneLimits =
+      derived === undefined
+        ? defaults
+        : {
+            ...defaults,
+            maxConcurrent: name === 'HEAVY' ? derived.heavy : derived.light,
+          };
     const limits: LaneLimits = {
       maxConcurrent: nonNegativeInteger(
         env,
@@ -180,8 +274,60 @@ export const admissionOptionsFromEnv = (
         defaultAdmissionOptions.retryAfterSeconds
       )
     ),
+    sizing,
   };
 };
+
+/**
+ * What the API user's ClickHouse session reports at startup: `max_threads`
+ * (its `auto` value is the server's usable cores: physical cores on hosts
+ * with 64 or more logical CPUs, limited by the container's cgroup) and the
+ * `max_concurrent_queries_for_user` backstop of the user's profile (0: none).
+ * Both undefined when the server cannot be reached.
+ */
+export const readClickHouseServerLimits = async (client: {
+  query: <T>(sql: string) => Promise<T[]>;
+}): Promise<{
+  maxThreads: number | undefined;
+  maxConcurrentQueriesForUser: number | undefined;
+}> => {
+  try {
+    const [row] = await client.query<{
+      max_threads: number | string;
+      max_concurrent_queries_for_user: number | string;
+    }>(
+      `SELECT toUInt64(getSetting('max_threads')) AS max_threads,
+              toUInt64(getSetting('max_concurrent_queries_for_user')) AS max_concurrent_queries_for_user`
+    );
+    const asNumber = (value: number | string | undefined) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    };
+    return {
+      maxConcurrentQueriesForUser: asNumber(
+        row?.max_concurrent_queries_for_user
+      ),
+      maxThreads: asNumber(row?.max_threads),
+    };
+  } catch {
+    return { maxConcurrentQueriesForUser: undefined, maxThreads: undefined };
+  }
+};
+
+/** One line describing the admission sizing, for the API's startup log. */
+export const admissionSummary = (
+  options: AdmissionOptions,
+  backstop: number | undefined
+) =>
+  `admission: ${options.enabled ? 'on' : 'off'} cores=${
+    options.sizing?.cores ?? 'unknown'
+  } (${options.sizing?.source ?? 'default'}) light=${
+    options.light.maxConcurrent
+  } heavy=${options.heavy.maxConcurrent} heavy_max_threads=${String(
+    options.heavy.settings.max_threads ?? 'server default'
+  )} max_concurrent_queries_for_user=${
+    backstop === undefined ? 'unknown' : backstop === 0 ? '0 (none)' : backstop
+  }`;
 
 /** The error code of a refused statement. */
 export const overloadedCode = 'OVERLOADED';

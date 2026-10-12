@@ -26,7 +26,9 @@ import type { AdmissionOptions } from './admission.js';
 import {
   Admission,
   admissionOptionsFromEnv,
+  admissionSummary,
   defaultAdmissionOptions,
+  laneConcurrencyForCores,
   overloadedCode,
   requestAbortedCode,
 } from './admission.js';
@@ -197,6 +199,54 @@ test('admission: options from the environment', (t) => {
   );
   t.throws(() =>
     admissionOptionsFromEnv({ CHAINGRAPH_API_HEAVY_WORKLOAD: 'a b' })
+  );
+});
+
+test('admission: lane sizes from the ClickHouse server cores', (t) => {
+  t.deepEqual(laneConcurrencyForCores(48, 8), { heavy: 6, light: 24 });
+  t.deepEqual(
+    {
+      heavy: defaultAdmissionOptions.heavy.maxConcurrent,
+      light: defaultAdmissionOptions.light.maxConcurrent,
+    },
+    laneConcurrencyForCores(48, 8),
+    'the static defaults are the 48-core sizes'
+  );
+  t.deepEqual(laneConcurrencyForCores(96, 8), { heavy: 12, light: 48 });
+  t.deepEqual(laneConcurrencyForCores(14, 8), { heavy: 1, light: 8 });
+  t.deepEqual(laneConcurrencyForCores(4, 8), { heavy: 1, light: 8 });
+  t.deepEqual(laneConcurrencyForCores(48, 0), { heavy: 1, light: 24 });
+  const fromServer = admissionOptionsFromEnv({}, 32);
+  t.is(fromServer.light.maxConcurrent, 16);
+  t.is(fromServer.heavy.maxConcurrent, 4);
+  t.deepEqual(fromServer.sizing, { cores: 32, source: 'clickhouse' });
+  const envCores = admissionOptionsFromEnv(
+    { CHAINGRAPH_API_CLICKHOUSE_CORES: '64' },
+    32
+  );
+  t.is(envCores.light.maxConcurrent, 32);
+  t.is(envCores.heavy.maxConcurrent, 8);
+  t.is(envCores.sizing?.source, 'env');
+  const threads = admissionOptionsFromEnv(
+    { CHAINGRAPH_API_HEAVY_MAX_THREADS: '16' },
+    48
+  );
+  t.is(threads.heavy.maxConcurrent, 3, 'heavy follows its max_threads');
+  const overridden = admissionOptionsFromEnv(
+    {
+      CHAINGRAPH_API_HEAVY_MAX_CONCURRENT: '2',
+      CHAINGRAPH_API_LIGHT_MAX_CONCURRENT: '5',
+    },
+    48
+  );
+  t.is(overridden.light.maxConcurrent, 5, 'explicit sizes win');
+  t.is(overridden.heavy.maxConcurrent, 2);
+  const unknown = admissionOptionsFromEnv({}, undefined);
+  t.is(unknown.light.maxConcurrent, 24);
+  t.is(unknown.sizing?.source, 'default');
+  t.regex(
+    admissionSummary(fromServer, 70),
+    /^admission: on cores=32 \(clickhouse\) light=16 heavy=4 heavy_max_threads=8 max_concurrent_queries_for_user=70$/u
   );
 });
 
