@@ -1,5 +1,9 @@
 # `CHAINGRAPH_CLICKHOUSE_UTXO=off`: no stored UTXO tables
 
+> **2026-10-12** ([utxo-async.md](utxo-async.md)): with UTXO off, a stored per-node UTXO set is maintained off the commit
+> path by default (`CHAINGRAPH_CLICKHOUSE_UTXO_SET`); the API's unspent roots read it. `utxo` / `utxo_by_script` below are
+> the commit-path tables (`CHAINGRAPH_CLICKHOUSE_UTXO=on`).
+
 > **2026-10-11** ([spend-index.md](spend-index.md)): with UTXO off nothing resolves a spent output any more (no lookup, no output cache, no pending spends); spent-output filters use the spend index.
 
 `CHAINGRAPH_CLICKHOUSE_UTXO=on|off` (default `on`, validated in `src/config.ts`) picks whether the ClickHouse store

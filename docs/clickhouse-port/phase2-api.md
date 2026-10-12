@@ -637,6 +637,8 @@ input OutputFilter { spent_by: InputFilter }       # node-agnostic EXISTS, as th
   `mempool`, `node`, aggregates and groups) and acceptance relationships (`node_validations`,
   `node_validation_timeline`, `Block.accepted_by`, the `Node` lists, `authchains`) keep their node. Unspent at
   query time stays per node: a spend in a stale block no node accepts does not spend an output.
+- **2026-10-12 (owner decision, item 3):** `block_inclusions` is ordered by block height, then block hash, by default
+  (`order_by: { block_internal_id: ASC }` gives storage order). The paragraph below describes the stage-3 default.
 - `block_inclusions` is in storage order (`block_internal_id`): ordering by height joins every inclusion to its
   block (~10–20 ms on the library documents: L26 121 → 144 ms) for a list that is almost always one block.
   `order_by: { block: { height: ASC } }` or a height filter still gets it (the inclusions are read once, a
@@ -693,6 +695,9 @@ committed tail). The regenerated 050 differs from the hand-written one in whites
 
 ### 9.3 Per-node acceptance projection `p_node_tx` (decision 3)
 
+> **2026-10-12 (owner decision, item 1):** `p_node_tx` is now a **default** DDL item; opt out with
+> `CHAINGRAPH_CLICKHOUSE_DDL_SKIP=p_node_tx` (or `--skip p_node_tx`). See [utxo-async.md](utxo-async.md) §1.
+
 - **DDL.** `ddl/optional/p_node_tx.sql`: `tx_acceptance` projection `ORDER BY (node_internal_id,
   transaction_internal_id)`, off by default. Applied when named: `CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL=p_node_tx` (DDL
   CLI, `applyClickHouseDdl`, `apply.sh`) or `bin/chaingraph-clickhouse-ddl.js --optional p_node_tx`. The DDL CLI
@@ -724,6 +729,10 @@ committed tail). The regenerated 050 differs from the hand-written one in whites
   a non-selective filter or another order, `outputs` / `inputs` / `unspent_outputs` without a selective filter.
 
 ### 9.4 Unspent at query time: hash anti-join (decision 4)
+
+> **2026-10-12 (owner decision, item 4):** the unspent roots now read the stored per-node UTXO set maintained off the
+> commit path when the store keeps one (`CHAINGRAPH_API_UTXO_SET`, default on); the query-time forms below remain the
+> fallback. See [utxo-async.md](utxo-async.md).
 
 The forms that subtract a large spent set (no filter, or a filter no index narrows) are now a `LEFT ANTI JOIN` row
 source (`unspentOutputRows`; the server's default `join_algorithm` `direct,parallel_hash,hash,ie_join` takes
