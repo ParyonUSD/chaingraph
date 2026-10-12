@@ -1,5 +1,5 @@
 /* eslint-disable functional/no-let, functional/no-loop-statement, no-await-in-loop, functional/no-try-statement, @typescript-eslint/naming-convention, camelcase, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, complexity, max-params, no-continue, @typescript-eslint/member-ordering, max-lines, @typescript-eslint/no-loop-func */
-// cspell:ignore clickhouse unhex seqs dedup rebase rebased rebases
+// cspell:ignore clickhouse unhex seqs dedup rebase rebased rebases analysed
 /**
  * The stored per-node UTXO set, maintained off the commit path
  * (`ddl/090_utxo_set.sql`, docs/clickhouse-port/utxo-async.md).
@@ -84,7 +84,7 @@ const zeroHash = "toFixedString(unhex(repeat('00', 32)), 32)";
  * scalar of the statement holding that array.
  *
  * Why scalars, not `MATERIALIZED` CTEs: ClickHouse 26.8's analyzer
- * re-analyses a materialized CTE's whole definition, recursively, at every
+ * re-analyses the whole definition of a materialized CTE definition, recursively, at every
  * reference (phase2-api.md §6.1). The change rows chain five steps that
  * reference earlier ones several times, so the first step was analysed 12
  * times: a one-commit correction cost ~200 ms before reading a row. A scalar
@@ -379,7 +379,8 @@ export const utxoTotalsSql = ({
     AND batch <= ${read.watermark ?? '{utxo:UInt64}'}
     AND ${categoryTerm}`;
   /* built only when used: building registers the change steps as WITH scalars */
-  const changes = () => `SELECT token_category, toInt64(s) AS outputs, s * v AS value_satoshis,
+  const changes =
+    () => `SELECT token_category, toInt64(s) AS outputs, s * v AS value_satoshis,
     if(isNull(f), 0, toInt64(s)) AS fungible_outputs,
     toInt128(s) * ifNull(f, 0) AS fungible_token_amount,
     if(isNull(c), 0, toInt64(s)) AS nonfungible_outputs
@@ -654,10 +655,20 @@ export interface UtxoSetOptions {
   bulkBuildMinRows?: number;
   /** Hash slices of a bulk build or rebase of a large set (default 16). */
   slices?: number;
-  /** A generation is rebased when its rows exceed max(this, rebaseFactor × its base rows) (default 1M). */
+  /**
+   * A generation is rebased when its rows exceed max(this, (1 +
+   * rebaseFactor) × its base rows) (default 1M): its change rows then
+   * outnumber the set by that factor.
+   */
   rebaseMinRows?: number;
   /** See `rebaseMinRows` (default 1). */
   rebaseFactor?: number;
+  /**
+   * ... or when its running-total rows (`utxo_total`: about one per batch
+   * and token category touched) exceed this (default 2M): whole-set totals
+   * read every row of the generation.
+   */
+  rebaseMaxTotalRows?: number;
   /** An old generation is dropped this long after its successor was published (default 10 min). */
   dropGraceMs?: number;
   /** Watermark rows older than this are pruned (the newest per node stays; default 1 h). */
@@ -1285,7 +1296,8 @@ export class UtxoSetMaintainer {
   /**
    * Rebase the node's set at `mark` into a new generation when the
    * generation's rows exceed max(rebaseMinRows, (1 + rebaseFactor) × its
-   * base rows): the change rows then outnumber the set by that factor.
+   * base rows) (the change rows then outnumber the set by that factor) or
+   * its running-total rows exceed rebaseMaxTotalRows.
    */
   private async maybeRebase(
     node: number,
@@ -1298,12 +1310,22 @@ export class UtxoSetMaintainer {
         candidate.node === node && candidate.generation === mark.generation
     );
     const total = partition?.rows ?? 0;
+    const totals =
+      (await utxoSetPartitions(this.context.client, 'utxo_total')).find(
+        (candidate) =>
+          candidate.node === node && candidate.generation === mark.generation
+      )?.rows ?? 0;
     const base = await this.generationBaseRows(node, mark.generation);
     const bound = Math.max(
       this.options.rebaseMinRows ?? 1_000_000,
       (1 + (this.options.rebaseFactor ?? 1)) * base
     );
-    if (total <= bound) return;
+    if (
+      total <= bound &&
+      totals <= (this.options.rebaseMaxTotalRows ?? 2_000_000)
+    ) {
+      return;
+    }
     await this.rebase(node, mark);
   }
 
