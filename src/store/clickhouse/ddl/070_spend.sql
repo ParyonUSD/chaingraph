@@ -21,6 +21,9 @@
 --     outputs Chaingraph never sees). A later batch that stores the output writes their spend rows (reverse pass).
 --     Small; never pruned (an orphan matches at most one later batch).
 --   * spend_watermark: one row per finished batch; readers take max(watermark).
+--   * Keys stop at the filter columns (planning-floor.md): primary key locking_bytecode_prefix, p_category sorted by
+--     (token_category, nonfungible_token_commitment_key). A `transaction_hash IN (set)` on a later key column excluded
+--     nothing here but was analysed against every mark before each read.
 
 CREATE TABLE IF NOT EXISTS cg.spend
 (
@@ -43,6 +46,7 @@ CREATE TABLE IF NOT EXISTS cg.spend
 )
 ENGINE = MergeTree
 PARTITION BY intDiv(batch, 1048576)
+PRIMARY KEY locking_bytecode_prefix
 ORDER BY (locking_bytecode_prefix, transaction_hash, input_index)
 SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000,
          old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
@@ -51,7 +55,7 @@ SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000,
 ALTER TABLE cg.spend ADD PROJECTION IF NOT EXISTS p_category
 (
     SELECT *, locking_bytecode_prefix, nonfungible_token_commitment_key
-    ORDER BY (token_category, nonfungible_token_commitment_key, transaction_hash, input_index)
+    ORDER BY (token_category, nonfungible_token_commitment_key)
 );
 
 CREATE TABLE IF NOT EXISTS cg.spend_orphan

@@ -18,6 +18,7 @@
 import {
   alignTableSettings,
   applyClickHouseDdl,
+  checkKeys,
   checkTableSettings,
   ddlFiles,
   legacySchemaFindings,
@@ -137,6 +138,21 @@ const run = async (settings: ReturnType<typeof settingsFromEnv>) => {
     );
   }
   log(`table settings as in the DDL: ${applied.join(' ')}`);
+  const keys = await checkKeys(server, database, { directory });
+  if (keys.length > 0) {
+    log(
+      `WARNING: keys differ from the DDL (results are the same; statements pay the planning cost these keys remove, docs/clickhouse-port/planning-floor.md; a projection can be rebuilt in place, a primary key needs a new table): ${keys
+        .map(
+          (key) =>
+            `${key.object} ${key.kind} is ${
+              key.actual === undefined
+                ? 'missing'
+                : `(${key.actual.join(', ')})`
+            }, DDL says (${key.columns.join(', ')})`
+        )
+        .join('; ')}`
+    );
+  }
   log(
     `ok, ${statements} statement(s) in ${
       Date.now() - started

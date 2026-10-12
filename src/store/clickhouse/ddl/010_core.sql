@@ -13,7 +13,13 @@
 --     add-on's -1 rows: one random granule per spent tx per part); at 1024 rows and 64 KiB-1 MiB blocks
 --     that read and decompressed ~1,500 rows / ~100 KB per outpoint (G1 lab: 0.5-2.7 s per lookup;
 --     g1-fix-pass-2.md §2). Its projections (060) keep 1024 and the default block sizes via WITH
---     SETTINGS, so script/category reads are unchanged.
+--     SETTINGS, so script/category reads are unchanged. The spend index filler still reads outputs by
+--     outpoint: at 1024 a batch took 2.3x as long (planning-floor.md §4), so 128 stays.
+--   * Primary keys shorter than the sort key (planning-floor.md): output and tx_acceptance are keyed by
+--     transaction_hash alone. A condition on a later key column (output_index NOT IN a set, node_internal_id = n)
+--     excludes nothing on these tables (a transaction's rows share a granule or two), but ClickHouse analysed it
+--     against every mark of every part before each read ("generic exclusion search"): on mainnet that was the
+--     ~0.5 s planning floor of every API statement. Rows are still sorted by the full ORDER BY.
 --
 -- Choices where the plan is silent (also listed in README.md):
 --   * Timestamps are DateTime64(3, 'UTC'): the agent writes JS Dates (ms), so ms is exact.
@@ -106,6 +112,7 @@ CREATE TABLE IF NOT EXISTS cg.output
 )
 ENGINE = MergeTree
 PARTITION BY intDiv(commit_seq, 1048576)
+PRIMARY KEY transaction_hash
 ORDER BY (transaction_hash, output_index)
 SETTINGS index_granularity = 128, min_compress_block_size = 4096, max_compress_block_size = 4096,
          non_replicated_deduplication_window = 10000,

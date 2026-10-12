@@ -12,6 +12,10 @@
 --   * tx_acceptance has a projection on a VCMT table, which ClickHouse refuses unless
 --     deduplicate_merge_projection_mode is set; 'rebuild' keeps the projection exact after collapses.
 --   * History tables carry ids only (plan columns); joins to block/transaction go via internal ids.
+--   * tx_acceptance's primary key is transaction_hash alone (its rows still sort by the full key, so VCMT
+--     collapses as before): `node_internal_id = n` cannot exclude granules (both nodes' rows of a transaction
+--     share one), and analysing it against every mark cost each statement up to ~0.1 s on the synthetic
+--     mainnet-scale copy (planning-floor.md).
 
 CREATE TABLE IF NOT EXISTS cg.node_block
 (
@@ -60,6 +64,7 @@ CREATE TABLE IF NOT EXISTS cg.tx_acceptance
     commit_seq               UInt64
 )
 ENGINE = VersionedCollapsingMergeTree(sign, version)
+PRIMARY KEY transaction_hash
 ORDER BY (transaction_hash, node_internal_id, block_internal_id)
 SETTINGS index_granularity = 1024, non_replicated_deduplication_window = 10000,
          old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,

@@ -465,3 +465,113 @@ export const alignTableSettings = async (
   }
   return changed;
 };
+
+/**
+ * A key the DDL declares that `IF NOT EXISTS` cannot change on an existing
+ * object: a table's explicit `PRIMARY KEY` or a projection's sort key.
+ */
+export interface DdlKey {
+  /** `table` or `table.projection`. */
+  object: string;
+  kind: 'primary key' | 'projection sort key';
+  columns: string[];
+}
+
+const keyColumns = (key: string) =>
+  key
+    .trim()
+    .replace(/^\((?<inner>[\s\S]*)\)$/u, '$<inner>')
+    .split(',')
+    .map((column) => column.trim())
+    .filter((column) => column !== '');
+
+const keyExpression = String.raw`(\([^)]*\)|\w+)`;
+
+/**
+ * The keys of the DDL (planning-floor.md): every explicit `PRIMARY KEY` of a
+ * table and every projection's `ORDER BY` in the numbered files.
+ */
+export const ddlKeys = (directory = resolveDdlDirectory()): DdlKey[] =>
+  ddlFiles(directory)
+    .flatMap((file) => ddlStatements(readFileSync(file, 'utf8'), 'cg'))
+    .flatMap((statement): DdlKey[] => {
+      const table =
+        /CREATE TABLE IF NOT EXISTS cg\.(?<table>\w+)[\s\S]*\)\s*(?<engine>ENGINE[\s\S]*)$/u.exec(
+          statement
+        );
+      if (table !== null) {
+        const primary = new RegExp(
+          String.raw`\bPRIMARY KEY\s+${keyExpression}`,
+          'u'
+        ).exec(table.groups!.engine!);
+        return primary === null
+          ? []
+          : [
+              {
+                columns: keyColumns(primary[1]!),
+                kind: 'primary key',
+                object: table.groups!.table!,
+              },
+            ];
+      }
+      const projection = new RegExp(
+        String.raw`ALTER TABLE cg\.(\w+) ADD PROJECTION IF NOT EXISTS (\w+)\s*\(\s*SELECT[\s\S]*?\bORDER BY\s+${keyExpression}`,
+        'u'
+      ).exec(statement);
+      return projection === null
+        ? []
+        : [
+            {
+              columns: keyColumns(projection[3]!),
+              kind: 'projection sort key',
+              object: `${projection[1]!}.${projection[2]!}`,
+            },
+          ];
+    });
+
+export interface KeyMismatch extends DdlKey {
+  /** `undefined`: the table or projection does not exist. */
+  actual: string[] | undefined;
+}
+
+/**
+ * Compare the keys of `database` with the DDL. A database created by an
+ * older DDL keeps its keys (the statements are `IF NOT EXISTS`); its results
+ * are the same, but statements pay the planning cost the newer keys remove
+ * (planning-floor.md). A projection can be rebuilt in place (DROP, ADD,
+ * MATERIALIZE); a primary key needs a new table.
+ */
+export const checkKeys = async (
+  server: ClickHouseServer,
+  database: string,
+  { directory = resolveDdlDirectory() } = {}
+): Promise<KeyMismatch[]> => {
+  ddlStatements('', database);
+  const client = adminClient(server);
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const [tables, projections] = await Promise.all([
+      client.query<{ name: string; key: string }>(
+        'SELECT name, primary_key AS key FROM system.tables WHERE database = {database:String}',
+        { database }
+      ),
+      client.query<{ name: string; key: string[] }>(
+        `SELECT concat(table, '.', name) AS name, sorting_key AS key FROM system.projections
+           WHERE database = {database:String}`,
+        { database }
+      ),
+    ]);
+    const actual = new Map<string, string[]>([
+      ...tables.map((row): [string, string[]] => [
+        row.name,
+        keyColumns(row.key),
+      ]),
+      ...projections.map((row): [string, string[]] => [row.name, row.key]),
+    ]);
+    return ddlKeys(directory)
+      .map((key) => ({ ...key, actual: actual.get(key.object) }))
+      .filter((key) => key.actual?.join(', ') !== key.columns.join(', '));
+  } finally {
+    await client.close();
+  }
+};

@@ -17,7 +17,9 @@ import {
 } from './block-commit.js';
 import {
   alignTableSettings,
+  checkKeys,
   checkTableSettings,
+  ddlKeys,
   ddlTableSettings,
   legacySchemaFindings,
 } from './ddl-apply.js';
@@ -99,6 +101,71 @@ test('the DDL sets the part cleanup settings on every table (fix pass 3)', (t) =
   );
   t.deepEqual(wrong, []);
 });
+
+test('the DDL keys stop at the filter columns (planning-floor.md)', (t) => {
+  const keys = new Map(
+    ddlKeys().map((key) => [`${key.object} ${key.kind}`, key.columns])
+  );
+  t.deepEqual(keys.get('output primary key'), ['transaction_hash']);
+  t.deepEqual(keys.get('tx_acceptance primary key'), ['transaction_hash']);
+  t.deepEqual(keys.get('spend primary key'), ['locking_bytecode_prefix']);
+  t.deepEqual(keys.get('output.p_script projection sort key'), [
+    'locking_bytecode_prefix',
+  ]);
+  t.deepEqual(keys.get('output.p_category projection sort key'), [
+    'token_category',
+    'nonfungible_token_commitment_key',
+  ]);
+  t.deepEqual(keys.get('spend.p_category projection sort key'), [
+    'token_category',
+    'nonfungible_token_commitment_key',
+  ]);
+  t.deepEqual(keys.get('input.p_outpoint projection sort key'), [
+    'outpoint_transaction_hash',
+    'outpoint_index',
+  ]);
+});
+
+e2e(
+  '[e2e] checkKeys: a database with the older keys is reported (IF NOT EXISTS keeps them), a new one is not',
+  async (t) => {
+    const scratch = await createScratchDatabase('floor_keys');
+    try {
+      const server = { url: e2eClickHouseUrl! };
+      t.deepEqual(await checkKeys(server, scratch.name), []);
+      await scratch.client.command(
+        'ALTER TABLE output DROP PROJECTION p_script'
+      );
+      await scratch.client.command(
+        `ALTER TABLE output ADD PROJECTION p_script (SELECT *, locking_bytecode_prefix, nonfungible_token_commitment_key
+           ORDER BY (locking_bytecode_prefix, transaction_hash, output_index))`
+      );
+      await scratch.client.command(
+        'ALTER TABLE output DROP PROJECTION p_category'
+      );
+      t.deepEqual(await checkKeys(server, scratch.name), [
+        {
+          actual: [
+            'locking_bytecode_prefix',
+            'transaction_hash',
+            'output_index',
+          ],
+          columns: ['locking_bytecode_prefix'],
+          kind: 'projection sort key',
+          object: 'output.p_script',
+        },
+        {
+          actual: undefined,
+          columns: ['token_category', 'nonfungible_token_commitment_key'],
+          kind: 'projection sort key',
+          object: 'output.p_category',
+        },
+      ]);
+    } finally {
+      await scratch.drop();
+    }
+  }
+);
 
 e2e(
   '[e2e] checkTableSettings: a table created with other settings is reported (IF NOT EXISTS keeps it)',

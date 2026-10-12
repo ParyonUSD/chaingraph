@@ -37,12 +37,12 @@ engine as written. VersionedCollapsingMergeTree appends `version` to the sorting
 | block | MergeTree / SharedMergeTree | `hash` | none | 1024 | node-agnostic data (7) |
 | transaction | MergeTree / SharedMergeTree | `hash` | `intDiv(commit_seq, 2^20)` | 1024 | node-agnostic (7) |
 | block_transaction | MergeTree / SharedMergeTree | `block_internal_id, transaction_index` | `intDiv(commit_seq, 2^20)` | 1024 | node-agnostic (7) |
-| output | MergeTree / SharedMergeTree | `transaction_hash, output_index` | `intDiv(commit_seq, 2^20)` | 128, 4 KiB blocks (projections: 1024, default blocks) | node-agnostic (7) |
+| output | MergeTree / SharedMergeTree | `transaction_hash, output_index` (primary key `transaction_hash`) | `intDiv(commit_seq, 2^20)` | 128, 4 KiB blocks (projections: 1024, default blocks) | node-agnostic (7) |
 | input | MergeTree / SharedMergeTree | `transaction_hash, input_index` | `intDiv(commit_seq, 2^20)` | 1024 (p_outpoint: 128, 4 KiB blocks) | node-agnostic (7); the input's own fields only (item 28) |
 | node | ReplacingMergeTree(updated_at) / SharedReplacingMergeTree | `internal_id` | none | 8192 | registry; resolves name → id (7) |
 | node_block | VersionedCollapsingMergeTree(sign, version) / SharedVersionedCollapsingMergeTree | `node_internal_id, block_internal_id, version` | none | 8192 | 1, 2, 4 |
 | node_transaction | VCMT / SharedVCMT | `node_internal_id, transaction_internal_id, version` | none | 8192 | 1, 2, 4 |
-| tx_acceptance | VCMT / SharedVCMT | `transaction_hash, node_internal_id, block_internal_id, version` | none | 1024 | 1, 2, 4 (tx-accepted(n, t)) |
+| tx_acceptance | VCMT / SharedVCMT | `transaction_hash, node_internal_id, block_internal_id, version` (primary key `transaction_hash`) | none | 1024 | 1, 2, 4 (tx-accepted(n, t)) |
 | node_block_history | MergeTree / SharedMergeTree | `node_internal_id, removed_at, block_internal_id` | none | 8192 | 1, 6 |
 | node_transaction_history | MergeTree / SharedMergeTree | `node_internal_id, transaction_internal_id, internal_id` | none | 8192 | 1, 6 |
 | utxo | VCMT / SharedVCMT | `node_internal_id, token_category, nonfungible_token_commitment_key, transaction_hash, output_index, version` | none | 8192 | 1, 2, 3, 4 (unspent(n, o)) |
@@ -53,7 +53,7 @@ engine as written. VersionedCollapsingMergeTree appends `version` to the sorting
 | commit_void (WP4) | MergeTree / SharedMergeTree | `commit_seq` | none | 8192 | 4 (aborted seqs; read by the gate) |
 | epoch_fence (WP4) | MergeTree / SharedMergeTree | `epoch` | none | 8192 | 4 (stale-writer fencing) |
 | writer_lease | ReplacingMergeTree(heartbeat_at) / SharedReplacingMergeTree | `lease_name, epoch, agent_id` (WP4) | none | 8192 | single writer (precondition of 4) |
-| spend (item 28) | MergeTree / SharedMergeTree | `locking_bytecode_prefix, transaction_hash, input_index` (p_category: `token_category, nonfungible_token_commitment_key, transaction_hash, input_index`) | `intDiv(batch, 2^20)` | 1024 | node-agnostic (7); filled behind `spend_watermark`, never on the commit path |
+| spend (item 28) | MergeTree / SharedMergeTree | `locking_bytecode_prefix, transaction_hash, input_index` (primary key `locking_bytecode_prefix`; p_category: `token_category, nonfungible_token_commitment_key`) | `intDiv(batch, 2^20)` | 1024 | node-agnostic (7); filled behind `spend_watermark`, never on the commit path |
 | spend_orphan (item 28) | MergeTree / SharedMergeTree | `outpoint_transaction_hash, outpoint_index` | `intDiv(batch, 2^20)` | 8192 | inputs a spend batch found no stored output for |
 | spend_watermark (item 28) | ReplacingMergeTree(watermark) / SharedReplacingMergeTree | `watermark` | none | 8192 | one row per finished spend batch; readers take `max` |
 | authchain_link (Phase 2 stage 2) | MergeTree / SharedMergeTree | `segment, position, transaction_hash` (p_tx: `transaction_hash`) | `intDiv(batch, 2^20)` | 1024 | node-agnostic placement of output-0 spenders on heavy-path segments; readers keep what their node accepts; behind `spend_watermark` |
@@ -61,13 +61,16 @@ engine as written. VersionedCollapsingMergeTree appends `version` to the sorting
 `pending_spend`, `input_stand_in` and `input_stand_in_resolution` were removed on 2026-10-11 (item 28).
 
 Projections (060): `block.p_height (height)`, `transaction.p_id (internal_id)`,
-`block_transaction.p_tx (transaction_hash)`, `output.p_script (locking_bytecode_prefix, transaction_hash, output_index)`,
-`output.p_category (token_category, nonfungible_token_commitment_key, transaction_hash, output_index)`,
+`block_transaction.p_tx (transaction_hash)`, `output.p_script (locking_bytecode_prefix)`,
+`output.p_category (token_category, nonfungible_token_commitment_key)`,
 `input.p_outpoint (outpoint_transaction_hash, outpoint_index)`, `tx_acceptance.p_node_height (node_internal_id, height,
-transaction_internal_id)`, and in 070 `spend.p_category (token_category, nonfungible_token_commitment_key, transaction_hash,
-input_index)`. All full-column except `input.p_outpoint`, which is slim (outpoint, input key, `commit_seq`) at
+transaction_internal_id)`, and in 070 `spend.p_category (token_category, nonfungible_token_commitment_key)`. All full-column except `input.p_outpoint`, which is slim (outpoint, input key, `commit_seq`) at
 granularity 128 with 4 KiB blocks (item 28). `input.p_spent_script` / `p_spent_category` were removed (their
-job is the spend index's). All accepted by both servers. Skip indexes: `bloom_filter` on
+job is the spend index's). All accepted by both servers. Keys stop at the columns reads filter on (primary keys shorter than the sort key on
+`output`, `tx_acceptance`, `spend`; projection sort keys without the trailing hash/index): a set on a later key column
+excluded nothing but was analysed against every mark of every part and candidate projection before each read, the
+~0.5 s per-statement planning floor on mainnet ([planning-floor.md](../../../../docs/clickhouse-port/planning-floor.md)).
+The DDL CLI warns (`checkKeys`) when an existing database has the older keys. Skip indexes: `bloom_filter` on
 `output.locking_bytecode` and `input.outpoint_transaction_hash` (plan §2.4 fallbacks).
 
 ## Views (050)
