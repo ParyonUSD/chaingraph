@@ -1,10 +1,13 @@
-/* eslint-disable camelcase, functional/no-throw-statement, @typescript-eslint/parameter-properties, @typescript-eslint/naming-convention, complexity, max-classes-per-file, @typescript-eslint/no-magic-numbers, @typescript-eslint/member-ordering, max-params */
-// cspell:ignore clickhouse
+/* eslint-disable camelcase, functional/no-throw-statement, @typescript-eslint/parameter-properties, @typescript-eslint/naming-convention, complexity, max-classes-per-file, @typescript-eslint/no-magic-numbers, @typescript-eslint/member-ordering, max-params, functional/no-try-statement */
+// cspell:ignore clickhouse cgapi
 /**
  * The API's access to ClickHouse: query counters (tests assert one
  * `readSnapshot` per request and per subscription re-run, and count data
  * queries), node-name resolution, and the per-request pinned snapshot.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
+
 import { ClickHouseError } from '@clickhouse/client';
 import { GraphQLError } from 'graphql';
 
@@ -25,6 +28,13 @@ import {
   snapshotForNode,
 } from '../store/clickhouse/visibility.js';
 
+import type { AdmissionOptions } from './admission.js';
+import {
+  Admission,
+  defaultAdmissionOptions,
+  requestAbortedError,
+  statementShape,
+} from './admission.js';
 import type { Ctx } from './compile.js';
 import { maxAuthchainDepth } from './model.js';
 import type { UtxoSetPolicy } from './sql.js';
@@ -152,6 +162,18 @@ export const statementTimeoutsFromEnv = (
   return { aggregate, data };
 };
 
+/**
+ * The request a statement belongs to: its abort signal fires when the HTTP
+ * client goes away (server.ts `listen`) or a graphql-ws operation ends.
+ * Every data statement of the request reads it: queued statements leave the
+ * admission queue, unsent ones are never sent, running ones are cancelled
+ * (the HTTP request is closed and the statement is killed by its query_id).
+ */
+export const requestScope = new AsyncLocalStorage<{ signal: AbortSignal }>();
+
+/** The prefix of every API statement's `query_id` (system.query_log, KILL QUERY). */
+export const apiQueryIdPrefix = 'cgapi-';
+
 /** ClickHouse TIMEOUT_EXCEEDED (max_execution_time). */
 const timeoutExceededCode = '159';
 
@@ -273,6 +295,17 @@ export class ApiDb {
   /** Server-side time budget per statement class (`max_execution_time`). */
   timeouts: StatementTimeouts = { ...defaultStatementTimeouts };
 
+  /** Admission control of data statements (admission.ts). */
+  admission = new Admission(defaultAdmissionOptions);
+
+  /** Replace the admission options (a fresh gate). */
+  setAdmission(options: AdmissionOptions) {
+    this.admission = new Admission(options);
+  }
+
+  /** Statements cancelled because their request went away (counter). */
+  cancelledStatements = 0;
+
   /** `authchain_branches` cap per base (`authchainMaxBranchesFromEnv`). */
   authchainMaxBranches = defaultAuthchainMaxBranches;
 
@@ -325,20 +358,47 @@ export class ApiDb {
     params: QueryParams,
     statementClass: StatementClass = 'data'
   ) {
-    this.stats.dataQueries += 1;
+    const signal = requestScope.getStore()?.signal;
     const budgetMs = this.timeouts[statementClass];
-    const rows = await this.client
-      .query<T>(
-        sql,
-        params,
-        {
-          ...dataQuerySettings,
-          max_execution_time: Math.max(1, Math.ceil(budgetMs / 1000)),
-          timeout_overflow_mode: 'throw',
-        } as unknown as ClickHouseSettings,
-        { retryTimeouts: false }
+    const rows = await this.admission
+      .run(
+        statementShape(label, sql),
+        statementClass === 'aggregate',
+        signal,
+        async (laneSettings) => {
+          if (signal?.aborted === true) throw requestAbortedError();
+          this.stats.dataQueries += 1;
+          const queryId = `${apiQueryIdPrefix}${randomUUID()}`;
+          const kill = () => {
+            this.cancelledStatements += 1;
+            this.client.kill(queryId).catch(() => undefined);
+          };
+          signal?.addEventListener('abort', kill, { once: true });
+          try {
+            return await this.client.query<T>(
+              sql,
+              params,
+              {
+                ...dataQuerySettings,
+                ...laneSettings,
+                max_execution_time: Math.max(1, Math.ceil(budgetMs / 1000)),
+                timeout_overflow_mode: 'throw',
+              } as unknown as ClickHouseSettings,
+              {
+                ...(signal === undefined ? {} : { abortSignal: signal }),
+                queryId,
+                retryTimeouts: false,
+              }
+            );
+          } finally {
+            signal?.removeEventListener('abort', kill);
+          }
+        }
       )
       .catch((error: unknown) => {
+        if (signal?.aborted === true && !(error instanceof GraphQLError)) {
+          throw requestAbortedError();
+        }
         if (
           error instanceof ClickHouseError &&
           error.code === throwIfCode &&

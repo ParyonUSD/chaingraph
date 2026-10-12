@@ -24,13 +24,23 @@
  *   30000, at most the former unless set) that of an aggregate / group-by
  *   statement; over budget, ClickHouse stops the statement and the API
  *   answers a QUERY_TIMEOUT error. The ClickHouse client's request timeout is
- *   the larger budget plus a margin, and a timed-out read is not retried.
+ *   the larger budget plus a margin, and a timed-out read is not retried;
+ * - admission control (admission.ts, fix-pass-4.md): data statements pass a
+ *   light or a heavy lane with a concurrency limit, a bounded queue and a
+ *   bounded wait; over them the API answers OVERLOADED (HTTP 503,
+ *   Retry-After) at once. CHAINGRAPH_API_ADMISSION=off disables it;
+ *   CHAINGRAPH_API_{LIGHT,HEAVY}_{MAX_CONCURRENT,MAX_QUEUED,MAX_WAIT_MS,
+ *   MAX_THREADS,PRIORITY,WORKLOAD}, CHAINGRAPH_API_HEAVY_MS and
+ *   CHAINGRAPH_API_RETRY_AFTER_SECONDS tune it;
+ * - a request whose client goes away has its queued statements dropped and
+ *   its running ones cancelled (KILL QUERY by query_id).
  */
 import {
   ClickHouseClient,
   clickHouseConfigFromEnv,
 } from '../store/clickhouse/client.js';
 
+import { admissionOptionsFromEnv } from './admission.js';
 import {
   authchainMaxBranchesFromEnv,
   requestTimeoutMarginMs,
@@ -59,6 +69,7 @@ const main = async () => {
     ...(env.CHAINGRAPH_API_MAX_RESULT_ROWS === undefined
       ? {}
       : { maxResultRows: Number(env.CHAINGRAPH_API_MAX_RESULT_ROWS) }),
+    admission: admissionOptionsFromEnv(env),
     authchainMaxBranches: authchainMaxBranchesFromEnv(env),
     responseCache: env.CHAINGRAPH_API_RESPONSE_CACHE === 'off' ? false : {},
     statementTimeouts,

@@ -26,8 +26,9 @@ import { WebSocketServer } from 'ws';
 
 import type { ClickHouseClient } from '../store/clickhouse/client.js';
 
+import type { AdmissionOptions } from './admission.js';
 import type { StatementTimeouts } from './db.js';
-import { ApiDb, PinnedSnapshot } from './db.js';
+import { ApiDb, PinnedSnapshot, requestScope } from './db.js';
 import type { LiveHubOptions } from './live.js';
 import { LiveHub } from './live.js';
 import type {
@@ -197,6 +198,8 @@ export interface ApiOptions {
   maxResultRows?: number;
   /** `authchain_branches` per base (default 1,000): above it, AUTHCHAIN_TOO_WIDE. */
   authchainMaxBranches?: number;
+  /** Admission control of ClickHouse statements (admission.ts; default on). */
+  admission?: AdmissionOptions;
   /** Server-side time budget per statement class (db.ts `defaultStatementTimeouts`). */
   statementTimeouts?: Partial<StatementTimeouts>;
   /**
@@ -214,6 +217,7 @@ export const createApi = (
   if (options.maxResultRows !== undefined) {
     db.maxResultRows = options.maxResultRows;
   }
+  if (options.admission !== undefined) db.setAdmission(options.admission);
   if (options.authchainMaxBranches !== undefined) {
     db.authchainMaxBranches = options.authchainMaxBranches;
   }
@@ -289,18 +293,62 @@ export const listen = async (
   port = 0,
   host = '127.0.0.1'
 ): Promise<RunningServer> => {
-  // eslint-disable-next-line @typescript-eslint/no-misused-promises
-  const server = createServer(api.yoga);
+  /*
+   * Each HTTP request runs in a request scope whose signal aborts when the
+   * response closes before it finished (the client went away): its queued
+   * statements are dropped and running ones cancelled (db.ts).
+   */
+  const server = createServer((request, response) => {
+    const controller = new AbortController();
+    response.once('close', () => {
+      if (!response.writableFinished) {
+        controller.abort(new Error('The HTTP client went away.'));
+      }
+    });
+    requestScope.run({ signal: controller.signal }, () => {
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      api.yoga(request, response);
+    });
+  });
   const wsServer = new WebSocketServer({
     path: api.yoga.graphqlEndpoint,
     server,
   });
+  /* graphql-ws: an operation's statements stop when its socket closes */
+  const socketSignals = new WeakMap<object, AbortController>();
+  const socketScope = (socket: unknown) => {
+    if (typeof socket !== 'object' || socket === null) {
+      return { signal: new AbortController().signal };
+    }
+    const key = socket;
+    let controller = socketSignals.get(key);
+    if (controller === undefined) {
+      const created = new AbortController();
+      (socket as { once: (event: string, f: () => void) => void }).once(
+        'close',
+        () => {
+          created.abort(new Error('The WebSocket closed.'));
+        }
+      );
+      socketSignals.set(key, created);
+      controller = created;
+    }
+    return { signal: controller.signal };
+  };
   const disposable = useServer(
     {
       execute: async (args) =>
-        (
-          args.rootValue as { execute: (a: typeof args) => Promise<unknown> }
-        ).execute(args) as never,
+        requestScope.run(
+          socketScope(
+            (args.contextValue as { socket?: unknown } | undefined)?.socket
+          ),
+          async () =>
+            (
+              args.rootValue as {
+                execute: (a: typeof args) => Promise<unknown>;
+              }
+            ).execute(args) as never
+        ),
       onSubscribe: async (context, _id, payload) => {
         const enveloped = api.yoga.getEnveloped({
           ...context,

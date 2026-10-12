@@ -58,6 +58,8 @@ export interface ClickHouseRequestInfo {
   sql: string;
   /** An insert's deduplication token (`seq:table:chunk`). */
   deduplicationToken?: string;
+  /** A query's `query_id`, when the caller set one (`QueryOptions.queryId`). */
+  queryId?: string;
 }
 
 export interface QueryParams {
@@ -190,6 +192,15 @@ export interface QueryOptions {
    * not that the connection failed.
    */
   retryTimeouts?: boolean;
+  /**
+   * Abort the read (the API: the HTTP client went away). A request still
+   * waiting for a socket is never sent; one in flight is closed, and the
+   * caller should also `kill` its `queryId` (the server may keep running
+   * a statement whose connection closed). An aborted read is not retried.
+   */
+  abortSignal?: AbortSignal;
+  /** The statement's `query_id` (default: a random one). */
+  queryId?: string;
 }
 
 /** INSERT returns no rows: discard the response body. */
@@ -244,6 +255,11 @@ export class ClickHouseClient {
 
   private readonly raw: RawClickHouseClient;
 
+  /** `createClient` options (without the pool size), for the kill client. */
+  private readonly rawConfig: Parameters<typeof createClient>[0];
+
+  private killer: RawClickHouseClient | undefined;
+
   private readonly faultBeforeRequest:
     | ((request: ClickHouseRequestInfo) => Promise<void> | void)
     | undefined;
@@ -253,19 +269,22 @@ export class ClickHouseClient {
     this.faultBeforeRequest = config.faultBeforeRequest;
     this.database = clean.database;
     this.endpoint = clean.url;
-    this.raw = createClient({
+    this.rawConfig = {
       clickhouse_settings: {
         // UInt64/Int64 come back as JSON strings; callers parse them with BigInt.
         output_format_json_quote_64bit_integers: 1,
       },
       database: clean.database,
       log: { level: ClickHouseLogLevel.OFF },
-      max_open_connections:
-        config.maxOpenConnections ?? defaultMaxOpenConnections,
       password: clean.password,
       request_timeout: clean.requestTimeoutMs,
       url: clean.url,
       username: clean.username,
+    };
+    this.raw = createClient({
+      ...this.rawConfig,
+      max_open_connections:
+        config.maxOpenConnections ?? defaultMaxOpenConnections,
     });
   }
 
@@ -299,19 +318,32 @@ export class ClickHouseClient {
     settings: ClickHouseSettings = {},
     options: QueryOptions = {}
   ): Promise<T[]> {
-    const retryable =
-      options.retryTimeouts === false
-        ? (error: unknown) => !isRequestTimeout(error) && isRetryable(error)
-        : isRetryable;
+    const { abortSignal } = options;
+    const retryable = (error: unknown) =>
+      abortSignal?.aborted !== true &&
+      (options.retryTimeouts === false
+        ? !isRequestTimeout(error) && isRetryable(error)
+        : isRetryable(error));
     return withRetries(
       defaultQueryRetries,
       async () => {
-        await this.faultBeforeRequest?.({ kind: 'query', sql });
+        await this.faultBeforeRequest?.({
+          kind: 'query',
+          sql,
+          ...(options.queryId === undefined
+            ? {}
+            : { queryId: options.queryId }),
+        });
+        abortSignal?.throwIfAborted();
         const result = await this.raw.query({
+          ...(abortSignal === undefined ? {} : { abort_signal: abortSignal }),
           clickhouse_settings: settings,
           format: 'JSONEachRow',
           query: sql,
           query_params: params,
+          ...(options.queryId === undefined
+            ? {}
+            : { query_id: options.queryId }),
         });
         return result.json<T>();
       },
@@ -393,6 +425,27 @@ export class ClickHouseClient {
     });
   }
 
+  /**
+   * `KILL QUERY … ASYNC` of a statement by its `query_id` (the API's
+   * abandoned reads), over a small connection pool of its own so a kill
+   * never waits behind the reads it is meant to stop. Never throws.
+   */
+  async kill(queryId: string): Promise<void> {
+    this.killer ??= createClient({
+      ...this.rawConfig,
+      max_open_connections: 2,
+      request_timeout: 10_000,
+    });
+    try {
+      await this.killer.command({
+        query: 'KILL QUERY WHERE query_id = {id:String} ASYNC',
+        query_params: { id: queryId },
+      });
+    } catch {
+      /* best effort: the statement's own budget still bounds it */
+    }
+  }
+
   /** True if the server answers; never throws. */
   async ping(): Promise<boolean> {
     try {
@@ -404,6 +457,7 @@ export class ClickHouseClient {
   }
 
   async close(): Promise<void> {
+    await this.killer?.close();
     await this.raw.close();
   }
 
