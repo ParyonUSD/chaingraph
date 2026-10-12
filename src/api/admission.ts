@@ -1,4 +1,4 @@
-/* eslint-disable functional/no-throw-statement, @typescript-eslint/no-magic-numbers, max-classes-per-file, camelcase, @typescript-eslint/naming-convention, complexity, functional/no-mixed-type, @typescript-eslint/parameter-properties, max-params, functional/no-try-statement */
+/* eslint-disable functional/no-throw-statement, @typescript-eslint/no-magic-numbers, max-classes-per-file, camelcase, @typescript-eslint/naming-convention, complexity, functional/no-mixed-type, @typescript-eslint/parameter-properties, max-params, functional/no-try-statement, @typescript-eslint/member-ordering */
 // cspell:ignore clickhouse EWMA
 /**
  * Admission control of the API's ClickHouse statements (fix pass 4,
@@ -6,9 +6,14 @@
  *
  * Every data statement passes a gate before it is sent. Two lanes:
  * - `light`: statements whose shape has been cheap (or is new);
- * - `heavy`: aggregates, and every shape whose recent wall time (an EWMA per
- *   statement shape: label + SQL text, parameters excluded) is at least
- *   `heavyMs`.
+ * - `heavy`: every shape whose recent cost (an EWMA per statement shape:
+ *   label + SQL text, parameters excluded) is at least `heavyRows`, and
+ *   aggregates until their shape has been measured. The cost is the rows a
+ *   statement reads as ClickHouse reports them (`X-ClickHouse-Summary`:
+ *   the larger of `read_rows` and `total_rows_to_read`), which does not
+ *   grow with load as wall time does (a wall-time rule moved every shape to
+ *   the heavy lane under load in the local measurement, fix-pass-4.md); a
+ *   statement that times out or runs out of memory counts as heavy.
  * Each lane has a concurrency limit, a bounded queue and a bounded wait.
  * A statement that finds its lane's queue full, or waits longer than the
  * lane allows, fails at once with OVERLOADED (HTTP 503, Retry-After): a fast,
@@ -41,8 +46,8 @@ export interface AdmissionOptions {
   enabled: boolean;
   light: LaneLimits;
   heavy: LaneLimits;
-  /** A shape whose wall-time EWMA reaches this is heavy, ms. */
-  heavyMs: number;
+  /** A shape whose cost EWMA (rows read) reaches this is heavy. */
+  heavyRows: number;
   /** Seconds a client is told to wait (Retry-After) when refused. */
   retryAfterSeconds: number;
   /** Shapes remembered (least recently used dropped). */
@@ -53,7 +58,8 @@ export interface AdmissionOptions {
  * Defaults (per API process): 24 light and 6 heavy statements at once;
  * queues of 256 / 24 waiting at most 5 s / 10 s. Heavy statements run with
  * at most 8 threads and a lower priority than light ones. A shape is heavy
- * from 500 ms of wall time on average.
+ * from 1 M rows read on average (the F3 restatement of 2026-10-12: key
+ * analysis is judged only below about 1 M rows read).
  */
 export const defaultAdmissionOptions: AdmissionOptions = {
   enabled: true,
@@ -63,7 +69,7 @@ export const defaultAdmissionOptions: AdmissionOptions = {
     maxWaitMs: 10_000,
     settings: { max_threads: 8, priority: 2 },
   },
-  heavyMs: 500,
+  heavyRows: 1_000_000,
   light: {
     maxConcurrent: 24,
     maxQueued: 256,
@@ -122,7 +128,7 @@ const laneSettingsFromEnv = (
  * CHAINGRAPH_API_LIGHT_… / CHAINGRAPH_API_HEAVY_…: MAX_CONCURRENT, MAX_QUEUED, MAX_WAIT_MS;
  * MAX_THREADS (0: the server's default),
  * _PRIORITY (0: none), _WORKLOAD (a ClickHouse workload name);
- * CHAINGRAPH_API_HEAVY_MS; CHAINGRAPH_API_RETRY_AFTER_SECONDS.
+ * CHAINGRAPH_API_HEAVY_ROWS; CHAINGRAPH_API_RETRY_AFTER_SECONDS.
  */
 export const admissionOptionsFromEnv = (
   env: NodeJS.ProcessEnv = process.env
@@ -159,10 +165,10 @@ export const admissionOptionsFromEnv = (
   return {
     enabled: flag !== 'off',
     heavy: lane('HEAVY', defaultAdmissionOptions.heavy),
-    heavyMs: nonNegativeInteger(
+    heavyRows: nonNegativeInteger(
       env,
-      'CHAINGRAPH_API_HEAVY_MS',
-      defaultAdmissionOptions.heavyMs
+      'CHAINGRAPH_API_HEAVY_ROWS',
+      defaultAdmissionOptions.heavyRows
     ),
     light: lane('LIGHT', defaultAdmissionOptions.light),
     maxShapes: defaultAdmissionOptions.maxShapes,
@@ -344,7 +350,7 @@ export const statementShape = (label: string, sql: string) =>
 export class Admission {
   readonly lanes: { [lane in Lane]: LaneGate };
 
-  /** Wall-time EWMA per statement shape, ms (insertion order = recency). */
+  /** Cost EWMA per statement shape, rows read (insertion order = recency). */
   private readonly costs = new Map<string, number>();
 
   constructor(readonly options: AdmissionOptions = defaultAdmissionOptions) {
@@ -354,23 +360,26 @@ export class Admission {
     };
   }
 
-  /** The lane of a statement: heavy for aggregates and shapes with a heavy history. */
+  /** The lane of a statement: heavy for shapes with a heavy history and for unmeasured aggregates. */
   laneOf(shape: string, aggregate: boolean): Lane {
-    if (aggregate) return 'heavy';
     const cost = this.costs.get(shape);
-    return cost !== undefined && cost >= this.options.heavyMs
-      ? 'heavy'
-      : 'light';
+    if (cost === undefined) return aggregate ? 'heavy' : 'light';
+    return cost >= this.options.heavyRows ? 'heavy' : 'light';
   }
 
-  /** Record a statement's wall time (also a failed one's: a timeout is a heavy shape). */
-  record(shape: string, ms: number) {
+  /** The cost recorded for a statement that timed out or ran out of memory. */
+  get failedCost() {
+    return Math.max(1, this.options.heavyRows) * 10;
+  }
+
+  /** Record a statement's cost (rows read). */
+  record(shape: string, rows: number) {
     const before = this.costs.get(shape);
     this.costs.delete(shape);
-    /* a slow run counts at once; cheap runs bring a heavy shape back slowly */
+    /* a costly run counts at once; cheap runs bring a heavy shape back slowly */
     this.costs.set(
       shape,
-      before === undefined || ms > before ? ms : before * 0.7 + ms * 0.3
+      before === undefined || rows > before ? rows : before * 0.7 + rows * 0.3
     );
     if (this.costs.size > this.options.maxShapes) {
       const oldest = this.costs.keys().next().value;
@@ -380,30 +389,40 @@ export class Admission {
 
   /**
    * Run `send` once the statement is admitted to its lane, with the lane's
-   * ClickHouse settings; records its wall time. Without admission (`enabled`
-   * false) `send` runs at once with no extra settings.
+   * ClickHouse settings; `send` reports the rows the statement read
+   * (`report`), and a statement that failed with `costly(error)` true
+   * counts as heavy. Without admission (`enabled` false) `send` runs at
+   * once with no extra settings.
    */
   async run<T>(
     shape: string,
     aggregate: boolean,
     signal: AbortSignal | undefined,
-    send: (settings: LaneLimits['settings'], lane: Lane) => Promise<T>
+    send: (
+      settings: LaneLimits['settings'],
+      report: (rows: number) => void
+    ) => Promise<T>,
+    costly: (error: unknown) => boolean = () => false
   ): Promise<T> {
+    const report = (rows: number) => {
+      this.record(shape, rows);
+    };
     if (!this.options.enabled) {
       if (signal?.aborted === true) throw requestAbortedError();
-      return send({}, 'light');
+      return send({}, report);
     }
     const lane = this.laneOf(shape, aggregate);
     const gate = this.lanes[lane];
     await gate.acquire(signal);
-    const started = performance.now();
     try {
-      return await send(this.options[lane].settings, lane);
-    } finally {
-      /* an abandoned statement's time says nothing about its cost */
-      if (signal?.aborted !== true) {
-        this.record(shape, performance.now() - started);
+      return await send(this.options[lane].settings, report);
+    } catch (error: unknown) {
+      /* an abandoned statement's failure says nothing about its cost */
+      if (signal?.aborted !== true && costly(error)) {
+        this.record(shape, this.failedCost);
       }
+      throw error;
+    } finally {
       gate.release();
     }
   }

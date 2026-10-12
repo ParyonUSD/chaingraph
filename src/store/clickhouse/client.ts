@@ -184,6 +184,7 @@ export interface InsertSelectSummary {
   writtenRows: number;
 }
 
+// eslint-disable-next-line functional/no-mixed-type
 export interface QueryOptions {
   /**
    * Retry a read whose request timed out on the client (default true).
@@ -201,7 +202,32 @@ export interface QueryOptions {
   abortSignal?: AbortSignal;
   /** The statement's `query_id` (default: a random one). */
   queryId?: string;
+  /**
+   * Called with the rows the statement read as the server reports them
+   * (`X-ClickHouse-Summary`: the larger of `read_rows` and
+   * `total_rows_to_read`), when it does.
+   */
+  onRowsRead?: (rows: number) => void;
 }
+
+/** Rows read from an `X-ClickHouse-Summary` header (undefined if absent or unreadable). */
+export const summaryRowsRead = (header: unknown): number | undefined => {
+  const text = Array.isArray(header) ? (header[0] as unknown) : header;
+  if (typeof text !== 'string') return undefined;
+  try {
+    const summary = JSON.parse(text) as {
+      read_rows?: string;
+      total_rows_to_read?: string;
+    };
+    const rows = Math.max(
+      Number(summary.read_rows ?? 0),
+      Number(summary.total_rows_to_read ?? 0)
+    );
+    return Number.isFinite(rows) ? rows : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 /** INSERT returns no rows: discard the response body. */
 const drain = async (stream: Readable) => {
@@ -345,7 +371,14 @@ export class ClickHouseClient {
             ? {}
             : { query_id: options.queryId }),
         });
-        return result.json<T>();
+        const rows = await result.json<T>();
+        if (options.onRowsRead !== undefined) {
+          const rowsRead = summaryRowsRead(
+            result.response_headers['x-clickhouse-summary']
+          );
+          if (rowsRead !== undefined) options.onRowsRead(rowsRead);
+        }
+        return rows;
       },
       retryable
     );

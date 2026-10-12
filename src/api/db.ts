@@ -174,6 +174,9 @@ export const requestScope = new AsyncLocalStorage<{ signal: AbortSignal }>();
 /** The prefix of every API statement's `query_id` (system.query_log, KILL QUERY). */
 export const apiQueryIdPrefix = 'cgapi-';
 
+/** ClickHouse MEMORY_LIMIT_EXCEEDED. */
+const memoryLimitExceededCode = '241';
+
 /** ClickHouse TIMEOUT_EXCEEDED (max_execution_time). */
 const timeoutExceededCode = '159';
 
@@ -365,7 +368,7 @@ export class ApiDb {
         statementShape(label, sql),
         statementClass === 'aggregate',
         signal,
-        async (laneSettings) => {
+        async (laneSettings, report) => {
           if (signal?.aborted === true) throw requestAbortedError();
           this.stats.dataQueries += 1;
           const queryId = `${apiQueryIdPrefix}${randomUUID()}`;
@@ -386,6 +389,7 @@ export class ApiDb {
               } as unknown as ClickHouseSettings,
               {
                 ...(signal === undefined ? {} : { abortSignal: signal }),
+                onRowsRead: report,
                 queryId,
                 retryTimeouts: false,
               }
@@ -393,7 +397,12 @@ export class ApiDb {
           } finally {
             signal?.removeEventListener('abort', kill);
           }
-        }
+        },
+        (error) =>
+          (error instanceof ClickHouseError &&
+            (error.code === timeoutExceededCode ||
+              error.code === memoryLimitExceededCode)) ||
+          isRequestTimeout(error)
       )
       .catch((error: unknown) => {
         if (signal?.aborted === true && !(error instanceof GraphQLError)) {

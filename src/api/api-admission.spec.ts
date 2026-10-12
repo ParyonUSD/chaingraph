@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-let, functional/no-loop-statement, no-await-in-loop, camelcase, complexity */
+/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-let, functional/no-loop-statement, no-await-in-loop, camelcase, complexity, functional/no-throw-statement */
 // cspell:ignore clickhouse
 /**
  * Fix pass 4 (docs/clickhouse-port/fix-pass-4.md §3a, §3b):
@@ -38,11 +38,11 @@ const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
 const options = (
   light: Partial<AdmissionOptions['light']>,
   heavy: Partial<AdmissionOptions['heavy']> = {},
-  heavyMs = 50
+  heavyRows = 1_000
 ): AdmissionOptions => ({
   ...defaultAdmissionOptions,
   heavy: { ...defaultAdmissionOptions.heavy, ...heavy },
-  heavyMs,
+  heavyRows,
   light: { ...defaultAdmissionOptions.light, ...light },
 });
 
@@ -109,14 +109,44 @@ test('admission: a queued statement whose request goes away leaves the queue and
   t.false(sent);
 });
 
-test('admission: slow shapes and aggregates go to the heavy lane; a saturated heavy lane never delays light statements', async (t) => {
+test('admission: costly shapes (rows read), failures that time out and unmeasured aggregates go to the heavy lane; a saturated heavy lane never delays light statements', async (t) => {
   const admission = new Admission(
-    options({ maxConcurrent: 2 }, { maxConcurrent: 1, maxQueued: 0 }, 50)
+    options({ maxConcurrent: 2 }, { maxConcurrent: 1, maxQueued: 0 }, 1_000)
   );
   t.is(admission.laneOf('new', false), 'light', 'a new shape is light');
-  t.is(admission.laneOf('new', true), 'heavy', 'an aggregate is heavy');
-  await admission.run('slow', false, undefined, async () => sleep(80));
-  t.is(admission.laneOf('slow', false), 'heavy', 'one slow run is enough');
+  t.is(
+    admission.laneOf('new', true),
+    'heavy',
+    'an unmeasured aggregate is heavy'
+  );
+  await admission.run('agg', true, undefined, async (_settings, report) => {
+    report(10);
+  });
+  t.is(
+    admission.laneOf('agg', true),
+    'light',
+    'a measured cheap aggregate is light'
+  );
+  await admission.run('slow', false, undefined, async (_settings, report) => {
+    report(5_000);
+  });
+  t.is(admission.laneOf('slow', false), 'heavy', 'one costly run is enough');
+  await admission
+    .run(
+      'timeout',
+      false,
+      undefined,
+      async () => {
+        throw new Error('over budget');
+      },
+      () => true
+    )
+    .catch(() => undefined);
+  t.is(
+    admission.laneOf('timeout', false),
+    'heavy',
+    'a timed-out shape is heavy'
+  );
   const hold = deferred();
   const heavy = admission.run(
     'slow',
@@ -147,7 +177,7 @@ test('admission: options from the environment', (t) => {
   const parsed = admissionOptionsFromEnv({
     CHAINGRAPH_API_HEAVY_MAX_CONCURRENT: '3',
     CHAINGRAPH_API_HEAVY_MAX_THREADS: '4',
-    CHAINGRAPH_API_HEAVY_MS: '900',
+    CHAINGRAPH_API_HEAVY_ROWS: '900',
     CHAINGRAPH_API_HEAVY_WORKLOAD: 'chaingraph_heavy',
     CHAINGRAPH_API_LIGHT_MAX_QUEUED: '10',
     CHAINGRAPH_API_LIGHT_PRIORITY: '0',
@@ -158,7 +188,7 @@ test('admission: options from the environment', (t) => {
     priority: 2,
     workload: 'chaingraph_heavy',
   });
-  t.is(parsed.heavyMs, 900);
+  t.is(parsed.heavyRows, 900);
   t.is(parsed.light.maxQueued, 10);
   t.deepEqual(parsed.light.settings, {});
   t.false(admissionOptionsFromEnv({ CHAINGRAPH_API_ADMISSION: 'off' }).enabled);
