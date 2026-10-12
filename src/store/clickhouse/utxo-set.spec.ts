@@ -183,21 +183,24 @@ const unspentKeys = async (
   return rows.map((row) => row.k);
 };
 
-const scenario = (utxo: 'off' | 'on', rebase: boolean) => {
+const scenario = (utxo: 'off' | 'on', rebase: boolean, build = false) => {
   e2e(
     `[e2e] stored UTXO set (utxo ${utxo}${
       rebase ? ', rebasing every batch' : ''
+    }${
+      build ? ', bulk build in 4 slices' : ''
     }): exact per node at every lag across mempool, re-org, header acceptance, a voided commit and a restart`,
     async (t) => {
       t.timeout(300_000);
       const { client, openStore } = await scratch(
         t,
-        `${utxo}${rebase ? '_rb' : ''}`,
+        `${utxo}${rebase ? '_rb' : ''}${build ? '_bb' : ''}`,
         {
           utxo,
           utxoSetOptions: {
-            bulkBuildMinCommits: 0,
+            bulkBuildMinCommits: build ? 1 : 0,
             intervalMs: 20,
+            slices: 4,
             /* rebasing: old generations are kept during the steps (every published mark is read) */
             ...(rebase
               ? { dropGraceMs: 600_000, rebaseFactor: 0, rebaseMinRows: 1 }
@@ -233,6 +236,21 @@ const scenario = (utxo: 'off' | 'on', rebase: boolean) => {
       await store.publishWatermarks();
       await store.catchUpUtxoSet();
       await assertExact(t, store, client, nodes, 'blocks 0-1, caught up');
+      if (build) {
+        const kinds = await client.query<{ kind: string }>(
+          `SELECT toString(kind) AS kind FROM utxo_watermark
+           ORDER BY node_internal_id, watermark, generation LIMIT 1 BY node_internal_id`
+        );
+        t.deepEqual(
+          kinds.map((row) => row.kind),
+          ['build', 'build'],
+          "each node's first set is a bulk build"
+        );
+        const [work] = await client.query<{ n: string }>(
+          'SELECT toString(count()) AS n FROM utxo_build_spent'
+        );
+        t.is(work?.n, '0', 'the build left no work rows');
+      }
 
       /* pause the job: everything below is answered through the correction */
       const held = (await store.publishWatermarks()).get(node1)!;
@@ -371,6 +389,50 @@ const scenario = (utxo: 'off' | 'on', rebase: boolean) => {
         'SELECT toString(countIf(batch NOT IN (SELECT watermark FROM utxo_watermark))) AS n FROM utxo_set'
       );
       t.is(batches?.n, '0', 'every utxo_set row belongs to a published batch');
+      if (utxo === 'off' && !rebase && !build) {
+        /* the check is not vacuous: a stored row with another value, or a duplicate, is reported */
+        await store.close();
+        const mark = (await checkUtxoSet(client, node1))!;
+        await client.command(
+          `INSERT INTO utxo_set (node_internal_id, generation, batch, transaction_hash, output_index,
+             transaction_internal_id, value_satoshis, locking_bytecode, token_category, fungible_token_amount,
+             nonfungible_token_capability, nonfungible_token_commitment, sign)
+           SELECT node_internal_id, generation, batch, transaction_hash, output_index, transaction_internal_id,
+             value_satoshis + 1, locking_bytecode, token_category, fungible_token_amount,
+             nonfungible_token_capability, nonfungible_token_commitment, sign
+           FROM utxo_set
+           WHERE node_internal_id = {node:UInt32} AND generation = {generation:UInt32} AND sign = 1
+             AND fungible_token_amount IS NULL
+             AND (transaction_hash, output_index) IN (
+               SELECT transaction_hash, output_index FROM utxo_set
+               WHERE node_internal_id = {node:UInt32} AND generation = {generation:UInt32}
+               GROUP BY transaction_hash, output_index HAVING sum(sign) = 1)
+           ORDER BY transaction_hash, output_index LIMIT 1`,
+          { generation: mark.generation, node: node1 }
+        );
+        const broken = (await checkUtxoSet(client, node1))!;
+        t.is(broken.invariant.length, 1, 'the duplicate breaks the invariant');
+        t.false(broken.totalsEqual, 'and the totals');
+        /* a -1 for another unspent outpoint: the read rule loses it, and says so */
+        await client.command(
+          `INSERT INTO utxo_set (node_internal_id, generation, batch, transaction_hash, output_index,
+             transaction_internal_id, value_satoshis, locking_bytecode, token_category, fungible_token_amount,
+             nonfungible_token_capability, nonfungible_token_commitment, sign)
+           SELECT node_internal_id, generation, batch, transaction_hash, output_index, transaction_internal_id,
+             value_satoshis, locking_bytecode, token_category, fungible_token_amount,
+             nonfungible_token_capability, nonfungible_token_commitment, -1
+           FROM utxo_set
+           WHERE node_internal_id = {node:UInt32} AND generation = {generation:UInt32} AND sign = 1
+             AND (transaction_hash, output_index) IN (
+               SELECT transaction_hash, output_index FROM utxo_set
+               WHERE node_internal_id = {node:UInt32} AND generation = {generation:UInt32}
+               GROUP BY transaction_hash, output_index HAVING sum(sign) = 1)
+           ORDER BY transaction_hash DESC, output_index LIMIT 1`,
+          { generation: mark.generation, node: node1 }
+        );
+        const lost = (await checkUtxoSet(client, node1))!;
+        t.is(lost.missing.length, 1, 'the lost outpoint is reported missing');
+      }
     }
   );
 };
@@ -378,6 +440,7 @@ const scenario = (utxo: 'off' | 'on', rebase: boolean) => {
 scenario('off', false);
 scenario('off', true);
 scenario('on', false);
+scenario('off', false, true);
 
 e2e(
   '[e2e] stored UTXO set: off (CHAINGRAPH_CLICKHOUSE_UTXO_SET=off) writes nothing; the snapshot has no mark',

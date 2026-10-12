@@ -234,16 +234,23 @@ export const utxoChangeSql = (context: UtxoChangeContext) => {
   );
   const affected = scalar(
     'utxo_affected',
-    /* the input branch keeps its own column names: an alias would shadow transaction_hash in its WHERE */
-    `SELECT groupUniqArray((h, i)) FROM (
+    /*
+     * The input branch keeps its own column names (an alias would shadow
+     * transaction_hash in its WHERE). Coinbase outpoints are dropped from the
+     * array, not in the WHERE: `outpoint_transaction_hash != zero` there is a
+     * condition on p_outpoint's leading key column, which ClickHouse analyses
+     * against every mark of that projection before choosing the base table
+     * (synthetic mainnet scale: 2.9 M marks, ~0.8 s per statement;
+     * planning-floor.md).
+     */
+    `SELECT arrayFilter(x -> x.1 != ${zeroHash}, groupUniqArray((h, i))) FROM (
       SELECT transaction_hash AS h, output_index AS i FROM ${table('output')}
       WHERE transaction_hash IN (${elements(changed)}) AND ${agnostic}
       UNION ALL
       SELECT outpoint_transaction_hash AS h, outpoint_index AS i FROM ${table(
         'input'
       )}
-      WHERE transaction_hash IN (${elements(changed)})
-        AND outpoint_transaction_hash != ${zeroHash} AND ${agnostic})`
+      WHERE transaction_hash IN (${elements(changed)}) AND ${agnostic})`
   );
   const affectedRows = tupleRows(affected, ['h', 'i']);
   const spenders = scalar(
@@ -470,9 +477,10 @@ export interface UtxoSetCheck {
 
 const rowKey =
   "concat(lower(hex(transaction_hash)), ':', toString(output_index))";
-const rowDigest = `cityHash64(transaction_internal_id, value_satoshis, locking_bytecode, token_category,
+/* toString of a tuple renders NULL as 'NULL': cityHash64 over a NULL argument would be NULL and drop the row from the comparison */
+const rowDigest = `cityHash64(toString(tuple(transaction_internal_id, value_satoshis, locking_bytecode, token_category,
   fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment, locking_bytecode_prefix,
-  nonfungible_token_commitment_key)`;
+  nonfungible_token_commitment_key)))`;
 
 /**
  * The stored set of `nodeId` read by the read rule (stored rows up to U plus
@@ -772,6 +780,9 @@ const agnosticParams = (snapshot: MultiNodeSnapshot) => ({
   void: snapshot.void,
 });
 
+/** A bulk build takes one hash slice per this many acceptance rows of the node (memory bound). */
+const buildSliceAcceptanceRows = 8_000_000;
+
 const insertColumns = `node_internal_id, generation, batch, ${utxoSetOutputColumns.join(
   ', '
 )}, sign`;
@@ -880,6 +891,19 @@ export class UtxoSetMaintainer {
         mark === undefined
           ? `node_internal_id = ${id}`
           : `node_internal_id = ${id} AND (generation > ${mark.generation} OR (generation = ${mark.generation} AND batch > ${mark.watermark}))`;
+      /* a build's work rows (only a running build has any) */
+      const [work] = await client.query<{ n: string }>(
+        `SELECT toString(count()) AS n FROM utxo_build_spent WHERE node_internal_id = {node:UInt32}`,
+        { node: id }
+      );
+      if (work !== undefined && work.n !== '0') {
+        this.context.assertHeld();
+        await client.command(
+          `ALTER TABLE utxo_build_spent DELETE WHERE node_internal_id = {node:UInt32}`,
+          { node: id },
+          { mutations_sync: '2' }
+        );
+      }
       for (const table of ['utxo_set', 'utxo_total']) {
         const [row] = await client.query<{ n: string }>(
           `SELECT toString(count()) AS n FROM ${table} WHERE ${condition}`
@@ -987,7 +1011,7 @@ export class UtxoSetMaintainer {
           minCommits > 0 &&
           (stats.commits >= minCommits || stats.rows >= minRows)
         ) {
-          await this.build(node, visible, snapshot);
+          await this.build(node, visible, snapshot, stats.rows);
           advanced = true;
           continue;
         }
@@ -1194,11 +1218,26 @@ export class UtxoSetMaintainer {
     return Number(row?.n ?? '0');
   }
 
-  /** The node's set at `visible`, computed at query time, as a new generation. */
+  /**
+   * The node's set at `visible`, computed at query time, as a new
+   * generation. Memory-bounded in two phases over hash slices (the build of
+   * a mainnet-like database must never hold the node's whole accepted set or
+   * its whole spent set at once):
+   * 1. per slice of SPENDER hashes: the outpoints spent by the node's
+   *    accepted transactions of the slice, into the work table
+   *    `utxo_build_spent` (inputs by their primary key, the slice's
+   *    collapsed acceptance rows as the set);
+   * 2. per slice of CREATOR hashes: the outputs of the node's accepted
+   *    transactions of the slice, minus the spent outpoints of the slice
+   *    (a hash anti-join of one slice of the work table).
+   * Slices: `slices` (default 16), more for a large node (one per ~8 M
+   * acceptance rows, at most 256).
+   */
   private async build(
     node: number,
     visible: bigint,
-    snapshot: MultiNodeSnapshot
+    snapshot: MultiNodeSnapshot,
+    acceptanceRows = 0
   ) {
     const { client } = this.context;
     const started = Date.now();
@@ -1212,15 +1251,51 @@ export class UtxoSetMaintainer {
       snapshot,
     }).join(' AND ');
     const agnostic = pinnedGateTerms('agnostic', { snapshot }).join(' AND ');
-    const accepted = `SELECT transaction_hash FROM tx_acceptance WHERE ${acceptance}
+    const accepted = (
+      slice: string
+    ) => `SELECT transaction_hash FROM tx_acceptance
+      WHERE ${slice.replaceAll('COLUMN', 'transaction_hash')} AND ${acceptance}
       GROUP BY transaction_hash, node_internal_id, block_internal_id HAVING sum(sign) > 0`;
+    const sliceCount = Math.min(
+      256,
+      Math.max(
+        this.options.slices ?? 16,
+        Math.ceil(acceptanceRows / buildSliceAcceptanceRows)
+      )
+    );
+    const slices = hashSlices(sliceCount);
+    const params = {
+      ...agnosticParams(snapshot),
+      generation,
+      node,
+      to: visible,
+    };
+    await client.command(
+      `ALTER TABLE utxo_build_spent DELETE WHERE node_internal_id = {node:UInt32}`,
+      { node },
+      { mutations_sync: '2' }
+    );
+    for (const [index, slice] of slices.entries()) {
+      this.context.assertHeld();
+      await client.insertSelect(
+        `INSERT INTO utxo_build_spent (node_internal_id, generation, outpoint_transaction_hash, outpoint_index)
+         SELECT {node:UInt32}, {generation:UInt32}, outpoint_transaction_hash, outpoint_index FROM input
+         WHERE ${slice.replaceAll('COLUMN', 'transaction_hash')}
+           AND outpoint_transaction_hash != ${zeroHash} AND ${agnostic}
+           AND transaction_hash IN (${accepted(slice)})`,
+        params,
+        {
+          deduplicationToken: this.token(
+            `build-spent:${node}:${generation}:${visible}:${index}`
+          ),
+        }
+      );
+    }
     let rows = 0;
-    const slices = hashSlices(this.options.slices ?? 16);
     for (const [index, slice] of slices.entries()) {
       this.context.assertHeld();
       const summary = await client.insertSelectCounted(
         `INSERT INTO utxo_set (${insertColumns})
-         WITH accepted AS MATERIALIZED (${accepted})
          SELECT {node:UInt32}, {generation:UInt32}, {to:UInt64}, ${utxoSetOutputColumns
            .map((column) => `o.${column}`)
            .join(', ')}, toInt8(1)
@@ -1228,20 +1303,17 @@ export class UtxoSetMaintainer {
                WHERE ${slice.replaceAll(
                  'COLUMN',
                  'transaction_hash'
-               )} AND transaction_hash IN accepted AND ${agnostic}
+               )} AND ${agnostic}
+                 AND transaction_hash IN (${accepted(slice)})
                LIMIT 1 BY transaction_hash, output_index) AS o
-         LEFT ANTI JOIN (SELECT outpoint_transaction_hash, outpoint_index FROM input
-                         WHERE ${slice.replaceAll(
-                           'COLUMN',
-                           'outpoint_transaction_hash'
-                         )} AND transaction_hash IN accepted AND ${agnostic}) AS s
+         LEFT ANTI JOIN (SELECT outpoint_transaction_hash, outpoint_index FROM utxo_build_spent
+                         WHERE node_internal_id = {node:UInt32} AND generation = {generation:UInt32}
+                           AND ${slice.replaceAll(
+                             'COLUMN',
+                             'outpoint_transaction_hash'
+                           )}) AS s
            ON s.outpoint_transaction_hash = o.transaction_hash AND s.outpoint_index = o.output_index`,
-        {
-          ...agnosticParams(snapshot),
-          generation,
-          node,
-          to: visible,
-        },
+        params,
         {
           deduplicationToken: this.token(
             `build:${node}:${generation}:${visible}:${index}`
@@ -1251,6 +1323,10 @@ export class UtxoSetMaintainer {
       );
       rows += summary.writtenRows;
     }
+    await client.command(
+      `ALTER TABLE utxo_build_spent DROP PARTITION ({node:UInt32}, {generation:UInt32})`,
+      { generation, node }
+    );
     rows = rows === 0 ? 0 : await this.batchRows(node, generation, visible);
     await this.publish(node, {
       from: 0n,

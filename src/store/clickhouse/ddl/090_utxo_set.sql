@@ -106,6 +106,23 @@ SETTINGS non_replicated_deduplication_window = 10000,
          old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
          cleanup_delay_period_random_add = 5;
 
+-- Work table of a bulk build (utxo-set.ts `build`): the outpoints spent by a node's accepted transactions, written per
+-- slice of spender hashes and read per slice of outpoint hashes, so no statement holds a node's whole accepted or
+-- spent set. Emptied when the build ends (DROP PARTITION) and at the maintainer's start.
+CREATE TABLE IF NOT EXISTS cg.utxo_build_spent
+(
+    node_internal_id           UInt32,
+    generation                 UInt32,
+    outpoint_transaction_hash  FixedString(32),
+    outpoint_index             UInt32
+)
+ENGINE = MergeTree
+PARTITION BY (node_internal_id, generation)
+ORDER BY (outpoint_transaction_hash, outpoint_index)
+SETTINGS non_replicated_deduplication_window = 10000,
+         old_parts_lifetime = 30, cleanup_delay_period = 5, max_cleanup_delay_period = 10,
+         cleanup_delay_period_random_add = 5;
+
 ALTER TABLE cg.node_block ADD INDEX IF NOT EXISTS mm_commit_seq commit_seq TYPE minmax GRANULARITY 1;
 
 ALTER TABLE cg.node_transaction ADD INDEX IF NOT EXISTS mm_commit_seq commit_seq TYPE minmax GRANULARITY 1;
@@ -125,13 +142,12 @@ WITH (SELECT groupUniqArray(transaction_hash) FROM (
     WHERE transaction_hash IN (SELECT arrayJoin(utxo_touched_1)) AND node_internal_id = {node:UInt32} AND commit_seq <= {visible:UInt64} AND bitAnd(commit_seq, 1099511627775) <= arrayElement({fence:Array(UInt64)}, bitShiftRight(commit_seq, 40)) AND NOT has({void:Array(UInt64)}, commit_seq) AND (NOT has({void:Array(UInt64)}, 18446744073709551615) OR commit_seq NOT IN (SELECT commit_seq FROM cg.commit_void))
     GROUP BY transaction_hash, block_internal_id)
   GROUP BY transaction_hash) WHERE b != a) AS utxo_changed_2,
-(SELECT groupUniqArray((h, i)) FROM (
+(SELECT arrayFilter(x -> x.1 != toFixedString(unhex(repeat('00', 32)), 32), groupUniqArray((h, i))) FROM (
       SELECT transaction_hash AS h, output_index AS i FROM cg.output
       WHERE transaction_hash IN (SELECT arrayJoin(utxo_changed_2)) AND (commit_seq <= {visible0:UInt64} OR has({tail:Array(UInt64)}, commit_seq)) AND bitAnd(commit_seq, 1099511627775) <= arrayElement({fence:Array(UInt64)}, bitShiftRight(commit_seq, 40)) AND NOT has({void:Array(UInt64)}, commit_seq) AND (NOT has({void:Array(UInt64)}, 18446744073709551615) OR commit_seq NOT IN (SELECT commit_seq FROM cg.commit_void))
       UNION ALL
       SELECT outpoint_transaction_hash AS h, outpoint_index AS i FROM cg.input
-      WHERE transaction_hash IN (SELECT arrayJoin(utxo_changed_2))
-        AND outpoint_transaction_hash != toFixedString(unhex(repeat('00', 32)), 32) AND (commit_seq <= {visible0:UInt64} OR has({tail:Array(UInt64)}, commit_seq)) AND bitAnd(commit_seq, 1099511627775) <= arrayElement({fence:Array(UInt64)}, bitShiftRight(commit_seq, 40)) AND NOT has({void:Array(UInt64)}, commit_seq) AND (NOT has({void:Array(UInt64)}, 18446744073709551615) OR commit_seq NOT IN (SELECT commit_seq FROM cg.commit_void)))) AS utxo_affected_3,
+      WHERE transaction_hash IN (SELECT arrayJoin(utxo_changed_2)) AND (commit_seq <= {visible0:UInt64} OR has({tail:Array(UInt64)}, commit_seq)) AND bitAnd(commit_seq, 1099511627775) <= arrayElement({fence:Array(UInt64)}, bitShiftRight(commit_seq, 40)) AND NOT has({void:Array(UInt64)}, commit_seq) AND (NOT has({void:Array(UInt64)}, 18446744073709551615) OR commit_seq NOT IN (SELECT commit_seq FROM cg.commit_void)))) AS utxo_affected_3,
 (SELECT groupUniqArray((outpoint_transaction_hash, outpoint_index, transaction_hash)) FROM cg.input
       WHERE (outpoint_transaction_hash, outpoint_index) IN (SELECT tupleElement(__x, 1) AS h, tupleElement(__x, 2) AS i FROM (SELECT arrayJoin(utxo_affected_3) AS __x))
         AND (commit_seq <= {visible0:UInt64} OR has({tail:Array(UInt64)}, commit_seq)) AND bitAnd(commit_seq, 1099511627775) <= arrayElement({fence:Array(UInt64)}, bitShiftRight(commit_seq, 40)) AND NOT has({void:Array(UInt64)}, commit_seq) AND (NOT has({void:Array(UInt64)}, 18446744073709551615) OR commit_seq NOT IN (SELECT commit_seq FROM cg.commit_void))) AS utxo_spenders_4,
