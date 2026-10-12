@@ -44,6 +44,7 @@ import {
 } from './plugins.js';
 import type { ApiContext } from './schema.js';
 import { schema } from './schema.js';
+import type { UtxoSetPolicy } from './sql.js';
 
 const argumentValue = (
   value: ValueNode,
@@ -150,6 +151,11 @@ export interface ApiOptions {
   maxResultRows?: number;
   /** Server-side time budget per statement class (db.ts `defaultStatementTimeouts`). */
   statementTimeouts?: Partial<StatementTimeouts>;
+  /**
+   * Stored UTXO set use (sql.ts `defaultUtxoSetPolicy`: on, used when the
+   * store has a set for the node; `main.ts` reads `utxoSetPolicyFromEnv`).
+   */
+  utxoSet?: Partial<UtxoSetPolicy>;
 }
 
 export const createApi = (
@@ -161,6 +167,7 @@ export const createApi = (
     db.maxResultRows = options.maxResultRows;
   }
   db.timeouts = { ...db.timeouts, ...options.statementTimeouts };
+  db.utxoSetPolicy = { ...db.utxoSetPolicy, ...options.utxoSet };
   const hub = new LiveHub(db, options.live);
   const responseCache =
     options.responseCache === undefined || options.responseCache === false

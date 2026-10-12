@@ -13,6 +13,9 @@
  *   nothing else;
  * - CHAINGRAPH_API_AGENT_URL=<agent internal API> enables send_transaction;
  * - CHAINGRAPH_API_MAX_RESULT_ROWS caps the rows of one root statement;
+ * - CHAINGRAPH_API_UTXO_SET=off reads unspent outputs at query time even
+ *   where the store has a stored UTXO set (default on);
+ *   CHAINGRAPH_API_UTXO_SET_MAX_LAG_ROWS (default 100000) is its plan bound;
  * - CHAINGRAPH_API_QUERY_TIMEOUT_MS (default 60000) is the server-side time
  *   budget of a data statement, CHAINGRAPH_API_AGGREGATE_TIMEOUT_MS (default
  *   30000, at most the former unless set) that of an aggregate / group-by
@@ -25,7 +28,11 @@ import {
   clickHouseConfigFromEnv,
 } from '../store/clickhouse/client.js';
 
-import { requestTimeoutMarginMs, statementTimeoutsFromEnv } from './db.js';
+import {
+  requestTimeoutMarginMs,
+  statementTimeoutsFromEnv,
+  utxoSetPolicyFromEnv,
+} from './db.js';
 import { loadTrustedDocuments } from './plugins.js';
 import { createApi, listen } from './server.js';
 
@@ -50,6 +57,7 @@ const main = async () => {
       : { maxResultRows: Number(env.CHAINGRAPH_API_MAX_RESULT_ROWS) }),
     responseCache: env.CHAINGRAPH_API_RESPONSE_CACHE === 'off' ? false : {},
     statementTimeouts,
+    utxoSet: utxoSetPolicyFromEnv(env),
     ...(trusted === undefined
       ? {}
       : {

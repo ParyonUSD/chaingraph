@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-magic-numbers, camelcase, @typescript-eslint/naming-convention, functional/no-loop-statement, functional/no-let, no-await-in-loop, @typescript-eslint/require-array-sort-compare, complexity, max-params, functional/no-throw-statement, sort-keys */
+/* eslint-disable @typescript-eslint/no-magic-numbers, camelcase, @typescript-eslint/naming-convention, functional/no-loop-statement, functional/no-let, no-await-in-loop, @typescript-eslint/require-array-sort-compare, complexity, max-params, functional/no-throw-statement, sort-keys, require-atomic-updates */
 // cspell:ignore clickhouse
 /**
  * Phase 2 G2 (docs/clickhouse-port/phase2-api.md): every scalar operator
@@ -435,5 +435,145 @@ e2e(
     ) as unknown[][];
     t.true(lists.length >= 3, 'chunked');
     t.true(lists.every((list) => list.length <= 1_000));
+  }
+);
+
+e2e(
+  '[e2e] stored UTXO set (utxo-async.md): unspent_outputs for every output filter, caught up, lagging (job held across a block and a confirmation) and with the set off, equal the evaluator on both nodes; unspent_outputs_aggregate from the running totals equals it too',
+  async (t) => {
+    t.timeout(600_000);
+    const env = await setup(t, 'g2_utxoset');
+    const c0 = env.data.c0.hash;
+    const expectedUnspent = (oracle: Oracle, filter: OutputFilter) => {
+      const spent = new Set(
+        oracle.inputs
+          .filter((input) => accepted(oracle, input.transaction_hash))
+          .map(
+            (input) =>
+              `${input.outpoint_transaction_hash}:${input.outpoint_index}`
+          )
+      );
+      return expectedOutputs(oracle, filter).filter((key) => !spent.has(key));
+    };
+    const totals = (oracle: Oracle, category?: string) => {
+      const keys = new Set(
+        expectedUnspent(
+          oracle,
+          category === undefined ? {} : { token_category: { _eq: category } }
+        )
+      );
+      const rows = oracle.outputs.filter((output) =>
+        keys.has(`${output.transaction_hash}:${output.output_index}`)
+      );
+      const fungible = rows.filter((row) => row.fungible_token_amount !== null);
+      return {
+        count: String(rows.length),
+        sum: {
+          fungible_token_amount:
+            fungible.length === 0
+              ? null
+              : String(
+                  fungible.reduce(
+                    (sum, row) => sum + row.fungible_token_amount!,
+                    0n
+                  )
+                ),
+          value_satoshis:
+            rows.length === 0
+              ? null
+              : String(rows.reduce((sum, row) => sum + row.value_satoshis, 0n)),
+        },
+      };
+    };
+    const check = async (
+      state: string,
+      pathOf: (node: string) => 'correction' | 'query' | 'stored'
+    ) => {
+      for (const node of [one, two]) {
+        const path = pathOf(node);
+        const oracle = await loadOracle(
+          env.client,
+          node === one ? env.nodes.node1 : env.nodes.node2
+        );
+        const recorder = recordQueries(env.api);
+        for (const filter of outputFilters(c0)) {
+          t.deepEqual(
+            sorted(await walk(env, 'unspent_outputs', node, variables(filter))),
+            sorted(expectedUnspent(oracle, filter)),
+            `${state}: ${node} unspent_outputs ${JSON.stringify(
+              variables(filter)
+            )}`
+          );
+        }
+        for (const category of [undefined, paryon, redeemer]) {
+          const result = await env.gql<{
+            u: { aggregate: ReturnType<typeof totals> };
+          }>(
+            `query($node: String!, $where: OutputFilter) {
+              u: unspent_outputs_aggregate(node: $node, where: $where) {
+                aggregate { count sum { value_satoshis fungible_token_amount } }
+              }
+            }`,
+            {
+              node,
+              where:
+                category === undefined
+                  ? null
+                  : { token_category: { _eq: category } },
+            }
+          );
+          t.deepEqual(
+            result.u.aggregate,
+            totals(oracle, category),
+            `${state}: ${node} unspent_outputs_aggregate ${String(category)}`
+          );
+        }
+        recorder.stop();
+        const data = recorder.events.filter((event) => event.kind === 'data');
+        const stored = data.filter((event) =>
+          event.sql.includes('FROM utxo_set')
+        );
+        const totalsRead = data.filter((event) =>
+          event.sql.includes('FROM utxo_total')
+        );
+        const corrected = data.filter((event) =>
+          event.sql.includes('utxo_touched')
+        );
+        if (path === 'query') {
+          t.is(stored.length + totalsRead.length, 0, `${state}: query time`);
+        } else {
+          /* the node-one unspent reads and its totals go through the stored set */
+          t.true(stored.length > 0, `${state}: ${node} stored set read`);
+          t.true(totalsRead.length > 0, `${state}: ${node} totals read`);
+          if (path === 'stored') {
+            t.is(corrected.length, 0, `${state}: ${node} no correction`);
+          } else {
+            t.true(corrected.length > 0, `${state}: ${node} corrected`);
+          }
+        }
+      }
+    };
+    /* caught up */
+    await env.store.catchUpUtxoSet();
+    await check('caught up', () => 'stored');
+    /* the job held: a block on node one and the confirmation of its mempool transaction */
+    const held = (await env.store.publishWatermarks()).get(env.nodes.node1)!;
+    env.store.holdUtxoSet(held);
+    await env.extendNodeOne([]);
+    await env.extendNodeOne([env.data.redeemB]);
+    /* node two accepts neither: it has no lag */
+    await check('lagging', (node) => (node === one ? 'correction' : 'stored'));
+    /* the plan bound: a lag above it reads at query time (same answers) */
+    env.api.db.utxoSetPolicy = { enabled: true, maxLagRows: 0 };
+    await check('lag above the plan bound', (node) =>
+      node === one ? 'query' : 'stored'
+    );
+    /* the set off in the API */
+    env.api.db.utxoSetPolicy = { enabled: false, maxLagRows: 100_000 };
+    await check('API flag off', () => 'query');
+    env.api.db.utxoSetPolicy = { enabled: true, maxLagRows: 100_000 };
+    env.store.holdUtxoSet(undefined);
+    await env.store.catchUpUtxoSet();
+    await check('caught up again', () => 'stored');
   }
 );

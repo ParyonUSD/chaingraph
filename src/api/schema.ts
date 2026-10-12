@@ -29,6 +29,7 @@ import {
   requestedAggregates,
   runAggregate,
   runGroups,
+  runUnspentTotals,
 } from './aggregates.js';
 import {
   encodeBlock,
@@ -1607,7 +1608,7 @@ const rootFields = (t: RootFieldBuilder) => ({
       where: t.arg({ type: OutputFilterInput }),
     },
     description:
-      "The node's unspent outputs, computed at query time from outputs minus spending inputs (UTXO tables off), keyset on (transaction_internal_id, output_index).",
+      "The node's unspent outputs (Chaingraph v1's definition: outputs of transactions the node accepts, minus outpoints spent by a transaction it accepts): from the stored per-node UTXO set where the store keeps one, else computed at query time; exact at the request's snapshot either way. Keyset on (transaction_internal_id, output_index).",
     type: OutputPageRef,
   },
 });
@@ -1931,15 +1932,25 @@ builder.queryType({
           node: t.arg.string({ required: true }),
           where: t.arg({ type: OutputFilterInput }),
         },
-        description: "Aggregates over the node's unspent outputs.",
+        description:
+          "Aggregates over the node's unspent outputs. Without a filter (or with only `token_category: { _eq }`), `count` and `sum` of `value_satoshis` / `fungible_token_amount` read the stored per-node running totals when the store keeps them.",
         resolve: async (_root, args, context, info) => {
           const env = await requestEnv(context, args.node);
-          return runAggregate(
-            env,
-            'unspent_outputs_aggregate',
-            aggregateSpecs.Output,
-            rowSets.unspentOutputs(env, args.where),
-            aggregateSelection(rootSels(info))
+          const requested = aggregateSelection(rootSels(info));
+          return (
+            (await runUnspentTotals(
+              env,
+              'unspent_outputs_aggregate',
+              args.where,
+              requested
+            )) ??
+            runAggregate(
+              env,
+              'unspent_outputs_aggregate',
+              aggregateSpecs.Output,
+              rowSets.unspentOutputs(env, args.where),
+              requested
+            )
           );
         },
         type: OutputAggregates.Aggregate,
@@ -2022,7 +2033,10 @@ const liveEnv = (
   db: ApiDb,
   snapshot: VisibilitySnapshot,
   nodeName: string
-): RootEnv => ({ ...singleNodeEnv(snapshot, nodeName, db.maxResultRows), db });
+): RootEnv => ({
+  ...singleNodeEnv(snapshot, nodeName, db.maxResultRows, db.utxoSetPolicy),
+  db,
+});
 
 builder.subscriptionType({
   description:

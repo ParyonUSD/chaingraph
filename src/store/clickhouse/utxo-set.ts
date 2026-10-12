@@ -378,7 +378,8 @@ export const utxoTotalsSql = ({
     AND generation = ${read.generation ?? '{utxo_generation:UInt32}'}
     AND batch <= ${read.watermark ?? '{utxo:UInt64}'}
     AND ${categoryTerm}`;
-  const changes = `SELECT token_category, toInt64(s) AS outputs, s * v AS value_satoshis,
+  /* built only when used: building registers the change steps as WITH scalars */
+  const changes = () => `SELECT token_category, toInt64(s) AS outputs, s * v AS value_satoshis,
     if(isNull(f), 0, toInt64(s)) AS fungible_outputs,
     toInt128(s) * ifNull(f, 0) AS fungible_token_amount,
     if(isNull(c), 0, toInt64(s)) AS nonfungible_outputs
@@ -389,7 +390,7 @@ export const utxoTotalsSql = ({
     sum(toInt128(fa)) AS fungible_token_amount, sum(nn) AS nonfungible_outputs
   FROM (SELECT token_category, outputs AS n, value_satoshis AS v, fungible_outputs AS fn,
           fungible_token_amount AS fa, nonfungible_outputs AS nn
-        FROM (${stored}${withChanges ? `\n  UNION ALL\n  ${changes}` : ''}))
+        FROM (${stored}${withChanges ? `\n  UNION ALL\n  ${changes()}` : ''}))
   GROUP BY token_category
   HAVING outputs != 0 OR fungible_outputs != 0 OR nonfungible_outputs != 0 OR value_satoshis != 0`;
 };
@@ -846,7 +847,8 @@ export class UtxoSetMaintainer {
   async catchUp() {
     await this.removeUnfinished();
     for (;;) {
-      const advanced = await this.pass();
+      /* the loop is stopped here: pass() must not take that as its own stop */
+      const advanced = await this.pass(false);
       if (!advanced) break;
     }
     return readUtxoSetMarks(this.context.client);
@@ -920,7 +922,7 @@ export class UtxoSetMaintainer {
     }
     while (!this.stopped) {
       try {
-        const advanced = await this.pass();
+        const advanced = await this.pass(true);
         await this.housekeeping();
         if (advanced) continue;
       } catch (error: unknown) {
@@ -947,7 +949,7 @@ export class UtxoSetMaintainer {
   }
 
   /** One step for every node that lags; true if any node advanced. */
-  private async pass(): Promise<boolean> {
+  private async pass(loop: boolean): Promise<boolean> {
     const { client } = this.context;
     const nodeRows = await client.query<{ node: number }>(
       `SELECT DISTINCT node_internal_id AS node FROM visibility WHERE node_internal_id != ${nodeAgnosticId} ORDER BY node`
@@ -958,7 +960,7 @@ export class UtxoSetMaintainer {
     const marks = await readUtxoSetMarks(client);
     let advanced = false;
     for (const node of nodes) {
-      if (this.stopped) break;
+      if (loop && this.stopped) break;
       let visible = snapshot.visibleByNode.get(node) ?? 0n;
       if (this.holdAt !== undefined && visible > this.holdAt) {
         visible = this.holdAt;

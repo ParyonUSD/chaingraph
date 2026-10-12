@@ -24,6 +24,7 @@
  */
 import { GraphQLError } from 'graphql';
 
+import { utxoSetRowsSql } from '../store/clickhouse/utxo-set.js';
 import type { VisibilitySnapshot } from '../store/clickhouse/visibility.js';
 import {
   inlinePinnedView,
@@ -38,10 +39,33 @@ export const snapshotParameterNames = [
   'node',
   'spend',
   'tail',
+  'utxo',
+  'utxo_generation',
   'visible',
   'visible0',
   'void',
 ] as const;
+
+/**
+ * Default plan bound of the stored UTXO set: above this lag (acceptance rows
+ * of the node's commits after the set's watermark, `UtxoSetMark.lagRows`)
+ * unspent outputs are computed at query time instead of the stored set plus
+ * its correction (both exact; the correction's cost grows with the lag).
+ */
+export const defaultUtxoSetMaxLagRows = 100_000;
+
+/** How a statement may use the stored UTXO set (docs/clickhouse-port/utxo-async.md). */
+export interface UtxoSetPolicy {
+  /** Use it when the snapshot has a mark for the node (`CHAINGRAPH_API_UTXO_SET`, default on). */
+  enabled: boolean;
+  /** See `defaultUtxoSetMaxLagRows` (`CHAINGRAPH_API_UTXO_SET_MAX_LAG_ROWS`). */
+  maxLagRows: number;
+}
+
+export const defaultUtxoSetPolicy: UtxoSetPolicy = {
+  enabled: true,
+  maxLagRows: defaultUtxoSetMaxLagRows,
+};
 
 const clientParamPattern = /^p\d+$/u;
 const extraNodeParamPattern = /^(?:node|visible)_\d+$/u;
@@ -90,9 +114,36 @@ export class Sql {
    */
   constructor(
     readonly snapshot: VisibilitySnapshot,
-    readonly others: ReadonlyMap<number, bigint> = new Map()
+    readonly others: ReadonlyMap<number, bigint> = new Map(),
+    readonly utxoSetPolicy: UtxoSetPolicy = defaultUtxoSetPolicy
   ) {
     this.params = { ...snapshotParams(snapshot) };
+  }
+
+  /**
+   * True when unspent outputs of `node` (default: the primary node) are read
+   * from the stored UTXO set: the snapshot carries the node's mark (the
+   * store has a set and the API reads it), the policy allows it and the lag
+   * is within its plan bound. Only the primary node's mark is bound (`utxo`,
+   * `utxo_generation`); other nodes read at query time.
+   */
+  storedUtxoSet(node?: number) {
+    const id = node ?? this.primaryNode;
+    const mark = this.snapshot.utxo;
+    return (
+      this.utxoSetPolicy.enabled &&
+      mark !== undefined &&
+      id !== undefined &&
+      id === this.snapshot.nodeId &&
+      mark.lagRows <= this.utxoSetPolicy.maxLagRows
+    );
+  }
+
+  /** A statement-level WITH scalar `(body) AS name` (evaluated once; see utxo-set.ts `ScalarRegistrar`). */
+  scalar(prefix: string, body: string) {
+    const name = this.uniqueName(prefix);
+    this.withItems.push(`(${body}) AS ${name}`);
+    return name;
   }
 
   /** The statement's primary node (undefined for a node-agnostic statement). */
@@ -2081,6 +2132,27 @@ const antiJoined = (outputs: string, spent: string) =>
     ON s.outpoint_transaction_hash = o.transaction_hash AND s.outpoint_index = o.output_index`;
 
 /**
+ * The primary node's unspent outputs from the stored UTXO set
+ * (docs/clickhouse-port/utxo-async.md, read rule): the stored rows up to the
+ * snapshot's watermark U plus the change rows of (U, visible(n)] (left out
+ * when no commit of the node is above U), both filtered by `matching` (a
+ * predicate over output columns: every row of an outpoint carries the same
+ * values, so filtering before the collapse is exact), collapsed per
+ * outpoint. Exact at the snapshot whatever the maintainer's lag. Output
+ * columns (`OutputEntity`); a SELECT text.
+ */
+export const storedUnspentRows = (sql: Sql, matching: string) =>
+  utxoSetRowsSql({
+    change: {
+      from: '{utxo:UInt64}',
+      scalar: (prefix, body) => sql.scalar(prefix, body),
+      snapshot: sql.snapshot,
+    },
+    where: matching,
+    withChanges: (sql.snapshot.utxo?.lagCommits ?? 0) > 0,
+  });
+
+/**
  * Per-node unspent outputs at query time (UTXO tables off, Chaingraph v1's
  * definition): outputs of transactions the node accepts, minus outpoints
  * spent by an input of a transaction the node accepts. A row source (output
@@ -2105,6 +2177,9 @@ export const unspentOutputRows = (
 ): { source: string; where: string } => {
   const output = sql.view('output_at');
   const matching = outputPredicate(sql, filter, outputRowColumns, node);
+  if (sql.storedUtxoSet(node)) {
+    return { source: storedUnspentRows(sql, matching), where: '1' };
+  }
   if (matching === '1') {
     return {
       source: antiJoined(
