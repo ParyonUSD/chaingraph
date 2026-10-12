@@ -176,6 +176,11 @@ const e2eEnvVariables = {
   CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS: '100',
   CHAINGRAPH_POSTGRES_CONNECTION_STRING: postgresE2eConnectionStringTestDb,
   CHAINGRAPH_TRUSTED_NODES: e2eTrustedNodesSet1,
+  /*
+   * The unspent_node_ids tests drive the tracking job themselves; a job in the
+   * spawned agents would race them (and hold the partitions they drain).
+   */
+  CHAINGRAPH_UNSPENT_NODE_IDS_JOB: 'false',
   NODE_ENV: 'production',
   /* eslint-enable @typescript-eslint/naming-convention */
 };
@@ -3032,9 +3037,23 @@ const concurrencyTransaction = (
  * job runs (backlog correction), while it is stalled, and after it caught up,
  * for every node and read tier; then the stored values are compared too.
  */
+const e2eDefaultStallMaxMs = '2000';
+/*
+ * The job modules imported by the tests read it from the environment; the
+ * production default (10 minutes) would make every stall in the scenario
+ * below sleep for 10 minutes.
+ */
+process.env.CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS ??= e2eDefaultStallMaxMs;
 const deferredStallMaxMs = Number(
-  process.env.CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS ?? 600_000
+  process.env.CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS
 );
+/**
+ * The unspent_node_ids tests compare every read tier for every node after
+ * every step; on the e2e chain (pre-tracking, answered live) one comparison
+ * takes about a second, so a test runs for minutes without finishing a test
+ * (AVA's --timeout).
+ */
+const unspentTestTimeoutMs = 45 * 60_000;
 const deferredReadTiers = ['auto', 'hash', 'probe', 'fallback'] as const;
 const deferredRows = async (sql: string, filter?: (row: string) => boolean) =>
   (await client.query<{ outpoint: string }>(sql)).rows
@@ -3184,6 +3203,7 @@ test.serial(
       t.pass();
       return;
     }
+    t.timeout(unspentTestTimeoutMs);
     const originalPostgresConnectionString =
       process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
     const setup = await deferredDbModule('unspent-deferred-setup');
@@ -3436,6 +3456,7 @@ test.serial(
       t.pass();
       return;
     }
+    t.timeout(unspentTestTimeoutMs);
     const blockCount = 24;
     const transactionsPerBlock = 40;
     const mempoolPairs = 24;
@@ -3642,6 +3663,7 @@ test.serial(
       t.pass();
       return;
     }
+    t.timeout(unspentTestTimeoutMs);
     const originalPostgresConnectionString =
       process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
     const db = await deferredDbModule('unspent-deferred-backlog');
@@ -3975,6 +3997,7 @@ test.serial(
       t.pass();
       return;
     }
+    t.timeout(unspentTestTimeoutMs);
     const originalPostgresConnectionString =
       process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
     const db = await deferredDbModule('unspent-deferred-event-order');
@@ -4291,6 +4314,103 @@ test.serial(
         process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
           originalPostgresConnectionString;
       }
+    }
+  }
+);
+
+/**
+ * Every pass calls unspent_node_ids_repartition. With the partition count
+ * unchanged it must not queue for the progress table lock behind a batch in
+ * flight (another job's, holding its progress row): the queued EXCLUSIVE
+ * request made every later batch wait behind it. A real re-partition gives up
+ * after lock_timeout (55P03) instead of waiting.
+ */
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): repartition does not queue behind a batch in flight`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    const partitionCount = Number(
+      (
+        await client.query<{ n: string }>(
+          /* sql */ `SELECT count(*) AS n FROM unspent_tracking_progress;`
+        )
+      ).rows[0]!.n
+    );
+    t.true(partitionCount > 1, `partitions: ${partitionCount}`);
+    const holder = new pg.Client({
+      connectionString: postgresE2eConnectionStringTestDb,
+    });
+    const other = new pg.Client({
+      connectionString: postgresE2eConnectionStringTestDb,
+    });
+    await holder.connect();
+    await other.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      // a batch of partition 0 in flight (another agent's job)
+      await holder.query('BEGIN;');
+      await holder.query(
+        /* sql */ `SELECT 1 FROM unspent_tracking_progress WHERE partition_index = 0 FOR UPDATE;`
+      );
+      const unchangedStart = Date.now();
+      t.false(
+        (
+          await client.query<{ repartitioned: boolean }>(
+            /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`,
+            [partitionCount]
+          )
+        ).rows[0]!.repartitioned,
+        'same partition count: nothing to do'
+      );
+      t.true(
+        Date.now() - unchangedStart < 1_000,
+        `same partition count returns at once (${
+          Date.now() - unchangedStart
+        } ms)`
+      );
+      // a batch of another partition still gets its row lock at once
+      await other.query(`SET lock_timeout = '1s';`);
+      await other.query('BEGIN;');
+      await t.notThrowsAsync(async () =>
+        other.query(
+          /* sql */ `SELECT 1 FROM unspent_tracking_progress WHERE partition_index = 1 FOR UPDATE;`
+        )
+      );
+      await other.query('ROLLBACK;');
+      // a real re-partition gives up (retried by the next pass)
+      const changeStart = Date.now();
+      const error = await t.throwsAsync(async () =>
+        client.query(
+          /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`,
+          [partitionCount + 1]
+        )
+      );
+      t.is((error as { code?: string } | undefined)?.code, '55P03');
+      t.true(
+        Date.now() - changeStart < 10_000,
+        `re-partition gave up after ${Date.now() - changeStart} ms`
+      );
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(
+              /* sql */ `SELECT count(*) AS n FROM unspent_tracking_progress WHERE partition_count = $1;`,
+              [partitionCount]
+            )
+          ).rows[0]!.n
+        ),
+        partitionCount,
+        'partitions unchanged'
+      );
+    } finally {
+      await holder.query('ROLLBACK;');
+      await holder.end();
+      await other.end();
     }
   }
 );

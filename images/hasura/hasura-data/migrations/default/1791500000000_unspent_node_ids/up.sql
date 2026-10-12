@@ -554,8 +554,14 @@ $$;
 -- Change the number of partitions: every new partition restarts from the
 -- minimum of the old watermarks (re-processing is idempotent). Events above
 -- the minimum consumed id are kept (deletion uses the minimum).
+-- Called before every pass: when the count is unchanged it returns without
+-- taking the table lock. The EXCLUSIVE lock conflicts with the row lock every
+-- batch holds on its progress row, so a queued request would wait for the
+-- batches in flight (another agent's job, or a long catch-up batch) and make
+-- every later batch queue behind it. A real re-partition waits at most
+-- lock_timeout (55P03); the caller retries on its next pass.
 CREATE FUNCTION unspent_node_ids_repartition (part_count integer)
-  RETURNS boolean LANGUAGE plpgsql AS $$
+  RETURNS boolean LANGUAGE plpgsql SET lock_timeout = '2s' AS $$
 DECLARE
   current_count integer;
   w bigint;
@@ -563,6 +569,11 @@ DECLARE
   consumed bigint;
   backfilled bigint;
 BEGIN
+  IF NOT EXISTS (SELECT 1 FROM unspent_tracking_progress)
+     OR ((SELECT count(*) FROM unspent_tracking_progress) = part_count
+         AND NOT EXISTS (SELECT 1 FROM unspent_tracking_progress p WHERE p.partition_count <> part_count)) THEN
+    RETURN false;
+  END IF;
   LOCK TABLE unspent_tracking_progress IN EXCLUSIVE MODE;
   SELECT min(partition_count), min(input_transaction_internal_id), min(block_internal_id), min(consumed_event_id),
          min(backfill_transaction_internal_id)

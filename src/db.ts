@@ -1545,6 +1545,9 @@ const settleLimits = async (client: pg.PoolClient, waitMs: number) => {
 const serializationFailure = '40001';
 const isSerializationFailure = (err: unknown) =>
   (err as { code?: string } | undefined)?.code === serializationFailure;
+const lockNotAvailable = '55P03';
+const isLockNotAvailable = (err: unknown) =>
+  (err as { code?: string } | undefined)?.code === lockNotAvailable;
 
 /**
  * One batch of one partition in its own REPEATABLE READ transaction (one
@@ -1690,12 +1693,20 @@ const ensureInitialized = async (
     }
     return;
   }
-  const repartitioned =
-    (
-      await client.query<{ repartitioned: boolean }>(repartitionSql, [
-        partitionCount,
-      ])
-    ).rows[0]?.repartitioned === true;
+  const repartitioned = await client
+    .query<{ repartitioned: boolean }>(repartitionSql, [partitionCount])
+    .then((result) => result.rows[0]?.repartitioned === true)
+    .catch((err: unknown) => {
+      if (isLockNotAvailable(err)) {
+        // batches of another job hold the partitions: retried next pass (meanwhile they report "repartition")
+        unspentTrackingLog.warn(
+          `Unspent tracking job: re-partitioning into ${partitionCount} partitions is waiting for batches in flight (another agent's job?); retrying next pass.`
+        );
+        return false;
+      }
+      // eslint-disable-next-line functional/no-throw-statement
+      throw err;
+    });
   if (repartitioned) {
     partitionStalls.clear();
     partitionSkipThrough.clear();
