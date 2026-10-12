@@ -905,7 +905,8 @@ e2e(
     t.is(await checker.blockTransactionCount(genesis.hash), 1);
 
     const report = await checker.schemaReport();
-    t.deepEqual(report.triggers, {});
+    /* the only materialized view: the stored UTXO set's running totals (utxo-async.md), derived rows only */
+    t.deepEqual(report.triggers, { utxo_total_mv: 'enabled' });
     t.true(report.indexes.includes('table:utxo'));
     t.true(report.indexes.includes('projection:output.p_script'));
     t.true(report.indexes.includes('index:output.bf_locking_bytecode'));
