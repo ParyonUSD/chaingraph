@@ -134,6 +134,14 @@ export interface UtxoChangeContext extends UtxoChangeParams {
   snapshot?: Pick<VisibilitySnapshot, 'committedTail' | 'void'>;
   /** Database qualifier of the tables (`cg.` in the DDL). */
   qualifier?: string;
+  /**
+   * A predicate over output columns: only change rows of matching outputs
+   * are needed (a filtered read). The affected outputs are narrowed to the
+   * matching ones before their spenders are looked up, so a selective
+   * filter's correction reads few spenders and acceptance rows. Every row of
+   * an outpoint carries the same output columns, so this is exact.
+   */
+  where?: string;
 }
 
 const tableName = (qualifier: string, table: string) => `${qualifier}${table}`;
@@ -252,7 +260,21 @@ export const utxoChangeSql = (context: UtxoChangeContext) => {
       )}
       WHERE transaction_hash IN (${elements(changed)}) AND ${agnostic})`
   );
-  const affectedRows = tupleRows(affected, ['h', 'i']);
+  const narrowed =
+    context.where === undefined || context.where === '1'
+      ? affected
+      : scalar(
+          'utxo_matching',
+          `SELECT groupUniqArray((transaction_hash, output_index)) FROM ${table(
+            'output'
+          )}
+           WHERE (transaction_hash, output_index) IN (${tupleRows(affected, [
+             'h',
+             'i',
+           ])})
+             AND ${agnostic} AND (${context.where})`
+        );
+  const affectedRows = tupleRows(narrowed, ['h', 'i']);
   const spenders = scalar(
     'utxo_spenders',
     `SELECT groupUniqArray((outpoint_transaction_hash, outpoint_index, transaction_hash)) FROM ${table(
@@ -338,9 +360,10 @@ export const utxoSetRowsSql = ({
     utxoStoredRowsSql(read, where),
     ...(withChanges
       ? [
-          `SELECT ${utxoSetReadColumns.join(', ')}, sign FROM (${utxoChangeSql(
-            change
-          )}) WHERE ${where}`,
+          `SELECT ${utxoSetReadColumns.join(', ')}, sign FROM (${utxoChangeSql({
+            ...change,
+            where,
+          })}) WHERE ${where}`,
         ]
       : []),
   ];
@@ -393,7 +416,10 @@ export const utxoTotalsSql = ({
     if(isNull(c), 0, toInt64(s)) AS nonfungible_outputs
   FROM (SELECT token_category, sign AS s, value_satoshis AS v, fungible_token_amount AS f,
           nonfungible_token_capability AS c
-        FROM (${utxoChangeSql(change)}) WHERE ${categoryTerm})`;
+        FROM (${utxoChangeSql({
+          ...change,
+          where: categoryTerm,
+        })}) WHERE ${categoryTerm})`;
   return `SELECT token_category, sum(n) AS outputs, sum(v) AS value_satoshis, sum(fn) AS fungible_outputs,
     sum(toInt128(fa)) AS fungible_token_amount, sum(nn) AS nonfungible_outputs
   FROM (SELECT token_category, outputs AS n, value_satoshis AS v, fungible_outputs AS fn,
