@@ -44,6 +44,7 @@ import type {
   OutputFilter,
 } from './sql.js';
 import {
+  authchainTooWideCode,
   blockInclusionPredicate,
   blockPredicate,
   blockTransactionPredicate,
@@ -627,12 +628,28 @@ export const authchainBranchesSql = (c: Ctx, link: string) => {
     WHERE b_kid != b_next`;
   const terminals = `SELECT y_base, y_pid, y_items[y_c].1, ${zero}, toUInt8(2)
     FROM (${ends}) WHERE empty(y_items[y_c].3)`;
-  const across = `SELECT e.b_base, if(e.b_kind = 2, p.p_path[e.b_j], e.b_kid),
-      if(e.b_kind = 2, e.b_j, e.b_j + 1),
-      if(e.b_kind = 2, arraySlice(p.p_path, 1, e.b_j), arrayPushBack(arraySlice(p.p_path, 1, e.b_j), e.b_kid)),
-      toUInt8(if(e.b_kind = 2 OR e.b_j + 1 >= ${max}, 2, 0)), toUInt64(1)
+  /*
+   * The branch cap (owner decision 2026-10-12): a step's new rows of one
+   * base are distinct paths that each end in at least one final path, so
+   * more of them than the cap already means a tree over it; the walk stops
+   * there instead of building the rest (the final check below counts the
+   * paths ended in earlier steps).
+   */
+  const cap = c.sql.authchainMaxBranches;
+  if (!Number.isInteger(cap) || cap < 1) {
+    throw new Error('authchainMaxBranches must be a positive integer.');
+  }
+  const tooWide = (count: string) =>
+    `throwIf(${count} > ${cap}, '${authchainTooWideCode}: an identity-output tree has more than ${cap} branches (authchain_branches cap per base); ask for authchains(node:) or a narrower base') = 0`;
+  const across = `SELECT a_base, a_cur, a_len, a_path, a_phase, a_start
+    FROM (SELECT e.b_base AS a_base, if(e.b_kind = 2, p.p_path[e.b_j], e.b_kid) AS a_cur,
+      if(e.b_kind = 2, e.b_j, e.b_j + 1) AS a_len,
+      if(e.b_kind = 2, arraySlice(p.p_path, 1, e.b_j), arrayPushBack(arraySlice(p.p_path, 1, e.b_j), e.b_kid)) AS a_path,
+      toUInt8(if(e.b_kind = 2 OR e.b_j + 1 >= ${max}, 2, 0)) AS a_phase, toUInt64(1) AS a_start,
+      count() OVER (PARTITION BY e.b_base) AS a_new
     FROM (${branches} UNION ALL ${terminals}) AS e
-    INNER JOIN (${paths(1)}) AS p ON p.p_base = e.b_base AND p.p_pid = e.b_pid`;
+    INNER JOIN (${paths(1)}) AS p ON p.p_base = e.b_base AND p.p_pid = e.b_pid)
+    WHERE ${tooWide('a_new')}`;
   return `SELECT * FROM ${c.sql.cte(
     'authchain_branches',
     `WITH RECURSIVE walk AS (
@@ -642,9 +659,12 @@ export const authchainBranchesSql = (c: Ctx, link: string) => {
       UNION ALL ${along}
       UNION ALL ${across}
     )
-    SELECT DISTINCT base, cur AS head, len AS length, path, len < ${max} AS unspent,
-      sipHash64(path) AS branch
-    FROM walk WHERE phase = 2`
+    SELECT base, head, length, path, unspent, branch
+    FROM (SELECT *, count() OVER (PARTITION BY base) AS paths_of_base
+      FROM (SELECT DISTINCT base, cur AS head, len AS length, path, len < ${max} AS unspent,
+          sipHash64(path) AS branch
+        FROM walk WHERE phase = 2))
+    WHERE ${tooWide('paths_of_base')}`
   )}`;
 };
 

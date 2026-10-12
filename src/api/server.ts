@@ -195,6 +195,8 @@ export interface ApiOptions {
   agentUrl?: string;
   /** Rows one root statement may return (R33). */
   maxResultRows?: number;
+  /** `authchain_branches` per base (default 1,000): above it, AUTHCHAIN_TOO_WIDE. */
+  authchainMaxBranches?: number;
   /** Server-side time budget per statement class (db.ts `defaultStatementTimeouts`). */
   statementTimeouts?: Partial<StatementTimeouts>;
   /**
@@ -211,6 +213,9 @@ export const createApi = (
   const db = new ApiDb(client);
   if (options.maxResultRows !== undefined) {
     db.maxResultRows = options.maxResultRows;
+  }
+  if (options.authchainMaxBranches !== undefined) {
+    db.authchainMaxBranches = options.authchainMaxBranches;
   }
   db.timeouts = { ...db.timeouts, ...options.statementTimeouts };
   db.utxoSetPolicy = { ...db.utxoSetPolicy, ...options.utxoSet };

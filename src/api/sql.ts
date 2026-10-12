@@ -67,6 +67,12 @@ export const defaultUtxoSetPolicy: UtxoSetPolicy = {
   maxLagRows: defaultUtxoSetMaxLagRows,
 };
 
+/** Default cap of `authchain_branches` per base (`Sql.authchainMaxBranches`). */
+export const defaultAuthchainMaxBranches = 1_000;
+
+/** The error code (and message prefix) of a tree over the cap. */
+export const authchainTooWideCode = 'AUTHCHAIN_TOO_WIDE';
+
 const clientParamPattern = /^p\d+$/u;
 const extraNodeParamPattern = /^(?:node|visible)_\d+$/u;
 
@@ -119,6 +125,13 @@ export class Sql {
   ) {
     this.params = { ...snapshotParams(snapshot) };
   }
+
+  /**
+   * Branches `authchain_branches` may build per base (owner decision
+   * 2026-10-12): above it the statement fails with AUTHCHAIN_TOO_WIDE
+   * instead of returning a truncated tree (`CHAINGRAPH_API_AUTHCHAIN_MAX_BRANCHES`).
+   */
+  authchainMaxBranches = defaultAuthchainMaxBranches;
 
   /**
    * A node's internal id by name, for filter-level `accepted_by` (the

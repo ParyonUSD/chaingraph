@@ -2056,7 +2056,13 @@ const liveEnv = (
   snapshot: VisibilitySnapshot,
   nodeName: string
 ): RootEnv => ({
-  ...singleNodeEnv(snapshot, nodeName, db.maxResultRows, db.utxoSetPolicy),
+  ...singleNodeEnv(
+    snapshot,
+    nodeName,
+    db.maxResultRows,
+    db.utxoSetPolicy,
+    db.authchainMaxBranches
+  ),
   db,
 });
 

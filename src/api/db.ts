@@ -30,6 +30,8 @@ import { maxAuthchainDepth } from './model.js';
 import type { UtxoSetPolicy } from './sql.js';
 import {
   acceptanceWindowRows,
+  authchainTooWideCode,
+  defaultAuthchainMaxBranches,
   defaultUtxoSetMaxLagRows,
   defaultUtxoSetPolicy,
   Sql,
@@ -98,6 +100,28 @@ export const utxoSetPolicyFromEnv = (
   }
   return { enabled: flag !== 'off', maxLagRows };
 };
+
+/**
+ * The `authchain_branches` cap per base from the environment:
+ * CHAINGRAPH_API_AUTHCHAIN_MAX_BRANCHES (default 1,000; owner decision
+ * 2026-10-12).
+ */
+export const authchainMaxBranchesFromEnv = (
+  env: NodeJS.ProcessEnv = process.env
+) => {
+  const raw = env.CHAINGRAPH_API_AUTHCHAIN_MAX_BRANCHES;
+  if (raw === undefined || raw === '') return defaultAuthchainMaxBranches;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(
+      'CHAINGRAPH_API_AUTHCHAIN_MAX_BRANCHES must be an integer >= 1.'
+    );
+  }
+  return value;
+};
+
+/** ClickHouse FUNCTION_THROW_IF_VALUE_IS_NON_ZERO (`throwIf`). */
+const throwIfCode = '395';
 
 /** Added to the longest budget for the client's own request timeout, so the server's error arrives first. */
 export const requestTimeoutMarginMs = 5_000;
@@ -249,6 +273,9 @@ export class ApiDb {
   /** Server-side time budget per statement class (`max_execution_time`). */
   timeouts: StatementTimeouts = { ...defaultStatementTimeouts };
 
+  /** `authchain_branches` cap per base (`authchainMaxBranchesFromEnv`). */
+  authchainMaxBranches = defaultAuthchainMaxBranches;
+
   /** Stored UTXO set use (`utxoSetPolicyFromEnv`). */
   utxoSetPolicy: UtxoSetPolicy = { ...defaultUtxoSetPolicy };
 
@@ -312,6 +339,21 @@ export class ApiDb {
         { retryTimeouts: false }
       )
       .catch((error: unknown) => {
+        if (
+          error instanceof ClickHouseError &&
+          error.code === throwIfCode &&
+          error.message.includes(`${authchainTooWideCode}:`)
+        ) {
+          const start = error.message.indexOf(`${authchainTooWideCode}:`);
+          const end = error.message.indexOf(': while executing', start);
+          throw new GraphQLError(
+            `${label}: ${error.message.slice(
+              start,
+              end < 0 ? undefined : end
+            )}`,
+            { extensions: { code: authchainTooWideCode } }
+          );
+        }
         const timedOut =
           (error instanceof ClickHouseError &&
             error.code === timeoutExceededCode) ||
@@ -386,7 +428,8 @@ export const singleNodeEnv = (
   snapshot: VisibilitySnapshot,
   nodeName: string | undefined,
   maxRows?: number,
-  utxoSetPolicy?: UtxoSetPolicy
+  utxoSetPolicy?: UtxoSetPolicy,
+  authchainMaxBranches?: number
 ): StatementEnv => {
   const sql = new Sql(snapshot, new Map(), utxoSetPolicy);
   const nodeId = (name: string) => {
@@ -399,6 +442,9 @@ export const singleNodeEnv = (
     return snapshot.nodeId;
   };
   sql.nodeIdOf = nodeId;
+  if (authchainMaxBranches !== undefined) {
+    sql.authchainMaxBranches = authchainMaxBranches;
+  }
   return {
     ctx: {
       maxRows,
@@ -469,7 +515,8 @@ export class PinnedSnapshot {
         this.preset,
         this.nodeNames[0],
         this.db.maxResultRows,
-        this.db.utxoSetPolicy
+        this.db.utxoSetPolicy,
+        this.db.authchainMaxBranches
       );
     }
     const snapshot = await this.get(node);
@@ -484,6 +531,7 @@ export class PinnedSnapshot {
       return id;
     };
     sql.nodeIdOf = nodeId;
+    sql.authchainMaxBranches = this.db.authchainMaxBranches;
     return {
       ctx: {
         maxRows: this.db.maxResultRows,

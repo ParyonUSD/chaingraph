@@ -873,5 +873,8 @@ and X4 26 → 32 (now 117 and 24). Headers of the document files hold the stage-
    the shared prefix per branch. The depth limit (100,000) bounds each path and the row cap (500,000) the rows
    returned, but nothing bounds the number of branches the walk builds. Acceptable for an explorer feature, or cap
    the branches per base (e.g. 1,000, with an error above it)?
+   **Owner decision 2026-10-12:** cap at 1,000 branches per base (`CHAINGRAPH_API_AUTHCHAIN_MAX_BRANCHES`). Above it
+   the field fails with `AUTHCHAIN_TOO_WIDE` naming the cap, never a truncated tree; the walk itself stops at the
+   first step that creates more new paths for one base than the cap. See [fix-pass-4.md](fix-pass-4.md) §2.
 6. Still open from stage 2: send_transaction through the agent (§7 question 3), the authchain index on mainnet
    (§7 question 5); unspent at query time on mainnet (§9.4) depends on the UTXO-table / maintained-total decision.

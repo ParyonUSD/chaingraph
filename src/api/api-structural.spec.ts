@@ -547,5 +547,62 @@ e2e(
       chain!.two.map((c) => c.migrations.map((m) => m.transaction_hash)),
       [[shared.hash, m2.hash]]
     );
+
+    /*
+     * ---- the authchain_branches cap per base (owner decision 2026-10-12) ----
+     * Above it: AUTHCHAIN_TOO_WIDE naming the cap, never a truncated tree; at
+     * or under it the full tree.
+     */
+    const branchesOf = `query($hashes: [Hex!]!) {
+      transactions_by_hash(hashes: $hashes) { hash branches: authchain_branches { authhead_transaction_hash } }
+    }`;
+    for (const [cap, fits] of [
+      [1, false],
+      [2, true],
+    ] as const) {
+      const capped = createApi(client, { authchainMaxBranches: cap });
+      const cappedServer = await listen(capped);
+      const response = await fetch(cappedServer.url, {
+        body: JSON.stringify({
+          query: branchesOf,
+          variables: { hashes: [shared.hash, c0.hash] },
+        }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      });
+      const body = (await response.json()) as {
+        data?: {
+          transactions_by_hash: {
+            hash: string;
+            branches: { authhead_transaction_hash: string }[];
+          }[];
+        } | null;
+        errors?: { message: string; extensions?: { code?: string } }[];
+      };
+      await cappedServer.close();
+      if (fits) {
+        t.is(body.errors, undefined, `cap ${cap}: no error`);
+        t.deepEqual(
+          body
+            .data!.transactions_by_hash.find((row) => row.hash === shared.hash)!
+            .branches.map((branch) => branch.authhead_transaction_hash)
+            .sort(),
+          [m1.hash, m2.hash].sort(),
+          `cap ${cap}: the whole tree`
+        );
+      } else {
+        t.is(body.errors?.[0]?.extensions?.code, 'AUTHCHAIN_TOO_WIDE');
+        t.regex(
+          body.errors?.[0]?.message ?? '',
+          /more than 1 branches/u,
+          'the message names the cap'
+        );
+        t.is(
+          body.data?.transactions_by_hash ?? null,
+          null,
+          'no truncated tree'
+        );
+      }
+    }
   }
 );
