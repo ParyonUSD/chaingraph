@@ -62,7 +62,10 @@ test('client values are bound as pN parameters, never in SQL text; snapshot para
     Object.keys(sql.params)
       .filter((name) => !isClientParamName(name))
       .sort(),
-    [...snapshotParameterNames].sort()
+    [...snapshotParameterNames]
+      .filter((name) => !name.startsWith('utxo'))
+      .sort(),
+    'no stored UTXO set mark: no utxo parameters'
   );
   t.is(sql.params.visible, 5n);
   t.is(sql.params.node, 3);
@@ -72,6 +75,54 @@ test('client values are bound as pN parameters, never in SQL text; snapshot para
     (match) => match[1]!
   );
   t.true(placeholders.every((name) => name in sql.params));
+});
+
+test('stored UTXO set: the mark is bound as snapshot parameters; client values stay pN parameters; the plan follows the policy and the lag', (t) => {
+  const marked: VisibilitySnapshot = {
+    ...snapshot,
+    utxo: { generation: 2, lagCommits: 1, lagRows: 10, watermark: 4n },
+  };
+  const sql = new Sql(marked);
+  const rows = unspentOutputRows(sql, {
+    locking_bytecode: { _eq: hostileHex },
+    token_category: { _eq: 'aa'.repeat(32) },
+  });
+  const text = `${sql.withClause()}${rows.source}`;
+  t.true(text.includes('FROM utxo_set'), 'the stored set');
+  t.true(text.includes('utxo_touched'), 'with the correction (lag 1)');
+  t.false(text.includes(hostileHex));
+  t.false(text.includes('aa'.repeat(32)));
+  t.deepEqual(
+    Object.keys(sql.params)
+      .filter((name) => !isClientParamName(name))
+      .sort(),
+    [...snapshotParameterNames].sort()
+  );
+  t.is(sql.params.utxo, 4n);
+  t.is(sql.params.utxo_generation, 2);
+  const placeholders = [...text.matchAll(/\{(\w+):/gu)].map(
+    (match) => match[1]!
+  );
+  t.true(placeholders.every((name) => name in sql.params));
+  /* caught up: no correction */
+  const caughtUp = new Sql({
+    ...snapshot,
+    utxo: { generation: 2, lagCommits: 0, lagRows: 0, watermark: 5n },
+  });
+  t.false(
+    `${caughtUp.withClause()}${
+      unspentOutputRows(caughtUp, {}).source
+    }`.includes('utxo_touched')
+  );
+  /* above the plan bound, the policy off, or another node: query time */
+  [
+    new Sql(marked, new Map(), { enabled: true, maxLagRows: 9 }),
+    new Sql(marked, new Map(), { enabled: false, maxLagRows: 100_000 }),
+  ].forEach((other) => {
+    t.false(unspentOutputRows(other, {}).source.includes('utxo_set'));
+  });
+  t.false(sql.storedUtxoSet(4), 'only the primary node has a mark');
+  t.true(sql.storedUtxoSet(3));
 });
 
 test('commitment equality and _in add p_category key conditions (planning-floor.md); negated filters do not', (t) => {

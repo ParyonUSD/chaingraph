@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-magic-numbers, camelcase, @typescript-eslint/naming-convention, functional/no-loop-statement, functional/no-let, no-await-in-loop, @typescript-eslint/require-array-sort-compare, complexity, max-params, functional/no-throw-statement, sort-keys, require-atomic-updates */
-// cspell:ignore clickhouse
+// cspell:ignore clickhouse utxoset
 /**
  * Phase 2 G2 (docs/clickhouse-port/phase2-api.md): every scalar operator
  * (R9), the boolean combinators incl. NOT EXISTS and OR of EXISTS (R10),

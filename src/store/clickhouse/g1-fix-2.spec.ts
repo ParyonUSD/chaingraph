@@ -92,8 +92,8 @@ const partCleanup = [
 
 test('the DDL sets the part cleanup settings on every table (fix pass 3)', (t) => {
   const settings = ddlTableSettings();
-  // 19 tables (pending_spend and the stand-in tables were removed with input's spent-output columns), plus spend, spend_orphan, spend_watermark and authchain_link
-  t.is(settings.size, 23);
+  // 19 tables (pending_spend and the stand-in tables were removed with input's spent-output columns), plus spend, spend_orphan, spend_watermark and authchain_link, plus utxo_set, utxo_total and utxo_watermark
+  t.is(settings.size, 26);
   const wrong = [...settings].flatMap(([table, values]) =>
     partCleanup
       .filter(([name, value]) => values.get(name) !== value)
