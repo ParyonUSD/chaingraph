@@ -154,8 +154,8 @@ e2e(
 
     t.deepEqual(
       await env.api.db.storeFeatures(),
-      { acceptanceByIdProjection: true },
-      'the projection is noticed'
+      { acceptanceByIdProjection: true, utxoSet: true },
+      'the projection (and the stored UTXO set tables) are noticed'
     );
     const recorder = recordQueries(env.api);
     await env.gql(
