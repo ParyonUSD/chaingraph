@@ -37,6 +37,14 @@ import {
   applyClickHouseDdl,
   dropClickHouseDatabase,
 } from '../store/clickhouse/ddl-apply.js';
+import {
+  checkUtxoSet,
+  publishedUtxoMarks,
+} from '../store/clickhouse/utxo-set.js';
+import {
+  readSnapshotMulti,
+  snapshotForNode,
+} from '../store/clickhouse/visibility.js';
 import { eventually, eventuallyEqual, readTwice } from '../store/eventually.js';
 import type { ChaingraphTransaction } from '../types/chaingraph.js';
 
@@ -2495,6 +2503,72 @@ serialTest('[e2e] records stale blocks', async (t) => {
   t.pass();
 });
 /* eslint-enable @typescript-eslint/no-magic-numbers */
+
+/**
+ * ClickHouse: the agent's stored UTXO set (docs/clickhouse-port/utxo-async.md,
+ * maintained off the commit path) after the re-orgs above: for every node, the
+ * read rule at the current snapshot (whatever the maintainer's lag) and at the
+ * node's newest published marks equals the query-time definition, totals
+ * included, and the stored rows keep their invariant.
+ */
+/* eslint-disable functional/no-loop-statement, no-await-in-loop, @typescript-eslint/no-magic-numbers */
+(isClickHouseE2e ? test.serial : test.skip)(
+  '[e2e] [clickhouse] stored UTXO set after the re-orgs: exact per node at the snapshot and at its published marks',
+  async (t) => {
+    t.timeout(clickHouseTestTimeoutMs);
+    const store = clickHouseClient!;
+    const nodes = await store.query<{ id: number; name: string }>(
+      'SELECT internal_id AS id, name FROM node FINAL ORDER BY id'
+    );
+    t.true(nodes.length >= 3);
+    for (const node of nodes) {
+      const id = Number(node.id);
+      /* the maintainer has published a set for the node (a build or a replay) */
+      const own = await eventually(async () => checkUtxoSet(store, id), {
+        isDone: (check) => check !== undefined,
+        timeoutMs: syncTimeoutMs,
+      });
+      const snapshot = snapshotForNode(
+        await readSnapshotMulti(store, [id], { utxo: true }),
+        id
+      );
+      const marks = (
+        await publishedUtxoMarks(store, id, snapshot.visible)
+      ).slice(-3);
+      const checks = [
+        own,
+        ...(await Promise.all(
+          marks.map(async (mark) => checkUtxoSet(store, id, mark))
+        )),
+      ];
+      for (const check of checks) {
+        t.deepEqual(
+          {
+            extra: check!.extra,
+            invariant: check!.invariant,
+            mismatched: check!.mismatched,
+            missing: check!.missing,
+            totalsEqual: check!.totalsEqual,
+          },
+          {
+            extra: [],
+            invariant: [],
+            mismatched: [],
+            missing: [],
+            totalsEqual: true,
+          },
+          `${node.name} at U=${check!.watermark} g${check!.generation}`
+        );
+      }
+      t.log(
+        `${node.name}: ${own!.count} unspent outputs; ${
+          checks.length
+        } reads exact`
+      );
+    }
+  }
+);
+/* eslint-enable functional/no-loop-statement, no-await-in-loop, @typescript-eslint/no-magic-numbers */
 
 // eslint-disable-next-line @typescript-eslint/no-magic-numbers
 const doubleSpendSaveTimeoutMs = Math.max(visibleTimeoutMs, 5_000);

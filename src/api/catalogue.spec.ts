@@ -1,4 +1,4 @@
-/* eslint-disable functional/no-loop-statement, no-await-in-loop, @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-try-statement, no-negated-condition, camelcase, prefer-named-capture-group, @typescript-eslint/require-array-sort-compare */
+/* eslint-disable functional/no-loop-statement, no-await-in-loop, @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-try-statement, no-negated-condition, camelcase, prefer-named-capture-group, @typescript-eslint/require-array-sort-compare, complexity, functional/no-let */
 // cspell:ignore clickhouse chipnet
 /**
  * `[e2e] [chipnet]`: every document of the v2 catalogue (L1–L47, X1–X16)
@@ -50,6 +50,16 @@ run(
       adminSecret: process.env.CHAINGRAPH_API_V1_ADMIN_SECRET ?? '',
       url: v1Url!,
     };
+    /* statements that read the stored UTXO set (utxo-async.md), when the database keeps one */
+    let storedSetReads = 0;
+    api.db.onQuery = (event) => {
+      if (event.kind === 'data' && event.sql.includes('FROM utxo_set')) {
+        storedSetReads += 1;
+      }
+    };
+    const [marks] = await client
+      .query<{ n: string }>('SELECT toString(count()) AS n FROM utxo_watermark')
+      .catch(() => [{ n: '0' }]);
     try {
       for (const entry of loadCatalogue()) {
         const result = await runEntry(api, endpoint, entry);
@@ -68,6 +78,17 @@ run(
             `${entry.id}: ${result.equality}`
           );
         }
+      }
+      t.log(
+        `${storedSetReads} statements read the stored UTXO set (${
+          marks?.n ?? '0'
+        } published marks)`
+      );
+      if (
+        Number(marks?.n ?? '0') > 0 &&
+        process.env.CHAINGRAPH_API_UTXO_SET !== 'off'
+      ) {
+        t.true(storedSetReads > 0, 'the unspent documents read the stored set');
       }
     } finally {
       await client.close();
