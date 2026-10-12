@@ -477,8 +477,17 @@ SELECT encode(transaction.hash, 'hex') AS "hash",
 };
 
 /**
- * Archive a single node_transaction row. Existing history triggers handle any
- * same-node descendants with the same replaced_at timestamp.
+ * Archive a single expired node_transaction row. Existing history triggers
+ * handle any same-node descendants with the same replaced_at timestamp.
+ *
+ * The row is left in place (archivedCount 0) if the transaction, or a
+ * conflicting spend of one of its outpoints, is already in a block accepted by
+ * the same node: {@link archiveMempoolTransactionsAcceptedByBlocks} archives
+ * those with the correct replaced_at (NULL or the block's accepted_at). The
+ * guard is part of the DELETE so it is evaluated against the row being
+ * archived, not a read taken earlier: a row inserted after the agent's
+ * accepted-block archive but before its expiry scan would otherwise be
+ * archived as expired/replaced even though it is confirmed.
  */
 export const archiveMempoolTransaction = async ({
   nodeInternalId,
@@ -500,6 +509,29 @@ WITH deleted_row AS (
     DELETE FROM node_transaction
       WHERE node_internal_id = $1
         AND transaction_internal_id = $2
+        AND NOT EXISTS (
+          SELECT 1
+            FROM block_transaction
+            JOIN node_block
+              ON node_block.node_internal_id = $1
+             AND node_block.block_internal_id = block_transaction.block_internal_id
+            WHERE block_transaction.transaction_internal_id = $2
+        )
+        AND NOT EXISTS (
+          SELECT 1
+            FROM input mempool_input
+            JOIN input accepted_input
+              ON accepted_input.outpoint_transaction_hash = mempool_input.outpoint_transaction_hash
+             AND accepted_input.outpoint_index = mempool_input.outpoint_index
+             AND accepted_input.transaction_internal_id != $2
+            JOIN block_transaction
+              ON block_transaction.transaction_internal_id = accepted_input.transaction_internal_id
+            JOIN node_block
+              ON node_block.node_internal_id = $1
+             AND node_block.block_internal_id = block_transaction.block_internal_id
+            WHERE mempool_input.transaction_internal_id = $2
+              AND mempool_input.outpoint_transaction_hash != '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
+        )
       RETURNING node_internal_id,
                 transaction_internal_id,
                 validated_at,

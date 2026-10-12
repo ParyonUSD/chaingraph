@@ -1201,7 +1201,7 @@ export class Agent {
     });
     if (archivedCount === 0) {
       this.logger.debug(
-        `Agent: skipped expiry of mempool transaction ${transaction.hash} for node ${transaction.nodeName}; it has already left node_transaction.`
+        `Agent: skipped expiry of mempool transaction ${transaction.hash} for node ${transaction.nodeName}; it has already left node_transaction, or it (or a conflicting spend) is in a block accepted by the node and is left for the accepted-block archive.`
       );
       return;
     }
