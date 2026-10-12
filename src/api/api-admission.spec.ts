@@ -213,12 +213,15 @@ test('admission: lane sizes from the ClickHouse server cores', (t) => {
     'the static defaults are the 48-core sizes'
   );
   t.deepEqual(laneConcurrencyForCores(96, 8), { heavy: 12, light: 48 });
-  t.deepEqual(laneConcurrencyForCores(14, 8), { heavy: 1, light: 8 });
-  t.deepEqual(laneConcurrencyForCores(4, 8), { heavy: 1, light: 8 });
+  t.deepEqual(laneConcurrencyForCores(14, 8), { heavy: 2, light: 8 });
+  t.deepEqual(laneConcurrencyForCores(11, 8), { heavy: 1, light: 8 });
+  t.deepEqual(laneConcurrencyForCores(3, 8), { heavy: 1, light: 8 });
   t.deepEqual(laneConcurrencyForCores(48, 0), { heavy: 1, light: 24 });
   const fromServer = admissionOptionsFromEnv({}, 32);
   t.is(fromServer.light.maxConcurrent, 16);
   t.is(fromServer.heavy.maxConcurrent, 4);
+  t.is(fromServer.heavy.maxQueued, 16, 'heavy queue: 4 per slot');
+  t.is(fromServer.light.maxQueued, 256);
   t.deepEqual(fromServer.sizing, { cores: 32, source: 'clickhouse' });
   const envCores = admissionOptionsFromEnv(
     { CHAINGRAPH_API_CLICKHOUSE_CORES: '64' },

@@ -70,19 +70,25 @@ export const lightConcurrentPerCore = 0.5;
 /** The light lane never gets fewer slots than this (small servers). */
 export const minLightConcurrent = 8;
 
+/** Heavy queue length per heavy slot when the sizes are derived (24 at 6 slots). */
+export const heavyQueuedPerSlot = 4;
+
 /** Heavy statements' `max_threads` unless CHAINGRAPH_API_HEAVY_MAX_THREADS says otherwise. */
 export const defaultHeavyMaxThreads = 8;
 
 /**
  * Lane sizes from the ClickHouse server's cores (owner decision 2026-10-12,
- * fix-pass-4.md §8): heavy = max(1, floor(cores / heavy max_threads)), so
+ * fix-pass-4.md §8): heavy = max(1, round(cores / heavy max_threads)), so
  * the heavy lane at full occupancy asks for about every core once and no
- * more (a heavy statement is CPU bound and uses all its threads); light =
+ * more (a heavy statement is CPU bound and uses all its threads; rounding,
+ * not flooring, keeps two heavy slots on a 14-core server where one left
+ * half the cores idle in the local overload test, fix-pass-5.md); light =
  * max(8, floor(cores × 0.5)): light statements are point and range lookups
  * of ~40–60 ms, mostly one thread and partly waiting on marks and reads, so
  * half a slot per core keeps them below the core count while heavy ones run
  * (they also have the higher `priority`). At 48 cores: 24 light, 6 heavy ×
- * 8 threads, the measured defaults. `heavyMaxThreads` 0 (the server's
+ * 8 threads, the measured defaults. The heavy queue is then 4 per heavy
+ * slot (24 at 6). `heavyMaxThreads` 0 (the server's
  * default, i.e. every core) gives one heavy slot.
  */
 export const laneConcurrencyForCores = (
@@ -92,7 +98,7 @@ export const laneConcurrencyForCores = (
   const usableCores = Math.max(1, Math.floor(cores));
   const threads = heavyMaxThreads > 0 ? heavyMaxThreads : usableCores;
   return {
-    heavy: Math.max(1, Math.floor(usableCores / threads)),
+    heavy: Math.max(1, Math.round(usableCores / threads)),
     light: Math.max(
       minLightConcurrent,
       Math.floor(usableCores * lightConcurrentPerCore)
@@ -232,6 +238,14 @@ export const admissionOptionsFromEnv = (
         : {
             ...defaults,
             maxConcurrent: name === 'HEAVY' ? derived.heavy : derived.light,
+            /*
+             * the heavy queue holds about 4 statements per slot (24 at 6):
+             * a deeper queue only turns fast refusals into 10 s waits
+             */
+            maxQueued:
+              name === 'HEAVY'
+                ? derived.heavy * heavyQueuedPerSlot
+                : defaults.maxQueued,
           };
     const limits: LaneLimits = {
       maxConcurrent: nonNegativeInteger(

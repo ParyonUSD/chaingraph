@@ -69,6 +69,30 @@ curl -s http://localhost:18123/ping   # Ok.
 
 Stop/start: `docker stop ch1-pg ch1-local` / `docker start ch1-pg ch1-local`.
 
+### The API's ClickHouse user (backstop, fix-pass-5.md)
+
+The API should read as its own user whose profile carries the
+`max_concurrent_queries_for_user` backstop (`pods × 30 + 10`). The local
+server has SQL access management (`CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1`), so
+create it with SQL (idempotent; re-run with another pod count to change the
+limit):
+
+```sh
+yarn build
+CHAINGRAPH_CLICKHOUSE_URL=http://localhost:18123 \
+CHAINGRAPH_CLICKHOUSE_DATABASE=cg \
+CHAINGRAPH_CLICKHOUSE_API_USER=chaingraph_api \
+CHAINGRAPH_CLICKHOUSE_API_PASSWORD=local_api_password \
+CHAINGRAPH_CLICKHOUSE_API_PODS=1 \
+  yarn clickhouse:api-user apply      # `sql` / `xml` print instead
+```
+
+Then start the API with `CHAINGRAPH_CLICKHOUSE_USER=chaingraph_api
+CHAINGRAPH_CLICKHOUSE_PASSWORD=local_api_password`; its first log line
+(`admission: … max_concurrent_queries_for_user=40`) shows the limit it sees and
+the lane sizes it derived from the server's cores. Config-file servers
+(Kubernetes) mount the `xml` output into `users.d` instead.
+
 ## Env vars
 
 ```sh
