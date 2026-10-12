@@ -35,7 +35,7 @@
  */
 import { fillAuthchainLinks } from './authchain-index.js';
 import type { ClickHouseClient } from './client.js';
-import { validCommitSql } from './utxo.js';
+import { notCoinbaseOutpointSql, validCommitSql } from './utxo.js';
 import { nodeAgnosticId, readWatermark } from './visibility.js';
 
 /** A progress report of the filler (logged by the store, `spend_index_progress`). */
@@ -73,8 +73,6 @@ export interface SpendIndexOptions {
   onError?: (error: unknown) => void;
 }
 
-const zeroHash = "toFixedString(unhex(repeat('00', 32)), 32)";
-
 export const spendColumns = [
   'transaction_hash',
   'input_index',
@@ -107,7 +105,7 @@ const batchInputsSql = `SELECT transaction_hash, input_index, transaction_intern
     outpoint_index, commit_seq
   FROM input
   WHERE commit_seq > {from:UInt64} AND commit_seq <= {to:UInt64}
-    AND outpoint_transaction_hash != ${zeroHash}
+    AND ${notCoinbaseOutpointSql()}
     AND ${validCommitSql()}`;
 
 /** Outputs stored at or below `to` (valid) spent by the batch's inputs, by primary key. */
@@ -117,7 +115,7 @@ const spentOutputsSql = `SELECT transaction_hash, output_index, value_satoshis, 
   WHERE (transaction_hash, output_index) IN (
       SELECT outpoint_transaction_hash, outpoint_index FROM input
       WHERE commit_seq > {from:UInt64} AND commit_seq <= {to:UInt64}
-        AND outpoint_transaction_hash != ${zeroHash}
+        AND ${notCoinbaseOutpointSql()}
         AND ${validCommitSql()})
     AND commit_seq <= {to:UInt64}
     AND ${validCommitSql()}`;

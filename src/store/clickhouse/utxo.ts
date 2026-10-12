@@ -263,6 +263,20 @@ export const encodeUtxoRows = (
 };
 
 /**
+ * "Not a coinbase input" (`column` is an input's outpoint_transaction_hash,
+ * all zero bytes for a coinbase), written so that ClickHouse cannot match
+ * it against a primary key. A plain `column != zero` is a NOT IN condition on
+ * the leading key column of `input.p_outpoint`; ClickHouse checks it against
+ * every mark of that projection (it excludes nothing) while choosing a
+ * projection, before it reads the base table: at synthetic scale (2.9 M
+ * marks) 0.8 s of CPU and ~0.2 s of wall per input read; golden has ~8 M
+ * (fix-pass-4.md §3c). `identity()` does not hide it (26.8 looks through
+ * it); the `toString` round trip is exact for FixedString(32).
+ */
+export const notCoinbaseOutpointSql = (column = 'outpoint_transaction_hash') =>
+  `toFixedString(toString(${column}), 32) != toFixedString(unhex(repeat('00', 32)), 32)`;
+
+/**
  * The visibility gate's "valid commit" test for writer-side reads of base
  * tables: not void (aborted) and not fenced. `{fence:Array(UInt64)}` is the
  * dense per-epoch fence array the writer loaded at init (only the lease
@@ -328,7 +342,7 @@ WITH
     SELECT i.outpoint_transaction_hash AS spent_hash, i.outpoint_index AS spent_index, d.d AS d
     FROM input AS i INNER JOIN deltas AS d ON i.transaction_hash = d.transaction_hash
     WHERE i.transaction_hash IN (SELECT transaction_hash FROM deltas)
-      AND i.outpoint_transaction_hash != toFixedString(unhex(repeat('00', 32)), 32)
+      AND ${notCoinbaseOutpointSql('i.outpoint_transaction_hash')}
       AND ${validCommitSql('i.commit_seq')}
   ),
   created AS (SELECT transaction_hash FROM deltas WHERE d = 1)

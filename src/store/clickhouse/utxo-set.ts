@@ -45,6 +45,7 @@ import type {
   QueryParams,
 } from './client.js';
 import { nextBatchEnd } from './spend-index.js';
+import { notCoinbaseOutpointSql } from './utxo.js';
 import type { MultiNodeSnapshot, VisibilitySnapshot } from './visibility.js';
 import {
   inlinePinnedView,
@@ -1698,7 +1699,7 @@ export class UtxoSetMaintainer {
         `INSERT INTO utxo_build_spent (node_internal_id, generation, outpoint_transaction_hash, outpoint_index)
          SELECT {node:UInt32}, {generation:UInt32}, outpoint_transaction_hash, outpoint_index FROM input
          WHERE ${slice.replaceAll('COLUMN', 'transaction_hash')}
-           AND outpoint_transaction_hash != ${zeroHash} AND ${agnostic}
+           AND ${notCoinbaseOutpointSql()} AND ${agnostic}
            AND transaction_hash IN (${accepted(slice)})`,
         params,
         {

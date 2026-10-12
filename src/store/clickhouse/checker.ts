@@ -50,6 +50,7 @@ import type {
 
 import type { ClickHouseClient, QueryParams } from './client.js';
 import { quoteIdentifier } from './client.js';
+import { notCoinbaseOutpointSql } from './utxo.js';
 import {
   gateSql,
   nodeAgnosticId,
@@ -874,7 +875,7 @@ export class ClickHouseChecker implements StoreChecker {
        FROM (SELECT transaction_hash, input_index, outpoint_transaction_hash, outpoint_index, commit_seq
              FROM ${this.view('input_at')}
              WHERE commit_seq <= {spend:UInt64}
-               AND outpoint_transaction_hash != toFixedString(unhex(repeat('00', 32)), 32)) AS i
+               AND ${notCoinbaseOutpointSql()}) AS i
        INNER JOIN (SELECT * FROM ${this.view(
          'output_at'
        )} WHERE commit_seq <= {spend:UInt64}) AS o
