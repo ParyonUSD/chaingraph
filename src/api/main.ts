@@ -12,18 +12,34 @@
  *   documents (by sha256), CHAINGRAPH_API_TRUSTED_DOCUMENTS_ONLY=true runs
  *   nothing else;
  * - CHAINGRAPH_API_AGENT_URL=<agent internal API> enables send_transaction;
- * - CHAINGRAPH_API_MAX_RESULT_ROWS caps the rows of one root statement.
+ * - CHAINGRAPH_API_MAX_RESULT_ROWS caps the rows of one root statement;
+ * - CHAINGRAPH_API_QUERY_TIMEOUT_MS (default 60000) is the server-side time
+ *   budget of a data statement, CHAINGRAPH_API_AGGREGATE_TIMEOUT_MS (default
+ *   30000, at most the former unless set) that of an aggregate / group-by
+ *   statement; over budget, ClickHouse stops the statement and the API
+ *   answers a QUERY_TIMEOUT error. The ClickHouse client's request timeout is
+ *   the larger budget plus a margin, and a timed-out read is not retried.
  */
-import { ClickHouseClient } from '../store/clickhouse/client.js';
+import {
+  ClickHouseClient,
+  clickHouseConfigFromEnv,
+} from '../store/clickhouse/client.js';
 
+import { requestTimeoutMarginMs, statementTimeoutsFromEnv } from './db.js';
 import { loadTrustedDocuments } from './plugins.js';
 import { createApi, listen } from './server.js';
 
 const defaultPort = 4000;
 
 const main = async () => {
-  const client = ClickHouseClient.fromEnv();
   const { env } = process;
+  const statementTimeouts = statementTimeoutsFromEnv(env);
+  const client = new ClickHouseClient({
+    ...clickHouseConfigFromEnv(env),
+    requestTimeoutMs:
+      Math.max(statementTimeouts.data, statementTimeouts.aggregate) +
+      requestTimeoutMarginMs,
+  });
   const trusted = env.CHAINGRAPH_API_TRUSTED_DOCUMENTS;
   const api = createApi(client, {
     ...(env.CHAINGRAPH_API_AGENT_URL === undefined
@@ -33,6 +49,7 @@ const main = async () => {
       ? {}
       : { maxResultRows: Number(env.CHAINGRAPH_API_MAX_RESULT_ROWS) }),
     responseCache: env.CHAINGRAPH_API_RESPONSE_CACHE === 'off' ? false : {},
+    statementTimeouts,
     ...(trusted === undefined
       ? {}
       : {

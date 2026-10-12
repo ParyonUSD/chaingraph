@@ -164,6 +164,28 @@ export const transientServerCodes: ReadonlySet<string> = new Set([
 export const isRetryable = (error: unknown) =>
   !(error instanceof ClickHouseError) || transientServerCodes.has(error.code);
 
+/**
+ * The client's own per-request timeout (`requestTimeoutMs`) fired: the
+ * statement may still be running on the server. Retrying it repeats the
+ * same work on a server that is already busy with it (golden 2026-10-11: a
+ * 300 s read was retried and both ran to the driver's limit).
+ */
+export const isRequestTimeout = (error: unknown) =>
+  error instanceof Error &&
+  !(error instanceof ClickHouseError) &&
+  error.message.startsWith('Timeout error');
+
+/** Per-read options of `ClickHouseClient.query`. */
+export interface QueryOptions {
+  /**
+   * Retry a read whose request timed out on the client (default true).
+   * The API turns it off: its statements carry a server-side
+   * `max_execution_time` and a timeout means the statement is too costly,
+   * not that the connection failed.
+   */
+  retryTimeouts?: boolean;
+}
+
 /** INSERT returns no rows: discard the response body. */
 const drain = async (stream: Readable) => {
   stream.resume();
@@ -188,7 +210,8 @@ const idempotentSettings = (
 
 const withRetries = async <T>(
   retries: number | undefined,
-  attempt: () => Promise<T>
+  attempt: () => Promise<T>,
+  retryable: (error: unknown) => boolean = isRetryable
 ): Promise<T> => {
   const maxRetries = retries ?? defaultInsertRetries;
   // eslint-disable-next-line functional/no-loop-statement, functional/no-let
@@ -197,7 +220,7 @@ const withRetries = async <T>(
       // eslint-disable-next-line no-await-in-loop
       return await attempt();
     } catch (error) {
-      if (tryIndex >= maxRetries || !isRetryable(error)) {
+      if (tryIndex >= maxRetries || !retryable(error)) {
         // eslint-disable-next-line functional/no-throw-statement
         throw error;
       }
@@ -260,23 +283,34 @@ export class ClickHouseClient {
   /**
    * Run a `SELECT`; rows are decoded from `JSONEachRow` (64-bit integers as
    * strings). Reads are idempotent: a transport or transient server error
-   * is retried (`defaultQueryRetries`, exponential backoff), as inserts are.
+   * is retried (`defaultQueryRetries`, exponential backoff), as inserts are;
+   * a client-side request timeout only when `options.retryTimeouts` is not
+   * false.
    */
   async query<T = { [key: string]: unknown }>(
     sql: string,
     params: QueryParams = {},
-    settings: ClickHouseSettings = {}
+    settings: ClickHouseSettings = {},
+    options: QueryOptions = {}
   ): Promise<T[]> {
-    return withRetries(defaultQueryRetries, async () => {
-      await this.faultBeforeRequest?.({ kind: 'query', sql });
-      const result = await this.raw.query({
-        clickhouse_settings: settings,
-        format: 'JSONEachRow',
-        query: sql,
-        query_params: params,
-      });
-      return result.json<T>();
-    });
+    const retryable =
+      options.retryTimeouts === false
+        ? (error: unknown) => !isRequestTimeout(error) && isRetryable(error)
+        : isRetryable;
+    return withRetries(
+      defaultQueryRetries,
+      async () => {
+        await this.faultBeforeRequest?.({ kind: 'query', sql });
+        const result = await this.raw.query({
+          clickhouse_settings: settings,
+          format: 'JSONEachRow',
+          query: sql,
+          query_params: params,
+        });
+        return result.json<T>();
+      },
+      retryable
+    );
   }
 
   /**

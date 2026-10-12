@@ -413,6 +413,31 @@ e2e(
       errors?: { message: string; extensions?: { code?: string } }[];
     };
     t.is(body.errors?.[0]?.extensions?.code, 'RESULT_TOO_LARGE');
+    /*
+     * statement budgets (planning-floor.md §5): over budget, ClickHouse stops
+     * the statement (max_execution_time) and the API answers QUERY_TIMEOUT
+     */
+    const budgeted = createApi(env.client, {
+      statementTimeouts: { aggregate: 1000 },
+    });
+    const recorded = recordQueries(budgeted);
+    const started = Date.now();
+    const error = await t.throwsAsync(
+      budgeted.db.query(
+        'test_aggregate',
+        'SELECT sum(cityHash64(number)) AS s FROM numbers(10000000000000)',
+        {},
+        'aggregate'
+      )
+    );
+    t.is(
+      (error as { extensions?: { code?: string } }).extensions?.code,
+      'QUERY_TIMEOUT'
+    );
+    t.regex(error!.message, /1 s limit for aggregate statements/u);
+    t.true(Date.now() - started < 20_000, 'stopped by the server budget');
+    t.is(recorded.events.length, 0, 'a failed statement is not reported');
+    recorded.stop();
   }
 );
 

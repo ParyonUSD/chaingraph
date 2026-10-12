@@ -273,7 +273,8 @@ export const runAggregate = async (
   const [row] = await env.db.query<{ [column: string]: unknown }>(
     label,
     statement,
-    env.sql.params
+    env.sql.params,
+    'aggregate'
   );
   return decodeRow(row ?? { count: '0' }, []);
 };
@@ -353,7 +354,8 @@ export const runGroups = async (
   const result = await env.db.query<{ [column: string]: unknown }>(
     label,
     statement,
-    env.sql.params
+    env.sql.params,
+    'aggregate'
   );
   const fields = keySql.map((key) => key.field);
   return {

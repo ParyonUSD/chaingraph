@@ -1,10 +1,11 @@
-/* eslint-disable camelcase, functional/no-throw-statement, @typescript-eslint/parameter-properties, @typescript-eslint/naming-convention, complexity, max-classes-per-file, @typescript-eslint/no-magic-numbers, @typescript-eslint/member-ordering */
+/* eslint-disable camelcase, functional/no-throw-statement, @typescript-eslint/parameter-properties, @typescript-eslint/naming-convention, complexity, max-classes-per-file, @typescript-eslint/no-magic-numbers, @typescript-eslint/member-ordering, max-params */
 // cspell:ignore clickhouse
 /**
  * The API's access to ClickHouse: query counters (tests assert one
  * `readSnapshot` per request and per subscription re-run, and count data
  * queries), node-name resolution, and the per-request pinned snapshot.
  */
+import { ClickHouseError } from '@clickhouse/client';
 import { GraphQLError } from 'graphql';
 
 import type {
@@ -12,6 +13,7 @@ import type {
   ClickHouseSettings,
   QueryParams,
 } from '../store/clickhouse/client.js';
+import { isRequestTimeout } from '../store/clickhouse/client.js';
 import type {
   MultiNodeSnapshot,
   VisibilitySnapshot,
@@ -32,6 +34,8 @@ import { acceptanceWindowRows, Sql } from './sql.js';
  * relationships is a `WITH page AS MATERIALIZED (…)` CTE (compile.ts).
  */
 export const dataQuerySettings = {
+  /* the client gave up (request timeout, aborted request): stop the statement too */
+  cancel_http_readonly_queries_on_client_close: 1,
   enable_materialized_cte: 1,
   /*
    * The authchain walk (model.ts) takes two recursion steps per segment end,
@@ -40,6 +44,62 @@ export const dataQuerySettings = {
    */
   max_recursive_cte_evaluation_depth: 2 * maxAuthchainDepth + 10,
 } as unknown as ClickHouseSettings;
+
+/**
+ * Statement classes with their own server-side time budget: `aggregate`
+ * (`*_aggregate` and `*_groups` roots: one statement over a whole row set,
+ * which on mainnet can be the whole chain) and `data` (everything else).
+ */
+export type StatementClass = 'aggregate' | 'data';
+
+/** Server-side time budgets (`max_execution_time`) per statement class, in ms. */
+export interface StatementTimeouts {
+  data: number;
+  aggregate: number;
+}
+
+/**
+ * Defaults: a data statement may take a minute (golden mainnet worst
+ * catalogue statement: X16 8 s warm, L33 16 s cold); an aggregate 30 s
+ * (golden: the whole-chain UTXO count ran 1,171 s and, through the API,
+ * timed out at 300 s and was retried, doubling the load).
+ */
+export const defaultStatementTimeouts: StatementTimeouts = {
+  aggregate: 30_000,
+  data: 60_000,
+};
+
+/** Added to the longest budget for the client's own request timeout, so the server's error arrives first. */
+export const requestTimeoutMarginMs = 5_000;
+
+/**
+ * Budgets from the environment: CHAINGRAPH_API_QUERY_TIMEOUT_MS (data
+ * statements; default 60 s) and CHAINGRAPH_API_AGGREGATE_TIMEOUT_MS
+ * (default: the smaller of 30 s and the data budget).
+ */
+export const statementTimeoutsFromEnv = (
+  env: NodeJS.ProcessEnv = process.env
+): StatementTimeouts => {
+  const positive = (name: string) => {
+    const raw = env[name];
+    if (raw === undefined || raw === '') return undefined;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error(`${name} must be a positive number of milliseconds.`);
+    }
+    return value;
+  };
+  const data =
+    positive('CHAINGRAPH_API_QUERY_TIMEOUT_MS') ??
+    defaultStatementTimeouts.data;
+  const aggregate =
+    positive('CHAINGRAPH_API_AGGREGATE_TIMEOUT_MS') ??
+    Math.min(defaultStatementTimeouts.aggregate, data);
+  return { aggregate, data };
+};
+
+/** ClickHouse TIMEOUT_EXCEEDED (max_execution_time). */
+const timeoutExceededCode = '159';
 
 export interface ApiStats {
   /** Snapshot reads: one per request (`pinnedSnapshot`) and per live re-run (`readSnapshot`). */
@@ -144,6 +204,9 @@ export class ApiDb {
 
   private readonly snapshotCache = new SnapshotCache(this.snapshotClient);
 
+  /** Server-side time budget per statement class (`max_execution_time`). */
+  timeouts: StatementTimeouts = { ...defaultStatementTimeouts };
+
   constructor(readonly client: ClickHouseClient) {}
 
   /** Exactly one ClickHouse query: a fresh visibility snapshot of `nodeId`. */
@@ -165,9 +228,43 @@ export class ApiDb {
     return snapshot;
   }
 
-  async query<T>(label: string, sql: string, params: QueryParams) {
+  /**
+   * One data statement, with its class's `max_execution_time`. A statement
+   * over budget fails with a QUERY_TIMEOUT error (the server stops it); a
+   * client-side request timeout is not retried (`retryTimeouts: false`).
+   */
+  async query<T>(
+    label: string,
+    sql: string,
+    params: QueryParams,
+    statementClass: StatementClass = 'data'
+  ) {
     this.stats.dataQueries += 1;
-    const rows = await this.client.query<T>(sql, params, dataQuerySettings);
+    const budgetMs = this.timeouts[statementClass];
+    const rows = await this.client
+      .query<T>(
+        sql,
+        params,
+        {
+          ...dataQuerySettings,
+          max_execution_time: Math.max(1, Math.ceil(budgetMs / 1000)),
+          timeout_overflow_mode: 'throw',
+        } as unknown as ClickHouseSettings,
+        { retryTimeouts: false }
+      )
+      .catch((error: unknown) => {
+        const timedOut =
+          (error instanceof ClickHouseError &&
+            error.code === timeoutExceededCode) ||
+          isRequestTimeout(error);
+        if (!timedOut) throw error;
+        throw new GraphQLError(
+          `${label}: the statement exceeded the API's ${Math.ceil(
+            budgetMs / 1000
+          )} s limit for ${statementClass} statements and was stopped. Narrow it (filters, node, block window, limit).`,
+          { extensions: { code: 'QUERY_TIMEOUT', statementClass } }
+        );
+      });
     this.onQuery?.({ kind: 'data', label, params, sql });
     return rows;
   }

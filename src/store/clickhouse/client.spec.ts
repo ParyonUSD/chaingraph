@@ -8,6 +8,7 @@ import test from 'ava';
 import {
   ClickHouseClient,
   clickHouseConfigFromEnv,
+  isRequestTimeout,
   isRetryable,
   quoteIdentifier,
   splitCredentials,
@@ -93,6 +94,21 @@ test('isRetryable: transport errors and transient server codes (209 socket timeo
   t.false(
     isRetryable(new ClickHouseError({ code: '60', message: 'Unknown table' }))
   );
+});
+
+test("isRequestTimeout: the client library's own request timeout only", (t) => {
+  t.true(isRequestTimeout(new Error('Timeout error.')));
+  t.false(isRequestTimeout(new Error('socket hang up')));
+  t.false(
+    isRequestTimeout(
+      new ClickHouseError({
+        code: '159',
+        message: 'Timeout exceeded: elapsed 1.0 seconds, maximum: 1',
+        type: 'TIMEOUT_EXCEEDED',
+      })
+    )
+  );
+  t.false(isRequestTimeout('Timeout error.'));
 });
 
 test('quoteIdentifier: accepts plain identifiers only', (t) => {

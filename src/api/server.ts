@@ -26,6 +26,7 @@ import { WebSocketServer } from 'ws';
 
 import type { ClickHouseClient } from '../store/clickhouse/client.js';
 
+import type { StatementTimeouts } from './db.js';
 import { ApiDb, PinnedSnapshot } from './db.js';
 import type { LiveHubOptions } from './live.js';
 import { LiveHub } from './live.js';
@@ -147,6 +148,8 @@ export interface ApiOptions {
   agentUrl?: string;
   /** Rows one root statement may return (R33). */
   maxResultRows?: number;
+  /** Server-side time budget per statement class (db.ts `defaultStatementTimeouts`). */
+  statementTimeouts?: Partial<StatementTimeouts>;
 }
 
 export const createApi = (
@@ -157,6 +160,7 @@ export const createApi = (
   if (options.maxResultRows !== undefined) {
     db.maxResultRows = options.maxResultRows;
   }
+  db.timeouts = { ...db.timeouts, ...options.statementTimeouts };
   const hub = new LiveHub(db, options.live);
   const responseCache =
     options.responseCache === undefined || options.responseCache === false
