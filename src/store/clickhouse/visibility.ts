@@ -1,4 +1,4 @@
-/* eslint-disable camelcase, @typescript-eslint/naming-convention, functional/no-mixed-type, functional/no-try-statement, @typescript-eslint/parameter-properties, max-classes-per-file, complexity */
+/* eslint-disable camelcase, @typescript-eslint/naming-convention, functional/no-try-statement, @typescript-eslint/parameter-properties, max-classes-per-file, complexity, max-lines */
 // cspell:ignore clickhouse seqs subquery subqueries inlinable analysed
 /**
  * Per-node visibility watermarks (plan §3.2, WP4).
@@ -177,6 +177,37 @@ export interface VisibilitySnapshot {
    * it from the join (docs/clickhouse-port/spend-index.md).
    */
   spend: bigint;
+  /**
+   * The stored UTXO set of this node (`utxo_set`, utxo-set.ts): the newest
+   * published batch end U at or below `visible` and its generation. Readers
+   * take the stored rows up to U and the change rows of (U, visible] from
+   * the acceptance tables (docs/clickhouse-port/utxo-async.md). Undefined
+   * when the snapshot was read without the UTXO set, or the node has no
+   * stored set yet.
+   */
+  utxo?: UtxoSetMark;
+}
+
+/** A node's stored UTXO set as of one snapshot (utxo-set.ts). */
+export interface UtxoSetMark {
+  /** The batch end U (a commit seq, at most visible(n)). */
+  watermark: bigint;
+  /** The generation (rebase) whose rows hold the set at U. */
+  generation: number;
+  /**
+   * Committed commits of the node (node scope) in (U, visible(n)]. Zero:
+   * no acceptance fact of the node changed after U, so the stored set at U
+   * is the set at visible(n) and readers add no correction.
+   */
+  lagCommits: number;
+  /**
+   * Their recorded acceptance rows (`tx_acceptance` + `node_transaction` +
+   * `node_block` row counts; server-side inserts of header acceptance and
+   * re-orgs are not counted, their `node_block` rows are). Readers use it
+   * to choose a plan (the correction's cost grows with it), never for a
+   * result.
+   */
+  lagRows: number;
 }
 
 /**
@@ -197,6 +228,8 @@ export interface MultiNodeSnapshot {
   voidOverflow: boolean;
   /** The spend watermark (at most visible0). */
   spend: bigint;
+  /** The stored UTXO set per pinned node (read with `{ utxo: true }`; nodes without one are absent). */
+  utxoByNode?: ReadonlyMap<number, UtxoSetMark>;
 }
 
 /**
@@ -225,6 +258,8 @@ export const snapshotSql = (tables: {
   commitVoid: string;
   epochFence: string;
   spendWatermark: string;
+  /** With the stored UTXO set (utxo-set.ts): `utxo_watermark`. */
+  utxoWatermark?: string;
 }) => `WITH
   (SELECT maxMap([n], [v]) FROM
      (SELECT node_internal_id AS n, visible_seq AS v FROM ${tables.visibility}
@@ -249,7 +284,27 @@ export const snapshotSql = (tables: {
      (SELECT epoch, min(max_valid_seq) AS max_valid_seq FROM ${
        tables.epochFence
      }
-      WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences
+      WHERE epoch <= bitShiftRight(bound, 40) GROUP BY epoch)) AS fences${
+        tables.utxoWatermark === undefined
+          ? ''
+          : `,
+  (SELECT (groupArray(n), groupArray(wg)) FROM
+     (SELECT node_internal_id AS n, max((watermark, generation)) AS wg FROM ${tables.utxoWatermark}
+      WHERE has({nodes:Array(UInt32)}, node_internal_id)
+        AND watermark <= marks.1[indexOf({nodes:Array(UInt32)}, node_internal_id)]
+      GROUP BY node_internal_id)) AS utxo_marks,
+  (SELECT (groupArray(n), groupArray((c, l))) FROM
+     (SELECT n, count() AS c,
+        sum(row_counts['tx_acceptance'] + row_counts['node_transaction'] + row_counts['node_block']) AS l
+      FROM ${tables.commitLog} ARRAY JOIN node_scope AS n
+      WHERE state = 'committed'
+        AND commit_seq > arrayMin(arrayPushBack(arrayMap(m -> m.1, utxo_marks.2), bound))
+        AND commit_seq <= bound
+        AND has(utxo_marks.1, n)
+        AND commit_seq > utxo_marks.2[indexOf(utxo_marks.1, n)].1
+        AND commit_seq <= marks.1[indexOf({nodes:Array(UInt32)}, n)]
+      GROUP BY n)) AS utxo_lags`
+      }
 SELECT
   arrayMap(x -> toString(x), marks.1) AS visible,
   toString(marks.2) AS visible0,
@@ -259,15 +314,54 @@ SELECT
   arrayMap(x -> toString(x), void_seqs) AS void,
   arrayMap(e -> toString(if(indexOf(fences.1, e) = 0, ${counterMaskSeq.toString()},
                             bitAnd(fences.2[indexOf(fences.1, e)], ${counterMaskSeq.toString()}))),
-           range(1, toUInt64(bitShiftRight(bound, 40)) + 1)) AS fence`;
+           range(1, toUInt64(bitShiftRight(bound, 40)) + 1)) AS fence${
+             tables.utxoWatermark === undefined
+               ? ''
+               : `,
+  arrayMap(n -> if(indexOf(utxo_marks.1, n) = 0, '',
+                   concat(toString(utxo_marks.2[indexOf(utxo_marks.1, n)].1), ':',
+                          toString(utxo_marks.2[indexOf(utxo_marks.1, n)].2), ':',
+                          if(indexOf(utxo_lags.1, n) = 0, '0:0',
+                             concat(toString(utxo_lags.2[indexOf(utxo_lags.1, n)].1), ':',
+                                    toString(utxo_lags.2[indexOf(utxo_lags.1, n)].2))))),
+           {nodes:Array(UInt32)}) AS utxo`
+           }`;
 
-const snapshotQuery = snapshotSql({
+const snapshotTables = {
   commitLog: 'commit_log',
   commitVoid: 'commit_void',
   epochFence: 'epoch_fence',
   spendWatermark: 'spend_watermark',
   visibility: 'visibility',
+};
+
+const snapshotQuery = snapshotSql(snapshotTables);
+
+const snapshotQueryWithUtxo = snapshotSql({
+  ...snapshotTables,
+  utxoWatermark: 'utxo_watermark',
 });
+
+/** Options of a snapshot read. */
+export interface SnapshotReadOptions {
+  /**
+   * Also read each pinned node's stored UTXO set mark (`utxo_watermark`;
+   * the table must exist: 090_utxo_set.sql).
+   */
+  utxo?: boolean;
+}
+
+/** `U:generation:lagCommits:lagRows` (snapshot column `utxo`) → mark; '' → undefined. */
+const parseUtxoMark = (value: string | undefined): UtxoSetMark | undefined => {
+  if (value === undefined || value === '') return undefined;
+  const [watermark, generation, commits, rows] = value.split(':');
+  return {
+    generation: Number(generation),
+    lagCommits: Number(commits ?? '0'),
+    lagRows: Number(rows ?? '0'),
+    watermark: BigInt(watermark!),
+  };
+};
 
 /** Bytes of an array parameter as the HTTP interface encodes it: `[a,b,…]`. */
 const encodedLength = (values: readonly bigint[]) =>
@@ -280,7 +374,8 @@ const encodedLength = (values: readonly bigint[]) =>
  */
 export const readSnapshotMulti = async (
   client: Pick<ClickHouseClient, 'query'>,
-  nodeIds: readonly number[]
+  nodeIds: readonly number[],
+  options: SnapshotReadOptions = {}
 ): Promise<MultiNodeSnapshot> => {
   const nodes = [...new Set(nodeIds)].sort((a, b) => a - b);
   const rows = await client.query<{
@@ -290,7 +385,11 @@ export const readSnapshotMulti = async (
     tail: string[];
     void: string[];
     fence: string[];
-  }>(snapshotQuery, { nodes, voidLimit: voidInlineLimit + 1 });
+    utxo?: string[];
+  }>(options.utxo === true ? snapshotQueryWithUtxo : snapshotQuery, {
+    nodes,
+    voidLimit: voidInlineLimit + 1,
+  });
   const [row] = rows;
   const voidSeqs = (row?.void ?? []).map(BigInt);
   const voidOverflow = voidSeqs.length > voidInlineLimit;
@@ -304,11 +403,22 @@ export const readSnapshotMulti = async (
     );
   }
   const visible = row?.visible ?? [];
+  const utxoMarks = row?.utxo;
   return {
     committedTail: (row?.tail ?? []).map(BigInt),
     fence,
     nodeIds: nodes,
     spend: BigInt(row?.spend ?? '0'),
+    ...(utxoMarks === undefined
+      ? {}
+      : {
+          utxoByNode: new Map(
+            nodes.flatMap((node, index) => {
+              const mark = parseUtxoMark(utxoMarks[index]);
+              return mark === undefined ? [] : [[node, mark] as const];
+            })
+          ),
+        }),
     visible0: BigInt(row?.visible0 ?? '0'),
     visibleByNode: new Map(
       nodes.map((node, index) => [node, BigInt(visible[index] ?? '0')])
@@ -331,11 +441,13 @@ export const snapshotForNode = (
     // eslint-disable-next-line functional/no-throw-statement
     throw new RangeError(`Node ${nodeId} is not pinned by this snapshot.`);
   }
+  const utxo = snapshot.utxoByNode?.get(nodeId);
   return {
     committedTail: snapshot.committedTail,
     fence: snapshot.fence,
     nodeId,
     spend: snapshot.spend,
+    ...(utxo === undefined ? {} : { utxo }),
     visible,
     visible0: snapshot.visible0,
     void: snapshot.void,
@@ -346,13 +458,25 @@ export const snapshotForNode = (
 /** Read a snapshot of one node in one query (`readSnapshotMulti` of `[nodeId]`). */
 export const readSnapshot = async (
   client: Pick<ClickHouseClient, 'query'>,
-  nodeId: number
+  nodeId: number,
+  options: SnapshotReadOptions = {}
 ): Promise<VisibilitySnapshot> =>
-  snapshotForNode(await readSnapshotMulti(client, [nodeId]), nodeId);
+  snapshotForNode(await readSnapshotMulti(client, [nodeId], options), nodeId);
 
 /** The cheap watermark read of `SnapshotCache`: visibility only, no subquery. */
 export const watermarksSql = `SELECT node_internal_id AS node, toString(max(visible_seq)) AS visible
   FROM visibility WHERE node_internal_id IN {nodes:Array(UInt32)} GROUP BY node_internal_id`;
+
+/**
+ * The same with each node's newest stored UTXO set mark `U:generation`
+ * (`utxo` '' on visibility rows; `visible` '' on mark rows).
+ */
+export const watermarksWithUtxoSql = `SELECT node_internal_id AS node, toString(max(visible_seq)) AS visible, '' AS utxo
+  FROM visibility WHERE node_internal_id IN {nodes:Array(UInt32)} GROUP BY node_internal_id
+  UNION ALL
+  SELECT node_internal_id AS node, '' AS visible,
+    concat(toString(max((watermark, generation)).1), ':', toString(max((watermark, generation)).2)) AS utxo
+  FROM utxo_watermark WHERE node_internal_id IN {nodes:Array(UInt32)} GROUP BY node_internal_id`;
 
 /**
  * Snapshots reused while the watermarks stand still (fix-pass-3.md §4).
@@ -381,34 +505,63 @@ export class SnapshotCache {
     private readonly maxEntries = defaultSnapshotCacheEntries
   ) {}
 
-  async read(nodeIds: readonly number[]): Promise<MultiNodeSnapshot> {
+  async read(
+    nodeIds: readonly number[],
+    options: SnapshotReadOptions = {}
+  ): Promise<MultiNodeSnapshot> {
     const nodes = [...new Set(nodeIds)].sort((a, b) => a - b);
-    const key = nodes.join(',');
+    const withUtxo = options.utxo === true;
+    const key = `${withUtxo ? 'u' : ''}${nodes.join(',')}`;
     const cached = this.entries.get(key);
     if (cached !== undefined) {
-      const rows = await this.client.query<{ node: number; visible: string }>(
-        watermarksSql,
-        { nodes: [nodeAgnosticId, ...nodes] }
-      );
+      const rows = await this.client.query<{
+        node: number;
+        visible: string;
+        utxo?: string;
+      }>(withUtxo ? watermarksWithUtxoSql : watermarksSql, {
+        nodes: [nodeAgnosticId, ...nodes],
+      });
       const marks = new Map(
-        rows.map((row) => [Number(row.node), BigInt(row.visible)])
+        rows
+          .filter((row) => row.visible !== '')
+          .map((row) => [Number(row.node), BigInt(row.visible)])
+      );
+      const utxoMarks = new Map(
+        rows
+          .filter((row) => row.utxo !== undefined && row.utxo !== '')
+          .map((row) => [Number(row.node), row.utxo!])
       );
       /*
        * The spend watermark is not compared: a cached (lower) one is still
        * exact, the tail join just covers more (spend-index.md, read rule).
+       * The UTXO set mark is: a cached lower one would still be exact, but
+       * every request would pay the correction until the next commit, and
+       * an older generation's rows are dropped some time after a rebase
+       * (utxo-async.md). While visible(n) stands still, the newest mark is
+       * at most visible(n), so it is the mark a fresh snapshot would take.
        */
       const same =
         (marks.get(nodeAgnosticId) ?? 0n) === cached.visible0 &&
         nodes.every(
           (node) => (marks.get(node) ?? 0n) === cached.visibleByNode.get(node)
-        );
+        ) &&
+        (!withUtxo ||
+          nodes.every((node) => {
+            const mark = cached.utxoByNode?.get(node);
+            return (
+              utxoMarks.get(node) ===
+              (mark === undefined
+                ? undefined
+                : `${mark.watermark}:${mark.generation}`)
+            );
+          }));
       if (same) {
         this.hits += 1;
         return cached;
       }
     }
     this.misses += 1;
-    const fresh = await readSnapshotMulti(this.client, nodes);
+    const fresh = await readSnapshotMulti(this.client, nodes, options);
     this.entries.delete(key);
     this.entries.set(key, fresh);
     if (this.entries.size > this.maxEntries) {
@@ -468,11 +621,21 @@ export const agnosticViewParams = (snapshot: VisibilitySnapshot) => ({
   void: snapshot.void,
 });
 
-/** Every parameter of one snapshot (for requests that use both view kinds and `spend_at`). */
+/**
+ * Every parameter of one snapshot (for requests that use both view kinds and
+ * `spend_at`), and with a stored UTXO set `utxo` (U) and `utxo_generation`.
+ */
 export const snapshotParams = (snapshot: VisibilitySnapshot) => ({
   ...agnosticViewParams(snapshot),
   ...nodeViewParams(snapshot),
   spend: snapshot.spend,
+  ...(snapshot.utxo === undefined
+    ? {}
+    : {
+        utxo: snapshot.utxo.watermark,
+
+        utxo_generation: snapshot.utxo.generation,
+      }),
 });
 
 /**
@@ -804,6 +967,8 @@ export interface PublisherOptions {
   minIntervalMs?: number;
   /** Called with errors from scheduled publishes. */
   onError?: (error: unknown) => void;
+  /** Called after a publish that advanced a watermark (background readers: the UTXO set maintainer). */
+  onPublished?: () => void;
 }
 
 const defaultMinIntervalMs = 100;
@@ -933,6 +1098,7 @@ export class VisibilityPublisher {
         { async_insert: 0 }
       );
       advanced.forEach(([node, visible]) => this.published.set(node, visible));
+      this.options.onPublished?.();
     }
     return watermarks;
   }

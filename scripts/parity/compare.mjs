@@ -8,7 +8,7 @@
  *     --nodes <name>[,<name>…] --out <dir>
  *     [--at-height H] [--every N --from H0 --to H1] [--tables t1,t2,…] [--include-mempool]
  *     [--hash sum|ordered] [--timestamps tolerance|exact|exclude] [--ts-tolerance-ms 120000]
- *     [--chunk-blocks 10000] [--hash-chunks 16] [--utxo-chunks 16] [--parallel 4] [--diff]
+ *     [--chunk-blocks 10000] [--hash-chunks 16] [--utxo-chunks 16] [--ch-utxo at|set|query] [--parallel 4] [--diff]
  *     [--pg-cache <dir> [--pg-cache-rebuild] [--pg-only | --ch-only]]
  *
  * --pg-cache <dir>: the Postgres side (all digests, incl. F1g utxo, and the
@@ -17,6 +17,11 @@
  * A parameter mismatch is an error unless --pg-cache-rebuild. --pg-only fills
  * the cache without touching ClickHouse; --ch-only requires a matching cache
  * (no --pg needed).
+ *
+ * --ch-utxo: the ClickHouse side of `utxo`: `at` (default) the commit-path
+ * UTXO tables, `set` the stored set maintained off the commit path at each
+ * node's published mark (utxo_set_at; docs/clickhouse-port/utxo-async.md),
+ * `query` the query-time definition.
  *
  * ClickHouse credentials: CH_USER / CH_PASSWORD (environment only).
  * A node is named as in both stores' `node.name`; a bare number that is not a
@@ -61,6 +66,7 @@ const { values: options } = parseArgs({
   options: {
     ch: { type: 'string' },
     'ch-db': { default: 'cg', type: 'string' },
+    'ch-utxo': { default: 'at', type: 'string' },
     'chunk-blocks': { default: '10000', type: 'string' },
     diff: { default: false, type: 'boolean' },
     every: { type: 'string' },
@@ -336,8 +342,23 @@ const main = async () => {
             nodes.map((node) => node.chId)
           );
     for (const node of nodes) node.visible = snapshot.visible.get(node.chId);
+    if (clickhouse !== undefined && options['ch-utxo'] === 'set') {
+      /* each node's newest published mark at or below its visible(n), as a snapshot takes it */
+      for (const node of nodes) {
+        const [mark] = await clickhouse.query(
+          `SELECT toString(wg.1) AS watermark, toString(wg.2) AS generation FROM (
+             SELECT max((watermark, generation)) AS wg FROM utxo_watermark
+             WHERE node_internal_id = ${Number(node.chId)} AND watermark <= ${BigInt(
+            node.visible ?? '0'
+          )}
+             HAVING count() > 0)`
+        );
+        node.utxoMark = mark;
+      }
+    }
     const ctx = {
       atHeight,
+      chUtxo: options['ch-utxo'],
       ch: {
         fence: snapshot.fence,
         spend: snapshot.spend,

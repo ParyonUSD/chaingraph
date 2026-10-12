@@ -8,6 +8,7 @@ import {
   clickhouseUrl,
   clickhouseUser,
   clickhouseUtxo,
+  clickhouseUtxoSet,
 } from '../config.js';
 import { instances } from '../logging.js';
 
@@ -39,6 +40,8 @@ export interface StoreConfig {
     utxo?: 'off' | 'on';
     /** The spend index (`CHAINGRAPH_CLICKHOUSE_SPEND_INDEX`; default `on`). */
     spendIndex?: 'off' | 'on';
+    /** The stored UTXO set (`CHAINGRAPH_CLICKHOUSE_UTXO_SET`; default `on`). */
+    utxoSet?: 'off' | 'on';
   };
 }
 
@@ -57,6 +60,7 @@ export const storeConfigFromEnvironment = (): StoreConfig => ({
     url: clickhouseUrl,
     user: clickhouseUser,
     utxo: clickhouseUtxo,
+    utxoSet: clickhouseUtxoSet,
   },
 });
 
@@ -87,9 +91,15 @@ export const createStore = (
         const { logger } = instances;
         if (logger === undefined) return;
         const message = `ClickHouse store: ${diagnostic.event}.`;
-        if (diagnostic.event === 'spend_index_progress') {
-          // the spend index's watermark and lag (spend-index.md), every ~10 s
+        if (
+          diagnostic.event === 'spend_index_progress' ||
+          diagnostic.event === 'utxo_set_progress'
+        ) {
+          // the spend index's / UTXO set's watermark and lag, every ~10 s
           logger.info({ clickhouseDiagnostic: diagnostic }, message);
+        } else if (diagnostic.event === 'utxo_set_invariant_violation') {
+          // a data discrepancy in the stored UTXO set (utxo-async.md): loud
+          logger.fatal({ clickhouseDiagnostic: diagnostic }, message);
         } else if (diagnostic.event === 'void_refused') {
           logger.fatal({ clickhouseDiagnostic: diagnostic }, message);
         } else if (
@@ -109,6 +119,7 @@ export const createStore = (
       },
       spendIndex: config.clickhouse.spendIndex,
       utxo: config.clickhouse.utxo,
+      utxoSet: config.clickhouse.utxoSet,
     });
     if (config.abandonOnShutdownSignals === true) {
       ['SIGINT', 'SIGTERM'].forEach((signal) => {

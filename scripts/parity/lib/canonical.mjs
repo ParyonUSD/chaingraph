@@ -732,13 +732,56 @@ export const tables = {
         ctx,
         outputFields(chExpr, 'u'),
         [],
-        `FROM utxo_at${nodeArgs(node, ctx)} AS u WHERE ${chHashRange(
+        `FROM ${chUtxoSource(ctx, node)} AS u WHERE ${chHashRange(
           'u.transaction_hash',
           chunk
         )}`
       ),
     }),
   },
+};
+
+/**
+ * The ClickHouse side of `utxo` (`--ch-utxo`): `at` the commit-path UTXO
+ * tables (`utxo_at`, CHAINGRAPH_CLICKHOUSE_UTXO=on); `set` the stored set
+ * maintained off the commit path (`utxo_set_at` at the node's published
+ * mark, docs/clickhouse-port/utxo-async.md); `query` the query-time v1
+ * definition (outputs of accepted transactions minus outpoints spent by an
+ * accepted transaction).
+ */
+const chUtxoSource = (ctx, node) => {
+  switch (ctx.chUtxo ?? 'at') {
+    case 'at':
+      return `utxo_at${nodeArgs(node, ctx)}`;
+    case 'set':
+      if (node.utxoMark === undefined) {
+        throw new Error(
+          `--ch-utxo set: node ${node.name} has no stored UTXO set at its visible(n)`
+        );
+      }
+      return `utxo_set_at(node = ${node.chId}, visible = ${node.visible}, ${gateArgs(
+        ctx
+      )}, visible0 = ${ctx.ch.visible0}, tail = [${ctx.ch.tail.join(
+        ', '
+      )}], utxo = ${node.utxoMark.watermark}, utxo_generation = ${
+        node.utxoMark.generation
+      })`;
+    case 'query': {
+      const accepted = `SELECT transaction_hash FROM tx_acceptance_at${nodeArgs(
+        node,
+        ctx
+      )}`;
+      return `(SELECT * FROM output_at${agnostic(ctx)}
+        WHERE transaction_hash IN (${accepted})
+          AND (transaction_hash, output_index) NOT IN (
+            SELECT outpoint_transaction_hash, outpoint_index FROM input_at${agnostic(
+              ctx
+            )} WHERE transaction_hash IN (${accepted}))
+        LIMIT 1 BY transaction_hash, output_index)`;
+    }
+    default:
+      throw new Error(`--ch-utxo must be at, set or query (got ${ctx.chUtxo})`);
+  }
 };
 
 export const defaultTables = [

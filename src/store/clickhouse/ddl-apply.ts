@@ -67,20 +67,30 @@ const databasePattern = /^[A-Za-z_][0-9A-Za-z_]*$/u;
 const applyTimeoutMs = 300_000;
 
 /**
- * Optional DDL items (`ddl/optional/<name>.sql`), off by default; applied
- * after the numbered files when named in `CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL`
- * (comma-separated) or the DDL CLI's `--optional <name>`. A projection item
- * added to a table that already has rows is materialized once (an
- * asynchronous mutation), never again on a re-apply.
+ * DDL items (`ddl/optional/<name>.sql`) applied after the numbered files.
+ * An item marked `default` is applied unless skipped
+ * (`CHAINGRAPH_CLICKHOUSE_DDL_SKIP`, comma-separated, or the DDL CLI's
+ * `--skip <name>`); any other item only when named
+ * (`CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL` or `--optional <name>`). A
+ * projection item added to a table that already has rows is materialized
+ * once (an asynchronous mutation), never again on a re-apply.
+ *
+ * `p_node_tx` is on by default since the owner decision of 2026-10-12
+ * (item 1); opt out with `CHAINGRAPH_CLICKHOUSE_DDL_SKIP=p_node_tx`.
  */
 export const optionalDdlItems: {
-  readonly [name: string]: { table: string; projection: string };
+  readonly [name: string]: {
+    table: string;
+    projection: string;
+    /** Applied unless skipped. */
+    default: boolean;
+  };
 } = {
   // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
-  p_node_tx: { projection: 'p_node_tx', table: 'tx_acceptance' },
+  p_node_tx: { default: true, projection: 'p_node_tx', table: 'tx_acceptance' },
 };
 
-/** The optional items named in `value` (comma-separated; unknown names throw). */
+/** The DDL items named in `value` (comma-separated; unknown names throw). */
 export const parseOptionalDdl = (value: string | undefined): string[] => {
   const names = (value ?? '')
     .split(',')
@@ -98,6 +108,36 @@ export const parseOptionalDdl = (value: string | undefined): string[] => {
   });
   return [...new Set(names)];
 };
+
+/** The items applied by default (`default: true`). */
+export const defaultDdlItems = () =>
+  Object.entries(optionalDdlItems)
+    .filter(([, item]) => item.default)
+    .map(([name]) => name);
+
+/**
+ * The items to apply: the default items and `add`, without `skip` (both
+ * comma-separated lists of names; unknown names throw).
+ */
+export const resolveDdlItems = ({
+  add,
+  skip,
+}: {
+  add?: string;
+  skip?: string;
+}): string[] => {
+  const skipped = new Set(parseOptionalDdl(skip));
+  return [...new Set([...defaultDdlItems(), ...parseOptionalDdl(add)])].filter(
+    (name) => !skipped.has(name)
+  );
+};
+
+/** `resolveDdlItems` from `CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL` / `_SKIP`. */
+export const ddlItemsFromEnvironment = (env: NodeJS.ProcessEnv) =>
+  resolveDdlItems({
+    add: env.CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL,
+    skip: env.CHAINGRAPH_CLICKHOUSE_DDL_SKIP,
+  });
 
 /** The DDL files, in apply order. */
 export const ddlFiles = (directory = resolveDdlDirectory()) =>
@@ -202,7 +242,8 @@ const applyOptionalItem = async (
 
 /**
  * Apply every DDL file to `database` (created if missing), then the
- * `optional` items. With `recreate`, drop the database first. Returns the
+ * `optional` items (default: `ddlItemsFromEnvironment`, i.e. the default
+ * items unless skipped; `[]` applies none). With `recreate`, drop the database first. Returns the
  * number of statements run.
  */
 export const applyClickHouseDdl = async (
@@ -211,7 +252,7 @@ export const applyClickHouseDdl = async (
   {
     directory = resolveDdlDirectory(),
     recreate = false,
-    optional = parseOptionalDdl(process.env.CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL),
+    optional = ddlItemsFromEnvironment(process.env),
   }: {
     directory?: string;
     recreate?: boolean;

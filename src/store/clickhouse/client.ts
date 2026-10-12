@@ -176,6 +176,12 @@ export const isRequestTimeout = (error: unknown) =>
   error.message.startsWith('Timeout error');
 
 /** Per-read options of `ClickHouseClient.query`. */
+/** What an `INSERT … SELECT` wrote (the server's summary; 0 when absent). */
+export interface InsertSelectSummary {
+  /** Rows inserted into the target table (`result_rows`, else `written_rows`). */
+  writtenRows: number;
+}
+
 export interface QueryOptions {
   /**
    * Retry a read whose request timed out on the client (default true).
@@ -359,17 +365,31 @@ export class ClickHouseClient {
     params: QueryParams,
     options: IdempotentInsertOptions
   ): Promise<void> {
-    await withRetries(options.retries, async () => {
+    await this.insertSelectCounted(sql, params, options);
+  }
+
+  /** `insertSelect`, returning what the server reports it wrote. */
+  async insertSelectCounted(
+    sql: string,
+    params: QueryParams,
+    options: IdempotentInsertOptions
+  ): Promise<InsertSelectSummary> {
+    return withRetries(options.retries, async () => {
       await this.faultBeforeRequest?.({
         deduplicationToken: options.deduplicationToken,
         kind: 'insert',
         sql,
       });
-      await this.raw.command({
+      const result = await this.raw.command({
         clickhouse_settings: idempotentSettings(options),
         query: sql,
         query_params: params,
       });
+      return {
+        writtenRows: Number(
+          result.summary?.result_rows ?? result.summary?.written_rows ?? 0
+        ),
+      };
     });
   }
 

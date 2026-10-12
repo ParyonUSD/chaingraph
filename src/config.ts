@@ -578,6 +578,25 @@ if (clickhouseSpendIndexValue !== 'on' && clickhouseSpendIndexValue !== 'off') {
  */
 const clickhouseSpendIndex: 'off' | 'on' = clickhouseSpendIndexValue;
 
+const clickhouseUtxoSetValue = optionalString(
+  optionalOptions.CHAINGRAPH_CLICKHOUSE_UTXO_SET,
+  'on'
+);
+if (clickhouseUtxoSetValue !== 'on' && clickhouseUtxoSetValue !== 'off') {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_CLICKHOUSE_UTXO_SET' environment variable: ${clickhouseUtxoSetValue}. Must be 'on' or 'off'.`
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_CLICKHOUSE_UTXO_SET` environment variable
+ * (default: `on`). `off`: the ClickHouse writer never maintains the stored
+ * per-node UTXO set (`utxo_set`, off the commit path); readers then compute
+ * unspent outputs at query time (docs/clickhouse-port/utxo-async.md).
+ * Ignored by the Postgres store.
+ */
+const clickhouseUtxoSet: 'off' | 'on' = clickhouseUtxoSetValue;
+
 const eventLoopDiagnosticValue = Number(
   optionalString(optionalOptions.CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS, '0')
 );
@@ -666,6 +685,7 @@ export {
   clickhouseUser,
   clickhouseSpendIndex,
   clickhouseUtxo,
+  clickhouseUtxoSet,
   encodeWorkers,
   eventLoopDiagnosticMs,
   genesisBlocks,

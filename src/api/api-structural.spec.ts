@@ -177,10 +177,13 @@ e2e(
       ['t1', [[block1.hash, 1, true, true]], true, true],
       [
         'shared',
-        [
-          [block2a.hash, 2, true, false],
-          [block2b.hash, 2, false, true],
-        ],
+        /* default order: height, then block hash (owner decision 2026-10-12, item 3) */
+        (
+          [
+            [block2a.hash, 2, true, false],
+            [block2b.hash, 2, false, true],
+          ] as [string, number, boolean, boolean][]
+        ).sort((a, b) => (a[0] < b[0] ? -1 : 1)),
         true,
         true,
       ],
@@ -223,6 +226,7 @@ e2e(
         by_height: { block: { height: number } }[];
         at_2: { block: { hash: string } }[];
         at_3: { block: { hash: string } }[];
+        by_internal_id: { block: { hash: string } }[];
       }[];
     }>(
       `query($hashes: [Hex!]!) {
@@ -231,6 +235,7 @@ e2e(
           by_height: block_inclusions(order_by: { block: { height: DESC } }) { block { height } }
           at_2: block_inclusions(where: { block: { height: { _eq: 2 } } }) { block { hash } }
           at_3: block_inclusions(where: { block: { height: { _gte: 3 } } }) { block { hash } }
+          by_internal_id: block_inclusions(order_by: { block_internal_id: ASC }) { block { hash } }
         }
       }`,
       { hashes: [shared.hash, z.hash] }
@@ -240,7 +245,12 @@ e2e(
     );
     t.deepEqual(
       heightRows.get(shared.hash)!.at_2.map((row) => row.block.hash),
-      [block2a.hash, block2b.hash]
+      [block2a.hash, block2b.hash].sort()
+    );
+    t.deepEqual(
+      heightRows.get(shared.hash)!.by_internal_id.map((row) => row.block.hash),
+      [block2a.hash, block2b.hash],
+      'order_by block_internal_id: storage order'
     );
     t.deepEqual(heightRows.get(shared.hash)!.at_3, []);
     t.deepEqual(
@@ -358,7 +368,7 @@ e2e(
       scoped.one.nodes.map((row) =>
         row.block_inclusions.map((i) => i.block.hash)
       ),
-      [[block2a.hash, block2b.hash]],
+      [[block2a.hash, block2b.hash].sort()],
       'below a per-node root, block_inclusions is still every stored block'
     );
     t.deepEqual(

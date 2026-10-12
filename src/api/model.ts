@@ -261,6 +261,9 @@ const blockInclusionOrder: OrderSpec = {
   },
 };
 
+/** Inclusions by height, then block hash (owner decision 2026-10-12, item 3). */
+const blockInclusionDefaultOrder = [term('height'), term('block_hash')];
+
 const blockTransactionOrder: OrderSpec = {
   fields: {
     transaction_index: { expr: 'transaction_index', kind: 'uint' },
@@ -777,15 +780,17 @@ export const TransactionEntity: Entity = {
     block_inclusions: {
       childKeys: ['transaction_hash'],
       /*
-       * In the order the blocks were stored: a height order would join every
-       * inclusion to its block (~10-20 ms on the library documents) for a
-       * list that is almost always one block; `order_by: { block: { height } }`
-       * asks for it.
+       * By height, then block hash (owner decision 2026-10-12, item 3): a
+       * stable order that does not depend on the store's internal ids. It
+       * joins the inclusions to their blocks (once, a statement-level CTE;
+       * ~10-20 ms on the library documents), for a list that is almost
+       * always one block. `order_by: { block_internal_id }` (storage order)
+       * reads no block row unless a block field is selected.
        */
-      defaultOrder: [term('block_internal_id')],
+      defaultOrder: blockInclusionDefaultOrder,
       kind: 'relation',
       many: true,
-      order: listOrder(blockInclusionOrder, [term('block_internal_id')]),
+      order: listOrder(blockInclusionOrder, blockInclusionDefaultOrder),
       parentKeys: ['hash'],
       /*
        * Node-agnostic and complete: every stored block containing the
@@ -795,36 +800,39 @@ export const TransactionEntity: Entity = {
        */
       source: (c, link, args, needs) => {
         const node = acceptedByNode(c, args);
-        if (node === undefined) {
-          const included = `SELECT block_internal_id, transaction_hash, transaction_index FROM ${c.sql.view(
-            'block_transaction_at'
-          )} WHERE transaction_hash IN (${link})`;
-          if (!needs.has('height')) {
-            return `SELECT transaction_hash, block_internal_id, toUInt32(0) AS height, transaction_index FROM (${included})`;
-          }
-          /* the inclusions once (a statement-level CTE), then their blocks' heights */
-          const rows = c.sql.cte('incl', included);
-          return `SELECT bt.transaction_hash AS transaction_hash, bt.block_internal_id AS block_internal_id,
-          b.height AS height, bt.transaction_index AS transaction_index
-        FROM ${rows} AS bt
-        INNER JOIN (SELECT internal_id, height FROM ${c.sql.view(
-          'block_at'
-        )} WHERE internal_id IN (SELECT block_internal_id FROM ${rows})) AS b
-          ON b.internal_id = bt.block_internal_id`;
-        }
-        const acceptance = `SELECT transaction_hash, block_internal_id, height FROM ${c.sql.nodeView(
+        const inclusions =
+          node === undefined
+            ? `SELECT block_internal_id, transaction_hash, transaction_index FROM ${c.sql.view(
+                'block_transaction_at'
+              )} WHERE transaction_hash IN (${link})`
+            : needs.has('transaction_index')
+            ? `SELECT a.transaction_hash AS transaction_hash, a.block_internal_id AS block_internal_id,
+          bt.transaction_index AS transaction_index
+        FROM (SELECT transaction_hash, block_internal_id FROM ${c.sql.nodeView(
           'tx_acceptance_at',
           node
-        )} WHERE block_internal_id != 0 AND transaction_hash IN (${link})`;
-        return needs.has('transaction_index')
-          ? `SELECT a.transaction_hash AS transaction_hash, a.block_internal_id AS block_internal_id,
-          a.height AS height, bt.transaction_index AS transaction_index
-        FROM (${acceptance}) AS a
+        )} WHERE block_internal_id != 0 AND transaction_hash IN (${link})) AS a
         LEFT JOIN (SELECT block_internal_id, transaction_hash, transaction_index FROM ${c.sql.view(
           'block_transaction_at'
         )} WHERE transaction_hash IN (${link})) AS bt
           ON bt.block_internal_id = a.block_internal_id AND bt.transaction_hash = a.transaction_hash`
-          : acceptance;
+            : `SELECT transaction_hash, block_internal_id, toUInt32(0) AS transaction_index FROM ${c.sql.nodeView(
+                'tx_acceptance_at',
+                node
+              )} WHERE block_internal_id != 0 AND transaction_hash IN (${link})`;
+        if (!needs.has('height') && !needs.has('block_hash')) {
+          return `SELECT transaction_hash, block_internal_id, toUInt32(0) AS height,
+          toFixedString('', 32) AS block_hash, transaction_index FROM (${inclusions})`;
+        }
+        /* the inclusions once (a statement-level CTE), then their blocks' heights and hashes */
+        const rows = c.sql.cte('incl', inclusions);
+        return `SELECT bt.transaction_hash AS transaction_hash, bt.block_internal_id AS block_internal_id,
+          b.height AS height, b.hash AS block_hash, bt.transaction_index AS transaction_index
+        FROM ${rows} AS bt
+        INNER JOIN (SELECT internal_id, height, hash FROM ${c.sql.view(
+          'block_at'
+        )} WHERE internal_id IN (SELECT block_internal_id FROM ${rows})) AS b
+          ON b.internal_id = bt.block_internal_id`;
       },
       target: () => BlockInclusionEntity,
       where: (c, where) =>
@@ -1240,6 +1248,7 @@ export const BlockInclusionEntity: Entity = {
     'transaction_hash',
     'block_internal_id',
     'height',
+    'block_hash',
     'transaction_index',
   ],
   fields: {

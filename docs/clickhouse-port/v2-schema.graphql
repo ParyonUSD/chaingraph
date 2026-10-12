@@ -858,7 +858,7 @@ type Query {
   unspent_output_groups(group_by: [OutputGroupColumn!]!, limit: Int!, node: String!, order_by: [OutputGroupOrder!], where: OutputFilter): [OutputGroup!]!
 
   """
-  The node's unspent outputs, computed at query time from outputs minus spending inputs (UTXO tables off), keyset on (transaction_internal_id, output_index).
+  The node's unspent outputs (Chaingraph v1's definition: outputs of transactions the node accepts, minus outpoints spent by a transaction it accepts): from the stored per-node UTXO set where the store keeps one, else computed at query time; exact at the request's snapshot either way. Keyset on (transaction_internal_id, output_index).
   """
   unspent_outputs(
     """The end_cursor of the previous page (keyset)."""
@@ -874,7 +874,9 @@ type Query {
     where: OutputFilter
   ): OutputPage!
 
-  """Aggregates over the node's unspent outputs."""
+  """
+  Aggregates over the node's unspent outputs. Without a filter (or with only `token_category: { _eq }`), `count` and `sum` of `value_satoshis` / `fungible_token_amount` read the stored per-node running totals when the store keeps them.
+  """
   unspent_outputs_aggregate(node: String!, where: OutputFilter): OutputAggregate!
 
   """
@@ -1063,7 +1065,7 @@ type Subscription {
   ): TransactionPage!
 
   """
-  The node's unspent outputs, computed at query time from outputs minus spending inputs (UTXO tables off), keyset on (transaction_internal_id, output_index).
+  The node's unspent outputs (Chaingraph v1's definition: outputs of transactions the node accepts, minus outpoints spent by a transaction it accepts): from the stored per-node UTXO set where the store keeps one, else computed at query time; exact at the request's snapshot either way. Keyset on (transaction_internal_id, output_index).
   """
   unspent_outputs(
     """The end_cursor of the previous page (keyset)."""
@@ -1134,7 +1136,7 @@ type Transaction {
   ): [Authchain!]!
 
   """
-  Every stored block that includes the transaction (node-agnostic: blocks of stale forks included), in the order the blocks were stored (`order_by: { block: { height: ASC } }` for height order). `accepted_by: node` keeps the blocks that node accepts; `accepted(node:)` on each inclusion tells them apart.
+  Every stored block that includes the transaction (node-agnostic: blocks of stale forks included), by block height, then block hash (`order_by: { block_internal_id: ASC }` for storage order). `accepted_by: node` keeps the blocks that node accepts; `accepted(node:)` on each inclusion tells them apart.
   """
   block_inclusions(
     """

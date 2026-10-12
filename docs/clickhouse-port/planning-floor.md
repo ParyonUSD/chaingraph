@@ -155,6 +155,12 @@ costs nothing unless a read filters on the outpoint, which is when it wins.
 
 ## 5. Statement budgets and timeouts (API)
 
+> **2026-10-12 (owner decision, item 2):** whole-chain aggregates keep the 30 s fail-fast budget
+> (`CHAINGRAPH_API_AGGREGATE_TIMEOUT_MS`). The node's total UTXO count and value, and per-category totals, are now
+> answered from the stored running totals in milliseconds ([utxo-async.md](utxo-async.md)); the budget still bounds
+> every aggregate the totals cannot answer (filters other than one category, min/max/avg, whole-chain output or
+> transaction aggregates).
+
 Golden Q1 (whole-chain UTXO count) hit the API client's fixed 300 s timeout. The client then **retried** the
 statement, so two copies ran on the server until the driver gave up. The direct SQL needed 19.5 min.
 

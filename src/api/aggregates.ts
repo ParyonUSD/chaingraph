@@ -1,4 +1,4 @@
-/* eslint-disable camelcase, @typescript-eslint/naming-convention, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, max-params, complexity, functional/no-mixed-type, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-unsafe-argument */
+/* eslint-disable camelcase, @typescript-eslint/naming-convention, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, max-params, complexity, functional/no-mixed-type, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-unsafe-argument, no-underscore-dangle */
 // cspell:ignore clickhouse
 /**
  * Aggregates (R24) and group-by (R25) over the per-node row sets of the
@@ -10,9 +10,12 @@
  */
 import { GraphQLError } from 'graphql';
 
+import { utxoTotalsSql } from '../store/clickhouse/utxo-set.js';
+
 import type { Sel } from './compile.js';
 import type { RootEnv, RowSet } from './roots.js';
 import { checkLimit, maxLimits } from './roots.js';
+import type { OutputFilter } from './sql.js';
 import { invalid, zeroCategory } from './sql.js';
 
 export type KeyKind = 'bool' | 'hex' | 'int' | 'string';
@@ -362,4 +365,109 @@ export const runGroups = async (
     has_more: result.length > args.limit,
     nodes: result.slice(0, args.limit).map((row) => decodeRow(row, fields)),
   };
+};
+
+/* ------------------------------------------------------------------ */
+/* stored per-node totals (docs/clickhouse-port/utxo-async.md)          */
+/* ------------------------------------------------------------------ */
+
+const categoryPattern = /^[0-9a-f]{64}$/u;
+
+/** The one category of `where` when it is exactly `{ token_category: { _eq: X } }` (or no filter: null). */
+const totalsScope = (
+  where: OutputFilter | null | undefined
+): { category: string | null } | undefined => {
+  if (where === undefined || where === null) return { category: null };
+  const keys = Object.entries(where).filter(
+    ([, value]) => value !== undefined && value !== null
+  );
+  if (keys.length === 0) return { category: null };
+  if (keys.length !== 1 || keys[0]![0] !== 'token_category') return undefined;
+  const comparison = where.token_category!;
+  const ops = Object.entries(comparison).filter(
+    ([, value]) => value !== undefined && value !== null
+  );
+  const value = comparison._eq;
+  if (
+    ops.length !== 1 ||
+    typeof value !== 'string' ||
+    !categoryPattern.test(value.toLowerCase()) ||
+    /^0+$/u.test(value)
+  ) {
+    return undefined;
+  }
+  return { category: value.toLowerCase() };
+};
+
+/** Aggregates the per-category totals hold: count, sum of value and of fungible amounts. */
+const totalsFields = new Set(['fungible_token_amount', 'value_satoshis']);
+
+/**
+ * `unspent_outputs_aggregate` from the stored per-node running totals
+ * (`utxo_total` up to the snapshot's watermark plus the change rows above
+ * it: the same read rule as the set) when they answer the request exactly:
+ * no filter or only `token_category: { _eq }`, and only `count` and `sum`
+ * of `value_satoshis` / `fungible_token_amount`. Undefined otherwise (the
+ * caller aggregates the row set). Same values and null rules as
+ * `runAggregate` (a sum over no rows with the field set is null).
+ */
+export const runUnspentTotals = async (
+  env: RootEnv,
+  label: string,
+  where: OutputFilter | null | undefined,
+  requested: Requested
+): Promise<AggregateRow | undefined> => {
+  const { sql } = env;
+  if (!sql.storedUtxoSet(env.ctx.node)) return undefined;
+  const scope = totalsScope(where);
+  if (scope === undefined) return undefined;
+  const functions = Object.entries(requested.functions) as [
+    AggregateFunction,
+    Set<string>
+  ][];
+  if (
+    functions.some(
+      ([fn, fields]) =>
+        fn !== 'sum' || [...fields].some((field) => !totalsFields.has(field))
+    )
+  ) {
+    return undefined;
+  }
+  const sums = requested.functions.sum ?? new Set<string>();
+  const totals = utxoTotalsSql({
+    ...(scope.category === null
+      ? {}
+      : {
+          category: `toFixedString(unhex(${sql.bind(
+            scope.category,
+            'String'
+          )}), 32)`,
+        }),
+    change: {
+      from: '{utxo:UInt64}',
+      scalar: (prefix, body) => sql.scalar(prefix, body),
+      snapshot: sql.snapshot,
+    },
+    withChanges: (sql.snapshot.utxo?.lagCommits ?? 0) > 0,
+  });
+  const columns = [
+    'toString(sum(outputs)) AS `count`',
+    ...(sums.has('value_satoshis')
+      ? [
+          'if(sum(outputs) = 0, NULL, toString(sum(toInt128(value_satoshis)))) AS `sum.value_satoshis`',
+        ]
+      : []),
+    ...(sums.has('fungible_token_amount')
+      ? [
+          'if(sum(fungible_outputs) = 0, NULL, toString(sum(fungible_token_amount))) AS `sum.fungible_token_amount`',
+        ]
+      : []),
+  ];
+  const [row] = await env.db.query<{ [column: string]: unknown }>(
+    label,
+    `${sql.withClause()}SELECT ${columns.join(', ')} FROM (${totals})`,
+    sql.params,
+    'aggregate'
+  );
+  return decodeRow(row ?? { count: '0' }, []);
 };

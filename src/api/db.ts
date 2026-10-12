@@ -27,7 +27,13 @@ import {
 
 import type { Ctx } from './compile.js';
 import { maxAuthchainDepth } from './model.js';
-import { acceptanceWindowRows, Sql } from './sql.js';
+import type { UtxoSetPolicy } from './sql.js';
+import {
+  acceptanceWindowRows,
+  defaultUtxoSetMaxLagRows,
+  defaultUtxoSetPolicy,
+  Sql,
+} from './sql.js';
 
 /**
  * Settings of every data query. `enable_materialized_cte`: a root page with
@@ -67,6 +73,30 @@ export interface StatementTimeouts {
 export const defaultStatementTimeouts: StatementTimeouts = {
   aggregate: 30_000,
   data: 60_000,
+};
+
+/**
+ * The stored UTXO set policy from the environment: CHAINGRAPH_API_UTXO_SET
+ * (`on` | `off`, default `on`: unspent reads use the stored set when the
+ * store has one for the node; docs/clickhouse-port/utxo-async.md) and
+ * CHAINGRAPH_API_UTXO_SET_MAX_LAG_ROWS (plan bound, default 100,000).
+ */
+export const utxoSetPolicyFromEnv = (
+  env: NodeJS.ProcessEnv = process.env
+): UtxoSetPolicy => {
+  const flag = env.CHAINGRAPH_API_UTXO_SET ?? 'on';
+  if (flag !== 'on' && flag !== 'off' && flag !== '') {
+    throw new Error(`CHAINGRAPH_API_UTXO_SET must be 'on' or 'off'.`);
+  }
+  const raw = env.CHAINGRAPH_API_UTXO_SET_MAX_LAG_ROWS;
+  const maxLagRows =
+    raw === undefined || raw === '' ? defaultUtxoSetMaxLagRows : Number(raw);
+  if (!Number.isInteger(maxLagRows) || maxLagRows < 0) {
+    throw new Error(
+      'CHAINGRAPH_API_UTXO_SET_MAX_LAG_ROWS must be an integer >= 0.'
+    );
+  }
+  return { enabled: flag !== 'off', maxLagRows };
 };
 
 /** Added to the longest budget for the client's own request timeout, so the server's error arrives first. */
@@ -114,10 +144,16 @@ export interface ApiStats {
   watermarkPolls: number;
 }
 
-/** Optional store objects the compiler adapts to (optional DDL items). */
+/** Optional store objects the compiler adapts to (DDL items, the stored UTXO set). */
 export interface StoreFeatures {
   /** tx_acceptance has the projection p_node_tx (ddl/optional/p_node_tx.sql). */
   acceptanceByIdProjection: boolean;
+  /**
+   * The database has the stored UTXO set's tables (ddl/090_utxo_set.sql):
+   * snapshots then read each node's mark (whether a node has a set yet is
+   * per snapshot).
+   */
+  utxoSet?: boolean;
 }
 
 export interface QueryEvent {
@@ -167,10 +203,13 @@ export class ApiDb {
       this.features === undefined ||
       now - this.features.at > this.featureTtlMs
     ) {
-      const sql = `SELECT count() AS n FROM system.projections
-        WHERE database = currentDatabase() AND table = 'tx_acceptance' AND name = 'p_node_tx'`;
+      const sql = `SELECT
+        (SELECT count() FROM system.projections
+         WHERE database = currentDatabase() AND table = 'tx_acceptance' AND name = 'p_node_tx') AS n,
+        (SELECT count() FROM system.tables
+         WHERE database = currentDatabase() AND name = 'utxo_watermark') AS u`;
       const value = this.client
-        .query<{ n: number | string }>(sql)
+        .query<{ n: number | string; u: number | string }>(sql)
         .then((rows) => {
           this.onQuery?.({
             kind: 'storeFeatures',
@@ -178,7 +217,10 @@ export class ApiDb {
             params: {},
             sql,
           });
-          return { acceptanceByIdProjection: Number(rows[0]?.n ?? 0) > 0 };
+          return {
+            acceptanceByIdProjection: Number(rows[0]?.n ?? 0) > 0,
+            utxoSet: Number(rows[0]?.u ?? 0) > 0,
+          };
         });
       this.features = { at: now, value };
       value.catch(() => {
@@ -207,12 +249,26 @@ export class ApiDb {
   /** Server-side time budget per statement class (`max_execution_time`). */
   timeouts: StatementTimeouts = { ...defaultStatementTimeouts };
 
+  /** Stored UTXO set use (`utxoSetPolicyFromEnv`). */
+  utxoSetPolicy: UtxoSetPolicy = { ...defaultUtxoSetPolicy };
+
+  /** Snapshot read options: the UTXO set marks when the policy and the store allow. */
+  private async snapshotOptions() {
+    if (!this.utxoSetPolicy.enabled) return {};
+    const { utxoSet } = await this.storeFeatures();
+    return utxoSet === true ? { utxo: true } : {};
+  }
+
   constructor(readonly client: ClickHouseClient) {}
 
   /** Exactly one ClickHouse query: a fresh visibility snapshot of `nodeId`. */
   async readSnapshot(nodeId: number): Promise<VisibilitySnapshot> {
     this.stats.snapshots += 1;
-    return readSnapshot(this.snapshotClient, nodeId);
+    return readSnapshot(
+      this.snapshotClient,
+      nodeId,
+      await this.snapshotOptions()
+    );
   }
 
   /**
@@ -223,7 +279,10 @@ export class ApiDb {
   async pinnedSnapshot(nodeIds: readonly number[]): Promise<MultiNodeSnapshot> {
     this.stats.snapshots += 1;
     const { hits } = this.snapshotCache;
-    const snapshot = await this.snapshotCache.read(nodeIds);
+    const snapshot = await this.snapshotCache.read(
+      nodeIds,
+      await this.snapshotOptions()
+    );
     if (this.snapshotCache.hits > hits) this.stats.snapshotCacheHits += 1;
     return snapshot;
   }
@@ -326,9 +385,10 @@ const unknownNode = (name: string) =>
 export const singleNodeEnv = (
   snapshot: VisibilitySnapshot,
   nodeName: string | undefined,
-  maxRows?: number
+  maxRows?: number,
+  utxoSetPolicy?: UtxoSetPolicy
 ): StatementEnv => {
-  const sql = new Sql(snapshot);
+  const sql = new Sql(snapshot, new Map(), utxoSetPolicy);
   return {
     ctx: {
       maxRows,
@@ -406,7 +466,8 @@ export class PinnedSnapshot {
       return singleNodeEnv(
         this.preset,
         this.nodeNames[0],
-        this.db.maxResultRows
+        this.db.maxResultRows,
+        this.db.utxoSetPolicy
       );
     }
     const snapshot = await this.get(node);
@@ -414,7 +475,7 @@ export class PinnedSnapshot {
     const others = new Map(
       [...multi.visibleByNode].filter(([id]) => id !== snapshot.nodeId)
     );
-    const sql = new Sql(snapshot, others);
+    const sql = new Sql(snapshot, others, this.db.utxoSetPolicy);
     return {
       ctx: {
         maxRows: this.db.maxResultRows,
