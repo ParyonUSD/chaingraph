@@ -82,6 +82,13 @@ import {
   readStoredChainFacts,
   TransactionLookup,
 } from './tx-lookup.js';
+import type {
+  UtxoSetOptions,
+  UtxoSetProgress,
+  UtxoSetStatus,
+  UtxoSetViolation,
+} from './utxo-set.js';
+import { UtxoSetMaintainer } from './utxo-set.js';
 import {
   committedSql,
   heightBatches,
@@ -173,6 +180,18 @@ export interface ClickHouseStoreOptions {
   spendIndex?: 'off' | 'on';
   /** Spend index filler tuning (tests). */
   spendIndexOptions?: { intervalMs?: number; maxRowsPerBatch?: number };
+  /**
+   * The stored per-node UTXO set, maintained off the commit path
+   * (`CHAINGRAPH_CLICKHOUSE_UTXO_SET`, default `on`;
+   * docs/clickhouse-port/utxo-async.md). `off`: the writer never fills
+   * `utxo_set`; readers then compute unspent outputs at query time.
+   */
+  utxoSet?: 'off' | 'on';
+  /** UTXO set maintainer tuning (tests, tools). */
+  utxoSetOptions?: Omit<
+    UtxoSetOptions,
+    'onError' | 'onProgress' | 'onViolation'
+  >;
   /** Background errors (watermark publishing, lease loss). */
   onError?: (error: unknown) => void;
   /**
@@ -248,6 +267,8 @@ export class StoreClosedError extends Error {}
 export type StoreDiagnostic =
   | CommitLogDiagnostic
   | SpendIndexProgress
+  | UtxoSetProgress
+  | UtxoSetViolation
   | WriterDiagnostic
   | {
       event: 'block_batch_failed';
@@ -390,6 +411,17 @@ export class ClickHouseStore implements ChaingraphStore {
   /** The spend index filler of the current epoch (`undefined` when off). */
   private spendFiller: SpendIndexFiller | undefined;
 
+  /** The UTXO set maintainer of the current epoch (`undefined` when off). */
+  private utxoMaintainer: UtxoSetMaintainer | undefined;
+
+  private utxoMaintainerStopped: Promise<void> | undefined;
+
+  /** Test hook: the maintainer never advances past this seq (`holdUtxoSet`). */
+  private utxoSetHoldAt: bigint | undefined;
+
+  /** `false` when `utxoSet: 'off'`. */
+  private readonly utxoSetEnabled: boolean;
+
   private mempoolCommitter: MempoolCommitter | undefined;
 
   private readonly lookupChunkSize: number;
@@ -440,6 +472,15 @@ export class ClickHouseStore implements ChaingraphStore {
       );
     }
     this.spendIndexEnabled = options.spendIndex !== 'off';
+    if (
+      options.utxoSet !== undefined &&
+      !['off', 'on'].includes(options.utxoSet)
+    ) {
+      throw new RangeError(
+        `utxoSet must be 'on' or 'off' (got ${String(options.utxoSet)}).`
+      );
+    }
+    this.utxoSetEnabled = options.utxoSet !== 'off';
     const cap = options.maxInFlightSaves ?? 0;
     if (!Number.isInteger(cap) || cap < 0) {
       throw new RangeError(
@@ -561,6 +602,11 @@ export class ClickHouseStore implements ChaingraphStore {
       onError: (error) => {
         this.options.publisher?.onError?.(error);
         this.options.onError?.(error);
+      },
+      onPublished: () => {
+        this.options.publisher?.onPublished?.();
+        /* the maintainer follows a published watermark at once, not at its next poll */
+        this.utxoMaintainer?.poke();
       },
     });
     await publisher.init();
@@ -711,6 +757,62 @@ export class ClickHouseStore implements ChaingraphStore {
       this.spendFiller = filler;
       filler.start();
     }
+    if (this.utxoSetEnabled) {
+      const maintainer = new UtxoSetMaintainer(
+        {
+          assertHeld: () => {
+            lease.assertHeld();
+          },
+          client,
+          epoch: () => lease.epoch,
+        },
+        {
+          ...this.options.utxoSetOptions,
+          onError: (error) => {
+            this.options.onError?.(error);
+          },
+          onProgress: (progress) => {
+            this.diagnostic(progress);
+          },
+          onViolation: (violation) => {
+            this.diagnostic(violation);
+          },
+        }
+      );
+      maintainer.holdAt = this.utxoSetHoldAt;
+      this.utxoMaintainer = maintainer;
+      maintainer.start();
+    }
+  }
+
+  /** The UTXO set maintainer's progress (per node watermark, lag); `undefined` when off. */
+  utxoSetStatus(): UtxoSetStatus | undefined {
+    return this.utxoMaintainer?.status;
+  }
+
+  /**
+   * Bring the stored UTXO set of every node up to its visible(n) as
+   * published now (tests and tools; the background maintainer does this on
+   * its own). Returns each node's published (U, generation).
+   */
+  async catchUpUtxoSet() {
+    const maintainer = this.utxoMaintainer;
+    if (maintainer === undefined) {
+      throw new StoreClosedError('The UTXO set is off.');
+    }
+    return maintainer.catchUpAndResume(() => !this.closed);
+  }
+
+  /**
+   * Test hook: the maintainer never advances past `seq` (a paused or
+   * lagging job; `undefined` releases it). Readers stay exact at any lag.
+   */
+  holdUtxoSet(seq: bigint | undefined) {
+    this.utxoSetHoldAt = seq;
+    if (this.utxoMaintainer !== undefined) {
+      this.utxoMaintainer.holdAt = seq;
+      this.utxoMaintainer.poke();
+    }
   }
 
   /** The spend index filler's progress (watermark, lag); `undefined` when off. */
@@ -749,6 +851,8 @@ export class ClickHouseStore implements ChaingraphStore {
     this.publisher = undefined;
     this.spendFillerStopped = this.spendFiller?.stop();
     this.spendFiller = undefined;
+    this.utxoMaintainerStopped = this.utxoMaintainer?.stop();
+    this.utxoMaintainer = undefined;
     this.commitLogInstance?.retire(String(error));
     this.abandonSignal.abandon(`writer lease lost: ${String(error)}`, true);
     this.options.onError?.(error);
@@ -803,6 +907,7 @@ export class ClickHouseStore implements ChaingraphStore {
     }
     // the old epoch's spend index filler has ended (no insert of it lands later)
     await this.spendFillerStopped;
+    await this.utxoMaintainerStopped;
     // 3. drop everything derived from the old epoch, then start the new one
     this.operations = new OperationRegistry();
     this.mempool = new MempoolState(this.utxoEnabled);
@@ -842,6 +947,7 @@ export class ClickHouseStore implements ChaingraphStore {
     }
     this.closed = true;
     await this.spendFiller?.stop();
+    await this.utxoMaintainer?.stop();
     if (this.operations.activeCount > 0) {
       // background work: abandon it and let it abort
       this.abandonSignal.abandon('store closed');
@@ -868,6 +974,7 @@ export class ClickHouseStore implements ChaingraphStore {
     this.fatal = new SimulatedCrash('crashed');
     this.publisher?.stop();
     await this.spendFiller?.stop();
+    await this.utxoMaintainer?.stop();
     this.lease?.stopHeartbeat();
     await this.client?.close();
   }

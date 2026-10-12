@@ -21,6 +21,7 @@ Files run in order; every statement is `IF NOT EXISTS`, so re-running is safe.
 | `060_projections.sql` | the §2.1/§2.4 projections as `ALTER TABLE … ADD PROJECTION IF NOT EXISTS` |
 | `070_spend.sql` | the asynchronous spend index: spend (+ p_category), spend_orphan, spend_watermark, view `spend_at` (item 28) |
 | `080_authchain.sql` | the authchain index: authchain_link (+ p_tx), view `authchain_link_at` (Phase 2 stage 2; filled with each spend batch; `bin/chaingraph-clickhouse-authchain-backfill.js` for existing databases) |
+| `090_utxo_set.sql` | the stored per-node UTXO set maintained off the commit path (owner decision 2026-10-12, item 4): utxo_set (+ p_script), utxo_total (filled by utxo_total_mv), utxo_watermark, minmax indexes on node_block / node_transaction `commit_seq`, view `utxo_set_at` (**generated** by `utxo-set.ts` `utxoSetViewStatement`; `utxo-set.spec.ts` checks it). Design and read rule: `docs/clickhouse-port/utxo-async.md` |
 | `optional/p_node_tx.sql` | **default on** (owner decision 2026-10-12, item 1): tx_acceptance projection ordered by (node, transaction internal id) for unselective per-node `transactions` pages. Applied by the DDL CLI, `applyClickHouseDdl` and `apply.sh` unless skipped: `CHAINGRAPH_CLICKHOUSE_DDL_SKIP=p_node_tx` or `--skip p_node_tx` (DDL CLI). The DDL CLI materializes it once when it adds it to a filled table. The API notices it (`system.projections`); without it, same results by the id range |
 
 Server-fact checks are in `../checks/` (`run.sh <url> <file>`); results below.
