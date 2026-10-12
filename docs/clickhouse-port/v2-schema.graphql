@@ -1134,7 +1134,7 @@ type Transaction {
   ): [Authchain!]!
 
   """
-  Every stored block that includes the transaction (node-agnostic: blocks of stale forks included), in the order the blocks were stored (`order_by: { block: { height: ASC } }` for height order). `accepted_by: node` keeps the blocks that node accepts; `accepted(node:)` on each inclusion tells them apart.
+  Every stored block that includes the transaction (node-agnostic: blocks of stale forks included), by block height, then block hash (`order_by: { block_internal_id: ASC }` for storage order). `accepted_by: node` keeps the blocks that node accepts; `accepted(node:)` on each inclusion tells them apart.
   """
   block_inclusions(
     """
