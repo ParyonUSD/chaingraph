@@ -131,6 +131,11 @@ const msPerSecond = 1000;
  * the Postgres connection was lost (e.g. Postgres is restarting).
  */
 const incompleteBlockRepairRetryDelayMs = 5_000;
+/**
+ * Delay before retrying creation of the unspent tracking indexes after a lost
+ * Postgres connection (invalid indexes left behind are rebuilt on retry).
+ */
+const unspentNodeIdsStartRetryDelayMs = 5_000;
 const durationDecimalPlaces = 1;
 const transactionRateDecimalPlaces = 2;
 
@@ -1264,6 +1269,23 @@ export class Agent {
         this.requestUnspentNodeIdsJobPass();
       })
       .catch((err: unknown) => {
+        if (isPostgresConnectionError(err) && !this.willShutdown) {
+          this.logger.warn(
+            `Agent: creating the unspent tracking indexes lost the Postgres connection (${describePostgresError(
+              err
+            )}); retrying in ${
+              unspentNodeIdsStartRetryDelayMs / msPerSecond
+            } seconds.`
+          );
+          setTimeout(() => {
+            if (this.willShutdown) {
+              return;
+            }
+            this.unspentNodeIdsJobStarted = false;
+            this.startUnspentNodeIdsJob();
+          }, unspentNodeIdsStartRetryDelayMs);
+          return;
+        }
         this.logger.fatal(err);
         this.shutdown().catch((shutdownErr) => {
           this.logger.error(shutdownErr);
