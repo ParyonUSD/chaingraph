@@ -9,6 +9,7 @@ import {
   clickhouseUser,
   clickhouseUtxo,
   clickhouseUtxoSet,
+  clickhouseUtxoSetSpotCheckMs,
 } from '../config.js';
 import { instances } from '../logging.js';
 
@@ -42,6 +43,8 @@ export interface StoreConfig {
     spendIndex?: 'off' | 'on';
     /** The stored UTXO set (`CHAINGRAPH_CLICKHOUSE_UTXO_SET`; default `on`). */
     utxoSet?: 'off' | 'on';
+    /** Its spot-check interval (`CHAINGRAPH_CLICKHOUSE_UTXO_SET_SPOT_CHECK_MS`; default 1 h, 0 = off). */
+    utxoSetSpotCheckMs?: number;
   };
 }
 
@@ -61,6 +64,7 @@ export const storeConfigFromEnvironment = (): StoreConfig => ({
     user: clickhouseUser,
     utxo: clickhouseUtxo,
     utxoSet: clickhouseUtxoSet,
+    utxoSetSpotCheckMs: clickhouseUtxoSetSpotCheckMs,
   },
 });
 
@@ -97,6 +101,14 @@ export const createStore = (
         ) {
           // the spend index's / UTXO set's watermark and lag, every ~10 s
           logger.info({ clickhouseDiagnostic: diagnostic }, message);
+        } else if (diagnostic.event === 'utxo_set_spot_check') {
+          logger.info({ clickhouseDiagnostic: diagnostic }, message);
+        } else if (diagnostic.event === 'utxo_set_spot_check_mismatch') {
+          // the stored UTXO set differs from the query-time answer: a data discrepancy, loud
+          logger.error(
+            { clickhouseDiagnostic: diagnostic },
+            `ClickHouse store: UTXO set spot-check MISMATCH on node ${diagnostic.node}, ${diagnostic.scope} ${diagnostic.value}: stored ${diagnostic.stored} vs query time ${diagnostic.reference}.`
+          );
         } else if (diagnostic.event === 'utxo_set_invariant_violation') {
           // a data discrepancy in the stored UTXO set (utxo-async.md): loud
           logger.fatal({ clickhouseDiagnostic: diagnostic }, message);
@@ -120,6 +132,13 @@ export const createStore = (
       spendIndex: config.clickhouse.spendIndex,
       utxo: config.clickhouse.utxo,
       utxoSet: config.clickhouse.utxoSet,
+      ...(config.clickhouse.utxoSetSpotCheckMs === undefined
+        ? {}
+        : {
+            utxoSetOptions: {
+              spotCheckIntervalMs: config.clickhouse.utxoSetSpotCheckMs,
+            },
+          }),
     });
     if (config.abandonOnShutdownSignals === true) {
       ['SIGINT', 'SIGTERM'].forEach((signal) => {

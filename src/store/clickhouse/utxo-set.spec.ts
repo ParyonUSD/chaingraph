@@ -17,7 +17,8 @@
 import type { ExecutionContext } from 'ava';
 import test from 'ava';
 
-import type { ClickHouseStore } from './clickhouse-store.js';
+import { ClickHouseChecker } from './checker.js';
+import type { ClickHouseStore, StoreDiagnostic } from './clickhouse-store.js';
 import {
   acceptance,
   category,
@@ -30,10 +31,13 @@ import {
   threeBlockChain,
 } from './spec-fixtures.js';
 import { e2eClickHouseUrl } from './test-support.js';
+import type { UtxoSetSpotCheckMismatch } from './utxo-set.js';
 import {
   checkUtxoSet,
   publishedUtxoMarks,
+  spotCheckUtxoSet,
   unspentAtQueryTimeSql,
+  utxoSetMetricsText,
   utxoSetViewStatement,
 } from './utxo-set.js';
 import {
@@ -468,6 +472,175 @@ e2e(
     );
     t.is(rows?.n, '0');
     t.is(await checkUtxoSet(client, node1), undefined);
+  }
+);
+
+e2e(
+  '[e2e] UTXO set spot-check: random categories, prefixes and totals equal the query-time answer at one snapshot; a rewritten history is a counted, reported mismatch',
+  async (t) => {
+    t.timeout(180_000);
+    const diagnostics: StoreDiagnostic[] = [];
+    const { client, name, openStore } = await scratch(
+      t,
+      'spot',
+      {
+        onDiagnostic: (diagnostic) => {
+          diagnostics.push(diagnostic);
+        },
+        utxo: 'off',
+        utxoSetOptions: { intervalMs: 20, spotCheckIntervalMs: 0 },
+      },
+      'ch1_utxoset'
+    );
+    const fx = fixture();
+    const { chain } = fx;
+    const store = await openStore();
+    const { node1, node2 } = await registerNodes(store);
+    const both = [acceptance(node1, at(0)), acceptance(node2, at(0))];
+    for (const block of [chain.block0, chain.block1, chain.block2]) {
+      await store.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: both,
+      });
+    }
+    /* r: a token output, in node 1's mempool only */
+    await store.saveMempoolTransaction(fx.r, [
+      { nodeInternalId: node1, validatedAt: at(20) },
+    ]);
+    await store.publishWatermarks();
+    await store.catchUpUtxoSet();
+    await store.publishWatermarks();
+
+    const rPrefix = fx.r.outputs[0]!.lockingBytecode.slice(0, 50);
+    const scoped = {
+      categoryValues: [category],
+      prefixValues: [rPrefix],
+    };
+    /* random scopes (the job's default): every scope equal, nothing skipped */
+    const random = await store.spotCheckUtxoSet();
+    t.deepEqual(
+      random.map((check) => check.node),
+      [node1, node2]
+    );
+    for (const check of random) {
+      t.deepEqual(check.skipped, []);
+      t.true(check.scopes.length >= 2, 'categories / prefixes and totals');
+      t.true(
+        check.scopes.every((scope) => scope.equal),
+        JSON.stringify(check.scopes)
+      );
+      t.true(check.scopes.some((scope) => scope.kind === 'totals'));
+    }
+    const before = await spotCheckUtxoSet(client, node1, scoped);
+    t.true(before!.scopes.every((scope) => scope.equal));
+    t.regex(
+      before!.scopes.find((scope) => scope.kind === 'category')!.stored,
+      /^[1-9]\d* outputs, /u,
+      "node 1's set holds r's token output"
+    );
+
+    /* fault injection: forget node 1's acceptance of r outside the commit protocol */
+    const checker = new ClickHouseChecker(client, name);
+    await checker.forgetNodeValidation('node-one', fx.r.hash);
+    await store.publishWatermarks();
+    const status = store.utxoSetStatus()!;
+    const counted = status.spotCheckMismatches;
+    const after = await store.spotCheckUtxoSet();
+    const one = after.find((check) => check.node === node1)!;
+    t.true(
+      one.scopes.some((scope) => scope.kind === 'totals' && !scope.equal),
+      "node 1's totals differ"
+    );
+    t.true(
+      after
+        .find((check) => check.node === node2)!
+        .scopes.every((scope) => scope.equal),
+      'node 2 is untouched'
+    );
+    const direct = await spotCheckUtxoSet(client, node1, {
+      ...scoped,
+      totals: false,
+    });
+    t.deepEqual(
+      direct!.scopes.map((scope) => [scope.kind, scope.equal]),
+      [
+        ['category', false],
+        ['prefix', false],
+      ],
+      'the category and prefix of r differ'
+    );
+    const mismatches = diagnostics.filter(
+      (diagnostic): diagnostic is UtxoSetSpotCheckMismatch =>
+        diagnostic.event === 'utxo_set_spot_check_mismatch'
+    );
+    t.true(mismatches.length >= 1);
+    t.true(
+      mismatches.every(
+        (mismatch) =>
+          mismatch.node === node1 &&
+          mismatch.stored !== mismatch.reference &&
+          mismatch.stored !== '' &&
+          mismatch.reference !== ''
+      ),
+      'each report names the node, the scope and both answers'
+    );
+    t.is(
+      status.spotCheckMismatches,
+      counted + mismatches.length,
+      'the mismatch counter'
+    );
+    t.regex(
+      utxoSetMetricsText(status),
+      new RegExp(
+        `chaingraph_utxo_set_spot_check_mismatches_total ${status.spotCheckMismatches}\\n`,
+        'u'
+      )
+    );
+    t.true(status.spotCheckMismatches > 0);
+  }
+);
+
+e2e(
+  '[e2e] UTXO set spot-check runs on its own every spotCheckIntervalMs',
+  async (t) => {
+    t.timeout(120_000);
+    const reports: StoreDiagnostic[] = [];
+    const { openStore } = await scratch(
+      t,
+      'spot_loop',
+      {
+        onDiagnostic: (diagnostic) => {
+          if (diagnostic.event === 'utxo_set_spot_check')
+            reports.push(diagnostic);
+        },
+        utxo: 'off',
+        utxoSetOptions: { intervalMs: 20, spotCheckIntervalMs: 300 },
+      },
+      'ch1_utxoset'
+    );
+    const { chain } = fixture();
+    const store = await openStore();
+    const { node1 } = await registerNodes(store);
+    for (const block of [chain.block0, chain.block1]) {
+      await store.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: [acceptance(node1, at(0))],
+      });
+    }
+    await store.publishWatermarks();
+    await store.catchUpUtxoSet();
+    const deadline = Date.now() + 30_000;
+    while (store.utxoSetStatus()!.spotChecks < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 100);
+      });
+    }
+    const status = store.utxoSetStatus()!;
+    t.true(status.spotChecks >= 2, 'two rounds');
+    t.is(status.spotCheckMismatches, 0);
+    t.true(reports.length >= 2);
   }
 );
 

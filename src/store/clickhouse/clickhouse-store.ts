@@ -85,6 +85,8 @@ import {
 import type {
   UtxoSetOptions,
   UtxoSetProgress,
+  UtxoSetSpotCheckMismatch,
+  UtxoSetSpotCheckReport,
   UtxoSetStatus,
   UtxoSetViolation,
 } from './utxo-set.js';
@@ -190,7 +192,11 @@ export interface ClickHouseStoreOptions {
   /** UTXO set maintainer tuning (tests, tools). */
   utxoSetOptions?: Omit<
     UtxoSetOptions,
-    'onError' | 'onProgress' | 'onViolation'
+    | 'onError'
+    | 'onProgress'
+    | 'onSpotCheck'
+    | 'onSpotCheckMismatch'
+    | 'onViolation'
   >;
   /** Background errors (watermark publishing, lease loss). */
   onError?: (error: unknown) => void;
@@ -268,6 +274,8 @@ export type StoreDiagnostic =
   | CommitLogDiagnostic
   | SpendIndexProgress
   | UtxoSetProgress
+  | UtxoSetSpotCheckMismatch
+  | UtxoSetSpotCheckReport
   | UtxoSetViolation
   | WriterDiagnostic
   | {
@@ -774,6 +782,12 @@ export class ClickHouseStore implements ChaingraphStore {
           onProgress: (progress) => {
             this.diagnostic(progress);
           },
+          onSpotCheck: (report) => {
+            this.diagnostic(report);
+          },
+          onSpotCheckMismatch: (mismatch) => {
+            this.diagnostic(mismatch);
+          },
           onViolation: (violation) => {
             this.diagnostic(violation);
           },
@@ -801,6 +815,19 @@ export class ClickHouseStore implements ChaingraphStore {
       throw new StoreClosedError('The UTXO set is off.');
     }
     return maintainer.catchUpAndResume(() => !this.closed);
+  }
+
+  /**
+   * Run the UTXO set spot-check now (the maintainer runs it every
+   * `spotCheckIntervalMs` on its own): every node with a stored set against
+   * the query-time answer on a few random scopes, one snapshot per node.
+   */
+  async spotCheckUtxoSet() {
+    const maintainer = this.utxoMaintainer;
+    if (maintainer === undefined) {
+      throw new StoreClosedError('The UTXO set is off.');
+    }
+    return maintainer.spotCheck();
   }
 
   /**

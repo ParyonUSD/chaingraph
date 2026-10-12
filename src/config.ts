@@ -597,6 +597,29 @@ if (clickhouseUtxoSetValue !== 'on' && clickhouseUtxoSetValue !== 'off') {
  */
 const clickhouseUtxoSet: 'off' | 'on' = clickhouseUtxoSetValue;
 
+const clickhouseUtxoSetSpotCheckMsValue = Number(
+  optionalString(
+    optionalOptions.CHAINGRAPH_CLICKHOUSE_UTXO_SET_SPOT_CHECK_MS,
+    '3600000'
+  )
+);
+if (
+  !Number.isInteger(clickhouseUtxoSetSpotCheckMsValue) ||
+  clickhouseUtxoSetSpotCheckMsValue < 0
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    'The CHAINGRAPH_CLICKHOUSE_UTXO_SET_SPOT_CHECK_MS environment variable must be an integer greater than or equal to 0.'
+  );
+}
+/**
+ * Set via `CHAINGRAPH_CLICKHOUSE_UTXO_SET_SPOT_CHECK_MS` (default 3600000,
+ * hourly; 0 = off): how often the UTXO set job compares a few random token
+ * categories, locking-bytecode prefixes and each node's totals of the stored
+ * set with the query-time answer (utxo-async.md). Ignored by Postgres.
+ */
+const clickhouseUtxoSetSpotCheckMs = clickhouseUtxoSetSpotCheckMsValue;
+
 const eventLoopDiagnosticValue = Number(
   optionalString(optionalOptions.CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS, '0')
 );
@@ -686,6 +709,7 @@ export {
   clickhouseSpendIndex,
   clickhouseUtxo,
   clickhouseUtxoSet,
+  clickhouseUtxoSetSpotCheckMs,
   encodeWorkers,
   eventLoopDiagnosticMs,
   genesisBlocks,

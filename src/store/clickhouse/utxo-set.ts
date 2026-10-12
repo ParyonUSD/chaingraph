@@ -39,7 +39,11 @@
  * written as generation g + 1 (sign +1, batch U) and published; the old
  * generation's partitions are dropped after a grace period.
  */
-import type { ClickHouseClient } from './client.js';
+import type {
+  ClickHouseClient,
+  ClickHouseSettings,
+  QueryParams,
+} from './client.js';
 import { nextBatchEnd } from './spend-index.js';
 import type { MultiNodeSnapshot, VisibilitySnapshot } from './visibility.js';
 import {
@@ -464,19 +468,26 @@ ${scalars.withClause()}${rows};`;
  * bind `snapshotParams(snapshot)`.
  */
 export const unspentAtQueryTimeSql = (
-  snapshot: Pick<VisibilitySnapshot, 'committedTail' | 'void'>
+  snapshot: Pick<VisibilitySnapshot, 'committedTail' | 'void'>,
+  where?: string
 ) => {
   const agnostic = pinnedGateTerms('agnostic', { snapshot }).join(' AND ');
   const accepted = `SELECT transaction_hash FROM ${inlinePinnedView(
     'tx_acceptance_at',
     snapshot
   )}`;
+  const outputs = `SELECT ${utxoSetReadColumns.join(', ')} FROM output
+    WHERE ${agnostic} AND ${where ?? '1'}`;
+  /* a scope (`where`): only the inputs spending the scope's outputs are read (input.p_outpoint) */
+  const scoped =
+    where === undefined
+      ? ''
+      : ` AND (outpoint_transaction_hash, outpoint_index) IN (SELECT transaction_hash, output_index FROM (${outputs}))`;
   return `SELECT o.* FROM (
-    SELECT ${utxoSetReadColumns.join(', ')} FROM output
-    WHERE ${agnostic} AND transaction_hash IN (${accepted})
+    ${outputs} AND transaction_hash IN (${accepted})
     LIMIT 1 BY transaction_hash, output_index) AS o
   LEFT ANTI JOIN (SELECT outpoint_transaction_hash, outpoint_index FROM input
-                  WHERE ${agnostic} AND transaction_hash IN (${accepted})) AS s
+                  WHERE ${agnostic}${scoped} AND transaction_hash IN (${accepted})) AS s
     ON s.outpoint_transaction_hash = o.transaction_hash AND s.outpoint_index = o.output_index`;
 };
 
@@ -607,6 +618,223 @@ export const checkUtxoSet = async (
   };
 };
 
+/* ------------------------------------------------------------------ */
+/* the periodic spot-check (owner decision 2026-10-12)                  */
+/* ------------------------------------------------------------------ */
+
+/** One compared scope of a spot-check: the stored set's answer and the query-time one. */
+export interface UtxoSpotCheckScope {
+  kind: 'category' | 'prefix' | 'totals';
+  /** The token category or locking-bytecode prefix (hex); empty for `totals`. */
+  value: string;
+  stored: string;
+  reference: string;
+  equal: boolean;
+}
+
+/** A spot-check of one node at one snapshot. */
+export interface UtxoSetSpotCheck {
+  node: number;
+  watermark: bigint;
+  generation: number;
+  visible: bigint;
+  scopes: UtxoSpotCheckScope[];
+  /** Scopes not compared (a statement over its time budget). */
+  skipped: { kind: UtxoSpotCheckScope['kind']; value: string; error: string }[];
+}
+
+// eslint-disable-next-line functional/no-mixed-type
+export interface UtxoSpotCheckOptions {
+  /** Random token categories (default 3; from the node's running totals). */
+  categories?: number;
+  /** Random locking-bytecode prefixes (default 3; from outputs at a random transaction hash). */
+  prefixes?: number;
+  /** Compare the node's whole-set totals (default true). */
+  totals?: boolean;
+  /** These categories / prefixes (hex) instead of random ones (tests, tools). */
+  categoryValues?: readonly string[];
+  prefixValues?: readonly string[];
+  /** Server-side budget of each statement, s (default 120). */
+  maxExecutionSeconds?: number;
+  /** Random source (tests). */
+  random?: () => number;
+}
+
+const scopeDigest = (rows: string) =>
+  `SELECT concat(toString(count()), ' outputs, digest ', hex(groupBitXor(cityHash64(${rowKey}, ${rowDigest})))) AS answer FROM (${rows})`;
+
+const totalsTuple = `tuple(token_category, toInt64(outputs), toInt64(value_satoshis),
+  toInt64(fungible_outputs), toInt128(fungible_token_amount), toInt64(nonfungible_outputs))`;
+
+const totalsDigest = (totals: string) =>
+  `SELECT concat(toString(count()), ' categories, ', toString(sum(toInt64(outputs))), ' outputs, ',
+     toString(sum(toInt64(value_satoshis))), ' sat, digest ', hex(cityHash64(groupArraySorted(1000000)(${totalsTuple})))) AS answer
+   FROM (${totals})`;
+
+const referenceTotals = (reference: string) =>
+  `SELECT token_category, count() AS outputs, sum(v) AS value_satoshis,
+     countIf(isNotNull(f)) AS fungible_outputs, sum(toInt128(ifNull(f, 0))) AS fungible_token_amount,
+     countIf(isNotNull(c)) AS nonfungible_outputs
+   FROM (SELECT token_category, value_satoshis AS v, fungible_token_amount AS f,
+           nonfungible_token_capability AS c FROM (${reference}))
+   GROUP BY token_category`;
+
+const randomHash = (random: () => number) =>
+  Array.from({ length: 32 }, () =>
+    Math.floor(random() * 256)
+      .toString(16)
+      .padStart(2, '0')
+  ).join('');
+
+/**
+ * Compare a few random scopes of a node's stored set with the query-time
+ * definition, all at ONE snapshot (the stored read at the snapshot's own
+ * mark plus its correction): token categories (rows and per-category
+ * totals), locking-bytecode prefixes (rows) and the node's whole-set totals.
+ * Cheap scopes: categories come from `utxo_total` (small), prefixes from the
+ * outputs at a random transaction hash (output key), and each scope reads
+ * its outputs by key or projection. Undefined when the node has no stored
+ * set.
+ */
+export const spotCheckUtxoSet = async (
+  client: Pick<ClickHouseClient, 'query'>,
+  nodeId: number,
+  options: UtxoSpotCheckOptions = {}
+): Promise<UtxoSetSpotCheck | undefined> => {
+  const snapshot = snapshotForNode(
+    await readSnapshotMulti(client, [nodeId], { utxo: true }),
+    nodeId
+  );
+  const mark = snapshot.utxo;
+  if (mark === undefined) return undefined;
+  const params = snapshotParams(snapshot);
+  const withChanges = mark.lagCommits > 0;
+  const random = options.random ?? Math.random;
+  const settings = {
+    max_execution_time: options.maxExecutionSeconds ?? 120,
+  } as unknown as ClickHouseSettings;
+  const zeroCategory = '00'.repeat(32);
+  const categories =
+    options.categoryValues ??
+    (
+      await client.query<{ c: string }>(
+        `SELECT lower(hex(token_category)) AS c FROM (SELECT DISTINCT token_category FROM utxo_total
+         WHERE node_internal_id = {node:UInt32} AND generation = {utxo_generation:UInt32}
+           AND batch <= {utxo:UInt64} AND token_category != unhex({zero:String}))
+         ORDER BY cityHash64(token_category, {seed:UInt64}) LIMIT {n:UInt32}`,
+        {
+          ...params,
+          n: options.categories ?? 3,
+          seed: Math.floor(random() * 2 ** 32),
+          zero: zeroCategory,
+        },
+        settings
+      )
+    ).map((row) => row.c);
+  const prefixCount = options.prefixes ?? 3;
+  const prefixes =
+    options.prefixValues ??
+    (prefixCount <= 0
+      ? []
+      : (
+          await client.query<{ p: string }>(
+            `SELECT DISTINCT lower(hex(locking_bytecode_prefix)) AS p FROM (
+               SELECT locking_bytecode_prefix FROM output WHERE transaction_hash >= unhex({from:String})
+               ORDER BY transaction_hash LIMIT 64)
+             LIMIT {n:UInt32}`,
+            { from: randomHash(random), n: prefixCount },
+            settings
+          )
+        ).map((row) => row.p));
+  const scopes: UtxoSpotCheckScope[] = [];
+  const skipped: UtxoSetSpotCheck['skipped'] = [];
+  const compare = async (
+    kind: UtxoSpotCheckScope['kind'],
+    value: string,
+    build: (scalar: ScalarRegistrar) => { stored: string; reference: string },
+    extra: QueryParams = {}
+  ) => {
+    const scalars = scalarCollector();
+    const { reference, stored } = build(scalars.register);
+    try {
+      const [row] = await client.query<{ s: string; r: string }>(
+        `${scalars.withClause()}SELECT (${stored}) AS s, (${reference}) AS r`,
+        { ...params, ...extra },
+        settings
+      );
+      scopes.push({
+        equal: row!.s === row!.r,
+        kind,
+        reference: row!.r,
+        stored: row!.s,
+        value,
+      });
+    } catch (error: unknown) {
+      skipped.push({ error: String(error), kind, value });
+    }
+  };
+  const change = (scalar: ScalarRegistrar) => ({
+    from: '{utxo:UInt64}',
+    scalar,
+    snapshot,
+  });
+  for (const value of categories) {
+    const where = 'token_category = unhex({spot:String})';
+    await compare(
+      'category',
+      value,
+      (scalar) => {
+        const reference = unspentAtQueryTimeSql(snapshot, where);
+        return {
+          reference: `SELECT concat(r1.answer, '; ', r2.answer) FROM (${scopeDigest(
+            reference
+          )}) AS r1, (${totalsDigest(referenceTotals(reference))}) AS r2`,
+          stored: `SELECT concat(s1.answer, '; ', s2.answer) FROM (${scopeDigest(
+            utxoSetRowsSql({ change: change(scalar), where, withChanges })
+          )}) AS s1, (${totalsDigest(
+            utxoTotalsSql({
+              category: 'unhex({spot:String})',
+              change: change(scalar),
+              withChanges,
+            })
+          )}) AS s2`,
+        };
+      },
+      { spot: value }
+    );
+  }
+  for (const value of prefixes) {
+    const where = 'locking_bytecode_prefix = unhex({spot:String})';
+    await compare(
+      'prefix',
+      value,
+      (scalar) => ({
+        reference: scopeDigest(unspentAtQueryTimeSql(snapshot, where)),
+        stored: scopeDigest(
+          utxoSetRowsSql({ change: change(scalar), where, withChanges })
+        ),
+      }),
+      { spot: value }
+    );
+  }
+  if (options.totals ?? true) {
+    await compare('totals', '', (scalar) => ({
+      reference: totalsDigest(referenceTotals(unspentAtQueryTimeSql(snapshot))),
+      stored: totalsDigest(
+        utxoTotalsSql({ change: change(scalar), withChanges })
+      ),
+    }));
+  }
+  return {
+    generation: mark.generation,
+    node: nodeId,
+    scopes,
+    skipped,
+    visible: snapshot.visible,
+    watermark: mark.watermark,
+  };
+};
+
 /** Every published (U, generation) of a node at or below `upTo`, oldest first. */
 export const publishedUtxoMarks = async (
   client: Pick<ClickHouseClient, 'query'>,
@@ -624,6 +852,46 @@ export const publishedUtxoMarks = async (
     generation: Number(row.g),
     watermark: BigInt(row.w),
   }));
+
+/**
+ * The maintainer's counters in the Prometheus text format (the agent's
+ * internal API serves them at `/metrics`).
+ */
+export const utxoSetMetricsText = (status: UtxoSetStatus) =>
+  [
+    [
+      'chaingraph_utxo_set_spot_checks_total',
+      'Spot-checks run (one per node per round).',
+      status.spotChecks,
+    ],
+    [
+      'chaingraph_utxo_set_spot_check_scopes_total',
+      'Scopes compared by spot-checks.',
+      status.spotCheckScopes,
+    ],
+    [
+      'chaingraph_utxo_set_spot_check_mismatches_total',
+      'Spot-check scopes where the stored UTXO set differed from the query-time answer (a data discrepancy).',
+      status.spotCheckMismatches,
+    ],
+    [
+      'chaingraph_utxo_set_spot_check_skipped_total',
+      'Spot-check scopes not compared (statement over budget).',
+      status.spotCheckSkipped,
+    ],
+    [
+      'chaingraph_utxo_set_batches_total',
+      'Batches published by the UTXO set maintainer.',
+      status.batches,
+    ],
+  ]
+    .map(
+      ([name, help, value]) =>
+        `# HELP ${String(name)} ${String(help)}\n# TYPE ${String(
+          name
+        )} counter\n${String(name)} ${String(value)}\n`
+    )
+    .join('');
 
 /* ------------------------------------------------------------------ */
 /* the maintainer                                                       */
@@ -657,6 +925,34 @@ export interface UtxoSetViolation {
   examples: string[];
 }
 
+/**
+ * A spot-check scope where the stored set and the query-time answer differ:
+ * a data discrepancy, reported loudly (logged as an error).
+ */
+export interface UtxoSetSpotCheckMismatch {
+  event: 'utxo_set_spot_check_mismatch';
+  node: number;
+  generation: number;
+  watermark: string;
+  visible: string;
+  scope: UtxoSpotCheckScope['kind'];
+  value: string;
+  stored: string;
+  reference: string;
+}
+
+/** The summary of one spot-check of one node (logged at info). */
+export interface UtxoSetSpotCheckReport {
+  event: 'utxo_set_spot_check';
+  node: number;
+  watermark: string;
+  visible: string;
+  scopes: number;
+  mismatches: number;
+  skipped: number;
+  ms: number;
+}
+
 export interface UtxoSetNodeStatus {
   watermark: bigint;
   generation: number;
@@ -671,6 +967,14 @@ export interface UtxoSetStatus {
   rebases: number;
   builds: number;
   byNode: Map<number, UtxoSetNodeStatus>;
+  /** Spot-checks run (one per node per round; counter). */
+  spotChecks: number;
+  /** Scopes compared by spot-checks (counter). */
+  spotCheckScopes: number;
+  /** Scopes where the stored set differed from the query-time answer (counter; must stay 0). */
+  spotCheckMismatches: number;
+  /** Scopes not compared (statement over budget; counter). */
+  spotCheckSkipped: number;
 }
 
 export interface UtxoSetOptions {
@@ -709,8 +1013,18 @@ export interface UtxoSetOptions {
   watermarkRetentionMs?: number;
   /** Progress reports at most this often (default 10 s). */
   reportIntervalMs?: number;
+  /**
+   * The periodic spot-check (owner decision 2026-10-12): every this many ms
+   * each node with a stored set is compared with the query-time answer on a
+   * few random scopes (`spotCheckUtxoSet`). Default 1 h; 0 = off.
+   */
+  spotCheckIntervalMs?: number;
+  /** Scopes of each spot-check (`spotCheckUtxoSet` options). */
+  spotCheck?: UtxoSpotCheckOptions;
   onProgress?: (progress: UtxoSetProgress) => void;
   onViolation?: (violation: UtxoSetViolation) => void;
+  onSpotCheck?: (report: UtxoSetSpotCheckReport) => void;
+  onSpotCheckMismatch?: (mismatch: UtxoSetSpotCheckMismatch) => void;
   onError?: (error: unknown) => void;
 }
 
@@ -849,7 +1163,82 @@ export class UtxoSetMaintainer {
     rebases: 0,
     rows: 0,
     running: false,
+    spotCheckMismatches: 0,
+    spotCheckScopes: 0,
+    spotCheckSkipped: 0,
+    spotChecks: 0,
   };
+
+  private lastSpotCheckAt = Date.now();
+
+  private spotCheckRunning: Promise<void> | undefined;
+
+  /**
+   * Spot-check every node with a stored set now, each at one snapshot;
+   * mismatches are counted and reported (`onSpotCheckMismatch`). Returns
+   * the checks.
+   */
+  async spotCheck(): Promise<UtxoSetSpotCheck[]> {
+    const { client } = this.context;
+    const marks = await readUtxoSetMarks(client);
+    const checks: UtxoSetSpotCheck[] = [];
+    for (const node of [...marks.keys()].sort((a, b) => a - b)) {
+      if (this.stopped && this.loop !== undefined) break;
+      const started = Date.now();
+      const check = await spotCheckUtxoSet(
+        client,
+        node,
+        this.options.spotCheck
+      );
+      if (check === undefined) continue;
+      checks.push(check);
+      const mismatches = check.scopes.filter((scope) => !scope.equal);
+      this.status.spotChecks += 1;
+      this.status.spotCheckScopes += check.scopes.length;
+      this.status.spotCheckMismatches += mismatches.length;
+      this.status.spotCheckSkipped += check.skipped.length;
+      mismatches.forEach((scope) => {
+        this.options.onSpotCheckMismatch?.({
+          event: 'utxo_set_spot_check_mismatch',
+          generation: check.generation,
+          node,
+          reference: scope.reference,
+          scope: scope.kind,
+          stored: scope.stored,
+          value: scope.value,
+          visible: check.visible.toString(),
+          watermark: check.watermark.toString(),
+        });
+      });
+      this.options.onSpotCheck?.({
+        event: 'utxo_set_spot_check',
+        mismatches: mismatches.length,
+        ms: Date.now() - started,
+        node,
+        scopes: check.scopes.length,
+        skipped: check.skipped.length,
+        visible: check.visible.toString(),
+        watermark: check.watermark.toString(),
+      });
+    }
+    return checks;
+  }
+
+  /** Start a spot-check round in the background when one is due (never two at once). */
+  private maybeSpotCheck() {
+    const interval = this.options.spotCheckIntervalMs ?? 3_600_000;
+    if (interval <= 0 || this.spotCheckRunning !== undefined) return;
+    if (Date.now() - this.lastSpotCheckAt < interval) return;
+    this.lastSpotCheckAt = Date.now();
+    this.spotCheckRunning = this.spotCheck()
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        this.options.onError?.(error);
+      })
+      .finally(() => {
+        this.spotCheckRunning = undefined;
+      });
+  }
 
   constructor(
     private readonly context: UtxoSetContext,
@@ -874,6 +1263,7 @@ export class UtxoSetMaintainer {
     this.stopped = true;
     this.wake?.();
     await this.loop?.catch(() => undefined);
+    await this.spotCheckRunning;
     this.loop = undefined;
   }
 
@@ -985,6 +1375,7 @@ export class UtxoSetMaintainer {
       try {
         const advanced = await this.pass(true);
         await this.housekeeping();
+        this.maybeSpotCheck();
         if (advanced) continue;
       } catch (error: unknown) {
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition

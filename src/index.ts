@@ -13,6 +13,8 @@ import {
   eventLoopDiagnosticMs,
 } from './config.js';
 import { instantiateLogger } from './logging.js';
+import { ClickHouseStore } from './store/clickhouse/index.js';
+import { utxoSetMetricsText } from './store/clickhouse/utxo-set.js';
 import { createStore } from './store/index.js';
 
 const logger = instantiateLogger();
@@ -36,6 +38,8 @@ if (eventLoopDiagnosticMs > 0) {
   });
 }
 const store = createStore();
+const utxoSetStatusOf = (value: unknown) =>
+  value instanceof ClickHouseStore ? value.utxoSetStatus() : undefined;
 await store.init();
 
 const shutdownTasks = [] as (() => void)[];
@@ -90,6 +94,15 @@ const internalApi = createServer((req, res) => {
   // eslint-disable-next-line complexity
   req.on('end', () => {
     switch (req.url) {
+      case '/metrics': {
+        /* Prometheus text: the stored UTXO set's spot-check counters (ClickHouse store) */
+        const status = utxoSetStatusOf(store);
+        res.writeHead(StatusCode.success, {
+          'Content-Type': 'text/plain; version=0.0.4',
+        });
+        res.end(status === undefined ? '' : utxoSetMetricsText(status));
+        return;
+      }
       case '/health-check':
         res.writeHead(StatusCode.success, headers);
         res.end('{"status":"alive"}');
