@@ -130,9 +130,12 @@ const e2eTestNetworkMagic = Buffer.from(utf8ToBin('grph').map((x) => x | 128));
 /* eslint-enable no-bitwise, @typescript-eslint/no-magic-numbers */
 const e2eTestNetworkMagicHex = e2eTestNetworkMagic.toString('hex');
 const e2eTestNetworkMagicAsNum = parseInt(e2eTestNetworkMagicHex, 16);
-const e2eTestNetworkNode1Port = 19333;
-const e2eTestNetworkNode2Port = 19334;
-const e2eTestNetworkNode3Port = 19335;
+/** The mock nodes' P2P ports: CHAINGRAPH_E2E_NODE_PORT_BASE (default 19333) and the next two (parallel runs). */
+const e2eTestNetworkNode1Port = Number(
+  process.env.CHAINGRAPH_E2E_NODE_PORT_BASE ?? '19333'
+);
+const e2eTestNetworkNode2Port = e2eTestNetworkNode1Port + 1;
+const e2eTestNetworkNode3Port = e2eTestNetworkNode2Port + 1;
 const node1Version = 70012;
 const node1UserAgent = '/chaingraph-e2e-node-1:0.0.0/';
 const node2Version = 70013;
@@ -654,8 +657,12 @@ test.after.always(async () => {
     }
   );
   await clickHouseClient?.close();
-  await dropClickHouseDatabase(e2eClickHouseServer, e2eClickHouseDatabase);
-  logger.info(`Dropped ClickHouse database ${e2eClickHouseDatabase}`);
+  if (process.env.CHAINGRAPH_E2E_KEEP_CLICKHOUSE_DB === undefined) {
+    await dropClickHouseDatabase(e2eClickHouseServer, e2eClickHouseDatabase);
+    logger.info(`Dropped ClickHouse database ${e2eClickHouseDatabase}`);
+  } else {
+    logger.info(`Kept ClickHouse database ${e2eClickHouseDatabase}`);
+  }
 });
 
 const handleStdout = () => {
@@ -767,6 +774,20 @@ const appendStdout = (chunk: unknown) => {
  * `clickHouseTestTimeoutMs` (its waits are longer than the CLI timeout);
  * on Postgres the CLI `--timeout` applies, as before.
  */
+/**
+ * Nodes whose acceptance history a test rewrote (`checker.forgetNodeValidation`
+ * cancels a committed row at its own commit seq, outside the commit protocol:
+ * fault injection). A store's derived per-node state computed before the
+ * rewrite (the stored UTXO set, utxo-async.md) legitimately disagrees with the
+ * rewritten history afterwards, so its check skips these nodes.
+ */
+const rewrittenNodes = new Set<string>();
+
+const forgetNodeValidation = async (node: string, hash: string) => {
+  rewrittenNodes.add(node);
+  return checker.forgetNodeValidation(node, hash);
+};
+
 const serialTest = (
   title: string,
   implementation: (t: ExecutionContext) => Promise<void> | void
@@ -1174,10 +1195,8 @@ serialTest(
     mempoolAnnouncements.node1 = [];
     mempoolAnnouncements.node2 = [];
     await Promise.all([
-      ...fetchChain.map(async (tx) =>
-        checker.forgetNodeValidation('node1', tx.hash)
-      ),
-      checker.forgetNodeValidation('node2', fetchNode2Tx!.hash),
+      ...fetchChain.map(async (tx) => forgetNodeValidation('node1', tx.hash)),
+      forgetNodeValidation('node2', fetchNode2Tx!.hash),
     ]);
     t.deepEqual(await membershipOf(fetchedHashes), {
       node1: [],
@@ -1227,7 +1246,7 @@ serialTest(
     );
     mempoolAnnouncements.node1 = [];
     await Promise.all(
-      hashes.map(async (hash) => checker.forgetNodeValidation('node1', hash))
+      hashes.map(async (hash) => forgetNodeValidation('node1', hash))
     );
   }
 );
@@ -2146,7 +2165,7 @@ serialTest(
       expectedNodes
     );
     t.deepEqual(await checker.transactionRowCount(halTxHash), 1);
-    await checker.forgetNodeValidation('node2', halTxHash);
+    await forgetNodeValidation('node2', halTxHash);
     t.deepEqual(
       await eventuallyEqual(
         async () => checker.validatingNodes(halTxHash),
@@ -2511,7 +2530,7 @@ serialTest('[e2e] records stale blocks', async (t) => {
  * node's newest published marks equals the query-time definition, totals
  * included, and the stored rows keep their invariant.
  */
-/* eslint-disable functional/no-loop-statement, no-await-in-loop, @typescript-eslint/no-magic-numbers */
+/* eslint-disable functional/no-loop-statement, no-await-in-loop, @typescript-eslint/no-magic-numbers, complexity */
 (isClickHouseE2e ? test.serial : test.skip)(
   '[e2e] [clickhouse] stored UTXO set after the re-orgs: exact per node at the snapshot and at its published marks',
   async (t) => {
@@ -2521,7 +2540,17 @@ serialTest('[e2e] records stale blocks', async (t) => {
       'SELECT internal_id AS id, name FROM node FINAL ORDER BY id'
     );
     t.true(nodes.length >= 3);
-    for (const node of nodes) {
+    const checked = nodes.filter((node) => !rewrittenNodes.has(node.name));
+    t.log(
+      `history rewritten by fault injection (not compared): ${
+        [...rewrittenNodes].sort().join(', ') || 'none'
+      }`
+    );
+    t.true(
+      checked.some((node) => node.name === 'node3'),
+      'the re-orged node is compared'
+    );
+    for (const node of checked) {
       const id = Number(node.id);
       /* the maintainer has published a set for the node (a build or a replay) */
       const own = await eventually(async () => checkUtxoSet(store, id), {
@@ -2557,7 +2586,13 @@ serialTest('[e2e] records stale blocks', async (t) => {
             missing: [],
             totalsEqual: true,
           },
-          `${node.name} at U=${check!.watermark} g${check!.generation}`
+          `${node.name} at U=${check!.watermark} g${check!.generation} (${
+            check === own ? 'the snapshot mark' : 'a published mark'
+          }, visible ${check!.visible}, ${
+            snapshot.utxo === undefined
+              ? 'no mark'
+              : `snapshot mark ${snapshot.utxo.watermark} lag ${snapshot.utxo.lagCommits}`
+          })`
         );
       }
       t.log(
@@ -2568,7 +2603,7 @@ serialTest('[e2e] records stale blocks', async (t) => {
     }
   }
 );
-/* eslint-enable functional/no-loop-statement, no-await-in-loop, @typescript-eslint/no-magic-numbers */
+/* eslint-enable functional/no-loop-statement, no-await-in-loop, @typescript-eslint/no-magic-numbers, complexity */
 
 // eslint-disable-next-line @typescript-eslint/no-magic-numbers
 const doubleSpendSaveTimeoutMs = Math.max(visibleTimeoutMs, 5_000);
