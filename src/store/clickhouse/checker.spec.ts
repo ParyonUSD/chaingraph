@@ -906,6 +906,7 @@ e2e(
 
     const report = await checker.schemaReport();
     /* the only materialized view: the stored UTXO set's running totals (utxo-async.md), derived rows only */
+    // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
     t.deepEqual(report.triggers, { utxo_total_mv: 'enabled' });
     t.true(report.indexes.includes('table:utxo'));
     t.true(report.indexes.includes('projection:output.p_script'));

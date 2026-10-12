@@ -2548,7 +2548,7 @@ serialTest('[e2e] records stale blocks', async (t) => {
     );
     t.true(
       checked.some((node) => node.name === 'node3'),
-      'the re-orged node is compared'
+      'the node that re-organized is compared'
     );
     for (const node of checked) {
       const id = Number(node.id);
