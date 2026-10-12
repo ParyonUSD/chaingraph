@@ -22,7 +22,12 @@
  * (`signal`). Heavy statements can never take the light lane's slots, so
  * cheap lookups keep their latency while heavy ones queue or are refused.
  * On the ClickHouse side each lane has its own settings (`max_threads`,
- * `priority`, optionally a `workload`).
+ * `priority`, optionally a `workload`). Lane sizes follow the ClickHouse
+ * server's cores (`laneConcurrencyForCores`); a cluster-wide backstop across
+ * API pods is the API user's `max_concurrent_queries_for_user`
+ * (store/clickhouse/api-user.ts). Trusted documents get no lane of their
+ * own: a trusted document's statement that reads ≥ `heavyRows` shares the
+ * heavy lane (owner decision 2026-10-12, fix-pass-5.md §4).
  */
 import { createHash } from 'node:crypto';
 

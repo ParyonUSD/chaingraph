@@ -261,13 +261,22 @@ F6 (every heavy statement faster than 10-11) covers those. Fix 3c should lower t
 6. `spent_by(accepted_by:)` filter and `authchain_branches` cap: catalogue equality as before (L15/L16 unchanged; the
    filter form is new and not in the catalogue).
 
-## 8. Owner decisions needed
+## 8. Owner decisions (2026-10-12; implemented in [fix-pass-5.md](fix-pass-5.md))
 
 1. **`max_concurrent_queries_for_user`** for the API's ClickHouse user (a cluster-wide backstop across API pods; the
    API's own limits are per process). Proposal: `pods × 30 + 10` in the user's profile, set by the deployment, not by
    the API.
+   **Decided: yes, `pods × 30 + 10`** in the API user's settings profile `chaingraph_api` (`const`), pod count
+   configurable; rendered as users.d XML or SQL by `yarn clickhouse:api-user`, wired into the next GKE kit and the
+   local Docker setup (local-dev.md). The API logs the value it sees. fix-pass-5.md §2.
 2. **Default lane sizes for production** (24 light / 6 heavy, heavy `max_threads` 8 per process): keep until the GKE
    soak, or set from the node size?
+   **Decided: derived from the ClickHouse server's cores by default, env overrides kept.** Cores = the server's
+   `max_threads` for the API user (its usable cores; 48 on the GKE c4d node); heavy = max(1, round(cores / 8)),
+   light = max(8, floor(cores / 2)), heavy queue 4 per heavy slot: 24 / 6 / 8 threads at 48 cores.
+   fix-pass-5.md §3.
 3. **X7-class documents** (light to clients, but > 1 M rows read on mainnet) share the heavy lane and are refused under
    heavy overload. Acceptable (they are refused fast), or give trusted documents a lane by document instead of by
    statement cost?
+   **Decided: trusted documents share the heavy lane** (admission stays by statement cost); clients retry after
+   `Retry-After`. Docs note only: fix-pass-5.md §4.
