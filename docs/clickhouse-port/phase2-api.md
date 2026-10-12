@@ -836,8 +836,14 @@ and X4 26 → 32 (now 117 and 24). Headers of the document files hold the stage-
 
 1. **`block_inclusions` order:** storage order (`block_internal_id`) by default, height order only when asked
    (saves 10–20 ms on ~25 library documents). Confirm, or keep height order as the default?
+   **Owner decision 2026-10-12:** the default order of `block_inclusions` is height, then block hash (not storage
+   order).
 2. **`BlockInclusion.accepted_at`** is gone (it was the level node's acceptance time); per node it is
    `block { accepted_by(node:) { accepted_at } }`. Confirm, or add `accepted_at(node: String!)`?
+   **Owner decision 2026-10-12: no shortcut.** v2 keeps `accepted_at` on blocks and `validated_at` on transactions
+   and reaches a block by traversal only: no `transaction.accepted_at(node:)`, no `BlockInclusion.accepted_at`
+   shortcut and no `transaction.block(node:)` field. Clients use
+   `block_inclusions(accepted_by: node) { block { accepted_by(node:) { accepted_at } } }`.
 3. **The `spent_by` filter** is node-agnostic like the relationship; acceptance through `transaction: { block_window:
    {} }` at the level's node. Confirm, or add an explicit filter-level `accepted_by`?
 4. **`p_node_tx` on mainnet:** the GKE session can measure it by applying the DDL with and without
@@ -845,6 +851,8 @@ and X4 26 → 32 (now 117 and 24). Headers of the document files hold the stage-
    paging `transactions(node:, limit: 100, after: …)` from a few cursors. The plan relies on
    `tx_acceptance.transaction_internal_id` being the transaction row's `internal_id` (true for every store write
    path; equal pages on chipnet and in the specs).
+   **Owner decision 2026-10-12:** `p_node_tx` is ON by default (floor session 2026-10-12: build 48 s / 14.76 GiB on
+   golden, U1 4.0 s and U3 105 ms with it; catalogue key CPU unchanged).
 5. **`authchain_branches` size:** branches are paths, so a tree with many conflicting spends on a long chain repeats
    the shared prefix per branch. The depth limit (100,000) bounds each path and the row cap (500,000) the rows
    returned, but nothing bounds the number of branches the walk builds. Acceptable for an explorer feature, or cap
