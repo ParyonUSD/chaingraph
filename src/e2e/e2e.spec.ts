@@ -94,6 +94,7 @@ const dbUpMigrationPaths = [
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
   migration('default/1791500000000_unspent_node_ids/up.sql'),
+  migration('default/1791600000000_node_block_height/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -829,6 +830,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'block_transaction_pkey',
     'input_pkey',
     'node_block_history_pkey',
+    'node_block_node_height_index',
     'node_block_pkey',
     'node_internal_id_key',
     'node_name_key',
@@ -5027,5 +5029,186 @@ test.serial(
       t.true(/\b(?:test_)?output_search_index\b/u.test(plan), plan);
       t.false(plan.includes('Seq Scan'), plan);
     });
+  }
+);
+
+test.serial(
+  '[e2e] [sql] node_block.block_height matches block.height for every row',
+  async (t) => {
+    const counts = (
+      await client.query<{ mismatched: string; total: string }>(/* sql */ `
+  SELECT COUNT(*)::bigint AS total,
+         COUNT(*) FILTER (WHERE node_block.block_height IS DISTINCT FROM block.height)::bigint AS mismatched
+    FROM node_block
+    JOIN block ON block.internal_id = node_block.block_internal_id;
+  `)
+    ).rows[0]!;
+    t.true(Number(counts.total) > 0);
+    t.deepEqual(counts.mismatched, '0');
+  }
+);
+
+test.serial(
+  '[e2e] [sql] node_block inserts without block_height take the height from block',
+  async (t) => {
+    await client.query('BEGIN;');
+    const insertWithoutHeight = async () =>
+      (
+        await client.query<{ blockHeight: string }>(/* sql */ `
+WITH inserted_block AS (
+  INSERT INTO block (height, version, "timestamp", hash, previous_block_hash, merkle_root, bits, nonce, size_bytes)
+    VALUES (987654, 1, 0, decode(repeat('e1', 32), 'hex'), decode(repeat('e2', 32), 'hex'), decode(repeat('e3', 32), 'hex'), 0, 0, 81)
+    RETURNING internal_id
+)
+INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
+  SELECT node.internal_id, inserted_block.internal_id, NULL
+    FROM node CROSS JOIN inserted_block
+    WHERE node.name = 'node1'
+  RETURNING block_height AS "blockHeight";
+`)
+      ).rows;
+    const rollback = async () => client.query('ROLLBACK;');
+    const rows = await insertWithoutHeight().then(
+      async (result) => rollback().then(() => result),
+      async (error: unknown) =>
+        // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+        rollback().then(async () => Promise.reject(error))
+    );
+    t.deepEqual(rows, [{ blockHeight: '987654' }]);
+  }
+);
+
+test.serial(
+  '[e2e] [sql] node_block_height migration backfills existing rows and can be re-applied',
+  async (t) => {
+    const migrationDirectory = 'default/1791600000000_node_block_height';
+    const downMigration = readFileSync(
+      migration(`${migrationDirectory}/down.sql`),
+      'utf8'
+    );
+    const upMigration = readFileSync(
+      migration(`${migrationDirectory}/up.sql`),
+      'utf8'
+    );
+    const describeNodeBlockHeight = async () =>
+      (
+        await client.query<{
+          indexExists: boolean;
+          mismatched: string;
+          notNull: boolean;
+          total: string;
+          triggerExists: boolean;
+        }>(/* sql */ `
+SELECT COUNT(*)::bigint AS total,
+       COUNT(*) FILTER (WHERE node_block.block_height IS DISTINCT FROM block.height)::bigint AS mismatched,
+       (SELECT is_nullable = 'NO' FROM information_schema.columns
+          WHERE table_name = 'node_block' AND column_name = 'block_height') AS "notNull",
+       to_regclass('node_block_node_height_index') IS NOT NULL AS "indexExists",
+       EXISTS (SELECT 1 FROM pg_trigger
+          WHERE tgname = 'trigger_public_node_block_fill_height') AS "triggerExists"
+  FROM node_block
+  JOIN block ON block.internal_id = node_block.block_internal_id;
+`)
+      ).rows[0]!;
+    await client.query('BEGIN;');
+    const reapply = async () => {
+      await client.query(downMigration);
+      const columnAfterDown = (
+        await client.query(/* sql */ `
+SELECT 1 FROM information_schema.columns
+  WHERE table_name = 'node_block' AND column_name = 'block_height';
+`)
+      ).rowCount;
+      await client.query(upMigration);
+      const afterBackfill = await describeNodeBlockHeight();
+      await client.query(upMigration);
+      const afterReapply = await describeNodeBlockHeight();
+      /*
+       * A nullable, partly filled column (e.g. an interrupted manual apply) is
+       * backfilled again.
+       */
+      await client.query(downMigration);
+      await client.query(/* sql */ `
+ALTER TABLE node_block ADD COLUMN block_height bigint;
+UPDATE node_block SET block_height = -1
+  WHERE block_internal_id = (SELECT min(block_internal_id) FROM node_block);
+`);
+      await client.query(upMigration);
+      const afterPartial = await describeNodeBlockHeight();
+      return { afterBackfill, afterPartial, afterReapply, columnAfterDown };
+    };
+    const rollback = async () => client.query('ROLLBACK;');
+    const { afterBackfill, afterPartial, afterReapply, columnAfterDown } =
+      await reapply().then(
+        async (result) => rollback().then(() => result),
+        async (error: unknown) =>
+          // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+          rollback().then(async () => Promise.reject(error))
+      );
+    t.deepEqual(columnAfterDown, 0);
+    t.true(Number(afterBackfill.total) > 0);
+    [afterBackfill, afterReapply, afterPartial].forEach((state) => {
+      t.deepEqual(state.mismatched, '0');
+      t.true(state.notNull);
+      t.true(state.indexExists);
+      t.true(state.triggerExists);
+    });
+  }
+);
+
+test.serial(
+  '[e2e] [sql] per-node tip query uses node_block_node_height_index',
+  async (t) => {
+    /*
+     * The SQL Hasura generates for:
+     * node(where: {name: {_eq: $node}}) {
+     *   accepted_blocks(order_by: {block_height: desc}, limit: 1) { block { hash height } }
+     * }
+     */
+    const tipQuery = /* sql */ `
+SELECT block.height
+  FROM node
+  LEFT JOIN LATERAL (
+    SELECT * FROM node_block
+      WHERE node.internal_id = node_block.node_internal_id
+      ORDER BY block_height DESC NULLS FIRST
+      LIMIT 1
+  ) AS tip ON true
+  JOIN block ON block.internal_id = tip.block_internal_id
+  WHERE node.name = 'node1'`;
+    const expectedHeight = (
+      await client.query<{ height: string }>(/* sql */ `
+SELECT MAX(block.height)::bigint AS height
+  FROM node_block
+  JOIN node ON node.internal_id = node_block.node_internal_id
+  JOIN block ON block.internal_id = node_block.block_internal_id
+  WHERE node.name = 'node1';
+`)
+    ).rows[0]!.height;
+    t.deepEqual((await client.query<{ height: string }>(tipQuery)).rows, [
+      { height: expectedHeight },
+    ]);
+    await client.query('BEGIN;');
+    const explain = async () => {
+      // cspell: disable-next-line
+      await client.query('SET LOCAL enable_seqscan = off;');
+      await client.query('SET LOCAL enable_sort = off;');
+      return (
+        await client.query<{ [column: string]: string }>(
+          `EXPLAIN (COSTS OFF) ${tipQuery}`
+        )
+      ).rows
+        .map((row) => Object.values(row).join(''))
+        .join('\n');
+    };
+    const rollback = async () => client.query('ROLLBACK;');
+    const plan = await explain().then(
+      async (result) => rollback().then(() => result),
+      async (error: unknown) =>
+        // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+        rollback().then(async () => Promise.reject(error))
+    );
+    t.true(plan.includes('node_block_node_height_index'), plan);
+    t.false(plan.includes('Sort'), plan);
   }
 );
