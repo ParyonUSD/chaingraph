@@ -7,9 +7,10 @@
  * `CHAINGRAPH_CLICKHOUSE_PASSWORD`. Idempotent; exits 0 on success, 1 on
  * failure. Meant for a Kubernetes init container or Job.
  *
- * Optional items (`ddl/optional/<name>.sql`, off by default): name them in
- * `CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL` (comma-separated) or with
- * `--optional <name>` (repeatable), e.g. `p_node_tx`.
+ * DDL items (`ddl/optional/<name>.sql`): the default ones (`p_node_tx`)
+ * are applied unless skipped with `CHAINGRAPH_CLICKHOUSE_DDL_SKIP`
+ * (comma-separated) or `--skip <name>` (repeatable); others only when named
+ * in `CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL` or with `--optional <name>`.
  *
  * Reads only these env vars (not `config.ts`, so no Postgres connection
  * string is needed). The password is never logged; the URL is logged without
@@ -23,8 +24,8 @@ import {
   ddlFiles,
   legacySchemaFindings,
   listClickHouseTables,
-  parseOptionalDdl,
   resolveDdlDirectory,
+  resolveDdlItems,
 } from './ddl-apply.js';
 
 const log = (message: string) => {
@@ -41,20 +42,30 @@ const nonEmpty = (value: string | undefined, fallback: string) =>
   value === undefined || value === '' ? fallback : value;
 
 /** The connection from env; `username` empty means the URL's user, else `default`. */
-/** `--optional a --optional b` / `--optional=a,b` plus the env list. */
+/** Values of `--flag a --flag b` / `--flag=a,b`, comma-joined. */
+const flagValues = (argv: readonly string[], flag: string) =>
+  argv
+    .flatMap((arg, index) =>
+      arg === flag
+        ? [argv[index + 1] ?? '']
+        : arg.startsWith(`${flag}=`)
+        ? [arg.slice(flag.length + 1)]
+        : []
+    )
+    .join(',');
+
+/** The default items plus `--optional` / the env list, minus `--skip` / the env list. */
 const optionalItems = (env: NodeJS.ProcessEnv, argv: readonly string[]) =>
-  parseOptionalDdl(
-    [
+  resolveDdlItems({
+    add: [
       env.CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL ?? '',
-      ...argv.flatMap((arg, index) =>
-        arg === '--optional'
-          ? [argv[index + 1] ?? '']
-          : arg.startsWith('--optional=')
-          ? [arg.slice('--optional='.length)]
-          : []
-      ),
-    ].join(',')
-  );
+      flagValues(argv, '--optional'),
+    ].join(','),
+    skip: [
+      env.CHAINGRAPH_CLICKHOUSE_DDL_SKIP ?? '',
+      flagValues(argv, '--skip'),
+    ].join(','),
+  });
 
 const settingsFromEnv = (env: NodeJS.ProcessEnv) => ({
   database: nonEmpty(env.CHAINGRAPH_CLICKHOUSE_DATABASE, 'cg'),
@@ -97,7 +108,7 @@ const run = async (settings: ReturnType<typeof settingsFromEnv>) => {
     `${safeUrl.origin} database=${database} user=${nonEmpty(
       username,
       '(from URL or default)'
-    )} dir=${directory} files=${files.join(',')} optional=${
+    )} dir=${directory} files=${files.join(',')} items=${
       optional.length === 0 ? '(none)' : optional.join(',')
     }`
   );

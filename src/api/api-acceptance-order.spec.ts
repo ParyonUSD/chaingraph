@@ -1,9 +1,10 @@
-/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-loop-statement, no-await-in-loop, functional/no-let, functional/no-throw-statement, functional/no-try-statement, @typescript-eslint/init-declarations, complexity */
+/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-loop-statement, no-await-in-loop, functional/no-let, functional/no-throw-statement, complexity */
 // cspell:ignore clickhouse
 /**
  * Unselective per-node roots (owner decision 2026-10-11, item 3):
  * `transactions(node:)` pages in internal-id order with no filter use the
- * optional projection p_node_tx when present (`Sql.acceptedInIdOrder`: a
+ * projection p_node_tx when present (a default DDL item since 2026-10-12,
+ * opt-out `CHAINGRAPH_CLICKHOUSE_DDL_SKIP=p_node_tx`) (`Sql.acceptedInIdOrder`: a
  * window of acceptance rows read in id order, exact) and the id range on the
  * base acceptance rows otherwise. Both, and the window's fallback to the
  * whole range, must give exactly the pages (and `has_more`) of the
@@ -12,7 +13,11 @@
 import type { ExecutionContext } from 'ava';
 import test from 'ava';
 
-import { applyClickHouseDdl } from '../store/clickhouse/ddl-apply.js';
+import {
+  applyClickHouseDdl,
+  ddlItemsFromEnvironment,
+  resolveDdlItems,
+} from '../store/clickhouse/ddl-apply.js';
 import { e2eClickHouseUrl } from '../store/clickhouse/test-support.js';
 
 import type { Env } from './spec-env.js';
@@ -20,6 +25,21 @@ import { one, recordQueries, setup, two } from './spec-env.js';
 import { acceptanceWindowRows } from './sql.js';
 
 const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
+
+test('DDL items: p_node_tx is applied by default, opt-out by skip, unknown names throw', (t) => {
+  t.deepEqual(resolveDdlItems({}), ['p_node_tx']);
+  t.deepEqual(resolveDdlItems({ add: 'p_node_tx' }), ['p_node_tx']);
+  t.deepEqual(resolveDdlItems({ skip: 'p_node_tx' }), []);
+  t.deepEqual(resolveDdlItems({ add: 'p_node_tx', skip: ' p_node_tx ' }), []);
+  t.deepEqual(ddlItemsFromEnvironment({}), ['p_node_tx']);
+  t.deepEqual(
+    ddlItemsFromEnvironment({ CHAINGRAPH_CLICKHOUSE_DDL_SKIP: 'p_node_tx' }),
+    []
+  );
+  t.throws(() => resolveDdlItems({ skip: 'p_unknown' }), {
+    message: /Unknown optional DDL item/u,
+  });
+});
 
 interface Page {
   t: {
@@ -126,18 +146,8 @@ e2e(
   '[e2e] unselective transactions(node:) pages: with p_node_tx (window read in id order, its fallback) and without (id range) equal the accepted transactions in id order, has_more exact',
   async (t) => {
     t.timeout(300_000);
-    const previous = process.env.CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL;
-    process.env.CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL = 'p_node_tx';
-    let env: Env;
-    try {
-      env = await setup(t, 'acc_order');
-    } finally {
-      if (previous === undefined) {
-        delete process.env.CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL;
-      } else {
-        process.env.CHAINGRAPH_CLICKHOUSE_DDL_OPTIONAL = previous;
-      }
-    }
+    /* p_node_tx is a default DDL item: the harness applies it without being asked */
+    const env: Env = await setup(t, 'acc_order');
     /* churn: blocks on node-one confirm nothing new but add rows; a mempool transaction gets confirmed */
     await env.extendNodeOne([env.data.redeemB]);
     await env.extendNodeOne([]);
@@ -178,6 +188,15 @@ e2e(
       'ALTER TABLE tx_acceptance DROP PROJECTION IF EXISTS p_node_tx'
     );
     const base = await applyClickHouseDdl(server, database, { optional: [] });
+    t.is(
+      (
+        await env.client.query<{ n: string }>(
+          "SELECT toString(count()) AS n FROM system.projections WHERE database = currentDatabase() AND table = 'tx_acceptance' AND name = 'p_node_tx'"
+        )
+      )[0]?.n,
+      '0',
+      'opted out (no items): not added'
+    );
     t.is(
       await applyClickHouseDdl(server, database, { optional: ['p_node_tx'] }),
       base + 2,
