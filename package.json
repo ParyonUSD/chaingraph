@@ -106,6 +106,7 @@
     "image:inspect:agent": "docker save chaingraph/agent:dev-build > data/agent.tar",
     "image:inspect:bchn": "docker save chaingraph/bitcoin-cash-node:dev-build > data/bitcoin-cash-node.tar",
     "build": "tsc",
+    "clickhouse:api-user": "node bin/chaingraph-clickhouse-api-user.js",
     "clickhouse:ddl": "node bin/chaingraph-clickhouse-ddl.js",
     "clickhouse:views:generate": "yarn build >/dev/null && node build/store/clickhouse/view-ddl-cli.js",
     "api:dev": "yarn build && node build/api/main.js",
