@@ -1009,7 +1009,13 @@ const lockingBytecodePrefixKey = (sql: Sql, comparison: HexComparison) => {
   return parts;
 };
 
-/** The same for an NFT commitment prefix: `nonfungible_token_commitment_key` (p_category). */
+/**
+ * The same for an NFT commitment: `nonfungible_token_commitment_key`
+ * (p_category's second key column, `ifNull(commitment, '')`). Equality and
+ * `_in` are implied by the comparison on the nullable column (a matching
+ * row is not NULL), so the key narrows p_category to the commitments'
+ * ranges instead of the whole category (planning-floor.md §6).
+ */
 const commitmentKeyCondition = (sql: Sql, comparison: HexComparison) => {
   const key = (prefix: string) =>
     `startsWith(nonfungible_token_commitment_key, unhex(${sql.bind(
@@ -1017,6 +1023,24 @@ const commitmentKeyCondition = (sql: Sql, comparison: HexComparison) => {
       'String'
     )}))`;
   return [
+    ...(given(comparison._eq)
+      ? [
+          `nonfungible_token_commitment_key = unhex(${sql.bind(
+            comparison._eq,
+            'String'
+          )})`,
+        ]
+      : []),
+    ...(given(comparison._in) && comparison._in.length > 0
+      ? [
+          `nonfungible_token_commitment_key IN ${hexList(
+            sql,
+            'bytes',
+            comparison._in,
+            'nonfungible_token_commitment'
+          )}`,
+        ]
+      : []),
     ...(given(comparison._prefix) ? [key(comparison._prefix)] : []),
     ...(given(comparison._prefix_in) && comparison._prefix_in.length > 0
       ? [any(comparison._prefix_in.map(key))]

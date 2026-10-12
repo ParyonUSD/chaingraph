@@ -8,6 +8,7 @@ import type { VisibilitySnapshot } from '../store/clickhouse/visibility.js';
 import { operationNodeNames } from './server.js';
 import {
   isClientParamName,
+  outputPredicate,
   snapshotParameterNames,
   Sql,
   transactionPredicate,
@@ -71,6 +72,23 @@ test('client values are bound as pN parameters, never in SQL text; snapshot para
     (match) => match[1]!
   );
   t.true(placeholders.every((name) => name in sql.params));
+});
+
+test('commitment equality and _in add p_category key conditions (planning-floor.md); negated filters do not', (t) => {
+  const sql = new Sql(snapshot);
+  const eq = outputPredicate(sql, {
+    nonfungible_token_commitment: { _eq: 'abcd' },
+  });
+  t.regex(eq, /nonfungible_token_commitment = unhex\(\{p\d+:String\}\)/u);
+  t.regex(eq, /nonfungible_token_commitment_key = unhex\(\{p\d+:String\}\)/u);
+  const list = outputPredicate(sql, {
+    nonfungible_token_commitment: { _in: ['ab', 'cd'] },
+  });
+  t.regex(list, /nonfungible_token_commitment_key IN \(SELECT unhex\(x\)/u);
+  const negated = outputPredicate(sql, {
+    _not: { nonfungible_token_commitment: { _eq: 'abcd' } },
+  });
+  t.false(negated.includes('nonfungible_token_commitment_key'));
 });
 
 test('hash-typed comparisons reject values that are not 32 bytes', (t) => {
