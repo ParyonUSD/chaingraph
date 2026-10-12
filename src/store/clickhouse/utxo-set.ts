@@ -473,22 +473,43 @@ export const unspentAtQueryTimeSql = (
   where?: string
 ) => {
   const agnostic = pinnedGateTerms('agnostic', { snapshot }).join(' AND ');
-  const accepted = `SELECT transaction_hash FROM ${inlinePinnedView(
-    'tx_acceptance_at',
-    snapshot
-  )}`;
-  const outputs = `SELECT ${utxoSetReadColumns.join(', ')} FROM output
-    WHERE ${agnostic} AND ${where ?? '1'}`;
-  /* a scope (`where`): only the inputs spending the scope's outputs are read (input.p_outpoint) */
-  const scoped =
-    where === undefined
-      ? ''
-      : ` AND (outpoint_transaction_hash, outpoint_index) IN (SELECT transaction_hash, output_index FROM (${outputs}))`;
-  return `SELECT o.* FROM (
-    ${outputs} AND transaction_hash IN (${accepted})
+  /* the node's acceptance, of every transaction or (a scope) only of `among`'s, read by key */
+  const accepted = (among?: string) =>
+    `SELECT transaction_hash FROM ${inlinePinnedView(
+      'tx_acceptance_at',
+      snapshot,
+      undefined,
+      among === undefined ? undefined : `transaction_hash IN (${among})`
+    )}`;
+  if (where === undefined) {
+    return `SELECT o.* FROM (
+    SELECT ${utxoSetReadColumns.join(', ')} FROM output
+    WHERE ${agnostic} AND transaction_hash IN (${accepted()})
     LIMIT 1 BY transaction_hash, output_index) AS o
   LEFT ANTI JOIN (SELECT outpoint_transaction_hash, outpoint_index FROM input
-                  WHERE ${agnostic}${scoped} AND transaction_hash IN (${accepted})) AS s
+                  WHERE ${agnostic} AND transaction_hash IN (${accepted()})) AS s
+    ON s.outpoint_transaction_hash = o.transaction_hash AND s.outpoint_index = o.output_index`;
+  }
+  /*
+   * A scope (`where` over output columns): its outputs by their key or
+   * projection, their spenders by input.p_outpoint, and the acceptance of
+   * only those transactions, so the cost follows the scope, not the chain.
+   */
+  const outputs = `SELECT ${utxoSetReadColumns.join(', ')} FROM output
+    WHERE ${agnostic} AND ${where}`;
+  const spenders = `SELECT transaction_hash, outpoint_transaction_hash, outpoint_index FROM input
+    WHERE ${agnostic} AND (outpoint_transaction_hash, outpoint_index) IN (
+      SELECT transaction_hash, output_index FROM (${outputs}))`;
+  return `SELECT o.* FROM (
+    SELECT * FROM (${outputs})
+    WHERE transaction_hash IN (${accepted(
+      `SELECT transaction_hash FROM output WHERE ${agnostic} AND ${where}`
+    )})
+    LIMIT 1 BY transaction_hash, output_index) AS o
+  LEFT ANTI JOIN (SELECT outpoint_transaction_hash, outpoint_index FROM (${spenders})
+                  WHERE transaction_hash IN (${accepted(
+                    `SELECT transaction_hash FROM (${spenders})`
+                  )})) AS s
     ON s.outpoint_transaction_hash = o.transaction_hash AND s.outpoint_index = o.output_index`;
 };
 

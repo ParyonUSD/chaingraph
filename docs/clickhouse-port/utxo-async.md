@@ -329,15 +329,48 @@ NULL, so rows with a NULL column dropped out of the hash): `checkUtxoSet` and th
    ~0.14 s (warm, 37 % scale), behind mempool commits ~0.07 s, for the job's batch time after each commit.
    Acceptable, or should the next step reduce it (e.g. a per-node outpoint index of the stored set so the correction
    need not look up spenders, or a cache of the correction rows per (U, visible(n)) shared by concurrent requests)?
+   **Owner decision 2026-10-12:** the correction cost is accepted for now. Measure it on mainnet in the next GKE
+   session (§8 item 4); no optimisation before that.
 2. **Plan bound** `CHAINGRAPH_API_UTXO_SET_MAX_LAG_ROWS = 100,000` acceptance rows: above it, query time. Keep, or
    tune after the GKE numbers.
+   **Owner decision 2026-10-12:** keep 100,000, configurable as it is.
 3. **Storage**: `p_script` doubles `utxo_set` (17 of 34 GiB at 37 % scale). It serves address lookups of the set
    (16 ms); without it they would read the category key's zero-category range. Keep?
+   **Owner decision 2026-10-12:** keep `p_script`.
 
 4. **Repairs that rewrite history.** The stored set assumes acceptance facts at or below a published watermark never
    change outside a commit (true of every production writer). A repair tool that rewrites them must drop the node's
    marks so the set is rebuilt. Should the maintainer verify this periodically (e.g. `checkUtxoSet` on one category
    per hour, logging loudly on a difference)?
+   **Owner decision 2026-10-12:** yes, a periodic spot-check in the UTXO job. Done in fix pass 4: §11 below.
+
+## 11. Spot-check (owner decision 2026-10-12; fix pass 4)
+
+The maintainer compares its stored set with the query-time answer every `CHAINGRAPH_CLICKHOUSE_UTXO_SET_SPOT_CHECK_MS`
+(default 3,600,000, hourly; 0 = off), in the background (never two rounds at once; `stop()` waits for a running one).
+Per node with a published mark, at ONE snapshot (`spotCheckUtxoSet`, `utxo-set.ts`):
+
+| scope | chosen | compared |
+|---|---|---|
+| 3 token categories | random among the node's `utxo_total` categories (small table, key read), never the zero category | rows (count + XOR of per-row digests, as `checkUtxoSet`) and the category's totals |
+| 3 locking-bytecode prefixes | from the 64 outputs at a random transaction hash (output key) | rows |
+| the node's totals | | per-category totals of the whole set (count, value, fungible and NFT counts, digest) |
+
+The stored side is the read rule (stored rows up to U + correction to visible(n)); the query-time side is
+`unspentAtQueryTimeSql` with the scope as a filter (inputs read only for the scope's outpoints, `input.p_outpoint`).
+Each statement has a 120 s budget; a scope over it is counted as skipped, not as a mismatch. The whole-set totals scope
+is the expensive one on mainnet (a whole-chain query-time count: U4 timed out at 30 s on golden through the API); its
+cost is to be measured on GKE, and `spotCheck.totals: false` turns it off if it is too heavy.
+
+A mismatch is a data discrepancy: diagnostic `utxo_set_spot_check_mismatch` (node, generation, U, visible(n), scope,
+value, both answers), logged at **error** level by the agent; each round logs `utxo_set_spot_check` at info. Counters
+in `utxoSetStatus()` (`spotChecks`, `spotCheckScopes`, `spotCheckMismatches`, `spotCheckSkipped`) and on the agent's
+internal API at `/metrics` (Prometheus text: `chaingraph_utxo_set_spot_check_mismatches_total` etc.).
+
+Tests (`utxo-set.spec.ts`): random scopes equal on both nodes; `ClickHouseChecker.forgetNodeValidation` (the
+history-rewrite helper) on node 1's token transaction makes the category, prefix and totals scopes differ on node 1
+only, reported with both answers and counted (metric text checked); the loop runs on its own every
+`spotCheckIntervalMs`. Chipnet: the spot-check of `ch1_fix4_chip` (fix-pass-4.md) is equal.
 
 ## 10. Suites (final code; scratch databases dropped afterwards)
 
