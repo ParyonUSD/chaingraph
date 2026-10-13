@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-loop-statement, no-await-in-loop, functional/no-let, functional/no-throw-statement, complexity */
-// cspell:ignore clickhouse
+// cspell:ignore clickhouse txid
 /**
  * Unselective per-node roots (owner decision 2026-10-11, item 3):
  * `transactions(node:)` pages in internal-id order with no filter use the

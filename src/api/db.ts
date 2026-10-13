@@ -1,5 +1,5 @@
 /* eslint-disable camelcase, functional/no-throw-statement, @typescript-eslint/parameter-properties, @typescript-eslint/naming-convention, complexity, max-classes-per-file, @typescript-eslint/no-magic-numbers, @typescript-eslint/member-ordering, max-params, functional/no-try-statement */
-// cspell:ignore clickhouse cgapi
+// cspell:ignore clickhouse cgapi txid
 /**
  * The API's access to ClickHouse: query counters (tests assert one
  * `readSnapshot` per request and per subscription re-run, and count data
