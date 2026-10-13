@@ -59,6 +59,20 @@ ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_outpoint
     ORDER BY (outpoint_transaction_hash, outpoint_index)
 ) WITH SETTINGS (index_granularity = 128, min_compress_block_size = 4096, max_compress_block_size = 4096);
 
+-- p_txid on input: the inputs of transactions by internal id (fix-pass-7.md §3, owner choice §11 q1 option (b),
+-- restricted to input). input is ordered by transaction hash, so the inputs level of a page (a contiguous id range,
+-- e.g. L35's 10,000 transactions) read ~9 hash-scattered granules per transaction in every part (golden: 96.5 M rows,
+-- 5.6 CPU-s, 15 of 15 parts, ~75 % of the levels' CPU). Ordered by id, a page's inputs are a few contiguous
+-- granules in the part of their time. Slim like p_outpoint (no unlocking_bytecode; a level that selects it reads the
+-- table). The inputs level reads `transaction_hash IN … AND transaction_internal_id IN …` and ClickHouse takes
+-- whichever selects fewer granules. Parts without it (until MATERIALIZE PROJECTION p_txid) are read by hash as before.
+ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_txid
+(
+    SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index,
+           sequence_number, commit_seq
+    ORDER BY transaction_internal_id
+);
+
 ALTER TABLE cg.tx_acceptance ADD PROJECTION IF NOT EXISTS p_node_height
 (
     SELECT * ORDER BY (node_internal_id, height, transaction_internal_id)

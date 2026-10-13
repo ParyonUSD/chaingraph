@@ -131,6 +131,10 @@ test('the DDL keys stop at the filter columns (planning-floor.md)', (t) => {
   t.deepEqual(keys.get('block_transaction.p_txid projection sort key'), [
     'transaction_internal_id',
   ]);
+  /* inputs by internal id (fix-pass-7.md §3) */
+  t.deepEqual(keys.get('input.p_txid projection sort key'), [
+    'transaction_internal_id',
+  ]);
 });
 
 e2e(

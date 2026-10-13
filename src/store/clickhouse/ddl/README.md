@@ -66,9 +66,12 @@ Projections (060): `block.p_height (height)`, `transaction.p_id (internal_id)`,
 docs/clickhouse-port/fix-pass-6.md §6: inclusions by id probe one time-ordered part, by hash every part),
 `output.p_script (locking_bytecode_prefix)`,
 `output.p_category (token_category, nonfungible_token_commitment_key)`,
-`input.p_outpoint (outpoint_transaction_hash, outpoint_index)`, `tx_acceptance.p_node_height (node_internal_id, height,
+`input.p_outpoint (outpoint_transaction_hash, outpoint_index)`, `input.p_txid (transaction_internal_id)` (2026-10-13,
+docs/clickhouse-port/fix-pass-7.md §3: a page's inputs by id are contiguous granules, by hash ~9 scattered ones per
+transaction in every part), `tx_acceptance.p_node_height (node_internal_id, height,
 transaction_internal_id)`, and in 070 `spend.p_category (token_category, nonfungible_token_commitment_key)`. All full-column except `input.p_outpoint`, which is slim (outpoint, input key, `commit_seq`) at
-granularity 128 with 4 KiB blocks (item 28). `input.p_spent_script` / `p_spent_category` were removed (their
+granularity 128 with 4 KiB blocks (item 28), and `input.p_txid`, slim too (no `unlocking_bytecode`) at the table's
+granularity. A filled database needs `ALTER TABLE input MATERIALIZE PROJECTION p_txid` once (a mutation). `input.p_spent_script` / `p_spent_category` were removed (their
 job is the spend index's). All accepted by both servers. Keys stop at the columns reads filter on (primary keys shorter than the sort key on
 `output`, `tx_acceptance`, `spend`; projection sort keys without the trailing hash/index): a set on a later key column
 excluded nothing but was analysed against every mark of every part and candidate projection before each read, the

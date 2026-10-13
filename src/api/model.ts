@@ -933,13 +933,20 @@ export const TransactionEntity: Entity = {
       childKeys: ['transaction_hash'],
       defaultOrder: [term('input_index')],
       kind: 'relation',
+      /*
+       * The parents' internal ids bound the read too (one per hash):
+       * input.p_txid reads a page's inputs as contiguous granules where the
+       * hash key reads ~9 scattered ones per transaction in every part
+       * (fix-pass-7.md §3); ClickHouse takes whichever selects fewer.
+       */
+      linkColumns: ['hash', 'internal_id'],
       many: true,
       order: indexOrder(inputOrder, 'input_index', [term('input_index')]),
       parentKeys: ['hash'],
       source: (c, link) =>
         `SELECT * FROM ${c.sql.view(
           'input_at'
-        )} WHERE transaction_hash IN (${link})`,
+        )} WHERE transaction_hash IN (SELECT hash FROM (${link})) AND transaction_internal_id IN (SELECT internal_id FROM (${link}))`,
       target: () => InputEntity,
       where: (c, where, source) =>
         inputPredicate(
