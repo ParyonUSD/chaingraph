@@ -901,7 +901,11 @@ export const pinnedGateTerms = (
  * `keyFilter`: a predicate on the view's key columns (for a membership view,
  * its GROUP BY columns), applied to the base rows before the gate. Same rows
  * as filtering the view, but the primary key is used even where ClickHouse
- * does not push a filter below the GROUP BY (a recursive CTE step).
+ * does not push a filter below the GROUP BY (a recursive CTE step). It may
+ * also use a column that is constant within each group, which ClickHouse
+ * never pushes down itself: tx_acceptance's `height` is the accepting
+ * block's height in every row of a (transaction, node, block) group, and 0
+ * in a mempool group (fix-pass-6.md §3).
  */
 /* eslint-disable max-params */
 export const inlinePinnedView = (

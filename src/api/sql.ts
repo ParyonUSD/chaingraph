@@ -1622,19 +1622,30 @@ const heightOnly = (filter: BlockFilter): boolean =>
   );
 
 /** A height-only block filter as a predicate on tx_acceptance / node_block rows (`height`). */
-const heightPredicate = (sql: Sql, filter: BlockFilter): string =>
+const heightPredicate = (
+  sql: Sql,
+  filter: BlockFilter,
+  column = 'height'
+): string =>
   all([
     ...(given(filter.height)
-      ? numericComparison(sql, 'height', 'UInt32', filter.height)
+      ? numericComparison(sql, column, 'UInt32', filter.height)
       : []),
-    ...(filter._and ?? []).map((f) => heightPredicate(sql, f)),
+    ...(filter._and ?? []).map((f) => heightPredicate(sql, f, column)),
     ...(given(filter._or)
-      ? [any(filter._or.map((f) => heightPredicate(sql, f)))]
+      ? [any(filter._or.map((f) => heightPredicate(sql, f, column)))]
       : []),
     ...(given(filter._not)
-      ? [`NOT (${heightPredicate(sql, filter._not)})`]
+      ? [`NOT (${heightPredicate(sql, filter._not, column)})`]
       : []),
   ]);
+
+/*
+ * The base rows' height inside an inlined tx_acceptance_at (`keyFilter`):
+ * qualified, since the collapsed select list aliases `any(height) AS height`
+ * and an alias wins over a column in WHERE.
+ */
+const baseHeight = 'tx_acceptance.height';
 
 /**
  * `block_internal_id` of blocks the node accepts that match `filter`, as a
@@ -1644,18 +1655,44 @@ const heightPredicate = (sql: Sql, filter: BlockFilter): string =>
 export const acceptedBlockCondition = (
   sql: Sql,
   filter: BlockFilter,
-  node?: number
-) =>
-  heightOnly(filter)
-    ? heightPredicate(sql, filter)
-    : `block_internal_id IN (SELECT internal_id FROM ${sql.view(
-        'block_at'
-      )} WHERE ${blockPredicate(sql, filter, node)})`;
+  node?: number,
+  impliedHeights = false
+) => {
+  if (heightOnly(filter)) {
+    return heightPredicate(sql, filter, impliedHeights ? baseHeight : 'height');
+  }
+  if (!impliedHeights) {
+    return `block_internal_id IN (SELECT internal_id FROM ${sql.view(
+      'block_at'
+    )} WHERE ${blockPredicate(sql, filter, node)})`;
+  }
+  /*
+   * `impliedHeights` (base tx_acceptance rows, whose `height` is their
+   * block's): the matching blocks once (a statement-level CTE), and the
+   * implied range of their heights. Redundant, but it lets the per-node read
+   * use its (node, height) projection instead of every row of the node
+   * (X16: a quarter's blocks by timestamp; fix-pass-6.md §3). No matching
+   * block: an empty range, no row.
+   */
+  const blocks = sql.cte(
+    'blocks',
+    `SELECT internal_id, height FROM ${sql.view(
+      'block_at'
+    )} WHERE ${blockPredicate(sql, filter, node)}`
+  );
+  const range = sql.scalar(
+    '__heights',
+    `SELECT (min(height), max(height)) FROM ${blocks}`
+  );
+  return `block_internal_id IN (SELECT internal_id FROM ${blocks}) AND ${baseHeight} >= tupleElement(${range}, 1) AND ${baseHeight} <= tupleElement(${range}, 2)`;
+};
 
 /**
  * A `TransactionFilter` as a predicate on a transaction_at row (`hash`,
  * `internal_id`, …). Relationship filters are semi-joins on the pinned views
- * (EXISTS = `hash IN (…)`, NOT EXISTS = `NOT (hash IN (…))`). `node`: the
+ * (EXISTS = `hash IN (…)`, NOT EXISTS = `NOT (hash IN (…))`; the per-node
+ * block filters on the internal id, which identifies a transaction as its
+ * hash does). `node`: the
  * node of the per-node parts (`block_window`, `in_block`, `in_mempool`);
  * default the statement's primary node.
  */
@@ -1741,40 +1778,52 @@ export const transactionPredicate = (
     const heights: string[] = ['block_internal_id != 0'];
     if (given(window.from_height)) {
       heights.push(
-        ...numericComparison(sql, 'height', 'UInt32', {
+        ...numericComparison(sql, baseHeight, 'UInt32', {
           _gte: window.from_height,
         })
       );
     }
     if (given(window.to_height)) {
       heights.push(
-        ...numericComparison(sql, 'height', 'UInt32', {
+        ...numericComparison(sql, baseHeight, 'UInt32', {
           _lt: window.to_height,
         })
       );
     }
     const mempool = window.include_mempool !== false;
+    /*
+     * Below the collapse (keyFilter): `height` is constant within a group,
+     * so filtering base rows by it is exact, and with the node it reads the
+     * p_node_height range instead of collapsing every acceptance row of the
+     * node first. The semi-join is on the internal id (one per transaction
+     * hash, on every row about it): a block range's transactions are an id
+     * range, read through transaction.p_id instead of a hash set that touches
+     * every granule of the table (X16; fix-pass-6.md §3).
+     */
     parts.push(
-      `hash IN (SELECT transaction_hash FROM ${sql.nodeView(
+      `internal_id IN (SELECT transaction_internal_id FROM ${sql.nodeView(
         'tx_acceptance_at',
-        node
-      )} WHERE ${restrict('transaction_hash')}(${
-        mempool ? any([all(heights), 'block_internal_id = 0']) : all(heights)
-      }))`
+        node,
+        `${restrict('transaction_hash')}(${
+          mempool ? any([all(heights), 'block_internal_id = 0']) : all(heights)
+        })`
+      )})`
     );
   }
   if (given(filter.in_block)) {
     parts.push(
-      `hash IN (SELECT transaction_hash FROM ${sql.nodeView(
+      `internal_id IN (SELECT transaction_internal_id FROM ${sql.nodeView(
         'tx_acceptance_at',
-        node
-      )} WHERE ${restrict(
-        'transaction_hash'
-      )}block_internal_id != 0 AND (${acceptedBlockCondition(
-        sql,
-        filter.in_block,
-        node
-      )}))`
+        node,
+        `${restrict(
+          'transaction_hash'
+        )}block_internal_id != 0 AND (${acceptedBlockCondition(
+          sql,
+          filter.in_block,
+          node,
+          true
+        )})`
+      )})`
     );
   }
   if (given(filter.in_mempool)) {
