@@ -4995,7 +4995,10 @@ test.serial(
  * hash bytes) starts at the minimum watermarks of the old partitions whose
  * ranges overlap its own, not at the global minimum (the 2026-10-13 lab: a
  * change from 32 to 64 partitions restarted every partition from the lowest
- * watermark).
+ * watermark). The backfill's prefix cursor (backfill_prefix) is carried
+ * over too: a new partition resumes at the lowest cursor of the overlapping old
+ * partitions whose backfill is not complete, and never counts a prefix as
+ * backfilled that was not.
  */
 test.serial(
   `[e2e] unspent_node_ids (${String(
@@ -5015,10 +5018,12 @@ test.serial(
           count: number;
           input: string;
           partition: number;
+          prefix: number;
         }>(/* sql */ `
 SELECT partition_index AS partition, partition_count AS count,
        input_transaction_internal_id::text AS input, block_internal_id::text AS block,
-       consumed_event_id::text AS consumed, backfill_transaction_internal_id::text AS backfill
+       consumed_event_id::text AS consumed, backfill_transaction_internal_id::text AS backfill,
+       backfill_prefix AS prefix
   FROM unspent_tracking_progress ORDER BY partition_index;`)
       ).rows;
     const repartition = async (count: number) =>
@@ -5028,20 +5033,37 @@ SELECT partition_index AS partition, partition_count AS count,
           [count]
         )
       ).rows[0]!.repartitioned;
+    // backfill complete for a partition at this cursor (set below)
+    const trackingStart = 50;
+    type Progress = Awaited<ReturnType<typeof progress>>;
+    /**
+     * The two-byte prefixes of partition p of n (the backfill batch's range):
+     * first bytes b with floor(b * n / 256) = p.
+     */
+    const rangeStart = (p: number, n: number) => Math.ceil((p * 256) / n) * 256;
+    const rangeEnd = (p: number, n: number) => rangeStart(p + 1, n);
+    const complete = (row: Progress[number]) =>
+      Number(row.backfill) >= trackingStart;
+    /** The prefix the partition's next batch starts at (the batch's p1). */
+    const effectivePrefix = (row: Progress[number], n: number) =>
+      Math.min(
+        Math.max(row.prefix, rangeStart(row.partition, n)),
+        rangeEnd(row.partition, n)
+      );
+    /** Is the two-byte prefix `x` backfilled under the progress rows? */
+    const backfilled = (rows: Progress, x: number) => {
+      // eslint-disable-next-line no-bitwise
+      const row = rows[Math.floor(((x >> 8) * rows.length) / 256)]!;
+      return complete(row) || x < effectivePrefix(row, rows.length);
+    };
     /**
      * Old partition p of n covers first bytes b with floor(b * n / 256) = p: the
      * expected start of new partition q of m is the minimum over the old
-     * partitions sharing a byte with it (the global minimum if it has none).
+     * partitions sharing a byte with it (the global minimum if it has none);
+     * its prefix cursor the minimum effective cursor of the incomplete ones
+     * within its range (the range end if all are complete, 0 if it shares no byte).
      */
-    const expected = (
-      old: {
-        block: string;
-        consumed: string;
-        input: string;
-        backfill: string;
-      }[],
-      m: number
-    ) =>
+    const expected = (old: Progress, m: number) =>
       Array.from({ length: m }, (_, q) => {
         const overlapping = Array.from({ length: 256 }, (_b, b) => b)
           .filter((b) => Math.floor((b * m) / 256) === q)
@@ -5049,6 +5071,7 @@ SELECT partition_index AS partition, partition_count AS count,
         const from = overlapping.length === 0 ? old : overlapping;
         const min = (key: 'backfill' | 'block' | 'consumed' | 'input') =>
           String(Math.min(...from.map((row) => Number(row[key]))));
+        const incomplete = overlapping.filter((row) => !complete(row));
         return {
           backfill: min('backfill'),
           block: min('block'),
@@ -5056,6 +5079,22 @@ SELECT partition_index AS partition, partition_count AS count,
           count: m,
           input: min('input'),
           partition: q,
+          prefix:
+            overlapping.length === 0
+              ? 0
+              : incomplete.length === 0
+              ? rangeEnd(q, m)
+              : Math.min(
+                  Math.max(
+                    Math.min(
+                      ...incomplete.map((row) =>
+                        effectivePrefix(row, old.length)
+                      )
+                    ),
+                    rangeStart(q, m)
+                  ),
+                  rangeEnd(q, m)
+                ),
         };
       });
     await client.query('BEGIN;');
@@ -5066,13 +5105,28 @@ SELECT partition_index AS partition, partition_count AS count,
       if (initial !== 4) {
         t.true(await repartition(4), 'to 4 partitions');
       }
-      // distinct, non-monotonic watermarks per partition
-      await client.query(/* sql */ `
+      /*
+       * distinct, non-monotonic watermarks per partition; backfill: partition
+       * 1 complete, 0 and 3 part-way through their ranges ([0, 16384) and
+       * [49152, 65536)), 2 not started
+       */
+      await client.query(
+        /* sql */ `UPDATE unspent_tracking_settings SET tracking_start_transaction_internal_id = $1;`,
+        [trackingStart]
+      );
+      await client.query(
+        /* sql */ `
 UPDATE unspent_tracking_progress
   SET input_transaction_internal_id = 1000 + 10 * ((partition_index * 7) % 4),
       block_internal_id = 500 + (partition_index * 3) % 4,
       consumed_event_id = 100 + (partition_index * 5) % 4,
-      backfill_transaction_internal_id = 10 + partition_index;`);
+      backfill_transaction_internal_id = CASE WHEN partition_index = 1 THEN $1 ELSE 10 + partition_index END,
+      backfill_prefix = (ARRAY[5000, 32768, 0, 60000])[partition_index + 1];`,
+        [trackingStart]
+      );
+      const prefixes = Array.from({ length: 65536 }, (_, x) => x);
+      const backfilledCount = (rows: Progress) =>
+        prefixes.filter((x) => backfilled(rows, x)).length;
       const transitions = [8, 3, 5, 300, 2];
       await transitions.reduce(async (previous, m) => {
         await previous;
@@ -5080,6 +5134,26 @@ UPDATE unspent_tracking_progress
         t.true(await repartition(m), `to ${m} partitions`);
         const after = await progress();
         t.deepEqual(after, expected(before, m), `${before.length} to ${m}`);
+        t.deepEqual(
+          prefixes.filter(
+            (x) => backfilled(after, x) && !backfilled(before, x)
+          ),
+          [],
+          `${before.length} to ${m}: no prefix newly counted as backfilled`
+        );
+        if (m === 8) {
+          // splitting loses nothing: each half keeps its old partition's cursor
+          t.is(
+            backfilledCount(after),
+            backfilledCount(before),
+            'split: all kept'
+          );
+          t.deepEqual(
+            after.map((row) => row.prefix),
+            [5000, 8192, 24576, 32768, 32768, 40960, 57344, 60000],
+            'split: cursors'
+          );
+        }
         t.is(
           Math.min(...after.map((row) => Number(row.input))),
           Math.min(...before.map((row) => Number(row.input))),

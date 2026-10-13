@@ -942,6 +942,17 @@ $$;
 -- own (more than 256 partitions), or old rows that are not one consistent
 -- partitioning, start at the global minimum. The global minimum is
 -- unchanged, so the query root and event deletion are unaffected.
+-- The backfill's prefix cursor (backfill_prefix) is carried over the same
+-- way: a new partition starts at the lowest effective cursor of the
+-- overlapping old partitions whose backfill is not complete (an old
+-- partition's prefixes from its range start up to its cursor are backfilled
+-- under the current preparation, which is global, so they stay backfilled
+-- whichever partition owns them; complete old partitions cover their whole
+-- range). Every prefix of the new range below that cursor is in an old
+-- partition that is either complete or past it (the cursor is clamped to the
+-- new range). If every overlapping old partition is complete the cursor is
+-- the range end (and the partition is complete); without a consistent old
+-- partitioning it is 0.
 -- Called before every pass: when the count is unchanged it returns without
 -- taking the table lock. The EXCLUSIVE lock conflicts with the row lock every
 -- batch holds on its progress row, so a queued request would wait for the
@@ -957,6 +968,7 @@ DECLARE
   wb bigint;
   consumed bigint;
   backfilled bigint;
+  start_tx bigint;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM unspent_tracking_progress)
      OR ((SELECT count(*) FROM unspent_tracking_progress) = part_count
@@ -964,6 +976,7 @@ BEGIN
     RETURN false;
   END IF;
   LOCK TABLE unspent_tracking_progress IN EXCLUSIVE MODE;
+  SELECT tracking_start_transaction_internal_id INTO start_tx FROM unspent_tracking_settings;
   SELECT min(partition_count), min(input_transaction_internal_id), min(block_internal_id), min(consumed_event_id),
          min(backfill_transaction_internal_id),
          min(partition_count) = max(partition_count) AND count(*) = min(partition_count)
@@ -977,16 +990,29 @@ BEGIN
   WITH old AS (
     DELETE FROM unspent_tracking_progress
       RETURNING partition_index, input_transaction_internal_id, block_internal_id, consumed_event_id,
-                backfill_transaction_internal_id
+                backfill_transaction_internal_id, backfill_prefix
   )
   INSERT INTO unspent_tracking_progress (partition_index, partition_count, input_transaction_internal_id,
-      block_internal_id, consumed_event_id, backfill_transaction_internal_id)
+      block_internal_id, consumed_event_id, backfill_transaction_internal_id, backfill_prefix)
     SELECT q, part_count, COALESCE(o.min_w, w), COALESCE(o.min_wb, wb), COALESCE(o.min_consumed, consumed),
-           COALESCE(o.min_backfilled, backfilled)
+           COALESCE(o.min_backfilled, backfilled),
+           -- (GREATEST / LEAST ignore NULLs: test min_prefix itself)
+           CASE WHEN o.min_prefix IS NOT NULL
+                  THEN LEAST(GREATEST(o.min_prefix, ((q * 256 + part_count - 1) / part_count) * 256),
+                             (((q + 1) * 256 + part_count - 1) / part_count) * 256)
+                WHEN o.min_backfilled >= start_tx
+                  THEN (((q + 1) * 256 + part_count - 1) / part_count) * 256
+                ELSE 0 END
       FROM generate_series(0, part_count - 1) q
       LEFT JOIN LATERAL (
         SELECT min(old.input_transaction_internal_id) AS min_w, min(old.block_internal_id) AS min_wb,
-               min(old.consumed_event_id) AS min_consumed, min(old.backfill_transaction_internal_id) AS min_backfilled
+               min(old.consumed_event_id) AS min_consumed, min(old.backfill_transaction_internal_id) AS min_backfilled,
+               -- effective cursor of an incomplete old partition: its stored
+               -- prefix within its own range (the batch's p1)
+               min(LEAST(GREATEST(old.backfill_prefix,
+                                  ((old.partition_index * 256 + current_count - 1) / current_count) * 256),
+                         (((old.partition_index + 1) * 256 + current_count - 1) / current_count) * 256))
+                 FILTER (WHERE old.backfill_transaction_internal_id < start_tx) AS min_prefix
           FROM generate_series(0, 255) b
           JOIN old ON old.partition_index = ((b * current_count) >> 8)
           WHERE consistent AND ((b * part_count) >> 8) = q
