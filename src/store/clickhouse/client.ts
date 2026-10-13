@@ -184,7 +184,6 @@ export interface InsertSelectSummary {
   writtenRows: number;
 }
 
-// eslint-disable-next-line functional/no-mixed-type
 export interface QueryOptions {
   /**
    * Retry a read whose request timed out on the client (default true).
@@ -208,6 +207,13 @@ export interface QueryOptions {
    * `total_rows_to_read`), when it does.
    */
   onRowsRead?: (rows: number) => void;
+  /**
+   * Called when the server's response starts (headers received), before
+   * its rows are read and decoded: the API attributes the event loop's time
+   * to requests not waiting for ClickHouse (admission.ts). Called once per
+   * attempt.
+   */
+  onResponse?: () => void;
 }
 
 /** Rows read from an `X-ClickHouse-Summary` header (undefined if absent or unreadable). */
@@ -371,6 +377,7 @@ export class ClickHouseClient {
             ? {}
             : { query_id: options.queryId }),
         });
+        options.onResponse?.();
         const rows = await result.json<T>();
         if (options.onRowsRead !== undefined) {
           const rowsRead = summaryRowsRead(

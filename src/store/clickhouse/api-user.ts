@@ -4,9 +4,11 @@
  * The API's ClickHouse user and its settings profile (fix-pass-4.md §8,
  * owner decision 2026-10-12): a cluster-wide backstop on the statements the
  * API user may run at once, `max_concurrent_queries_for_user = pods ×
- * statementsPerPod + margin` (default `pods × 72 + 10`). The API's admission
- * gate limits each process (48 light + 24 heavy = 72 on a 48-core server);
- * the backstop bounds all API pods together, so a mis-sized pod count or a
+ * statementsPerPod + margin` (default `pods × 72 + 10`). Each API process
+ * sends at most 64 statements at once (its ClickHouse client's sockets;
+ * since fix pass 8 its admission budgets requests by CPU, not statements);
+ * with several worker processes per pod, count processes as pods. The
+ * backstop bounds all API pods together, so a mis-sized pod count or a
  * misbehaving process cannot flood the server. Over it ClickHouse refuses a
  * statement at once (code 202 TOO_MANY_SIMULTANEOUS_QUERIES). The margin
  * covers what the gate does not count: watermark polls, live-query
@@ -23,7 +25,7 @@ import { createHash } from 'node:crypto';
 /** The settings profile of the API user. */
 export const apiProfileName = 'chaingraph_api';
 
-/** Statements per API pod: the light + heavy lanes at 48 cores (admission.ts: 48 + 24 since fix pass 7). */
+/** Statements per API pod (process): its ClickHouse client's 64 sockets plus headroom (fix-pass-8.md). */
 export const defaultStatementsPerPod = 72;
 
 /** Statements outside the gate (watermark polls, live refreshes, kills). */
@@ -159,9 +161,10 @@ export const apiUserXml = (definition: ApiUserDefinition) => {
 /**
  * SQL (servers with SQL access management): the profile, the user (created
  * if missing, password as sha256), the profile assigned and SELECT on the
- * database plus the two system tables the API reads (`system.processes`:
+ * database plus the system tables the API reads (`system.processes`:
  * KILL QUERY of its own abandoned statements; `system.projections`: store
- * features). An XML user has every grant unless restricted, so the XML
+ * features; `system.query_log`: the measured CPU of its own statements,
+ * admission.ts). An XML user has every grant unless restricted, so the XML
  * rendering needs none. Idempotent; re-running with another pod count
  * updates the limit.
  */
@@ -185,5 +188,6 @@ export const apiUserSql = (definition: ApiUserDefinition) => {
     `GRANT SELECT ON ${database}.* TO ${user}`,
     `GRANT SELECT ON system.processes TO ${user}`,
     `GRANT SELECT ON system.projections TO ${user}`,
+    `GRANT SELECT ON system.query_log TO ${user}`,
   ];
 };
