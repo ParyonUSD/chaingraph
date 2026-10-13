@@ -57,6 +57,7 @@ import {
   spendRelationSql,
   spendRowPredicate,
   transactionCandidates,
+  transactionConjuncts,
   transactionPredicate,
   unindexed,
   unspentOutputRows,
@@ -383,7 +384,10 @@ export const runTransactions = async (
       checks,
       range,
       args.order ?? 'ASC',
-      env.db.candidateWindowRows(args.limit + 1)
+      env.db.candidateWindowRows(
+        args.limit + 1,
+        transactionConjuncts(args.where) > 1
+      )
     );
     const seen: { capped?: unknown } = {};
     const page = await pageOf(

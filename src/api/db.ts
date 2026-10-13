@@ -237,7 +237,8 @@ export class ApiDb {
   acceptanceWindowRows: (need: number) => number = acceptanceWindowRows;
 
   /** Candidates a `transactions` page in id order checks first (tests force the fallback with a small value). */
-  candidateWindowRows: (need: number) => number = candidateWindowRows;
+  candidateWindowRows: (need: number, residual?: boolean) => number =
+    candidateWindowRows;
 
   /** Tests: fix the features instead of reading them. */
   forceFeatures: StoreFeatures | undefined;

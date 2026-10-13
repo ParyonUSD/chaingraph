@@ -100,14 +100,47 @@ export const maxListChunk = 1_000;
  */
 export const acceptanceWindowRows = (need: number) => 8 * need + 1_000;
 
+/** How much wider the candidate window is when the filter has conjuncts beyond its candidates (fix-pass-7.md §4). */
+export const residualWindowFactor = 16;
+
 /**
  * Candidates a `transactions` page in internal-id order checks before it
  * falls back to all of them (roots.ts `candidateWindow`): the `need` rows of
  * the page plus a quarter and 100, for candidates the node does not accept or
- * that fail the rest of the filter (fix-pass-6.md §2).
+ * that fail the rest of the filter (fix-pass-6.md §2). `residual`: the
+ * filter has conjuncts beyond the one(s) its candidates come from (mainnet
+ * L23 / L24 / L28: loan spends that are NOT closures), so most candidates
+ * may fail and a page is rarely full: the window is `residualWindowFactor`
+ * times wider (~200 k candidates for a page of 10,000), so a candidate set
+ * of that size is checked whole in the first statement instead of a capped
+ * window falling back to a second one (fix-pass-7.md §4). Exact either way.
  */
-export const candidateWindowRows = (need: number) =>
-  need + Math.ceil(need / 4) + 100;
+export const candidateWindowRows = (need: number, residual = false) =>
+  (need + Math.ceil(need / 4) + 100) * (residual ? residualWindowFactor : 1);
+
+/**
+ * The top-level conjuncts of a transaction filter (its keys, `_and` parts
+ * flattened): a filter with more than one has conjuncts its candidate set
+ * does not stand for (`candidateWindowRows`' `residual`).
+ */
+export const transactionConjuncts = (
+  filter: TransactionFilter | null | undefined
+): number => {
+  if (filter === null || filter === undefined) return 0;
+  return Object.entries(filter).reduce(
+    (count, [key, value]) =>
+      value === null || value === undefined
+        ? count
+        : key === '_and'
+        ? count +
+          (value as readonly TransactionFilter[]).reduce(
+            (sum, part) => sum + transactionConjuncts(part),
+            0
+          )
+        : count + 1,
+    0
+  );
+};
 
 const chunks = <T>(values: readonly T[], size = maxListChunk): T[][] => {
   const out: T[][] = [];

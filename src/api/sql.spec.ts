@@ -7,10 +7,12 @@ import type { VisibilitySnapshot } from '../store/clickhouse/visibility.js';
 
 import { operationNodeNames } from './server.js';
 import {
+  candidateWindowRows,
   isClientParamName,
   outputPredicate,
   snapshotParameterNames,
   Sql,
+  transactionConjuncts,
   transactionPredicate,
   unspentOutputRows,
 } from './sql.js';
@@ -164,4 +166,40 @@ test('operationNodeNames reads root node arguments from literals, variables and 
     operationNodeNames(parse('{ transaction_watermark }'), undefined, {}),
     []
   );
+});
+
+test('candidate window: wider when the filter has conjuncts beyond its candidates (fix-pass-7.md §4)', (t) => {
+  t.is(candidateWindowRows(10_001), 12_602);
+  t.is(candidateWindowRows(10_001, true), 16 * 12_602);
+  t.is(candidateWindowRows(2), 103);
+  const hasInput = { outpoint: { token_category: { _eq: 'aa' } } };
+  t.is(transactionConjuncts({ has_input: hasInput }), 1, 'L35 / L40');
+  t.is(
+    transactionConjuncts({
+      _or: [
+        { has_input: hasInput },
+        { has_output: { token_category: { _eq: 'aa' } } },
+      ],
+    }),
+    1,
+    'L33'
+  );
+  t.is(
+    transactionConjuncts({
+      _not: { has_output: { locking_bytecode: { _eq: 'aa' } } },
+      has_input: hasInput,
+    }),
+    2,
+    'L23 / L28'
+  );
+  t.is(
+    transactionConjuncts({
+      _and: [{ _not: { has_input: hasInput }, has_input: hasInput }],
+      has_input: hasInput,
+    }),
+    3,
+    'L21: _and parts count'
+  );
+  t.is(transactionConjuncts({ has_input: null }), 0);
+  t.is(transactionConjuncts(undefined), 0);
 });
