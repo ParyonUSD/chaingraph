@@ -272,7 +272,7 @@ const candidateWindow = (
   /* the window's page, or no row when it does not decide the page */
   const page = sql.scalar(
     '__cand_page',
-    `SELECT if(length(tupleElement(${first}, 2)) < ${k} OR length(__h) >= ${needed}, __h, []) FROM (SELECT groupArray(hash) AS __h FROM (SELECT hash, internal_id FROM ${sql.view(
+    `SELECT if(length(tupleElement(${first}, 2)) < ${k} OR length(__h) >= ${needed}, (__h, __i), ([], [])) FROM (SELECT groupArray(hash) AS __h, groupArray(internal_id) AS __i FROM (SELECT hash, internal_id FROM ${sql.view(
       'transaction_at'
     )} WHERE ${checks(
       `SELECT arrayJoin(tupleElement(${first}, 1))`,
@@ -281,7 +281,8 @@ const candidateWindow = (
       .map((part) => `(${part})`)
       .join(' AND ')} ORDER BY internal_id ${dir} LIMIT ${needed}))`
   );
-  return `hash IN (SELECT arrayJoin(${page}))`;
+  /* the page's rows by hash and by internal id (the key or p_id, as above) */
+  return `hash IN (SELECT arrayJoin(tupleElement(${page}, 1))) AND internal_id IN (SELECT arrayJoin(tupleElement(${page}, 2)))`;
 };
 
 export const runTransactions = async (
