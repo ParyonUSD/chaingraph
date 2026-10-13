@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-magic-numbers, functional/no-let, camelcase, @typescript-eslint/naming-convention, functional/no-try-statement */
-// cspell:ignore clickhouse unhex
+// cspell:ignore clickhouse unhex txid
 /**
  * G1 fix pass 2 (docs/clickhouse-port/g1-fix-pass-2.md §2): the spent-output
  * lookup reads few rows per outpoint (output granularity 128, base table, not

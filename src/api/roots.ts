@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention, functional/no-throw-statement, complexity, max-params */
-// cspell:ignore clickhouse unhex unindexed
+// cspell:ignore clickhouse unhex unindexed cand
 /**
  * The v2 root fields: their row sources, acceptance rules, ordering,
  * pagination (keyset, offset) and page caps. Each root is ONE statement
@@ -285,6 +285,49 @@ const candidateWindow = (
   return `hash IN (SELECT arrayJoin(tupleElement(${page}, 1))) AND internal_id IN (SELECT arrayJoin(tupleElement(${page}, 2)))`;
 };
 
+/** A `transactions` page checking every candidate (or the whole acceptance set). */
+const fullTransactionsPage = async (
+  env: RootEnv,
+  label: string,
+  args: TransactionsArgs,
+  sels: readonly Sel[],
+  explicit: OrderTerm[] | undefined,
+  order: readonly OrderTerm[],
+  range: { _gt?: bigint; _lt?: bigint }
+): Promise<Page> => {
+  const { sql, ctx } = env;
+  const candidates = transactionCandidates(sql, args.where, ctx.node);
+  const bounds = numericComparison(sql, 'internal_id', 'UInt64', range);
+  const among =
+    candidates === undefined
+      ? undefined
+      : `SELECT transaction_hash FROM ${sql.cte('candidates', candidates)}`;
+  return pageOf(
+    env,
+    label,
+    TransactionEntity,
+    sql.view('transaction_at'),
+    [
+      ...(among === undefined ? [] : [`hash IN (${among})`]),
+      ...(impliesAcceptance(args.where)
+        ? []
+        : [
+            unselective(args.where) && explicit === undefined
+              ? await acceptedInIdOrder(env, range, args)
+              : `hash IN (${sql.accepted(ctx.node, among)})`,
+          ]),
+      ...bounds,
+      transactionPredicate(sql, args.where, ctx.node, among),
+    ],
+    order,
+    { ...args, after: args.cursor },
+    sels,
+    maxLimits.transactions,
+    /* the spike's cursor: the last internal_id (pass as `after`/`before`) */
+    explicit === undefined ? (_row, values) => values[0]! : undefined
+  );
+};
+
 export const runTransactions = async (
   env: RootEnv,
   label: string,
@@ -371,49 +414,6 @@ export const runTransactions = async (
     );
   }
   return fullTransactionsPage(env, label, args, sels, explicit, order, range);
-};
-
-/** A `transactions` page checking every candidate (or the whole acceptance set). */
-const fullTransactionsPage = async (
-  env: RootEnv,
-  label: string,
-  args: TransactionsArgs,
-  sels: readonly Sel[],
-  explicit: OrderTerm[] | undefined,
-  order: readonly OrderTerm[],
-  range: { _gt?: bigint; _lt?: bigint }
-): Promise<Page> => {
-  const { sql, ctx } = env;
-  const candidates = transactionCandidates(sql, args.where, ctx.node);
-  const bounds = numericComparison(sql, 'internal_id', 'UInt64', range);
-  const among =
-    candidates === undefined
-      ? undefined
-      : `SELECT transaction_hash FROM ${sql.cte('candidates', candidates)}`;
-  return pageOf(
-    env,
-    label,
-    TransactionEntity,
-    sql.view('transaction_at'),
-    [
-      ...(among === undefined ? [] : [`hash IN (${among})`]),
-      ...(impliesAcceptance(args.where)
-        ? []
-        : [
-            unselective(args.where) && explicit === undefined
-              ? await acceptedInIdOrder(env, range, args)
-              : `hash IN (${sql.accepted(ctx.node, among)})`,
-          ]),
-      ...bounds,
-      transactionPredicate(sql, args.where, ctx.node, among),
-    ],
-    order,
-    { ...args, after: args.cursor },
-    sels,
-    maxLimits.transactions,
-    /* the spike's cursor: the last internal_id (pass as `after`/`before`) */
-    explicit === undefined ? (_row, values) => values[0]! : undefined
-  );
 };
 
 /* ------------------------------------------------------------------ */

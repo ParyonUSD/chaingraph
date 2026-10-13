@@ -1,5 +1,5 @@
 /* eslint-disable camelcase, @typescript-eslint/naming-convention, max-lines, functional/no-throw-statement, max-params, complexity */
-// cspell:ignore clickhouse unhex authchain authchains authhead subquery
+// cspell:ignore clickhouse unhex authchain authchains authhead subquery txid
 /**
  * The v2 entities: per GraphQL object type, the raw columns of its rows, the
  * scalar fields (SQL over those columns), the computed fields (resolved from

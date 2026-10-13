@@ -1,5 +1,5 @@
-/* eslint-disable @typescript-eslint/no-magic-numbers, camelcase, @typescript-eslint/naming-convention, functional/no-loop-statement, functional/no-let, no-await-in-loop, @typescript-eslint/require-array-sort-compare, complexity, max-params, functional/no-throw-statement, sort-keys, require-atomic-updates */
-// cspell:ignore clickhouse utxoset
+/* eslint-disable @typescript-eslint/no-magic-numbers, camelcase, @typescript-eslint/naming-convention, functional/no-loop-statement, functional/no-let, no-await-in-loop, @typescript-eslint/require-array-sort-compare, complexity, max-params, functional/no-throw-statement, sort-keys, require-atomic-updates, max-depth */
+// cspell:ignore clickhouse utxoset cand
 /**
  * Phase 2 G2 (docs/clickhouse-port/phase2-api.md): every scalar operator
  * (R9), the boolean combinators incl. NOT EXISTS and OR of EXISTS (R10),
@@ -674,9 +674,9 @@ e2e(
               t.deepEqual(
                 await walkInOrder(env, node, variables(filter), order, limit),
                 order === 'ASC' ? matching : [...matching].reverse(),
-                `${node} window ${String(window)} limit ${limit} ${order} ${JSON.stringify(
-                  variables(filter)
-                )}`
+                `${node} window ${String(
+                  window
+                )} limit ${limit} ${order} ${JSON.stringify(variables(filter))}`
               );
             }
           }
