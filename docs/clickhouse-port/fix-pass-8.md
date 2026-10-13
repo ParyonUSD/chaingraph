@@ -353,7 +353,7 @@ Housekeeping: `ch1_fix8_syn`, `ch1_fix8_chip`, the Hasura container `ch1-fix8-ha
 | `ab66407` | feat(api): request-level admission by predicted CPU and event-loop budgets; workers; `GET /admission` (§2) |
 | `7030939` | perf(api): admission defaults from the clean local load test; contended heavy threads; clean worker shutdown (§2.1, §4) |
 | `bff2b7a` | style(api): sorted keys |
-| (docs) | this document |
+| `9667dd0` | docs: this document |
 
 Merge note: `src/api/db.ts` changes only `query()` (no statement gate; the ticket's settings and records),
 `pinnedSnapshot` (waiting marks), the admission field and `statementCpu`; branch `experiment/clickhouse-c1` also
