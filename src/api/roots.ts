@@ -230,13 +230,15 @@ const acceptedInIdOrder = async (
  *   since no candidate before the window's end was skipped;
  * - else the whole candidate set as before (a constant condition: the branch
  *   not taken reads nothing).
- * The acceptance and filter reads cost one granule per candidate, so a page
- * of 10,000 among 200,000 candidates (mainnet L33) reads a twentieth.
+ * The acceptance and filter reads cost one granule per candidate (per part,
+ * by hash), so a page of 10,000 among some 60,000 candidates (mainnet L33)
+ * reads a sixth. `checks(among, amongIds)` gets the window's hashes and their
+ * internal ids, so each read can take the id path (fix-pass-6.md §5).
  */
 const candidateWindow = (
   sql: Sql,
   cand: string,
-  checks: (among: string) => string[],
+  checks: (among: string, amongIds: string) => string[],
   idBounds: { _gt?: bigint; _lt?: bigint },
   dir: 'ASC' | 'DESC',
   need: number,
@@ -257,21 +259,24 @@ const candidateWindow = (
     } ORDER BY transaction_internal_id ${dir} LIMIT ${k})`
   );
   const capped = `length(${ids}) = ${k}`;
-  const inWindow = `SELECT transaction_hash FROM ${cand} WHERE NOT ${capped} OR transaction_internal_id ${
+  const windowed = `NOT ${capped} OR transaction_internal_id ${
     dir === 'ASC' ? '<=' : '>='
   } ${ids}[-1]`;
   const page = sql.scalar(
     '__cand_page',
-    `SELECT groupArray(hash) FROM (SELECT hash, internal_id FROM ${sql.view(
+    `SELECT (groupArray(hash), groupArray(internal_id)) FROM (SELECT hash, internal_id FROM ${sql.view(
       'transaction_at'
-    )} WHERE ${checks(inWindow)
+    )} WHERE ${checks(
+      `SELECT transaction_hash FROM ${cand} WHERE ${windowed}`,
+      `SELECT transaction_internal_id FROM ${cand} WHERE ${windowed}`
+    )
       .map((part) => `(${part})`)
       .join(' AND ')} ORDER BY internal_id ${dir} LIMIT ${needed})`
   );
-  const enough = `(NOT ${capped} OR length(${page}) >= ${needed})`;
-  const rest = `SELECT transaction_hash FROM ${cand} WHERE NOT ${enough}`;
-  return `(${enough} AND hash IN (SELECT arrayJoin(${page}))) OR (NOT ${enough} AND ${checks(
-    rest
+  const enough = `(NOT ${capped} OR length(tupleElement(${page}, 1)) >= ${needed})`;
+  return `(${enough} AND hash IN (SELECT arrayJoin(tupleElement(${page}, 1))) AND internal_id IN (SELECT arrayJoin(tupleElement(${page}, 2)))) OR (NOT ${enough} AND ${checks(
+    `SELECT transaction_hash FROM ${cand} WHERE NOT ${enough}`,
+    `SELECT transaction_internal_id FROM ${cand} WHERE NOT ${enough}`
   )
     .map((part) => `(${part})`)
     .join(' AND ')})`;
@@ -303,12 +308,18 @@ export const runTransactions = async (
     _lt: args.before ?? undefined,
   };
   const bounds = numericComparison(sql, 'internal_id', 'UInt64', range);
-  /* the transaction rows among `among`, the node's acceptance and the filter */
-  const checks = (among: string) => [
+  /*
+   * The transaction rows among the candidates `among` (hashes) / `amongIds`
+   * (their internal ids: both bound the read, ClickHouse takes the key or
+   * p_id, whichever selects fewer granules), the node's acceptance and the
+   * filter.
+   */
+  const checks = (among: string, amongIds: string) => [
     `hash IN (${among})`,
+    `internal_id IN (${amongIds})`,
     ...(impliesAcceptance(args.where)
       ? []
-      : [`hash IN (${sql.accepted(ctx.node, among)})`]),
+      : [`hash IN (${sql.accepted(ctx.node, among, amongIds)})`]),
     ...bounds,
     transactionPredicate(sql, args.where, ctx.node, among),
   ];

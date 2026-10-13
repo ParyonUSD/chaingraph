@@ -372,13 +372,24 @@ export class Sql {
    * it accepts or its mempool). With `among` (a subquery of transaction
    * hashes), only those are checked: the acceptance rows are then read by
    * the primary key (the filter applies to the base rows, below the
-   * collapsing GROUP BY), not in full.
+   * collapsing GROUP BY), not in full. `amongIds`: the same transactions'
+   * internal ids (one per hash): both sets then bound the read, and
+   * ClickHouse reads whichever of the hash key and the (node, id) projection
+   * p_node_tx selects fewer granules. Acceptance rows are written in commit
+   * (time) order, so their parts overlap in hash: a hash is looked up in
+   * every part, an id in the one part of its time (fix-pass-6.md §5).
    */
-  accepted(node?: number, among?: string) {
+  accepted(node?: number, among?: string, amongIds?: string) {
     return `SELECT transaction_hash FROM ${this.nodeView(
       'tx_acceptance_at',
       node,
-      among === undefined ? undefined : `transaction_hash IN (${among})`
+      among === undefined
+        ? undefined
+        : `transaction_hash IN (${among})${
+            amongIds === undefined
+              ? ''
+              : ` AND tx_acceptance.transaction_internal_id IN (${amongIds})`
+          }`
     )}`;
   }
 }
