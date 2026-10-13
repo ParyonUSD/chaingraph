@@ -35,6 +35,7 @@ import type { UtxoSetSpotCheckMismatch } from './utxo-set.js';
 import {
   checkUtxoSet,
   hashRangeChunks,
+  nodeCheckChunkCount,
   publishedUtxoMarks,
   spotCheckUtxoSet,
   unspentAtQueryTimeSql,
@@ -644,6 +645,96 @@ e2e(
       {
         message: /injected/u,
       }
+    );
+  }
+);
+
+test('whole-set check chunks follow the UTXO count of the node, not the outputs of the database (fix-pass-8.md §6)', (t) => {
+  /* mainnet 2026-10-13: node 1 and node 39 in one database of 1.16 B outputs (256 chunks for both before) */
+  t.is(nodeCheckChunkCount(125_659_151n), 128);
+  t.is(nodeCheckChunkCount(1_185_908n), 2);
+  t.is(nodeCheckChunkCount(242_512_925), 256);
+  t.is(nodeCheckChunkCount(0n), 1);
+  t.is(nodeCheckChunkCount(1_000_000), 1);
+  t.is(nodeCheckChunkCount(5, 1), 8);
+  t.is(nodeCheckChunkCount(10n ** 12n), 65_536);
+});
+
+e2e(
+  '[e2e] whole-set check and spot-check totals: chunks per node from its stored UTXO count; a small node reads what it holds (fix-pass-8.md §6)',
+  async (t) => {
+    t.timeout(180_000);
+    const { client, openStore } = await scratch(
+      t,
+      'chunks',
+      { utxo: 'off', utxoSetOptions: { intervalMs: 20 } },
+      'ch1_utxoset'
+    );
+    const { chain } = fixture();
+    const store = await openStore();
+    const { node1, node2 } = await registerNodes(store);
+    /* node 1 accepts the three blocks; node 2 only the first */
+    await store.saveBlock({
+      block: chain.block0,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1, at(0)), acceptance(node2, at(0))],
+    });
+    for (const block of [chain.block1, chain.block2]) {
+      await store.saveBlock({
+        block,
+        isSavedTransaction: notSaved,
+        nodeAcceptances: [acceptance(node1, at(0))],
+      });
+    }
+    await store.publishWatermarks();
+    await store.catchUpUtxoSet();
+    await store.publishWatermarks();
+    /* count the chunk statements each check sends */
+    let chunkStatements = 0;
+    const counting = {
+      query: async <T>(...args: Parameters<typeof client.query>) => {
+        if (args[0].includes('chunk_lo')) chunkStatements += 1;
+        return client.query<T>(...args);
+      },
+    };
+    const sizes = new Map<number, number>();
+    for (const node of [node1, node2]) {
+      const single = await checkUtxoSet(client, node, undefined, {
+        chunks: 1,
+      });
+      chunkStatements = 0;
+      const perUtxo = await checkUtxoSet(counting, node, undefined, {
+        utxosPerChunk: 1,
+      });
+      const expected = nodeCheckChunkCount(single!.count, 1);
+      t.is(perUtxo!.chunks, expected, `node ${node}: chunks from its count`);
+      /* one comparison and one invariant statement per chunk */
+      t.is(chunkStatements, 2 * expected);
+      t.deepEqual(
+        { ...perUtxo!, chunks: 1 },
+        single!,
+        `node ${node}: answers as one chunk`
+      );
+      t.deepEqual(
+        [perUtxo!.extra, perUtxo!.missing, perUtxo!.mismatched],
+        [[], [], []]
+      );
+      t.true(perUtxo!.totalsEqual);
+      sizes.set(node, expected);
+      chunkStatements = 0;
+      const spot = await spotCheckUtxoSet(counting, node, {
+        categories: 0,
+        prefixes: 0,
+        totals: true,
+        totalsUtxosPerChunk: 1,
+      });
+      t.deepEqual(spot!.failed, []);
+      t.true(spot!.scopes.every((scope) => scope.equal));
+      t.is(chunkStatements, expected, `node ${node}: totals chunks per node`);
+    }
+    t.true(
+      sizes.get(node2)! < sizes.get(node1)!,
+      'the node holding less is checked in fewer chunks'
     );
   }
 );

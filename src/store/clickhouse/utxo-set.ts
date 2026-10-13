@@ -563,6 +563,10 @@ export const hashRangeParams = (range: HashRange): QueryParams => ({
  * range, the inputs spending outpoints of the range by `input.p_outpoint`'s
  * key range, and the acceptance of only those spenders. Memory follows the
  * range, not the chain (the whole-set form needs more than 280 GiB on mainnet).
+ * The spenders read are only those of outpoints whose transaction the node
+ * accepted (the same acceptance set as the outputs'), so a chunk of a small
+ * node costs what the node holds, not what the chain holds in that range
+ * (fix-pass-8.md §6: node 39's totals 9 s → 322 s on mainnet).
  */
 export const unspentInHashRangeSql = (
   snapshot: Pick<VisibilitySnapshot, 'committedTail' | 'void'>,
@@ -576,14 +580,15 @@ export const unspentInHashRangeSql = (
       undefined,
       keyFilter
     )}`;
+  /* the same subquery text twice: ClickHouse builds the set once */
+  const createdInRange = accepted(hashRangeSql('transaction_hash', range));
   const spenders = `SELECT transaction_hash, outpoint_transaction_hash, outpoint_index FROM input
-    WHERE ${agnostic} AND ${hashRangeSql('outpoint_transaction_hash', range)}`;
+    WHERE ${agnostic} AND ${hashRangeSql('outpoint_transaction_hash', range)}
+      AND outpoint_transaction_hash IN (${createdInRange})`;
   return `SELECT o.* FROM (
     SELECT ${utxoSetReadColumns.join(', ')} FROM output
     WHERE ${agnostic} AND ${hashRangeSql('transaction_hash', range)}
-      AND transaction_hash IN (${accepted(
-        hashRangeSql('transaction_hash', range)
-      )})
+      AND transaction_hash IN (${createdInRange})
     LIMIT 1 BY transaction_hash, output_index) AS o
   LEFT ANTI JOIN (SELECT outpoint_transaction_hash, outpoint_index FROM (${spenders})
                   WHERE transaction_hash IN (${accepted(
@@ -703,6 +708,36 @@ const storedTotals = async (
 export const checkOutputsPerChunk = 8_000_000;
 
 /**
+ * Unspent outputs per chunk a node's whole-set check aims at (fix-pass-8.md
+ * §6): mainnet node 1 (125.7 M UTXOs, 1.16 B outputs) gets 128 chunks, about
+ * the 8 M outputs per chunk of `checkOutputsPerChunk`; chipnet node 39 in
+ * the same database (1.19 M) gets 2 instead of the database's 256.
+ */
+export const checkUtxosPerChunk = 1_000_000;
+
+/**
+ * Chunks for a whole-set check of one node holding `utxos` unspent outputs:
+ * the smallest power of two that keeps at most `utxosPerChunk` per hash
+ * range (1 to 65,536). Per node, not per database: each chunk statement
+ * reads the node's acceptance and what it created and spent in the range.
+ */
+export const nodeCheckChunkCount = (
+  utxos: bigint | number,
+  utxosPerChunk = checkUtxosPerChunk
+) => {
+  const count = Number(utxos);
+  let chunks = 1;
+  while (chunks < 65_536 && count / chunks > Math.max(1, utxosPerChunk)) {
+    chunks *= 2;
+  }
+  return chunks;
+};
+
+/** Unspent outputs of a set of per-category totals. */
+const totalOutputs = (totals: ReadonlyMap<string, UtxoCategoryTotals>) =>
+  [...totals.values()].reduce((sum, t) => sum + t.outputs, 0n);
+
+/**
  * Chunks for a whole-set check of this database: the smallest power of two
  * that keeps about `outputsPerChunk` outputs (as `system.parts` counts them)
  * per hash range, at least 1, at most 65,536.
@@ -723,8 +758,13 @@ export const checkChunkCount = async (
 
 // eslint-disable-next-line functional/no-mixed-type
 export interface WholeSetCheckOptions {
-  /** Hash-range chunks (a power of two); default from the output count (`checkChunkCount`). */
+  /**
+   * Hash-range chunks (a power of two); default from the node's stored
+   * UTXO count (`nodeCheckChunkCount`, `utxosPerChunk`).
+   */
   chunks?: number;
+  /** Unspent outputs per chunk when `chunks` is not given (default `checkUtxosPerChunk`). */
+  utxosPerChunk?: number;
   /** Chunks checked at once (default 1). */
   concurrency?: number;
   /** Server-side budget of each statement, s (default: the server's). */
@@ -762,11 +802,17 @@ const forEachLimited = async <T>(
 export const referenceTotalsChunked = async (
   client: Pick<ClickHouseClient, 'query'>,
   snapshot: VisibilitySnapshot,
-  options: WholeSetCheckOptions = {}
+  options: WholeSetCheckOptions & {
+    /** The node's stored UTXO count (chunk sizing; default: the database's output count). */
+    utxos?: bigint;
+  } = {}
 ) => {
   const params = snapshotParams(snapshot);
   const chunks = hashRangeChunks(
-    options.chunks ?? (await checkChunkCount(client))
+    options.chunks ??
+      (options.utxos === undefined
+        ? await checkChunkCount(client)
+        : nodeCheckChunkCount(options.utxos, options.utxosPerChunk))
   );
   const settings =
     options.maxExecutionSeconds === undefined
@@ -860,15 +906,24 @@ export const checkUtxoSet = async (
   };
   const params = snapshotParams(pinned);
   const withChanges = pinned.utxo!.lagCommits > 0;
-  const chunks = hashRangeChunks(
-    options.chunks ?? (await checkChunkCount(client))
-  );
   const settings =
     options.maxExecutionSeconds === undefined
       ? undefined
       : ({
           max_execution_time: options.maxExecutionSeconds,
         } as unknown as ClickHouseSettings);
+  /* the stored totals first: the node's UTXO count sizes the chunks (fix-pass-8.md §6) */
+  const storedByCategory = await storedTotals(
+    client,
+    pinned,
+    withChanges,
+    params,
+    settings
+  );
+  const chunks = hashRangeChunks(
+    options.chunks ??
+      nodeCheckChunkCount(totalOutputs(storedByCategory), options.utxosPerChunk)
+  );
   const found = { extra: [], mismatched: [], missing: [] } as {
     [kind in 'extra' | 'mismatched' | 'missing']: string[];
   };
@@ -939,18 +994,11 @@ export const checkUtxoSet = async (
     done += 1;
     options.onChunk?.(done, chunks.length);
   });
-  const stored = await storedTotals(
-    client,
-    pinned,
-    withChanges,
-    params,
-    settings
-  );
   const totals = {
     reference: totalsAnswer(reference),
-    stored: totalsAnswer(stored),
+    stored: totalsAnswer(storedByCategory),
   };
-  const count = [...reference.values()].reduce((sum, t) => sum + t.outputs, 0n);
+  const count = totalOutputs(reference);
   const sorted = (list: string[]) =>
     [...list].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   return {
@@ -1028,8 +1076,10 @@ export interface UtxoSpotCheckOptions {
    * hash-range chunks (`totalsChunks`, memory bounded).
    */
   totals?: boolean;
-  /** Hash-range chunks of the totals reference (default from the output count). */
+  /** Hash-range chunks of the totals reference (default from the node's stored UTXO count, `nodeCheckChunkCount`). */
   totalsChunks?: number;
+  /** Unspent outputs per totals chunk when `totalsChunks` is not given (default `checkUtxosPerChunk`). */
+  totalsUtxosPerChunk?: number;
   /** Throw `UtxoSpotCheckFailedError` when a scope's statement failed (default true). */
   throwOnFailure?: boolean;
   /** These categories / prefixes (hex) instead of random ones (tests, tools). */
@@ -1201,19 +1251,29 @@ export const spotCheckUtxoSet = async (
   if (options.totals ?? false) {
     /* chunked: the single-statement reference needed > 280 GiB on mainnet (fix-pass-7.md §5) */
     try {
+      /* the stored totals first: the node's UTXO count sizes the chunks (fix-pass-8.md §6) */
+      const storedByCategory = await storedTotals(
+        client,
+        snapshot,
+        withChanges,
+        params,
+        settings
+      );
       const reference = totalsAnswer(
         (
           await referenceTotalsChunked(client, snapshot, {
             ...(options.totalsChunks === undefined
               ? {}
               : { chunks: options.totalsChunks }),
+            ...(options.totalsUtxosPerChunk === undefined
+              ? {}
+              : { utxosPerChunk: options.totalsUtxosPerChunk }),
             maxExecutionSeconds: options.maxExecutionSeconds ?? 120,
+            utxos: totalOutputs(storedByCategory),
           })
         ).totals
       );
-      const stored = totalsAnswer(
-        await storedTotals(client, snapshot, withChanges, params, settings)
-      );
+      const stored = totalsAnswer(storedByCategory);
       scopes.push({
         equal: stored === reference,
         kind: 'totals',
