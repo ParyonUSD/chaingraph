@@ -1891,15 +1891,30 @@ export const transactionPredicate = (
      * hash, on every row about it): a block range's transactions are an id
      * range, read through transaction.p_id instead of a hash set that touches
      * every granule of the table (X16; fix-pass-6.md §3).
+     *
+     * The mempool rows are a second read (UNION ALL), not an OR: an OR with
+     * a non-key atom (`block_internal_id`) made the key analysis of
+     * p_node_height and p_node_tx a generic exclusion search over every mark
+     * of the node (mainnet node 1: ~410k marks each, 0.2-0.5 s of key CPU on
+     * every block_window document, L1/L4-L8/L10/L11; fix-pass-8b.md §1).
+     * Each read is a conjunction: a binary search on (node, height). Mempool
+     * rows carry height 0 (both writers: mempool-commit.ts and the golden
+     * backfill), which bounds their read to the node's height-0 range.
      */
-    parts.push(
-      `internal_id IN (SELECT transaction_internal_id FROM ${sql.nodeView(
+    const accepted = (condition: string) =>
+      `SELECT transaction_internal_id FROM ${sql.nodeView(
         'tx_acceptance_at',
         node,
-        `${restrict('transaction_hash')}(${
-          mempool ? any([all(heights), 'block_internal_id = 0']) : all(heights)
-        })`
-      )})`
+        `${restrict('transaction_hash')}${condition}`
+      )}`;
+    parts.push(
+      `internal_id IN (${accepted(`(${all(heights)})`)}${
+        mempool
+          ? ` UNION ALL ${accepted(
+              `block_internal_id = 0 AND ${baseHeight} = 0`
+            )}`
+          : ''
+      })`
     );
   }
   if (given(filter.in_block)) {
