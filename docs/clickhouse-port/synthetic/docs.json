@@ -1,0 +1,106 @@
+{
+ "L31": {
+  "file": "L31-PriceContractUtxos.graphql",
+  "variables": {
+   "paryonTokenId": "b5599ea0503817c54c6739af8fcd4353597e944ef70c06f5d754a1bb17e2ff08",
+   "priceContractLockingBytecode": "aa20683b531f41ec88a2f345b727afe59757b73162a340a65c86bba62866f8fe556c87",
+   "node": "synth-node",
+   "limit": 5000
+  }
+ },
+ "L33": {
+  "file": "L33-ContractUtxoActivity.graphql",
+  "variables": {
+   "tokenId": "b5599ea0503817c54c6739af8fcd4353597e944ef70c06f5d754a1bb17e2ff08",
+   "lockingBytecode": "aa20683b531f41ec88a2f345b727afe59757b73162a340a65c86bba62866f8fe556c87",
+   "node": "synth-node",
+   "limit": 10000,
+   "order": "ASC",
+   "after": "-1"
+  }
+ },
+ "L35": {
+  "file": "L35-MonitorLoans.graphql",
+  "variables": {
+   "paryonTokenId": "b5599ea0503817c54c6739af8fcd4353597e944ef70c06f5d754a1bb17e2ff08",
+   "loanContractLockingBytecode": "aa20472bbf14923e2e7cefd8529825c401e8d1a2937b96dd697a6d1c75c53e6cca3a87",
+   "node": "synth-node",
+   "limit": 10000
+  }
+ },
+ "L40": {
+  "file": "L40-MonitorLoansSignal.graphql",
+  "variables": {
+   "paryonTokenId": "b5599ea0503817c54c6739af8fcd4353597e944ef70c06f5d754a1bb17e2ff08",
+   "loanContractLockingBytecode": "aa20472bbf14923e2e7cefd8529825c401e8d1a2937b96dd697a6d1c75c53e6cca3a87",
+   "node": "synth-node"
+  }
+ },
+ "L42": {
+  "file": "L42-MonitorLoansSignalPoll.graphql",
+  "variables": {
+   "paryonTokenId": "b5599ea0503817c54c6739af8fcd4353597e944ef70c06f5d754a1bb17e2ff08",
+   "loanContractLockingBytecode": "aa20472bbf14923e2e7cefd8529825c401e8d1a2937b96dd697a6d1c75c53e6cca3a87",
+   "node": "synth-node"
+  }
+ },
+ "L12": {
+  "file": "L12-AllHolders.graphql",
+  "variables": {
+   "paryonTokenId": "5e6dead7ef094858e6e885ce1fe3ddaae8fe6884773deb47473402fb1c29d588",
+   "node": "synth-node",
+   "limit": 5000
+  }
+ },
+ "X12": {
+  "file": "X12-GetJonathan100CashAccount.graphql",
+  "variables": {
+   "node": "synth-node",
+   "prefix": "6a0401010101084a6f6e617468616e",
+   "height": 170000
+  }
+ },
+ "X13": {
+  "file": "X13-GetBitjson100Authchain.graphql",
+  "variables": {
+   "node": "synth-node",
+   "prefix": "6a0401010101076269746a736f6e",
+   "height": 170000
+  }
+ },
+ "X16": {
+  "file": "X16-TransactionStats2021Q1.graphql",
+  "variables": {
+   "node": "synth-node",
+   "from": "1680000000",
+   "to": "1687800000"
+  }
+ },
+ "L31qt": {
+  "file": "L31-PriceContractUtxos.graphql",
+  "variables": {
+   "paryonTokenId": "b5599ea0503817c54c6739af8fcd4353597e944ef70c06f5d754a1bb17e2ff08",
+   "priceContractLockingBytecode": "aa20683b531f41ec88a2f345b727afe59757b73162a340a65c86bba62866f8fe556c87",
+   "node": "synth-node",
+   "limit": 5000
+  },
+  "options": {
+   "utxoSet": {
+    "enabled": false
+   }
+  }
+ },
+ "L12qt": {
+  "file": "L12-AllHolders.graphql",
+  "variables": {
+   "paryonTokenId": "5e6dead7ef094858e6e885ce1fe3ddaae8fe6884773deb47473402fb1c29d588",
+   "node": "synth-node",
+   "limit": 5000
+  },
+  "options": {
+   "utxoSet": {
+    "enabled": false
+   }
+  }
+ }
+}
