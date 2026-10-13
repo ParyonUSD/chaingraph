@@ -85,6 +85,7 @@ import {
 import type {
   UtxoSetOptions,
   UtxoSetProgress,
+  UtxoSetSpotCheckFailure,
   UtxoSetSpotCheckMismatch,
   UtxoSetSpotCheckReport,
   UtxoSetStatus,
@@ -195,6 +196,7 @@ export interface ClickHouseStoreOptions {
     | 'onError'
     | 'onProgress'
     | 'onSpotCheck'
+    | 'onSpotCheckFailure'
     | 'onSpotCheckMismatch'
     | 'onViolation'
   >;
@@ -274,6 +276,7 @@ export type StoreDiagnostic =
   | CommitLogDiagnostic
   | SpendIndexProgress
   | UtxoSetProgress
+  | UtxoSetSpotCheckFailure
   | UtxoSetSpotCheckMismatch
   | UtxoSetSpotCheckReport
   | UtxoSetViolation
@@ -784,6 +787,9 @@ export class ClickHouseStore implements ChaingraphStore {
           },
           onSpotCheck: (report) => {
             this.diagnostic(report);
+          },
+          onSpotCheckFailure: (failure) => {
+            this.diagnostic(failure);
           },
           onSpotCheckMismatch: (mismatch) => {
             this.diagnostic(mismatch);

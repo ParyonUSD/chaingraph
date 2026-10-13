@@ -1,4 +1,4 @@
-/* eslint-disable functional/no-let, functional/no-loop-statement, no-await-in-loop, functional/no-try-statement, @typescript-eslint/naming-convention, camelcase, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, complexity, max-params, no-continue, @typescript-eslint/member-ordering, max-lines, @typescript-eslint/no-loop-func */
+/* eslint-disable functional/no-let, functional/no-loop-statement, no-await-in-loop, functional/no-try-statement, @typescript-eslint/naming-convention, camelcase, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, complexity, max-params, no-continue, @typescript-eslint/member-ordering, max-lines, @typescript-eslint/no-loop-func, max-classes-per-file, functional/no-throw-statement */
 // cspell:ignore clickhouse unhex seqs dedup rebase rebased rebases analysed
 /**
  * The stored per-node UTXO set, maintained off the commit path
@@ -39,6 +39,8 @@
  * written as generation g + 1 (sign +1, batch U) and published; the old
  * generation's partitions are dropped after a grace period.
  */
+import { createHash } from 'node:crypto';
+
 import type {
   ClickHouseClient,
   ClickHouseSettings,
@@ -513,6 +515,280 @@ export const unspentAtQueryTimeSql = (
     ON s.outpoint_transaction_hash = o.transaction_hash AND s.outpoint_index = o.output_index`;
 };
 
+/**
+ * Hash ranges of a chunked whole-set check (fix-pass-7.md §5): `count` (a
+ * power of two, 1 to 65,536) contiguous ranges of a 32-byte hash by its
+ * leading 16 bits, as `[lo, hi)` (hex; `hi` undefined for the last).
+ * Conditions on these are key ranges of output, input.p_outpoint and
+ * tx_acceptance, so a chunk reads only its part of the chain.
+ */
+export const hashRangeChunks = (count: number) => {
+  if (!Number.isInteger(count) || count < 1 || count > 65_536) {
+    throw new Error(`chunk count ${count} must be 1 to 65536`);
+  }
+  // eslint-disable-next-line no-bitwise
+  if ((count & (count - 1)) !== 0) {
+    throw new Error(`chunk count ${count} must be a power of two`);
+  }
+  const step = 65_536 / count;
+  const bound = (index: number) =>
+    `${(index * step).toString(16).padStart(4, '0')}${'00'.repeat(30)}`;
+  return Array.from({ length: count }, (_, index) => ({
+    hi: index + 1 < count ? bound(index + 1) : undefined,
+    lo: bound(index),
+  }));
+};
+
+export interface HashRange {
+  lo: string;
+  hi: string | undefined;
+}
+
+/** `column` in the range (placeholders `{chunk_lo:String}` / `{chunk_hi:String}`; `hashRangeParams`). */
+export const hashRangeSql = (column: string, range: HashRange) =>
+  `${column} >= toFixedString(unhex({chunk_lo:String}), 32)${
+    range.hi === undefined
+      ? ''
+      : ` AND ${column} < toFixedString(unhex({chunk_hi:String}), 32)`
+  }`;
+
+export const hashRangeParams = (range: HashRange): QueryParams => ({
+  chunk_lo: range.lo,
+  ...(range.hi === undefined ? {} : { chunk_hi: range.hi }),
+});
+
+/**
+ * `unspentAtQueryTimeSql` for the outputs whose transaction hash is in one
+ * hash range: the range's outputs and their creators' acceptance by key
+ * range, the inputs spending outpoints of the range by `input.p_outpoint`'s
+ * key range, and the acceptance of only those spenders. Memory follows the
+ * range, not the chain (the whole-set form needs > 280 GiB on mainnet).
+ */
+export const unspentInHashRangeSql = (
+  snapshot: Pick<VisibilitySnapshot, 'committedTail' | 'void'>,
+  range: HashRange
+) => {
+  const agnostic = pinnedGateTerms('agnostic', { snapshot }).join(' AND ');
+  const accepted = (keyFilter: string) =>
+    `SELECT transaction_hash FROM ${inlinePinnedView(
+      'tx_acceptance_at',
+      snapshot,
+      undefined,
+      keyFilter
+    )}`;
+  const spenders = `SELECT transaction_hash, outpoint_transaction_hash, outpoint_index FROM input
+    WHERE ${agnostic} AND ${hashRangeSql('outpoint_transaction_hash', range)}`;
+  return `SELECT o.* FROM (
+    SELECT ${utxoSetReadColumns.join(', ')} FROM output
+    WHERE ${agnostic} AND ${hashRangeSql('transaction_hash', range)}
+      AND transaction_hash IN (${accepted(
+        hashRangeSql('transaction_hash', range)
+      )})
+    LIMIT 1 BY transaction_hash, output_index) AS o
+  LEFT ANTI JOIN (SELECT outpoint_transaction_hash, outpoint_index FROM (${spenders})
+                  WHERE transaction_hash IN (${accepted(
+                    `transaction_hash IN (SELECT transaction_hash FROM (${spenders}))`
+                  )})) AS s
+    ON s.outpoint_transaction_hash = o.transaction_hash AND s.outpoint_index = o.output_index`;
+};
+
+/** Per-category totals of a set as compared by the checks (hex category → counts). */
+export interface UtxoCategoryTotals {
+  outputs: bigint;
+  value: bigint;
+  fungibleOutputs: bigint;
+  fungibleAmount: bigint;
+  nonfungibleOutputs: bigint;
+}
+
+interface TotalsRow {
+  c: string;
+  n: string;
+  v: string;
+  fn: string;
+  fa: string;
+  nn: string;
+}
+
+const totalsRowsSql = (rows: string) =>
+  `SELECT lower(hex(token_category)) AS c, toString(count()) AS n, toString(sum(v)) AS v,
+     toString(countIf(isNotNull(f))) AS fn, toString(sum(toInt128(ifNull(f, 0)))) AS fa,
+     toString(countIf(isNotNull(cap))) AS nn
+   FROM (SELECT token_category, value_satoshis AS v, fungible_token_amount AS f,
+           nonfungible_token_capability AS cap FROM (${rows}))
+   GROUP BY token_category`;
+
+const addTotals = (
+  into: Map<string, UtxoCategoryTotals>,
+  rows: readonly TotalsRow[]
+) => {
+  for (const row of rows) {
+    const before = into.get(row.c) ?? {
+      fungibleAmount: 0n,
+      fungibleOutputs: 0n,
+      nonfungibleOutputs: 0n,
+      outputs: 0n,
+      value: 0n,
+    };
+    into.set(row.c, {
+      fungibleAmount: before.fungibleAmount + BigInt(row.fa),
+      fungibleOutputs: before.fungibleOutputs + BigInt(row.fn),
+      nonfungibleOutputs: before.nonfungibleOutputs + BigInt(row.nn),
+      outputs: before.outputs + BigInt(row.n),
+      value: before.value + BigInt(row.v),
+    });
+  }
+  return into;
+};
+
+/** Totals without empty categories (a category whose outputs all left the set), in category order. */
+const totalsEntries = (totals: ReadonlyMap<string, UtxoCategoryTotals>) =>
+  [...totals.entries()]
+    .filter(
+      ([, t]) =>
+        t.outputs !== 0n ||
+        t.fungibleOutputs !== 0n ||
+        t.nonfungibleOutputs !== 0n ||
+        t.value !== 0n
+    )
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+
+/** One line for a set of per-category totals: categories, outputs, sat and a digest of every row. */
+export const totalsAnswer = (
+  totals: ReadonlyMap<string, UtxoCategoryTotals>
+) => {
+  const entries = totalsEntries(totals);
+  const digest = createHash('sha256');
+  let outputs = 0n;
+  let value = 0n;
+  for (const [category, t] of entries) {
+    outputs += t.outputs;
+    value += t.value;
+    digest.update(
+      `${category}:${t.outputs}:${t.value}:${t.fungibleOutputs}:${t.fungibleAmount}:${t.nonfungibleOutputs}\n`
+    );
+  }
+  return `${
+    entries.length
+  } categories, ${outputs} outputs, ${value} sat, digest ${digest
+    .digest('hex')
+    .slice(0, 16)}`;
+};
+
+/** The stored per-category totals of a node at the snapshot (utxo_total up to U plus the correction). */
+const storedTotals = async (
+  client: Pick<ClickHouseClient, 'query'>,
+  snapshot: VisibilitySnapshot,
+  withChanges: boolean,
+  params: QueryParams,
+  settings?: ClickHouseSettings
+) => {
+  const scalars = scalarCollector();
+  const totals = utxoTotalsSql({
+    change: { from: '{utxo:UInt64}', scalar: scalars.register, snapshot },
+    withChanges,
+  });
+  const rows = await client.query<TotalsRow>(
+    `${scalars.withClause()}SELECT lower(hex(token_category)) AS c, toString(outputs) AS n,
+       toString(value_satoshis) AS v, toString(fungible_outputs) AS fn,
+       toString(fungible_token_amount) AS fa, toString(nonfungible_outputs) AS nn
+     FROM (${totals})`,
+    params,
+    settings
+  );
+  return addTotals(new Map(), rows);
+};
+
+/** Outputs per chunk a whole-set check aims at (memory per statement ~1-2 GiB, fix-pass-7.md §5). */
+export const checkOutputsPerChunk = 4_000_000;
+
+/**
+ * Chunks for a whole-set check of this database: the smallest power of two
+ * that keeps about `outputsPerChunk` outputs (as `system.parts` counts them)
+ * per hash range, at least 1, at most 65,536.
+ */
+export const checkChunkCount = async (
+  client: Pick<ClickHouseClient, 'query'>,
+  outputsPerChunk = checkOutputsPerChunk
+) => {
+  const [row] = await client.query<{ n: string }>(
+    `SELECT toString(sum(rows)) AS n FROM system.parts
+     WHERE database = currentDatabase() AND table = 'output' AND active`
+  );
+  const outputs = Number(row?.n ?? '0');
+  let chunks = 1;
+  while (chunks < 65_536 && outputs / chunks > outputsPerChunk) chunks *= 2;
+  return chunks;
+};
+
+// eslint-disable-next-line functional/no-mixed-type
+export interface WholeSetCheckOptions {
+  /** Hash-range chunks (a power of two); default from the output count (`checkChunkCount`). */
+  chunks?: number;
+  /** Chunks checked at once (default 1). */
+  concurrency?: number;
+  /** Server-side budget of each statement, s (default: the server's). */
+  maxExecutionSeconds?: number;
+  /** Progress after each chunk (tools). */
+  onChunk?: (done: number, of: number) => void;
+}
+
+/** Run `work` over `items` with at most `concurrency` at once; rejects with the first failure. */
+const forEachLimited = async <T>(
+  items: readonly T[],
+  concurrency: number,
+  work: (item: T, index: number) => Promise<void>
+) => {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      await work(items[index]!, index);
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.max(1, Math.min(concurrency, items.length)) },
+      worker
+    )
+  );
+};
+
+/**
+ * The query-time per-category totals of a node's whole set at the snapshot,
+ * summed over hash-range chunks (memory bounded per statement).
+ */
+export const referenceTotalsChunked = async (
+  client: Pick<ClickHouseClient, 'query'>,
+  snapshot: VisibilitySnapshot,
+  options: WholeSetCheckOptions = {}
+) => {
+  const params = snapshotParams(snapshot);
+  const chunks = hashRangeChunks(
+    options.chunks ?? (await checkChunkCount(client))
+  );
+  const settings =
+    options.maxExecutionSeconds === undefined
+      ? undefined
+      : ({
+          max_execution_time: options.maxExecutionSeconds,
+        } as unknown as ClickHouseSettings);
+  const totals = new Map<string, UtxoCategoryTotals>();
+  let done = 0;
+  await forEachLimited(chunks, options.concurrency ?? 1, async (range) => {
+    const rows = await client.query<TotalsRow>(
+      totalsRowsSql(unspentInHashRangeSql(snapshot, range)),
+      { ...params, ...hashRangeParams(range) },
+      settings
+    );
+    addTotals(totals, rows);
+    done += 1;
+    options.onChunk?.(done, chunks.length);
+  });
+  return { chunks: chunks.length, totals };
+};
+
 /** What `checkUtxoSet` found: empty lists and equal totals = exact. */
 export interface UtxoSetCheck {
   node: number;
@@ -522,16 +798,20 @@ export interface UtxoSetCheck {
   visible: bigint;
   /** Outpoints of the query-time set (the reference). */
   count: number;
-  /** In the reference, not in the stored read (up to 20). */
+  /** In the reference, not in the stored read (up to 3 per chunk, 20 in all). */
   missing: string[];
-  /** In the stored read, not in the reference (up to 20). */
+  /** In the stored read, not in the reference (up to 3 per chunk, 20 in all). */
   extra: string[];
-  /** In both with different column values (up to 20). */
+  /** In both with different column values (up to 3 per chunk, 20 in all). */
   mismatched: string[];
   /** Per-category totals (stored totals + correction) equal the reference's. */
   totalsEqual: boolean;
+  /** The two totals as `totalsAnswer` lines. */
+  totals: { stored: string; reference: string };
   /** Outpoints whose stored sum of signs up to U is not 0 or 1 (up to 20). */
   invariant: string[];
+  /** Hash-range chunks the check ran in. */
+  chunks: number;
 }
 
 const rowKey =
@@ -548,11 +828,20 @@ const rowDigest = `cityHash64(toString(tuple(transaction_internal_id, value_sato
  * snapshot's watermark were this published (U, generation) (a lagging
  * reader; U must be at most visible(n) and published). Undefined when the
  * node has no stored set (and no mark is forced).
+ *
+ * Whole set, memory bounded (fix-pass-7.md §5): the outpoints are compared
+ * row for row per hash range of their transaction (`options.chunks`, by
+ * default ~4 M outputs per range: a few GiB per statement on mainnet, where
+ * the single-statement form needed > 280 GiB); the per-category totals of
+ * the reference are summed over the ranges and compared with the stored
+ * totals. A statement that fails (memory, time) fails the check: it throws,
+ * nothing is reported as compared.
  */
 export const checkUtxoSet = async (
   client: Pick<ClickHouseClient, 'query'>,
   nodeId: number,
-  mark?: { watermark: bigint; generation: number }
+  mark?: { watermark: bigint; generation: number },
+  options: WholeSetCheckOptions = {}
 ): Promise<UtxoSetCheck | undefined> => {
   const snapshot = snapshotForNode(
     await readSnapshotMulti(client, [nodeId], { utxo: true }),
@@ -571,70 +860,98 @@ export const checkUtxoSet = async (
   };
   const params = snapshotParams(pinned);
   const withChanges = pinned.utxo!.lagCommits > 0;
-  const rows = scalarCollector();
-  const stored = utxoSetRowsSql({
-    change: { from: '{utxo:UInt64}', scalar: rows.register, snapshot: pinned },
-    withChanges,
+  const chunks = hashRangeChunks(
+    options.chunks ?? (await checkChunkCount(client))
+  );
+  const settings =
+    options.maxExecutionSeconds === undefined
+      ? undefined
+      : ({
+          max_execution_time: options.maxExecutionSeconds,
+        } as unknown as ClickHouseSettings);
+  const found = { extra: [], mismatched: [], missing: [] } as {
+    [kind in 'extra' | 'mismatched' | 'missing']: string[];
+  };
+  const invariant: string[] = [];
+  const reference = new Map<string, UtxoCategoryTotals>();
+  let done = 0;
+  await forEachLimited(chunks, options.concurrency ?? 1, async (range) => {
+    const chunkParams = { ...params, ...hashRangeParams(range) };
+    const rows = scalarCollector();
+    const stored = utxoSetRowsSql({
+      change: {
+        from: '{utxo:UInt64}',
+        scalar: rows.register,
+        snapshot: pinned,
+      },
+      where: hashRangeSql('transaction_hash', range),
+      withChanges,
+    });
+    const chunkReference = unspentInHashRangeSql(pinned, range);
+    const diff = await client.query<{ kind: string; key: string }>(
+      `${rows.withClause()}SELECT kind, key FROM (
+         SELECT if(r.k = '', 'extra', if(s.k = '', 'missing', 'mismatched')) AS kind,
+                if(r.k = '', s.k, r.k) AS key
+         FROM (SELECT ${rowKey} AS k, ${rowDigest} AS d FROM (${chunkReference})) AS r
+         FULL OUTER JOIN (SELECT ${rowKey} AS k, ${rowDigest} AS d FROM (${stored})) AS s
+           ON r.k = s.k
+         WHERE r.k = '' OR s.k = '' OR r.d != s.d)
+       ORDER BY kind, key LIMIT 3 BY kind
+       SETTINGS join_use_nulls = 0`,
+      chunkParams,
+      settings
+    );
+    for (const row of diff) {
+      const list = found[row.kind as keyof typeof found];
+      if (list.length < 20) list.push(row.key);
+    }
+    addTotals(
+      reference,
+      await client.query<TotalsRow>(
+        totalsRowsSql(chunkReference),
+        chunkParams,
+        settings
+      )
+    );
+    const broken = await client.query<{ key: string }>(
+      `SELECT concat(${rowKey}, ' sum ', toString(sum(sign))) AS key FROM utxo_set
+       WHERE node_internal_id = {node:UInt32} AND generation = {utxo_generation:UInt32} AND batch <= {utxo:UInt64}
+         AND ${hashRangeSql('transaction_hash', range)}
+       GROUP BY transaction_hash, output_index HAVING sum(sign) NOT IN (0, 1) LIMIT 20`,
+      chunkParams,
+      settings
+    );
+    invariant.push(
+      ...broken.map((row) => row.key).slice(0, 20 - invariant.length)
+    );
+    done += 1;
+    options.onChunk?.(done, chunks.length);
   });
-  const reference = unspentAtQueryTimeSql(pinned);
-  const diff = await client.query<{ kind: string; key: string }>(
-    `${rows.withClause()}SELECT kind, key FROM (
-       SELECT if(r.k = '', 'extra', if(s.k = '', 'missing', 'mismatched')) AS kind,
-              if(r.k = '', s.k, r.k) AS key
-       FROM (SELECT ${rowKey} AS k, ${rowDigest} AS d FROM (${reference})) AS r
-       FULL OUTER JOIN (SELECT ${rowKey} AS k, ${rowDigest} AS d FROM (${stored})) AS s
-         ON r.k = s.k
-       WHERE r.k = '' OR s.k = '' OR r.d != s.d)
-     ORDER BY kind, key LIMIT 3 BY kind
-     SETTINGS join_use_nulls = 0`,
-    params
-  );
-  const [counted] = await client.query<{ n: string }>(
-    `SELECT toString(count()) AS n FROM (${reference})`,
-    params
-  );
-  const totals = scalarCollector();
-  const storedTotals = utxoTotalsSql({
-    change: {
-      from: '{utxo:UInt64}',
-      scalar: totals.register,
-      snapshot: pinned,
-    },
+  const stored = await storedTotals(
+    client,
+    pinned,
     withChanges,
-  });
-  const [compared] = await client.query<{ equal: number }>(
-    `${totals.withClause()}SELECT
-       (SELECT groupArraySorted(100000)(tuple(token_category, toInt64(outputs), toInt64(value_satoshis),
-          toInt64(fungible_outputs), toInt128(fungible_token_amount), toInt64(nonfungible_outputs)))
-        FROM (${storedTotals}))
-       = (SELECT groupArraySorted(100000)(tuple(token_category, toInt64(outputs), toInt64(value_satoshis),
-          toInt64(fungible_outputs), toInt128(fungible_token_amount), toInt64(nonfungible_outputs)))
-          FROM (SELECT token_category, count() AS outputs, sum(v) AS value_satoshis,
-                  countIf(isNotNull(f)) AS fungible_outputs,
-                  sum(toInt128(ifNull(f, 0))) AS fungible_token_amount,
-                  countIf(isNotNull(c)) AS nonfungible_outputs
-                FROM (SELECT token_category, value_satoshis AS v, fungible_token_amount AS f,
-                        nonfungible_token_capability AS c FROM (${reference}))
-                GROUP BY token_category)) AS equal`,
-    params
+    params,
+    settings
   );
-  const invariant = await client.query<{ key: string }>(
-    `SELECT concat(${rowKey}, ' sum ', toString(sum(sign))) AS key FROM utxo_set
-     WHERE node_internal_id = {node:UInt32} AND generation = {utxo_generation:UInt32} AND batch <= {utxo:UInt64}
-     GROUP BY transaction_hash, output_index HAVING sum(sign) NOT IN (0, 1) LIMIT 20`,
-    params
-  );
-  const of = (kind: string) =>
-    diff.filter((row) => row.kind === kind).map((row) => row.key);
+  const totals = {
+    reference: totalsAnswer(reference),
+    stored: totalsAnswer(stored),
+  };
+  const count = [...reference.values()].reduce((sum, t) => sum + t.outputs, 0n);
+  const sorted = (list: string[]) =>
+    [...list].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   return {
-    count: Number(counted?.n ?? '0'),
-    extra: of('extra'),
+    chunks: chunks.length,
+    count: Number(count),
+    extra: sorted(found.extra),
     generation: used.generation,
-    invariant: invariant.map((row) => row.key),
-    mismatched: of('mismatched'),
-    missing: of('missing'),
+    invariant: sorted(invariant),
+    mismatched: sorted(found.mismatched),
+    missing: sorted(found.missing),
     node: nodeId,
-    totalsEqual: Number(compared?.equal ?? 0) === 1,
+    totals,
+    totalsEqual: totals.reference === totals.stored,
     visible: snapshot.visible,
     watermark: used.watermark,
   };
@@ -661,8 +978,29 @@ export interface UtxoSetSpotCheck {
   generation: number;
   visible: bigint;
   scopes: UtxoSpotCheckScope[];
-  /** Scopes not compared (a statement over its time budget). */
-  skipped: { kind: UtxoSpotCheckScope['kind']; value: string; error: string }[];
+  /**
+   * Scopes whose statements failed (time, memory): NOT compared, so the
+   * check failed (fix-pass-7.md §5; they were reported as "skipped" before,
+   * and a tool exited 0). `spotCheckUtxoSet` throws `UtxoSpotCheckFailedError`
+   * when any scope failed, unless `throwOnFailure` is false.
+   */
+  failed: { kind: UtxoSpotCheckScope['kind']; value: string; error: string }[];
+}
+
+/** A spot-check where some scope could not be compared (`check.failed`): the check failed, loudly. */
+export class UtxoSpotCheckFailedError extends Error {
+  constructor(readonly check: UtxoSetSpotCheck) {
+    super(
+      `UTXO set spot-check of node ${check.node} FAILED: ${
+        check.failed.length
+      } scope(s) not compared (${check.failed
+        .map((scope) => `${scope.kind} ${scope.value}: ${scope.error}`)
+        .join('; ')}); ${check.scopes.length} compared, ${
+        check.scopes.filter((scope) => !scope.equal).length
+      } mismatched`
+    );
+    this.name = 'UtxoSpotCheckFailedError';
+  }
 }
 
 // eslint-disable-next-line functional/no-mixed-type
@@ -671,8 +1009,17 @@ export interface UtxoSpotCheckOptions {
   categories?: number;
   /** Random locking-bytecode prefixes (default 3; from outputs at a random transaction hash). */
   prefixes?: number;
-  /** Compare the node's whole-set totals (default true). */
+  /**
+   * Compare the node's whole-set totals (default false: on mainnet the
+   * query-time totals read the whole chain, ~15 min of a 48-core server;
+   * decision rule U6 of 2026-10-13). When on, the reference is summed over
+   * hash-range chunks (`totalsChunks`, memory bounded).
+   */
   totals?: boolean;
+  /** Hash-range chunks of the totals reference (default from the output count). */
+  totalsChunks?: number;
+  /** Throw `UtxoSpotCheckFailedError` when a scope's statement failed (default true). */
+  throwOnFailure?: boolean;
   /** These categories / prefixes (hex) instead of random ones (tests, tools). */
   categoryValues?: readonly string[];
   prefixValues?: readonly string[];
@@ -769,7 +1116,7 @@ export const spotCheckUtxoSet = async (
           )
         ).map((row) => row.p));
   const scopes: UtxoSpotCheckScope[] = [];
-  const skipped: UtxoSetSpotCheck['skipped'] = [];
+  const failed: UtxoSetSpotCheck['failed'] = [];
   const compare = async (
     kind: UtxoSpotCheckScope['kind'],
     value: string,
@@ -792,7 +1139,7 @@ export const spotCheckUtxoSet = async (
         value,
       });
     } catch (error: unknown) {
-      skipped.push({ error: String(error), kind, value });
+      failed.push({ error: String(error), kind, value });
     }
   };
   const change = (scalar: ScalarRegistrar) => ({
@@ -839,22 +1186,45 @@ export const spotCheckUtxoSet = async (
       { spot: value }
     );
   }
-  if (options.totals ?? true) {
-    await compare('totals', '', (scalar) => ({
-      reference: totalsDigest(referenceTotals(unspentAtQueryTimeSql(snapshot))),
-      stored: totalsDigest(
-        utxoTotalsSql({ change: change(scalar), withChanges })
-      ),
-    }));
+  if (options.totals ?? false) {
+    /* chunked: the single-statement reference needed > 280 GiB on mainnet (fix-pass-7.md §5) */
+    try {
+      const reference = totalsAnswer(
+        (
+          await referenceTotalsChunked(client, snapshot, {
+            ...(options.totalsChunks === undefined
+              ? {}
+              : { chunks: options.totalsChunks }),
+            maxExecutionSeconds: options.maxExecutionSeconds ?? 120,
+          })
+        ).totals
+      );
+      const stored = totalsAnswer(
+        await storedTotals(client, snapshot, withChanges, params, settings)
+      );
+      scopes.push({
+        equal: stored === reference,
+        kind: 'totals',
+        reference,
+        stored,
+        value: '',
+      });
+    } catch (error: unknown) {
+      failed.push({ error: String(error), kind: 'totals', value: '' });
+    }
   }
-  return {
+  const check: UtxoSetSpotCheck = {
+    failed,
     generation: mark.generation,
     node: nodeId,
     scopes,
-    skipped,
     visible: snapshot.visible,
     watermark: mark.watermark,
   };
+  if (failed.length > 0 && (options.throwOnFailure ?? true)) {
+    throw new UtxoSpotCheckFailedError(check);
+  }
+  return check;
 };
 
 /** Every published (U, generation) of a node at or below `upTo`, oldest first. */
@@ -897,9 +1267,9 @@ export const utxoSetMetricsText = (status: UtxoSetStatus) =>
       status.spotCheckMismatches,
     ],
     [
-      'chaingraph_utxo_set_spot_check_skipped_total',
-      'Spot-check scopes not compared (statement over budget).',
-      status.spotCheckSkipped,
+      'chaingraph_utxo_set_spot_check_failed_total',
+      'Spot-check scopes whose statements failed (time, memory): not compared, a failed check.',
+      status.spotCheckFailed,
     ],
     [
       'chaingraph_utxo_set_batches_total',
@@ -971,8 +1341,19 @@ export interface UtxoSetSpotCheckReport {
   visible: string;
   scopes: number;
   mismatches: number;
-  skipped: number;
+  /** Scopes whose statements failed (not compared): the check failed. */
+  failed: number;
   ms: number;
+}
+
+/** A spot-check scope that could not be compared (its statement failed): logged as an error. */
+export interface UtxoSetSpotCheckFailure {
+  event: 'utxo_set_spot_check_failed';
+  node: number;
+  watermark: string;
+  scope: UtxoSpotCheckScope['kind'];
+  value: string;
+  error: string;
 }
 
 export interface UtxoSetNodeStatus {
@@ -995,8 +1376,8 @@ export interface UtxoSetStatus {
   spotCheckScopes: number;
   /** Scopes where the stored set differed from the query-time answer (counter; must stay 0). */
   spotCheckMismatches: number;
-  /** Scopes not compared (statement over budget; counter). */
-  spotCheckSkipped: number;
+  /** Scopes whose statements failed: not compared, a failed check (counter; must stay 0). */
+  spotCheckFailed: number;
 }
 
 export interface UtxoSetOptions {
@@ -1047,6 +1428,7 @@ export interface UtxoSetOptions {
   onViolation?: (violation: UtxoSetViolation) => void;
   onSpotCheck?: (report: UtxoSetSpotCheckReport) => void;
   onSpotCheckMismatch?: (mismatch: UtxoSetSpotCheckMismatch) => void;
+  onSpotCheckFailure?: (failure: UtxoSetSpotCheckFailure) => void;
   onError?: (error: unknown) => void;
 }
 
@@ -1185,9 +1567,9 @@ export class UtxoSetMaintainer {
     rebases: 0,
     rows: 0,
     running: false,
+    spotCheckFailed: 0,
     spotCheckMismatches: 0,
     spotCheckScopes: 0,
-    spotCheckSkipped: 0,
     spotChecks: 0,
   };
 
@@ -1207,18 +1589,27 @@ export class UtxoSetMaintainer {
     for (const node of [...marks.keys()].sort((a, b) => a - b)) {
       if (this.stopped && this.loop !== undefined) break;
       const started = Date.now();
-      const check = await spotCheckUtxoSet(
-        client,
-        node,
-        this.options.spotCheck
-      );
+      const check = await spotCheckUtxoSet(client, node, {
+        ...this.options.spotCheck,
+        throwOnFailure: false,
+      });
       if (check === undefined) continue;
       checks.push(check);
       const mismatches = check.scopes.filter((scope) => !scope.equal);
       this.status.spotChecks += 1;
       this.status.spotCheckScopes += check.scopes.length;
       this.status.spotCheckMismatches += mismatches.length;
-      this.status.spotCheckSkipped += check.skipped.length;
+      this.status.spotCheckFailed += check.failed.length;
+      check.failed.forEach((scope) => {
+        this.options.onSpotCheckFailure?.({
+          error: scope.error,
+          event: 'utxo_set_spot_check_failed',
+          node,
+          scope: scope.kind,
+          value: scope.value,
+          watermark: check.watermark.toString(),
+        });
+      });
       mismatches.forEach((scope) => {
         this.options.onSpotCheckMismatch?.({
           event: 'utxo_set_spot_check_mismatch',
@@ -1234,11 +1625,11 @@ export class UtxoSetMaintainer {
       });
       this.options.onSpotCheck?.({
         event: 'utxo_set_spot_check',
+        failed: check.failed.length,
         mismatches: mismatches.length,
         ms: Date.now() - started,
         node,
         scopes: check.scopes.length,
-        skipped: check.skipped.length,
         visible: check.visible.toString(),
         watermark: check.watermark.toString(),
       });

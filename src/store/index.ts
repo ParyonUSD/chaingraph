@@ -10,6 +10,7 @@ import {
   clickhouseUtxo,
   clickhouseUtxoSet,
   clickhouseUtxoSetSpotCheckMs,
+  clickhouseUtxoSetSpotCheckTotals,
 } from '../config.js';
 import { instances } from '../logging.js';
 
@@ -45,6 +46,8 @@ export interface StoreConfig {
     utxoSet?: 'off' | 'on';
     /** Its spot-check interval (`CHAINGRAPH_CLICKHOUSE_UTXO_SET_SPOT_CHECK_MS`; default 1 h, 0 = off). */
     utxoSetSpotCheckMs?: number;
+    /** Whole-set totals in each spot-check (`CHAINGRAPH_CLICKHOUSE_UTXO_SET_SPOT_CHECK_TOTALS`; default off). */
+    utxoSetSpotCheckTotals?: 'off' | 'on';
   };
 }
 
@@ -65,6 +68,7 @@ export const storeConfigFromEnvironment = (): StoreConfig => ({
     utxo: clickhouseUtxo,
     utxoSet: clickhouseUtxoSet,
     utxoSetSpotCheckMs: clickhouseUtxoSetSpotCheckMs,
+    utxoSetSpotCheckTotals: clickhouseUtxoSetSpotCheckTotals,
   },
 });
 
@@ -109,6 +113,12 @@ export const createStore = (
             { clickhouseDiagnostic: diagnostic },
             `ClickHouse store: UTXO set spot-check MISMATCH on node ${diagnostic.node}, ${diagnostic.scope} ${diagnostic.value}: stored ${diagnostic.stored} vs query time ${diagnostic.reference}.`
           );
+        } else if (diagnostic.event === 'utxo_set_spot_check_failed') {
+          // a scope could not be compared (time, memory): the check failed, loud
+          logger.error(
+            { clickhouseDiagnostic: diagnostic },
+            `ClickHouse store: UTXO set spot-check FAILED on node ${diagnostic.node}, ${diagnostic.scope} ${diagnostic.value}: ${diagnostic.error}`
+          );
         } else if (diagnostic.event === 'utxo_set_invariant_violation') {
           // a data discrepancy in the stored UTXO set (utxo-async.md): loud
           logger.fatal({ clickhouseDiagnostic: diagnostic }, message);
@@ -132,13 +142,14 @@ export const createStore = (
       spendIndex: config.clickhouse.spendIndex,
       utxo: config.clickhouse.utxo,
       utxoSet: config.clickhouse.utxoSet,
-      ...(config.clickhouse.utxoSetSpotCheckMs === undefined
-        ? {}
-        : {
-            utxoSetOptions: {
-              spotCheckIntervalMs: config.clickhouse.utxoSetSpotCheckMs,
-            },
-          }),
+      utxoSetOptions: {
+        ...(config.clickhouse.utxoSetSpotCheckMs === undefined
+          ? {}
+          : { spotCheckIntervalMs: config.clickhouse.utxoSetSpotCheckMs }),
+        spotCheck: {
+          totals: config.clickhouse.utxoSetSpotCheckTotals === 'on',
+        },
+      },
     });
     if (config.abandonOnShutdownSignals === true) {
       ['SIGINT', 'SIGTERM'].forEach((signal) => {

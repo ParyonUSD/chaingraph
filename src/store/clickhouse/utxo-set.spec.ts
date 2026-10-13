@@ -34,11 +34,13 @@ import { e2eClickHouseUrl } from './test-support.js';
 import type { UtxoSetSpotCheckMismatch } from './utxo-set.js';
 import {
   checkUtxoSet,
+  hashRangeChunks,
   publishedUtxoMarks,
   spotCheckUtxoSet,
   unspentAtQueryTimeSql,
   utxoSetMetricsText,
   utxoSetViewStatement,
+  UtxoSpotCheckFailedError,
 } from './utxo-set.js';
 import {
   readSnapshotMulti,
@@ -135,7 +137,18 @@ const assertExact = async (
       ...(await Promise.all(
         marks.map(async (mark) => checkUtxoSet(client, node, mark))
       )),
+      /* the same read in 16 hash-range chunks (fix-pass-7.md §5) */
+      ...(own === undefined
+        ? []
+        : [await checkUtxoSet(client, node, undefined, { chunks: 16 })]),
     ];
+    if (own !== undefined) {
+      t.deepEqual(
+        { ...checks.at(-1)!, chunks: 1 },
+        { ...own, chunks: 1 },
+        `${step}: 16 chunks answer as ${own.chunks}`
+      );
+    }
     for (const check of checks) {
       const label = `${step}: node ${node} at U=${check!.watermark} g${
         check!.generation
@@ -488,7 +501,11 @@ e2e(
           diagnostics.push(diagnostic);
         },
         utxo: 'off',
-        utxoSetOptions: { intervalMs: 20, spotCheckIntervalMs: 0 },
+        utxoSetOptions: {
+          intervalMs: 20,
+          spotCheck: { totals: true, totalsChunks: 4 },
+          spotCheckIntervalMs: 0,
+        },
       },
       'ch1_utxoset'
     );
@@ -524,7 +541,7 @@ e2e(
       [node1, node2]
     );
     for (const check of random) {
-      t.deepEqual(check.skipped, []);
+      t.deepEqual(check.failed, []);
       t.true(check.scopes.length >= 2, 'categories / prefixes and totals');
       t.true(
         check.scopes.every((scope) => scope.equal),
@@ -598,8 +615,55 @@ e2e(
       )
     );
     t.true(status.spotCheckMismatches > 0);
+
+    /* a scope whose statement fails is a FAILED check: it throws (fix-pass-7.md §5), not "skipped" */
+    const failing = {
+      query: async <T>(...args: Parameters<typeof client.query>) =>
+        args[0].includes('chunk_lo')
+          ? // eslint-disable-next-line functional/no-promise-reject
+            Promise.reject(new Error('MEMORY_LIMIT_EXCEEDED (injected)'))
+          : client.query<T>(...args),
+    };
+    const thrown = await t.throwsAsync(
+      spotCheckUtxoSet(failing, node2, { totals: true, totalsChunks: 2 }),
+      { instanceOf: UtxoSpotCheckFailedError }
+    );
+    t.regex(thrown!.message, /FAILED: 1 scope\(s\) not compared \(totals/u);
+    t.deepEqual(
+      (thrown as UtxoSpotCheckFailedError).check.failed.map((f) => f.kind),
+      ['totals']
+    );
+    const quiet = await spotCheckUtxoSet(failing, node2, {
+      throwOnFailure: false,
+      totals: true,
+    });
+    t.is(quiet!.failed.length, 1, 'reported as failed when not thrown');
+    /* and the whole-set check throws too */
+    await t.throwsAsync(
+      checkUtxoSet(failing, node2, undefined, { chunks: 2 }),
+      {
+        message: /injected/u,
+      }
+    );
   }
 );
+
+test('hash-range chunks cover the hash space in order, powers of two only', (t) => {
+  t.deepEqual(hashRangeChunks(1), [{ hi: undefined, lo: '00'.repeat(32) }]);
+  const four = hashRangeChunks(4);
+  t.deepEqual(
+    four.map((range) => [range.lo.slice(0, 4), range.hi?.slice(0, 4)]),
+    [
+      ['0000', '4000'],
+      ['4000', '8000'],
+      ['8000', 'c000'],
+      ['c000', undefined],
+    ]
+  );
+  t.is(hashRangeChunks(65_536).length, 65_536);
+  t.throws(() => hashRangeChunks(3), { message: /power of two/u });
+  t.throws(() => hashRangeChunks(131_072));
+});
 
 e2e(
   '[e2e] UTXO set spot-check runs on its own every spotCheckIntervalMs',

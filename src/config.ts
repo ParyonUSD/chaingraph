@@ -620,6 +620,29 @@ if (
  */
 const clickhouseUtxoSetSpotCheckMs = clickhouseUtxoSetSpotCheckMsValue;
 
+const clickhouseUtxoSetSpotCheckTotalsValue = optionalString(
+  optionalOptions.CHAINGRAPH_CLICKHOUSE_UTXO_SET_SPOT_CHECK_TOTALS,
+  'off'
+);
+if (
+  clickhouseUtxoSetSpotCheckTotalsValue !== 'on' &&
+  clickhouseUtxoSetSpotCheckTotalsValue !== 'off'
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_CLICKHOUSE_UTXO_SET_SPOT_CHECK_TOTALS' environment variable: ${clickhouseUtxoSetSpotCheckTotalsValue}. Must be 'on' or 'off'.`
+  );
+}
+/**
+ * Set via `CHAINGRAPH_CLICKHOUSE_UTXO_SET_SPOT_CHECK_TOTALS` (default `off`):
+ * whether each spot-check also compares every node's whole-set totals with
+ * the query-time totals. Off by default: on mainnet the query-time totals
+ * read the whole chain (memory bounded in hash-range chunks, but ~15 min of
+ * a 48-core server; rule U6, fix-pass-7.md §5). Ignored by Postgres.
+ */
+const clickhouseUtxoSetSpotCheckTotals: 'off' | 'on' =
+  clickhouseUtxoSetSpotCheckTotalsValue;
+
 const eventLoopDiagnosticValue = Number(
   optionalString(optionalOptions.CHAINGRAPH_EVENT_LOOP_DIAGNOSTIC_MS, '0')
 );
@@ -710,6 +733,7 @@ export {
   clickhouseUtxo,
   clickhouseUtxoSet,
   clickhouseUtxoSetSpotCheckMs,
+  clickhouseUtxoSetSpotCheckTotals,
   encodeWorkers,
   eventLoopDiagnosticMs,
   genesisBlocks,
