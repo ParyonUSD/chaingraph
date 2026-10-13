@@ -588,8 +588,7 @@ BEGIN
             FROM node_block nb GROUP BY nb.block_internal_id) s
     GROUP BY s.ids ORDER BY count(*) DESC, s.ids LIMIT 1;
   full_ids := COALESCE(full_ids, '{}');
-  DROP TABLE IF EXISTS pg_temp.unspent_node_ids_full_blocks;
-  CREATE TEMP TABLE unspent_node_ids_full_blocks (id bigint PRIMARY KEY) ON COMMIT DROP;
+  CREATE TEMP TABLE IF NOT EXISTS unspent_node_ids_full_blocks (id bigint PRIMARY KEY) ON COMMIT DROP;
   INSERT INTO unspent_node_ids_full_blocks (id)
     SELECT nb.block_internal_id FROM node_block nb GROUP BY nb.block_internal_id
       HAVING array_agg(nb.node_internal_id::integer ORDER BY nb.node_internal_id) = full_ids;
