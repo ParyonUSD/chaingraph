@@ -150,6 +150,23 @@ const chunks = <T>(values: readonly T[], size = maxListChunk): T[][] => {
   return out.length === 0 ? [[]] : out;
 };
 
+/** Which relationship levels read by internal id alone (`Sql.readsById`). */
+export interface ReadsById {
+  /** block_inclusions: block_transaction.p_txid materialized in every part. */
+  inclusions: boolean;
+  /** inputs: input.p_txid materialized in every part. */
+  inputs: boolean;
+}
+
+/** `ReadsById` from the store features (absent: off). */
+export const readsByIdFrom = (features: {
+  inclusionsByIdProjection?: boolean;
+  inputsByIdProjection?: boolean;
+}): ReadsById => ({
+  inclusions: features.inclusionsByIdProjection === true,
+  inputs: features.inputsByIdProjection === true,
+});
+
 export class Sql {
   readonly params: { [name: string]: unknown };
 
@@ -181,6 +198,18 @@ export class Sql {
    * statement environment sets it to the request's pinned nodes).
    */
   nodeIdOf: ((name: string) => number) | undefined;
+
+  /**
+   * Relationship reads by internal id alone (`readsByIdFrom`): every active
+   * part of `input` / `block_transaction` has its p_txid projection, so the
+   * inputs and block-inclusion levels read `transaction_internal_id IN …`
+   * without the hash set next to it. With both conditions ClickHouse
+   * analysed the hash set against the base key of every part and the id set
+   * against p_txid before choosing (mainnet L17: key CPU 0.8 to 1.45 s;
+   * fix-pass-8b.md §1). Default off: a part without the projection would
+   * read every row of the table by id.
+   */
+  readsById: ReadsById = { inclusions: false, inputs: false };
 
   /** `nodeIdOf`, failing when the statement has no node resolver. */
   resolveNode(name: string) {
@@ -296,6 +325,7 @@ export class Sql {
     const next = new Sql(this.snapshot, this.others, this.utxoSetPolicy);
     next.nodeIdOf = this.nodeIdOf;
     next.authchainMaxBranches = this.authchainMaxBranches;
+    next.readsById = this.readsById;
     return next;
   }
 

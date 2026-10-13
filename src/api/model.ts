@@ -828,7 +828,10 @@ export const TransactionEntity: Entity = {
         const node = acceptedByNode(c, args);
         const hashes = `SELECT hash FROM (${link})`;
         const ids = `SELECT internal_id FROM (${link})`;
-        const included = `transaction_hash IN (${hashes}) AND transaction_internal_id IN (${ids})`;
+        /* by id alone when every part has p_txid (Sql.readsById): one id per hash */
+        const included = c.sql.readsById.inclusions
+          ? `transaction_internal_id IN (${ids})`
+          : `transaction_hash IN (${hashes}) AND transaction_internal_id IN (${ids})`;
         /* below the collapse: the alias any(transaction_internal_id) would shadow the column */
         const accepted = `block_internal_id != 0 AND transaction_hash IN (${hashes}) AND tx_acceptance.transaction_internal_id IN (${ids})`;
         const inclusions =
@@ -944,9 +947,12 @@ export const TransactionEntity: Entity = {
       order: indexOrder(inputOrder, 'input_index', [term('input_index')]),
       parentKeys: ['hash'],
       source: (c, link) =>
-        `SELECT * FROM ${c.sql.view(
-          'input_at'
-        )} WHERE transaction_hash IN (SELECT hash FROM (${link})) AND transaction_internal_id IN (SELECT internal_id FROM (${link}))`,
+        `SELECT * FROM ${c.sql.view('input_at')} WHERE ${
+          /* by id alone when every part has p_txid (Sql.readsById): one id per hash */
+          c.sql.readsById.inputs
+            ? ''
+            : `transaction_hash IN (SELECT hash FROM (${link})) AND `
+        }transaction_internal_id IN (SELECT internal_id FROM (${link}))`,
       target: () => InputEntity,
       where: (c, where, source) =>
         inputPredicate(
