@@ -28,10 +28,10 @@ import {
   snapshotForNode,
 } from '../store/clickhouse/visibility.js';
 
-import type { AdmissionOptions } from './admission.js';
+import type { AdmissionOptions, StatementRecord, Ticket } from './admission.js';
 import {
   Admission,
-  defaultAdmissionOptions,
+  disabledAdmissionOptions,
   requestAbortedError,
   statementShape,
 } from './admission.js';
@@ -163,20 +163,29 @@ export const statementTimeoutsFromEnv = (
   return { aggregate, data };
 };
 
+/** What a statement knows of the request it belongs to (`requestScope`). */
+export interface RequestScope {
+  /** Fires when the HTTP client goes away or a graphql-ws operation ends. */
+  signal?: AbortSignal;
+  /** The request's admission ticket (admission.ts), once admitted. */
+  ticket?: Ticket;
+  /** An HTTP request (server.ts `listen`): its ticket ends when the response closes. */
+  http?: boolean;
+}
+
 /**
  * The request a statement belongs to: its abort signal fires when the HTTP
  * client goes away (server.ts `listen`) or a graphql-ws operation ends.
- * Every data statement of the request reads it: queued statements leave the
- * admission queue, unsent ones are never sent, running ones are cancelled
- * (the HTTP request is closed and the statement is killed by its query_id).
+ * Every data statement of the request reads it: unsent statements are never
+ * sent, running ones are cancelled (the HTTP request is closed and the
+ * statement is killed by its query_id). The admission ticket's class picks
+ * the statements' ClickHouse settings, and each statement is recorded on it
+ * (its rows, its query_id for the measured CPU).
  */
-export const requestScope = new AsyncLocalStorage<{ signal: AbortSignal }>();
+export const requestScope = new AsyncLocalStorage<RequestScope>();
 
 /** The prefix of every API statement's `query_id` (system.query_log, KILL QUERY). */
 export const apiQueryIdPrefix = 'cgapi-';
-
-/** ClickHouse MEMORY_LIMIT_EXCEEDED. */
-const memoryLimitExceededCode = '241';
 
 /** ClickHouse TIMEOUT_EXCEEDED (max_execution_time). */
 const timeoutExceededCode = '159';
@@ -303,12 +312,33 @@ export class ApiDb {
   /** Server-side time budget per statement class (`max_execution_time`). */
   timeouts: StatementTimeouts = { ...defaultStatementTimeouts };
 
-  /** Admission control of data statements (admission.ts). */
-  admission = new Admission(defaultAdmissionOptions);
+  /**
+   * Admission control of requests (admission.ts; off unless set: main.ts
+   * sets it from the environment, with the server's cores).
+   */
+  admission = new Admission(disabledAdmissionOptions);
 
-  /** Replace the admission options (a fresh gate). */
+  /** Replace the admission options (a fresh gate, started: loop attribution and the CPU ledger). */
   setAdmission(options: AdmissionOptions) {
+    this.admission.stop();
     this.admission = new Admission(options);
+    this.admission.start(async (ids) => this.statementCpu(ids));
+  }
+
+  /**
+   * Measured ClickHouse CPU (user + system, µs) of finished API statements
+   * by query_id, from `system.query_log` (the API user needs SELECT on it;
+   * rows appear after the log's flush interval). Missing ids: not logged yet.
+   */
+  async statementCpu(queryIds: readonly string[]) {
+    const rows = await this.client.query<{ id: string; us: string }>(
+      `SELECT query_id AS id, toString(ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds']) AS us
+       FROM system.query_log
+       WHERE event_date >= yesterday() AND event_time >= now() - INTERVAL 15 MINUTE
+         AND type != 'QueryStart' AND query_id IN {ids:Array(String)}`,
+      { ids: queryIds }
+    );
+    return new Map(rows.map((row) => [row.id, Number(row.us)]));
   }
 
   /** Statements cancelled because their request went away (counter). */
@@ -347,12 +377,19 @@ export class ApiDb {
   async pinnedSnapshot(nodeIds: readonly number[]): Promise<MultiNodeSnapshot> {
     this.stats.snapshots += 1;
     const { hits } = this.snapshotCache;
-    const snapshot = await this.snapshotCache.read(
-      nodeIds,
-      await this.snapshotOptions()
-    );
-    if (this.snapshotCache.hits > hits) this.stats.snapshotCacheHits += 1;
-    return snapshot;
+    /* the request waits for ClickHouse meanwhile (loop attribution, admission.ts) */
+    const ticket = requestScope.getStore()?.ticket;
+    if (ticket !== undefined) ticket.waiting += 1;
+    try {
+      const snapshot = await this.snapshotCache.read(
+        nodeIds,
+        await this.snapshotOptions()
+      );
+      if (this.snapshotCache.hits > hits) this.stats.snapshotCacheHits += 1;
+      return snapshot;
+    } finally {
+      if (ticket !== undefined) ticket.waiting -= 1;
+    }
   }
 
   /**
@@ -366,80 +403,90 @@ export class ApiDb {
     params: QueryParams,
     statementClass: StatementClass = 'data'
   ) {
-    const signal = requestScope.getStore()?.signal;
+    const scope = requestScope.getStore();
+    const signal = scope?.signal;
+    const ticket = scope?.ticket;
     const budgetMs = this.timeouts[statementClass];
-    const rows = await this.admission
-      .run(
-        statementShape(label, sql),
-        statementClass === 'aggregate',
-        signal,
-        async (laneSettings, report) => {
-          if (signal?.aborted === true) throw requestAbortedError();
-          this.stats.dataQueries += 1;
-          const queryId = `${apiQueryIdPrefix}${randomUUID()}`;
-          const kill = () => {
-            this.cancelledStatements += 1;
-            this.client.kill(queryId).catch(() => undefined);
-          };
-          signal?.addEventListener('abort', kill, { once: true });
-          try {
-            return await this.client.query<T>(
-              sql,
-              params,
-              {
-                ...dataQuerySettings,
-                ...laneSettings,
-                max_execution_time: Math.max(1, Math.ceil(budgetMs / 1000)),
-                timeout_overflow_mode: 'throw',
-              } as unknown as ClickHouseSettings,
-              {
-                ...(signal === undefined ? {} : { abortSignal: signal }),
-                onRowsRead: report,
-                queryId,
-                retryTimeouts: false,
-              }
-            );
-          } finally {
-            signal?.removeEventListener('abort', kill);
+    const { admission } = this;
+    const send = async () => {
+      if (signal?.aborted === true) throw requestAbortedError();
+      this.stats.dataQueries += 1;
+      const queryId = `${apiQueryIdPrefix}${randomUUID()}`;
+      const statement: StatementRecord = {
+        queryId,
+        rows: 0,
+        shape: admission.options.enabled ? statementShape(label, sql) : '',
+      };
+      ticket?.statements.push(statement);
+      /* waiting for ClickHouse until its response starts (loop attribution) */
+      const wait = { open: ticket !== undefined };
+      if (ticket !== undefined) ticket.waiting += 1;
+      const responded = () => {
+        if (!wait.open || ticket === undefined) return;
+        wait.open = false;
+        ticket.waiting -= 1;
+      };
+      const kill = () => {
+        this.cancelledStatements += 1;
+        this.client.kill(queryId).catch(() => undefined);
+      };
+      signal?.addEventListener('abort', kill, { once: true });
+      try {
+        return await this.client.query<T>(
+          sql,
+          params,
+          {
+            ...dataQuerySettings,
+            ...(admission.options.enabled
+              ? admission.options.settings[ticket?.cls ?? 'light']
+              : {}),
+            max_execution_time: Math.max(1, Math.ceil(budgetMs / 1000)),
+            timeout_overflow_mode: 'throw',
+          } as unknown as ClickHouseSettings,
+          {
+            ...(signal === undefined ? {} : { abortSignal: signal }),
+            onResponse: responded,
+            onRowsRead: (rows) => {
+              statement.rows = rows;
+            },
+            queryId,
+            retryTimeouts: false,
           }
-        },
-        (error) =>
-          (error instanceof ClickHouseError &&
-            (error.code === timeoutExceededCode ||
-              error.code === memoryLimitExceededCode)) ||
-          isRequestTimeout(error)
-      )
-      .catch((error: unknown) => {
-        if (signal?.aborted === true && !(error instanceof GraphQLError)) {
-          throw requestAbortedError();
-        }
-        if (
-          error instanceof ClickHouseError &&
-          error.code === throwIfCode &&
-          error.message.includes(`${authchainTooWideCode}:`)
-        ) {
-          const start = error.message.indexOf(`${authchainTooWideCode}:`);
-          const end = error.message.indexOf(': while executing', start);
-          throw new GraphQLError(
-            `${label}: ${error.message.slice(
-              start,
-              end < 0 ? undefined : end
-            )}`,
-            { extensions: { code: authchainTooWideCode } }
-          );
-        }
-        const timedOut =
-          (error instanceof ClickHouseError &&
-            error.code === timeoutExceededCode) ||
-          isRequestTimeout(error);
-        if (!timedOut) throw error;
-        throw new GraphQLError(
-          `${label}: the statement exceeded the API's ${Math.ceil(
-            budgetMs / 1000
-          )} s limit for ${statementClass} statements and was stopped. Narrow it (filters, node, block window, limit).`,
-          { extensions: { code: 'QUERY_TIMEOUT', statementClass } }
         );
-      });
+      } finally {
+        responded();
+        signal?.removeEventListener('abort', kill);
+        admission.statementFinished(ticket, statement);
+      }
+    };
+    const rows = await send().catch((error: unknown) => {
+      if (signal?.aborted === true && !(error instanceof GraphQLError)) {
+        throw requestAbortedError();
+      }
+      if (
+        error instanceof ClickHouseError &&
+        error.code === throwIfCode &&
+        error.message.includes(`${authchainTooWideCode}:`)
+      ) {
+        const start = error.message.indexOf(`${authchainTooWideCode}:`);
+        const end = error.message.indexOf(': while executing', start);
+        throw new GraphQLError(
+          `${label}: ${error.message.slice(start, end < 0 ? undefined : end)}`,
+          { extensions: { code: authchainTooWideCode } }
+        );
+      }
+      const timedOut =
+        (error instanceof ClickHouseError &&
+          error.code === timeoutExceededCode) ||
+        isRequestTimeout(error);
+      if (!timedOut) throw error;
+      throw new GraphQLError(
+        `${label}: the statement exceeded the API's ${Math.ceil(
+          budgetMs / 1000
+        )} s limit for ${statementClass} statements and was stopped. Narrow it (filters, node, block window, limit).`,
+        { extensions: { code: 'QUERY_TIMEOUT', statementClass } }
+      );
+    });
     this.onQuery?.({ kind: 'data', label, params, sql });
     return rows;
   }

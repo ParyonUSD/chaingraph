@@ -1,5 +1,5 @@
 /* eslint-disable functional/no-mixed-type, complexity, functional/no-let, @typescript-eslint/init-declarations, functional/no-try-statement */
-// cspell:ignore clickhouse serialised Pothos
+// cspell:ignore clickhouse serialised serialisation Pothos
 /**
  * The Phase 2 spike server: GraphQL Yoga over the Pothos schema, HTTP
  * (queries, SSE subscriptions) and graphql-ws on `/graphql`.
@@ -13,6 +13,7 @@ import type { AddressInfo } from 'node:net';
 
 import type {
   DocumentNode,
+  ExecutionArgs,
   GraphQLError,
   GraphQLSchema,
   OperationDefinitionNode,
@@ -26,8 +27,9 @@ import { WebSocketServer } from 'ws';
 
 import type { ClickHouseClient } from '../store/clickhouse/client.js';
 
-import type { AdmissionOptions } from './admission.js';
-import type { StatementTimeouts } from './db.js';
+import type { AdmissionOptions, Ticket } from './admission.js';
+import { planKeys } from './admission.js';
+import type { RequestScope, StatementTimeouts } from './db.js';
 import { ApiDb, PinnedSnapshot, requestScope } from './db.js';
 import type { LiveHubOptions } from './live.js';
 import { LiveHub } from './live.js';
@@ -158,6 +160,58 @@ export const operationNodeNames = (
   return [...names];
 };
 
+/**
+ * Request-level admission (admission.ts, fix-pass-8.md): a query operation
+ * is admitted or refused before any of its statements (or its snapshot
+ * read) runs; refused, it answers OVERLOADED (503, Retry-After) at once.
+ * Runs after the response cache (a hit costs nothing and is not admitted).
+ * The admitted execution runs in a request scope that carries the ticket,
+ * so every statement records itself on it (db.ts). An HTTP request's ticket
+ * ends when its response closes (`listen`: the response's serialisation is
+ * loop time of the request too); any other's when execution is done.
+ */
+const useAdmission = (db: ApiDb): Plugin<ApiContext> => ({
+  onExecute: ({ args, executeFn, setExecuteFn, setResultAndStopExecution }) => {
+    const { admission } = db;
+    if (!admission.options.enabled) return undefined;
+    const document = args.document as DocumentNode;
+    const operationName = args.operationName as string | null | undefined;
+    const variables = args.variableValues as
+      | { [name: string]: unknown }
+      | null
+      | undefined;
+    const operation = getOperationAST(document, operationName ?? undefined);
+    if (operation?.operation !== 'query') return undefined;
+    let ticket: Ticket;
+    try {
+      ticket = admission.admit(
+        planKeys(
+          document,
+          operationName,
+          variables,
+          operationNodeNames(document, operationName, variables)
+        )
+      );
+    } catch (error: unknown) {
+      setResultAndStopExecution({ errors: [error as GraphQLError] });
+      return undefined;
+    }
+    const outer = requestScope.getStore();
+    const http = outer?.http === true;
+    if (http) outer.ticket = ticket;
+    const scope = { ...outer, ticket };
+    const execute = executeFn as (a: ExecutionArgs) => Promise<unknown>;
+    setExecuteFn(async (executeArgs: ExecutionArgs) =>
+      requestScope.run(scope, async () => execute(executeArgs))
+    );
+    return {
+      onExecuteDone: () => {
+        if (!http) admission.finish(ticket);
+      },
+    };
+  },
+});
+
 const useRequestSnapshot = (db: ApiDb): Plugin<ApiContext> => ({
   onExecute: ({ args, extendContext }) => {
     extendContext({
@@ -253,6 +307,7 @@ export const createApi = (
               )
             ),
           ]),
+      useAdmission(db),
       useRequestSnapshot(db),
     ],
     schema,
@@ -299,13 +354,23 @@ export const listen = async (
    * statements are dropped and running ones cancelled (db.ts).
    */
   const server = createServer((request, response) => {
+    if (request.method === 'GET' && request.url === '/admission') {
+      /* the admission gate's state (fix-pass-8.md §3): counters, budgets, loop */
+      // eslint-disable-next-line @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(api.db.admission.snapshot()));
+      return;
+    }
     const controller = new AbortController();
+    const scope: RequestScope = { http: true, signal: controller.signal };
     response.once('close', () => {
       if (!response.writableFinished) {
         controller.abort(new Error('The HTTP client went away.'));
       }
+      /* the admitted request ends with its response (serialisation included) */
+      if (scope.ticket !== undefined) api.db.admission.finish(scope.ticket);
     });
-    requestScope.run({ signal: controller.signal }, () => {
+    requestScope.run(scope, () => {
       // eslint-disable-next-line @typescript-eslint/no-floating-promises
       api.yoga(request, response);
     });

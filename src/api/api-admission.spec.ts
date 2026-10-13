@@ -1,15 +1,20 @@
-/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-let, functional/no-loop-statement, no-await-in-loop, camelcase, complexity, functional/no-throw-statement */
-// cspell:ignore clickhouse
+/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-let, functional/no-loop-statement, no-await-in-loop, functional/no-throw-statement */
+// cspell:ignore clickhouse EWMA mispredicted unticketed utilisation cgapi
 /**
- * Fix pass 4 (docs/clickhouse-port/fix-pass-4.md §3a, §3b):
- * - admission control: per-lane concurrency, a bounded queue and a bounded
- *   wait; refusals are fast OVERLOADED errors (HTTP 503 + Retry-After);
- *   heavy statements never take light slots;
- * - abandoned work: a request whose client went away leaves the queue, and
- *   its running statement is cancelled on the server (KILL by query_id).
+ * Request-level admission (fix pass 8, docs/clickhouse-port/fix-pass-8.md):
+ * - a request is admitted or refused once, before any statement runs, by
+ *   its predicted ClickHouse CPU and event-loop time against two token
+ *   budgets with a light reserve; refused at once (OVERLOADED, 503,
+ *   Retry-After); an admitted request is never refused part-way;
+ * - the prediction is learned per plan key (document, nodes, variable
+ *   magnitudes) from measured costs (system.query_log, loop attribution),
+ *   and the budgets are reconciled with them;
+ * - abandoned work (fix pass 4): a request whose client went away has its
+ *   unsent statements dropped and its running statement killed.
  */
+import type { ExecutionContext } from 'ava';
 import test from 'ava';
-import { GraphQLError } from 'graphql';
+import { GraphQLError, parse } from 'graphql';
 
 import { ClickHouseClient } from '../store/clickhouse/client.js';
 import {
@@ -22,31 +27,26 @@ import {
 } from '../store/clickhouse/spec-fixtures.js';
 import { e2eClickHouseUrl } from '../store/clickhouse/test-support.js';
 
-import type { AdmissionOptions } from './admission.js';
+import type {
+  AdmissionOptions,
+  CpuReader,
+  PlanKeys,
+  StatementRecord,
+} from './admission.js';
 import {
   Admission,
   admissionOptionsFromEnv,
   admissionSummary,
+  Budget,
   defaultAdmissionOptions,
-  laneConcurrencyForCores,
   overloadedCode,
+  planKeys,
   requestAbortedCode,
 } from './admission.js';
 import { ApiDb, apiQueryIdPrefix, requestScope } from './db.js';
 import { createApi, listen } from './server.js';
 
 const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
-
-const options = (
-  light: Partial<AdmissionOptions['light']>,
-  heavy: Partial<AdmissionOptions['heavy']> = {},
-  heavyRows = 1_000
-): AdmissionOptions => ({
-  ...defaultAdmissionOptions,
-  heavy: { ...defaultAdmissionOptions.heavy, ...heavy },
-  heavyRows,
-  light: { ...defaultAdmissionOptions.light, ...light },
-});
 
 const sleep = async (ms: number) =>
   new Promise<void>((resolve) => {
@@ -64,302 +64,365 @@ const deferred = () => {
 const codeOf = (error: unknown) =>
   error instanceof GraphQLError ? error.extensions.code : undefined;
 
-test('admission: a full queue and a long wait are fast OVERLOADED errors with Retry-After', async (t) => {
-  const admission = new Admission(
-    options({ maxConcurrent: 1, maxQueued: 1, maxWaitMs: 200 })
+/** Options with small, round budgets: 10 CPU-s/s and 1,000 loop-ms/s, 1 s bursts, light share 0.2. */
+const options = (
+  overrides: Partial<AdmissionOptions> = {}
+): AdmissionOptions => ({
+  ...defaultAdmissionOptions,
+  clickhouse: { burstSeconds: 1, lightShare: 0.2, ratePerSecond: 10 },
+  cpuSource: 'rows',
+  loop: { burstSeconds: 1, lightShare: 0.2, ratePerSecond: 1_000 },
+  ...overrides,
+});
+
+/** A quiet loop for the unit tests (no attribution unless a test drives it). */
+const quietMeter = () => ({ activeMs: 0, elapsedMs: 100 });
+
+const keys = (name: string): PlanKeys => ({
+  document: `d:${name}`,
+  plan: `p:${name}`,
+  roots: `r:${name}`,
+});
+
+/** Teach the model a request's cost (as a finished, measured request would). */
+const teach = (
+  admission: Admission,
+  name: string,
+  cost: number | { cpuSeconds: number; loopMs: number }
+) => {
+  admission.model.observe(
+    keys(name),
+    typeof cost === 'number' ? { cpuSeconds: cost, loopMs: 1 } : cost
   );
-  const hold = deferred();
-  const first = admission.run('a', false, undefined, async () => hold.promise);
-  const second = admission.run('a', false, undefined, async () => 'second');
-  const started = Date.now();
-  const third = await admission
-    .run('a', false, undefined, async () => 'third')
-    .catch((error: unknown) => error);
-  t.true(Date.now() - started < 50, 'a full queue refuses at once');
-  t.is(codeOf(third), overloadedCode);
-  t.deepEqual((third as GraphQLError).extensions.http, {
-    headers: { 'Retry-After': '2' },
+};
+
+test('budget: shares refill at their rates, a full share overflows into the other, debt is allowed and repaid', (t) => {
+  const budget = new Budget(
+    { burstSeconds: 1, lightShare: 0.25, ratePerSecond: 8 },
+    0
+  );
+  t.deepEqual(budget.level, { heavy: 6, light: 2 }, 'starts full');
+  t.is(budget.take('heavy', 20), 'heavy', 'admitted while positive');
+  t.is(budget.level.heavy, -14, 'into debt');
+  t.is(budget.take('heavy', 1), undefined, 'refused in debt');
+  t.is(budget.secondsToPositive('heavy'), 14 / 6);
+  /* light is full: its refill overflows into heavy, which repays at the whole rate */
+  budget.refill(1_000);
+  t.is(budget.level.light, 2);
+  t.is(budget.level.heavy, -6, '6 + 2 overflowed');
+  t.is(budget.take('light', 0.5), 'light', 'the light share is untouched');
+  /* light borrows heavy tokens only when its own are spent and heavy holds the cost */
+  const borrow = new Budget(
+    { burstSeconds: 1, lightShare: 0.5, ratePerSecond: 2 },
+    0
+  );
+  t.is(borrow.take('light', 1.5), 'light');
+  t.is(borrow.take('light', 0.5), 'heavy', 'borrowed');
+  t.is(borrow.take('light', 1), undefined, 'heavy holds 0.5 < 1');
+  t.deepEqual(borrow.fill(), { heavy: 0.5, light: -0.5 });
+});
+
+test('admission: refuses at once when the budget is spent (503, Retry-After, the reason); never more than the in-flight cap of heavy requests', (t) => {
+  const admission = new Admission(options(), quietMeter);
+  teach(admission, 'heavy', 5);
+  t.is(admission.admit(keys('heavy'), 0).cls, 'heavy');
+  /* heavy share 8: 5 + 5 charged (the second while positive: debt 2), the third refused */
+  admission.admit(keys('heavy'), 0);
+  t.is(admission.budgets.clickhouse.level.heavy, -2);
+  const started = performance.now();
+  const refused = t.throws(() => admission.admit(keys('heavy'), 0));
+  t.true(performance.now() - started < 50, 'refused in under 50 ms');
+  t.is(codeOf(refused), overloadedCode);
+  const { extensions } = refused as GraphQLError;
+  t.is(extensions.reason, 'clickhouse');
+  t.is(extensions.lane, 'heavy');
+  t.deepEqual(extensions.http, {
+    headers: { 'Retry-After': String(extensions.retryAfterSeconds) },
     status: 503,
   });
-  const waited = await second.catch((error: unknown) => error);
-  t.is(codeOf(waited), overloadedCode, 'no slot within maxWaitMs');
-  t.is(admission.lanes.light.stats.rejectedFull, 1);
-  t.is(admission.lanes.light.stats.rejectedWait, 1);
-  hold.resolve();
-  await first;
-  t.is(admission.lanes.light.stats.running, 0);
+  t.is(
+    extensions.retryAfterSeconds,
+    1,
+    'debt 2 at 8 CPU-s/s: 0.25 s, at least 1'
+  );
+  t.is(admission.stats.refused.clickhouse, 1);
+  /* the in-flight cap, whatever the budget */
+  const capped = new Admission(options({ heavyMaxInFlight: 1 }), quietMeter);
+  teach(capped, 'heavy', 0.5);
+  const first = capped.admit(keys('heavy'), 0);
+  const refusedCap = t.throws(() => capped.admit(keys('heavy'), 0));
+  t.is((refusedCap as GraphQLError).extensions.reason, 'in_flight');
+  capped.finish(first, 0);
+  t.is(capped.admit(keys('heavy'), 0).cls, 'heavy', 'a slot freed');
+  t.is(capped.stats.refused.in_flight, 1);
 });
 
-test('admission: a queued statement whose request goes away leaves the queue and is never sent', async (t) => {
-  const admission = new Admission(options({ maxConcurrent: 1 }));
-  const hold = deferred();
-  const first = admission.run('a', false, undefined, async () => hold.promise);
-  const controller = new AbortController();
-  let sent = false;
-  const queued = admission.run('a', false, controller.signal, async () => {
-    sent = true;
+test('admission: light requests keep their reserve while heavy ones are refused', (t) => {
+  const admission = new Admission(options(), quietMeter);
+  teach(admission, 'heavy', 20);
+  teach(admission, 'light', 0.01);
+  admission.admit(keys('heavy'), 0);
+  t.throws(() => admission.admit(keys('heavy'), 0), {
+    message: /overloaded/u,
   });
-  await sleep(20);
-  t.is(admission.lanes.light.stats.queued, 1);
-  controller.abort();
-  const error = await queued.catch((caught: unknown) => caught);
-  t.is(codeOf(error), requestAbortedCode);
-  t.is(admission.lanes.light.stats.queued, 0);
-  t.is(admission.lanes.light.stats.abandoned, 1);
-  hold.resolve();
-  await first;
-  t.false(sent);
-});
-
-test('admission: costly shapes (rows read), failures that time out and unmeasured aggregates go to the heavy lane; a saturated heavy lane never delays light statements', async (t) => {
-  const admission = new Admission(
-    options({ maxConcurrent: 2 }, { maxConcurrent: 1, maxQueued: 0 }, 1_000)
-  );
-  t.is(admission.laneOf('new', false), 'light', 'a new shape is light');
-  t.is(
-    admission.laneOf('new', true),
-    'heavy',
-    'an unmeasured aggregate is heavy'
-  );
-  await admission.run('agg', true, undefined, async (_settings, report) => {
-    report(10);
-  });
-  t.is(
-    admission.laneOf('agg', true),
-    'light',
-    'a measured cheap aggregate is light'
-  );
-  await admission.run('slow', false, undefined, async (_settings, report) => {
-    report(5_000);
-  });
-  t.is(admission.laneOf('slow', false), 'heavy', 'one costly run is enough');
-  await admission
-    .run(
-      'timeout',
-      false,
-      undefined,
-      async () => {
-        throw new Error('over budget');
-      },
-      () => true
-    )
-    .catch(() => undefined);
-  t.is(
-    admission.laneOf('timeout', false),
-    'heavy',
-    'a timed-out shape is heavy'
-  );
-  const hold = deferred();
-  const heavy = admission.run(
-    'slow',
-    false,
-    undefined,
-    async () => hold.promise
-  );
-  const refused = await admission
-    .run('slow', false, undefined, async () => 'x')
-    .catch((error: unknown) => error);
-  t.is(codeOf(refused), overloadedCode, 'heavy lane full: refused');
-  const started = Date.now();
-  t.is(
-    await admission.run('point', false, undefined, async () => 'light'),
-    'light'
-  );
-  t.true(Date.now() - started < 50, 'the light lane is untouched');
-  hold.resolve();
-  await heavy;
-  /* cheap runs bring a shape back slowly */
-  for (let index = 0; index < 10; index += 1) {
-    admission.record('slow', 1);
+  for (let index = 0; index < 100; index += 1) {
+    t.is(admission.admit(keys('light'), 0).cls, 'light');
   }
-  t.is(admission.laneOf('slow', false), 'light');
+  t.is(admission.stats.admitted.light, 100);
+  /* the loop budget has its own reserve: heavy loop work never spends the light share */
+  const loopBound = new Admission(options(), quietMeter);
+  teach(loopBound, 'loopHeavy', { cpuSeconds: 0.01, loopMs: 2_000 });
+  teach(loopBound, 'light', 0.01);
+  loopBound.admit(keys('loopHeavy'), 0);
+  const refused = t.throws(() => loopBound.admit(keys('loopHeavy'), 0));
+  t.is((refused as GraphQLError).extensions.reason, 'loop');
+  t.is(loopBound.admit(keys('light'), 0).cls, 'light');
+  t.deepEqual(
+    loopBound.budgets.clickhouse.level,
+    { heavy: 8 - 0.01, light: 2 - 0.01 },
+    'a refusal by the loop gives the CPU charge back'
+  );
 });
 
-test('admission: options from the environment', (t) => {
-  const parsed = admissionOptionsFromEnv({
-    CHAINGRAPH_API_HEAVY_MAX_CONCURRENT: '3',
-    CHAINGRAPH_API_HEAVY_MAX_THREADS: '4',
-    CHAINGRAPH_API_HEAVY_ROWS: '900',
-    CHAINGRAPH_API_HEAVY_WORKLOAD: 'chaingraph_heavy',
-    CHAINGRAPH_API_LIGHT_MAX_QUEUED: '10',
-    CHAINGRAPH_API_LIGHT_PRIORITY: '0',
-  });
-  t.is(parsed.heavy.maxConcurrent, 3);
-  t.deepEqual(parsed.heavy.settings, {
-    max_threads: 4,
-    workload: 'chaingraph_heavy',
-  });
-  t.deepEqual(parsed.contendedSettings, { max_threads: 4, priority: 2 });
-  t.is(parsed.heavyRows, 900);
-  t.is(parsed.light.maxQueued, 10);
-  t.deepEqual(parsed.light.settings, {});
-  t.false(admissionOptionsFromEnv({ CHAINGRAPH_API_ADMISSION: 'off' }).enabled);
-  t.throws(() =>
-    admissionOptionsFromEnv({ CHAINGRAPH_API_LIGHT_MAX_CONCURRENT: '0' })
+test('admission: predictions from the plan key, then the document, then the root fields; a request nothing is known about is heavy', (t) => {
+  const admission = new Admission(options(), quietMeter);
+  const unknown = admission.predict(keys('new'));
+  t.is(unknown.source, 'default');
+  t.is(unknown.cls, 'heavy', 'unknown: heavy even at a light default cost');
+  admission.model.observe(
+    { document: 'd:x', plan: 'p:x1', roots: 'r:transactions' },
+    { cpuSeconds: 4, loopMs: 100 }
   );
+  t.deepEqual(
+    admission.predict({ document: 'd:x', plan: 'p:x2', roots: 'r:other' }),
+    { cls: 'heavy', cost: { cpuSeconds: 4, loopMs: 100 }, source: 'document' }
+  );
+  t.is(
+    admission.predict({ document: 'd:y', plan: 'p:y', roots: 'r:transactions' })
+      .source,
+    'roots'
+  );
+  /* EWMA (0.3) of measured costs */
+  admission.model.observe(
+    { document: 'd:x', plan: 'p:x1', roots: 'r:transactions' },
+    { cpuSeconds: 0, loopMs: 0 }
+  );
+  t.deepEqual(
+    admission.predict({ document: 'd:x', plan: 'p:x1', roots: 'r:z' }).cost,
+    { cpuSeconds: 4 * 0.7, loopMs: 100 * 0.7 }
+  );
+});
+
+test('plan keys: the same document with other hashes is the same plan; a limit or list of another magnitude, or another node, is another', (t) => {
+  const document = parse(
+    'query Q($limit: Int, $ids: [String!]) { transactions(limit: $limit) { hash } }'
+  );
+  const a = planKeys(
+    document,
+    'Q',
+    { ids: ['aa', 'bb'], limit: 10, token: 'x' },
+    ['n1']
+  );
+  const b = planKeys(
+    document,
+    'Q',
+    { ids: ['cc', 'dd'], limit: 12, token: 'y' },
+    ['n1']
+  );
+  t.deepEqual(a, b);
+  t.not(
+    planKeys(document, 'Q', { ids: ['aa', 'bb'], limit: 10_000 }, ['n1']).plan,
+    a.plan
+  );
+  t.not(
+    planKeys(document, 'Q', { ids: Array(100).fill('a'), limit: 10 }, ['n1'])
+      .plan,
+    a.plan
+  );
+  t.not(
+    planKeys(document, 'Q', { ids: ['aa', 'bb'], limit: 10 }, ['n2']).plan,
+    a.plan
+  );
+  t.is(a.roots, 'r:query:transactions');
+  t.is(
+    planKeys(parse('{ transactions(limit: 1) { hash } }'), undefined, {}, [])
+      .roots,
+    a.roots
+  );
+});
+
+test('admission: charges are reconciled with measured costs; a mispredicted light request is charged to the heavy share', (t) => {
+  let busy = 0;
+  const admission = new Admission(options(), () => {
+    const activeMs = busy;
+    busy = 0;
+    return { activeMs, elapsedMs: 100 };
+  });
+  teach(admission, 'q', { cpuSeconds: 0.1, loopMs: 5 });
+  const ticket = admission.admit(keys('q'), 0);
+  t.is(ticket.cls, 'light');
+  t.deepEqual(admission.budgets.clickhouse.level, { heavy: 8, light: 1.9 });
+  /* 300 ms of loop work while no statement is waiting: all of it this request's */
+  busy = 300;
+  admission.tick();
+  t.is(ticket.loopMs, 300);
+  /* a statement waiting for ClickHouse is not charged loop time */
+  ticket.waiting = 1;
+  busy = 50;
+  admission.tick();
+  t.is(ticket.loopMs, 300);
+  ticket.waiting = 0;
+  const statement: StatementRecord = {
+    queryId: 'q1',
+    rows: 10_000_000,
+    shape: 's',
+  };
+  ticket.statements.push(statement);
+  admission.statementFinished(ticket, statement, 0);
+  admission.finish(ticket, 0);
+  /* rows × 0.3 µs = 3 CPU-s: heavy now; the light share gets its 0.1 back */
+  t.is(admission.budgets.clickhouse.level.light, 2);
+  t.is(admission.budgets.clickhouse.level.heavy, 5);
+  t.is(admission.budgets.loop.level.light, 200, 'loop charge given back');
+  t.is(admission.budgets.loop.level.heavy, 800 - 300);
+  const learned = admission.predict(keys('q'));
+  t.is(learned.cls, 'heavy');
+  t.is(learned.cost.loopMs, 5 * 0.7 + 300 * 0.3);
+  t.is(admission.stats.inFlight.light, 0);
+});
+
+test('admission: the CPU ledger replaces estimates with system.query_log measurements, also for statements outside requests; without the grant it falls back to rows', async (t) => {
+  const measured = new Map<string, number>();
+  const reader: CpuReader = async (ids) =>
+    new Map(
+      ids.flatMap((id) => (measured.has(id) ? [[id, measured.get(id)!]] : []))
+    );
+  const admission = new Admission(
+    options({ cpuSource: 'query_log' }),
+    quietMeter
+  );
+  admission.start(reader);
+  t.teardown(() => {
+    admission.stop();
+  });
+  teach(admission, 'q', 1);
+  const ticket = admission.admit(keys('q'), 0);
+  const statement: StatementRecord = {
+    queryId: 'a',
+    rows: 1_000_000,
+    shape: 's',
+  };
+  ticket.statements.push(statement);
+  admission.statementFinished(ticket, statement, 0);
+  admission.finish(ticket, 0);
+  t.is(admission.pendingStatements, 1, 'awaiting its query_log row');
+  t.is(
+    admission.budgets.clickhouse.level.heavy,
+    8 - 0.3,
+    'estimate: 1 M rows × 0.3 µs'
+  );
+  /* a live re-run (no ticket) is charged its estimate at once */
+  const live: StatementRecord = { queryId: 'b', rows: 2_000_000, shape: 's2' };
+  admission.statementFinished(undefined, live, 0);
+  t.is(admission.stats.unticketed, 1);
+  await admission.pollLedger(0);
+  t.is(admission.pendingStatements, 2, 'not logged yet: kept');
+  measured.set('a', 2_500_000);
+  measured.set('b', 100_000);
+  await admission.pollLedger(0);
+  t.is(admission.pendingStatements, 0);
+  t.is(admission.stats.ledgerResolved, 2);
+  t.is(statement.cpuSeconds, 2.5);
+  /* the request reconciled to 2.5 CPU-s; the live re-run (estimated 0.6: heavy) to 0.1 */
+  t.true(
+    Math.abs(admission.budgets.clickhouse.level.heavy - (8 - 2.5 - 0.1)) < 1e-9,
+    String(admission.budgets.clickhouse.level.heavy)
+  );
+  t.is(admission.budgets.clickhouse.level.light, 2);
+  t.is(admission.predict(keys('q')).cost.cpuSeconds, 1 * 0.7 + 2.5 * 0.3);
+  /* a statement whose row never comes keeps its estimate */
+  const lost: StatementRecord = { queryId: 'c', rows: 1, shape: 's' };
+  admission.statementFinished(undefined, lost, 0);
+  await admission.pollLedger(70_000);
+  t.is(admission.stats.ledgerExpired, 1);
+  /* no grant on system.query_log: the ledger stops, rows estimate the CPU */
+  const denied = new Admission(options({ cpuSource: 'query_log' }), quietMeter);
+  denied.start(async () => {
+    throw new Error('ACCESS_DENIED');
+  });
+  t.teardown(() => {
+    denied.stop();
+  });
+  denied.statementFinished(undefined, { queryId: 'x', rows: 1, shape: 's' }, 0);
+  t.is(denied.cpuSource, 'query_log');
+  await denied.pollLedger(0);
+  t.is(denied.cpuSource, 'rows');
+  t.regex(denied.stats.ledgerError ?? '', /ACCESS_DENIED/u);
+});
+
+test('admission: a busy event loop refuses heavy requests whatever the budget says; light ones still run', (t) => {
+  const admission = new Admission(options(), () => ({
+    activeMs: 100,
+    elapsedMs: 100,
+  }));
+  teach(admission, 'heavy', 0.5);
+  teach(admission, 'light', 0.01);
+  for (let index = 0; index < 20; index += 1) admission.tick();
+  t.true(admission.loopUtilisation > 0.95);
+  const refused = t.throws(() => admission.admit(keys('heavy'), 0));
+  t.is((refused as GraphQLError).extensions.reason, 'loop_guard');
+  t.is(admission.admit(keys('light'), 0).cls, 'light');
+});
+
+test('admission: options from the environment and the startup line', (t) => {
+  const fromServer = admissionOptionsFromEnv({}, 48);
+  t.is(fromServer.clickhouse.ratePerSecond, 36, '48 cores × 0.75');
+  t.is(fromServer.loop.ratePerSecond, 850);
+  t.is(fromServer.heavyMaxInFlight, 24);
+  t.deepEqual(fromServer.settings, { heavy: {}, light: {} });
+  t.is(fromServer.cpuSource, 'query_log');
+  t.deepEqual(fromServer.sizing, {
+    cores: 48,
+    cpuTarget: 0.75,
+    loopTarget: 0.85,
+    processes: 1,
+    source: 'clickhouse',
+  });
+  const shared = admissionOptionsFromEnv(
+    {
+      CHAINGRAPH_API_CPU_TARGET: '0.5',
+      CHAINGRAPH_API_HEAVY_PRIORITY: '2',
+      CHAINGRAPH_API_LIGHT_MAX_CPU_MS: '100',
+      CHAINGRAPH_API_PROCESSES: '4',
+    },
+    48,
+    2
+  );
+  t.is(shared.clickhouse.ratePerSecond, 6, '48 × 0.5 / 4 processes');
+  t.is(shared.heavyMaxInFlight, 6);
+  t.deepEqual(shared.settings.heavy, { priority: 2 });
+  t.is(shared.lightMaxCpuMs, 100);
+  t.is(
+    admissionOptionsFromEnv({}, 48, 4).clickhouse.ratePerSecond,
+    9,
+    'workers divide the budget'
+  );
+  t.is(admissionOptionsFromEnv({}, undefined).sizing?.source, 'default');
+  t.is(
+    admissionOptionsFromEnv({ CHAINGRAPH_API_CLICKHOUSE_CORES: '64' }, 48)
+      .clickhouse.ratePerSecond,
+    48
+  );
+  t.false(admissionOptionsFromEnv({ CHAINGRAPH_API_ADMISSION: 'off' }).enabled);
+  t.throws(() => admissionOptionsFromEnv({ CHAINGRAPH_API_LOOP_TARGET: '2' }));
+  t.throws(() => admissionOptionsFromEnv({ CHAINGRAPH_API_CPU_SOURCE: 'x' }));
   t.throws(() =>
     admissionOptionsFromEnv({ CHAINGRAPH_API_HEAVY_WORKLOAD: 'a b' })
   );
-});
-
-test('admission: lane sizes from the ClickHouse server cores', (t) => {
-  /* a fixed heavy max_threads keeps the fix-pass-5 rule for heavy slots */
-  t.deepEqual(laneConcurrencyForCores(48, 8), { heavy: 6, light: 48 });
-  t.deepEqual(laneConcurrencyForCores(14, 8), { heavy: 2, light: 14 });
-  t.deepEqual(laneConcurrencyForCores(3, 8), { heavy: 1, light: 8 });
-  /* the server's default threads (fix pass 7): heavy = cores / 2, light = cores */
-  t.deepEqual(
-    {
-      heavy: defaultAdmissionOptions.heavy.maxConcurrent,
-      light: defaultAdmissionOptions.light.maxConcurrent,
-    },
-    laneConcurrencyForCores(48, 0),
-    'the static defaults are the 48-core sizes'
-  );
-  t.deepEqual(laneConcurrencyForCores(48, 0), { heavy: 24, light: 48 });
-  t.deepEqual(laneConcurrencyForCores(14, 0), { heavy: 7, light: 14 });
-  t.deepEqual(laneConcurrencyForCores(2, 0), { heavy: 2, light: 8 });
-  const fromServer = admissionOptionsFromEnv({}, 32);
-  t.is(fromServer.light.maxConcurrent, 32);
-  t.is(fromServer.heavy.maxConcurrent, 16);
-  t.is(fromServer.heavy.maxQueued, 16, 'heavy queue: 1 per slot');
-  t.deepEqual(fromServer.heavy.settings, {}, 'no thread cap, no priority');
-  t.deepEqual(fromServer.contendedSettings, { max_threads: 4, priority: 2 });
-  t.is(fromServer.contendedAt, 1);
-  t.is(fromServer.heavy.maxWaitMs, 250);
-  t.is(fromServer.light.maxWaitMs, 250);
-  t.is(fromServer.heavyRows, 10_000_000);
-  t.is(fromServer.light.maxQueued, 256);
-  t.deepEqual(fromServer.sizing, { cores: 32, source: 'clickhouse' });
-  const envCores = admissionOptionsFromEnv(
-    { CHAINGRAPH_API_CLICKHOUSE_CORES: '64' },
-    32
-  );
-  t.is(envCores.light.maxConcurrent, 64);
-  t.is(envCores.heavy.maxConcurrent, 32);
-  t.is(envCores.sizing?.source, 'env');
-  const threads = admissionOptionsFromEnv(
-    {
-      CHAINGRAPH_API_HEAVY_CONTENDED_AT: '0',
-      CHAINGRAPH_API_HEAVY_MAX_THREADS: '16',
-      CHAINGRAPH_API_HEAVY_PRIORITY: '3',
-    },
-    48
-  );
-  t.is(threads.heavy.maxConcurrent, 3, 'heavy follows a fixed max_threads');
-  t.deepEqual(threads.heavy.settings, { max_threads: 16 });
-  t.deepEqual(
-    threads.contendedSettings,
-    { max_threads: 16, priority: 3 },
-    'never more threads than the fixed cap'
-  );
-  t.is(threads.contendedAt, 0);
-  t.deepEqual(
-    admissionOptionsFromEnv(
-      {
-        CHAINGRAPH_API_HEAVY_CONTENDED_MAX_THREADS: '0',
-        CHAINGRAPH_API_HEAVY_PRIORITY: '0',
-      },
-      48
-    ).contendedSettings,
-    {},
-    'priority 0, threads 0: nothing changes under contention'
-  );
-  t.throws(() =>
-    admissionOptionsFromEnv({ CHAINGRAPH_API_HEAVY_CONTENDED_AT: 'x' })
-  );
-  const overridden = admissionOptionsFromEnv(
-    {
-      CHAINGRAPH_API_HEAVY_MAX_CONCURRENT: '2',
-      CHAINGRAPH_API_LIGHT_MAX_CONCURRENT: '5',
-    },
-    48
-  );
-  t.is(overridden.light.maxConcurrent, 5, 'explicit sizes win');
-  t.is(overridden.heavy.maxConcurrent, 2);
-  const unknown = admissionOptionsFromEnv({}, undefined);
-  t.is(unknown.light.maxConcurrent, 48);
-  t.is(unknown.sizing?.source, 'default');
   t.regex(
-    admissionSummary(fromServer, 70),
-    /^admission: on cores=32 \(clickhouse\) light=32 heavy=16 heavy_max_threads=server default heavy_contended=1:max_threads 4,priority 2 heavy_rows=10000000 max_wait_ms=250\/250 max_concurrent_queries_for_user=70$/u
+    admissionSummary(fromServer, 154),
+    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=36\.0 CPU-s\/s burst 2 s loop_budget=850 ms\/s burst 0\.5 s light_share=0\.25 light<=250 CPU-ms,25 loop-ms heavy_in_flight=24 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=server default heavy_settings=server default max_concurrent_queries_for_user=154$/u
   );
-});
-
-test('admission (fix pass 7): a statement whose predicted wait is over the bound is refused at once, not after the wait', async (t) => {
-  const admission = new Admission(
-    options({ maxConcurrent: 1, maxQueued: 10, maxWaitMs: 300 })
-  );
-  /* the lane's statements take ~200 ms */
-  await admission.run('a', false, undefined, async () => sleep(200));
-  t.true(admission.lanes.light.serviceMs! >= 150);
-  const hold = deferred();
-  const first = admission.run('a', false, undefined, async () => hold.promise);
-  /* position 1: ~200 ms predicted, within 300 ms: it queues */
-  const second = admission.run('a', false, undefined, async () => 'second');
-  await sleep(10);
-  t.is(admission.lanes.light.stats.queued, 1);
-  /* position 2: ~400 ms predicted: refused now */
-  const started = Date.now();
-  const third = await admission
-    .run('a', false, undefined, async () => 'third')
-    .catch((error: unknown) => error);
-  t.true(Date.now() - started < 50, 'refused in milliseconds');
-  t.is(codeOf(third), overloadedCode);
-  t.regex((third as GraphQLError).message, /predicted wait/u);
-  t.is(admission.lanes.light.stats.rejectedPredicted, 1);
-  hold.resolve();
-  await first;
-  t.is(await second, 'second');
-});
-
-test('admission (fix pass 7): heavy statements get the lower priority only under contention', async (t) => {
-  const admission = new Admission({
-    ...options({}, { maxConcurrent: 4, maxQueued: 4, settings: {} }, 1),
-    contendedAt: 0.75,
-    contendedSettings: { priority: 2 },
-  });
-  t.deepEqual(
-    admission.laneSettings('heavy', { queued: false, running: 1 }),
-    {}
-  );
-  t.deepEqual(
-    admission.laneSettings('heavy', { queued: false, running: 2 }),
-    {}
-  );
-  t.deepEqual(
-    admission.laneSettings('heavy', { queued: false, running: 3 }),
-    { priority: 2 },
-    '3 of 4 slots: contended'
-  );
-  t.deepEqual(
-    admission.laneSettings('heavy', { queued: true, running: 1 }),
-    { priority: 2 },
-    'it waited: contended'
-  );
-  t.deepEqual(
-    admission.laneSettings('light', { queued: true, running: 40 }),
-    defaultAdmissionOptions.light.settings,
-    'light statements keep their own settings'
-  );
-  /* through run: alone, then the third of four at once */
-  await admission.run('h', false, undefined, async (_s, report) => {
-    report(10);
-  });
-  const seen: (number | string | undefined)[] = [];
-  const hold = deferred();
-  const held = [1, 2].map(async () =>
-    admission.run('h', false, undefined, async (settings) => {
-      seen.push(settings.priority);
-      await hold.promise;
-    })
-  );
-  await admission.run('h', false, undefined, async (settings) => {
-    seen.push(settings.priority);
-  });
-  hold.resolve();
-  await Promise.all(held);
-  t.deepEqual(seen, [undefined, undefined, 2]);
 });
 
 e2e(
@@ -411,154 +474,163 @@ e2e(
   }
 );
 
+/** A one-block store and an API whose data statements wait for `gate` before they are sent. */
+const gatedApi = async (
+  t: ExecutionContext,
+  name: string,
+  admission: AdmissionOptions
+) => {
+  const { name: database, openStore } = await scratch(
+    t,
+    name,
+    { utxo: 'off' },
+    'ch1_api'
+  );
+  const store = await openStore();
+  const { node1 } = await registerNodes(store);
+  const { block0 } = threeBlockChain();
+  await store.saveBlock({
+    block: block0,
+    isSavedTransaction: notSaved,
+    nodeAcceptances: [acceptance(node1)],
+  });
+  await store.publishWatermarks();
+  const state = { gate: deferred(), held: true, sent: 0 };
+  state.gate.resolve();
+  state.gate = deferred();
+  const client = new ClickHouseClient({
+    ...connectionFor(database),
+    faultBeforeRequest: async (request) => {
+      if (request.queryId?.startsWith(apiQueryIdPrefix) !== true) return;
+      if (state.held) await state.gate.promise;
+      state.sent += 1;
+    },
+  });
+  t.teardown(async () => client.close());
+  const api = createApi(client, { admission, responseCache: false });
+  t.teardown(() => {
+    api.db.admission.stop();
+  });
+  const server = await listen(api);
+  t.teardown(async () => server.close());
+  /* API data statements the server saw (query_log) */
+  const logged = async () => {
+    await client.command('SYSTEM FLUSH LOGS');
+    const [row] = await client.query<{ n: string }>(
+      `SELECT toString(count()) AS n FROM system.query_log
+       WHERE type = 'QueryStart' AND current_database = {db:String} AND query_id LIKE 'cgapi-%'`,
+      { db: database }
+    );
+    return Number(row?.n ?? 0);
+  };
+  const post = async (query: string, signal?: AbortSignal) =>
+    fetch(server.url, {
+      body: JSON.stringify({ query }),
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+      ...(signal === undefined ? {} : { signal }),
+    });
+  return { api, block0, logged, post, state };
+};
+
 e2e(
-  '[e2e] abandoned work over HTTP: a client that disconnects leaves the queue; its statements are never sent',
+  '[e2e] request-level admission over HTTP: refused at once with 503 + Retry-After before any statement is sent; an admitted request is never refused part-way',
   async (t) => {
     t.timeout(120_000);
-    const { name, openStore } = await scratch(
-      t,
-      'admission',
-      { utxo: 'off' },
-      'ch1_api'
-    );
-    const store = await openStore();
-    const { node1 } = await registerNodes(store);
-    const { block0 } = threeBlockChain();
-    await store.saveBlock({
-      block: block0,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(node1)],
-    });
-    await store.publishWatermarks();
-    /* hold every data statement until released: the single light slot stays busy */
-    let gate = deferred();
-    let dataStatements = 0;
-    const client = new ClickHouseClient({
-      ...connectionFor(name),
-      faultBeforeRequest: async (request) => {
-        if (request.queryId?.startsWith(apiQueryIdPrefix) !== true) return;
-        dataStatements += 1;
-        await gate.promise;
-      },
-    });
-    t.teardown(async () => client.close());
-    const api = createApi(client, {
-      admission: options({ maxConcurrent: 1, maxQueued: 8, maxWaitMs: 30_000 }),
-      responseCache: false,
-    });
-    const server = await listen(api);
-    t.teardown(async () => server.close());
-    const query = `{ blocks_by_hash(hashes: ["${block0.hash}"]) { hash } }`;
-    const post = async (signal?: AbortSignal) =>
-      fetch(server.url, {
-        body: JSON.stringify({ query }),
-        headers: { 'content-type': 'application/json' },
-        method: 'POST',
-        ...(signal === undefined ? {} : { signal }),
-      });
-    const first = post();
-    const lane = api.db.admission.lanes.light.stats;
-    for (let attempt = 0; attempt < 100 && lane.running < 1; attempt += 1) {
+    const { api, block0, post, state } = await gatedApi(t, 'admit', options());
+    const { admission } = api.db;
+    const query = `{ a: blocks_by_hash(hashes: ["${block0.hash}"]) { hash } b: blocks_by_hash(hashes: ["${block0.hash}", "${block0.hash}"]) { hash } }`;
+    /* the first request (nothing known: heavy) is admitted; its statements wait */
+    const first = post(query);
+    for (let attempt = 0; attempt < 100 && state.sent === 0; attempt += 1) {
+      if (admission.stats.inFlight.heavy > 0) break;
       await sleep(20);
     }
-    t.is(lane.running, 1, 'the first request holds the slot');
-    const abandoned = [1, 2, 3].map(() => new AbortController());
-    const waiting = abandoned.map(async (controller) =>
-      post(controller.signal).catch(() => undefined)
-    );
-    for (let attempt = 0; attempt < 100 && lane.queued < 3; attempt += 1) {
-      await sleep(20);
-    }
-    t.is(lane.queued, 3, 'three requests wait for the slot');
-    abandoned.forEach((controller) => {
-      controller.abort();
-    });
-    await Promise.all(waiting);
-    for (let attempt = 0; attempt < 100 && lane.queued > 0; attempt += 1) {
-      await sleep(20);
-    }
-    t.is(lane.queued, 0, 'the disconnected clients left the queue');
-    t.is(lane.abandoned, 3);
-    const sentBefore = dataStatements;
-    gate.resolve();
-    gate = deferred();
-    gate.resolve();
+    t.is(admission.stats.inFlight.heavy, 1);
+    /* spend the budget while it runs: the next request is refused at once, nothing sent */
+    admission.budgets.clickhouse.level.heavy = -50;
+    admission.budgets.clickhouse.level.light = -50;
+    const sentBefore = state.sent;
+    const started = Date.now();
+    const refused = await post(query);
+    const elapsed = Date.now() - started;
+    const body = (await refused.json()) as {
+      errors?: { extensions?: { code?: string; reason?: string } }[];
+    };
+    t.is(refused.status, 503);
+    t.truthy(refused.headers.get('retry-after'));
+    t.is(body.errors?.[0]?.extensions?.code, overloadedCode);
+    t.is(body.errors?.[0]?.extensions?.reason, 'clickhouse');
+    t.true(elapsed < 250, `refused in ${elapsed} ms`);
+    t.is(state.sent, sentBefore, 'the refused request sent nothing');
+    /* the admitted request's statements all run although the budget is spent */
+    state.held = false;
+    state.gate.resolve();
     const response = await first;
     t.is(response.status, 200);
-    await sleep(200);
+    const result = (await response.json()) as {
+      data?: { a: unknown[]; b: unknown[] };
+      errors?: unknown[];
+    };
+    t.is(result.errors, undefined);
+    t.is(result.data?.a.length, 1);
+    t.true(state.sent >= 2, 'every statement of the admitted request ran');
     t.is(
-      dataStatements,
-      sentBefore,
-      'no statement of an abandoned request was sent'
+      admission.stats.inFlight.heavy,
+      0,
+      'the ticket ended with the response'
     );
   }
 );
 
 e2e(
-  '[e2e] overload over HTTP: a full queue answers 503 OVERLOADED with Retry-After at once',
+  '[e2e] abandoned work over HTTP: a client that disconnects before its statements are sent never sends them',
   async (t) => {
     t.timeout(120_000);
-    const { name, openStore } = await scratch(
+    const { api, block0, logged, post, state } = await gatedApi(
       t,
-      'overload',
-      { utxo: 'off' },
-      'ch1_api'
+      'abandon',
+      options()
     );
-    const store = await openStore();
-    const { node1 } = await registerNodes(store);
-    const { block0 } = threeBlockChain();
-    await store.saveBlock({
-      block: block0,
-      isSavedTransaction: notSaved,
-      nodeAcceptances: [acceptance(node1)],
-    });
-    await store.publishWatermarks();
-    const gate = deferred();
-    const client = new ClickHouseClient({
-      ...connectionFor(name),
-      faultBeforeRequest: async (request) => {
-        if (request.queryId?.startsWith(apiQueryIdPrefix) !== true) return;
-        await gate.promise;
-      },
-    });
-    t.teardown(async () => client.close());
-    const api = createApi(client, {
-      admission: options({ maxConcurrent: 1, maxQueued: 1, maxWaitMs: 30_000 }),
-      responseCache: false,
-    });
-    const server = await listen(api);
-    t.teardown(async () => server.close());
-    const post = async () =>
-      fetch(server.url, {
-        body: JSON.stringify({
-          query: `{ blocks_by_hash(hashes: ["${block0.hash}"]) { hash } }`,
-        }),
-        headers: { 'content-type': 'application/json' },
-        method: 'POST',
-      });
-    const held = [post()];
-    const lane = api.db.admission.lanes.light.stats;
-    for (let attempt = 0; attempt < 100 && lane.running < 1; attempt += 1) {
+    const query = `{ blocks_by_hash(hashes: ["${block0.hash}"]) { hash } }`;
+    const controllers = [1, 2, 3].map(() => new AbortController());
+    const waiting = controllers.map(async (controller) =>
+      post(query, controller.signal).catch(() => undefined)
+    );
+    const { admission } = api.db;
+    for (
+      let attempt = 0;
+      attempt < 100 &&
+      admission.stats.inFlight.heavy + admission.stats.inFlight.light < 3;
+      attempt += 1
+    ) {
       await sleep(20);
     }
-    held.push(post());
-    for (let attempt = 0; attempt < 100 && lane.queued < 1; attempt += 1) {
+    t.is(
+      admission.stats.inFlight.heavy + admission.stats.inFlight.light,
+      3,
+      'three requests admitted, their statements held'
+    );
+    controllers.forEach((controller) => {
+      controller.abort();
+    });
+    await Promise.all(waiting);
+    for (
+      let attempt = 0;
+      attempt < 100 &&
+      admission.stats.inFlight.heavy + admission.stats.inFlight.light > 0;
+      attempt += 1
+    ) {
       await sleep(20);
     }
-    const started = Date.now();
-    const refused = await post();
-    const elapsed = Date.now() - started;
-    const body = (await refused.json()) as {
-      errors?: { extensions?: { code?: string } }[];
-    };
-    t.is(refused.status, 503);
-    t.is(refused.headers.get('retry-after'), '2');
-    t.is(body.errors?.[0]?.extensions?.code, overloadedCode);
-    t.true(elapsed < 500, `refused in ${elapsed} ms`);
-    gate.resolve();
-    const statuses = await Promise.all(
-      held.map(async (response) => (await response).status)
+    t.is(
+      admission.stats.inFlight.heavy + admission.stats.inFlight.light,
+      0,
+      'the tickets ended with the closed responses'
     );
-    t.deepEqual(statuses, [200, 200]);
+    state.held = false;
+    state.gate.resolve();
+    await sleep(300);
+    t.is(await logged(), 0, 'no statement of an abandoned request was sent');
   }
 );

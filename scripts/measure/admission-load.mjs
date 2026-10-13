@@ -27,7 +27,14 @@
  * a3; ClickHouse CPU-s of the API's statements (query_log, cgapi-%).
  * Variables: the synthetic database's planted contracts (docs.json and the
  * generator's functions), mapped onto the chipnet catalogue's variables.
+ *
+ * Fix pass 8: per level also the API process's own CPU (ps, the primary and
+ * its workers: a single event loop was the mainnet limit) and the admission
+ * gate's state (`GET /admission`); --warm-rounds (default 2) warm-up rounds
+ * of every document, then --warm-wait-s (default 10) for the CPU ledger
+ * (system.query_log flushes every 7.5 s) before the first level.
  */
+import { execFileSync } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -57,6 +64,8 @@ const chUrl = opt('--clickhouse', 'http://localhost:18123');
 const out = opt('--out', `/tmp/admission-load-${arm}.json`);
 /* catalogue: the chipnet catalogue's own variables (a chipnet database), else the synthetic database's */
 const variableSource = opt('--variables', 'synthetic');
+const warmRounds = Number(opt('--warm-rounds', '2'));
+const warmWaitS = Number(opt('--warm-wait-s', '10'));
 if (db === undefined) {
   console.error('usage: --db <database> [--arm on|off|<label>] …');
   process.exit(2);
@@ -108,16 +117,30 @@ const doc = (id) => {
     variableSource === 'catalogue'
       ? entry.variables ?? entry.v2?.variables
       : synthetic[id]?.variables ??
-    Object.fromEntries(
-      Object.entries(entry.variables ?? entry.v2?.variables ?? {}).map(([name, value]) => [
-        name,
-        byName[name] ?? value,
-      ])
-    );
+        Object.fromEntries(
+          Object.entries(entry.variables ?? entry.v2?.variables ?? {}).map(
+            ([name, value]) => [name, byName[name] ?? value]
+          )
+        );
   return { id, query, variables };
 };
-const a1Mix = ['L40', 'L41', 'L42', 'L43', 'L44', 'L45', 'L46', 'L47', 'L12', 'L31', 'L35', 'X2'].map(doc);
-const lightMix = ['L13', 'L20', 'L25', 'L40', 'L43', 'L46', 'X4', 'X8'].map(doc);
+const a1Mix = [
+  'L40',
+  'L41',
+  'L42',
+  'L43',
+  'L44',
+  'L45',
+  'L46',
+  'L47',
+  'L12',
+  'L31',
+  'L35',
+  'X2',
+].map(doc);
+const lightMix = ['L13', 'L20', 'L25', 'L40', 'L43', 'L46', 'X4', 'X8'].map(
+  doc
+);
 const heavyMix = ['L23', 'L30', 'L33', 'L35', 'X12', 'X13'].map(doc);
 
 /* ------------------------------------------------------------ the API */
@@ -129,20 +152,24 @@ const extraEnv = Object.fromEntries(
 );
 const apiUrl = `http://127.0.0.1:${port}/graphql`;
 const startApi = async () => {
-  const child = spawn(process.execPath, [join(build, 'build', 'api', 'main.js')], {
-    cwd: '/tmp',
-    env: {
-      ...process.env,
-      CHAINGRAPH_API_HOST: '127.0.0.1',
-      CHAINGRAPH_API_PORT: String(port),
-      CHAINGRAPH_API_RESPONSE_CACHE: 'off',
-      CHAINGRAPH_CLICKHOUSE_DATABASE: db,
-      CHAINGRAPH_CLICKHOUSE_URL: chUrl,
-      ...(arm === 'off' ? { CHAINGRAPH_API_ADMISSION: 'off' } : {}),
-      ...extraEnv,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const child = spawn(
+    process.execPath,
+    [join(build, 'build', 'api', 'main.js')],
+    {
+      cwd: '/tmp',
+      env: {
+        ...process.env,
+        CHAINGRAPH_API_HOST: '127.0.0.1',
+        CHAINGRAPH_API_PORT: String(port),
+        CHAINGRAPH_API_RESPONSE_CACHE: 'off',
+        CHAINGRAPH_CLICKHOUSE_DATABASE: db,
+        CHAINGRAPH_CLICKHOUSE_URL: chUrl,
+        ...(arm === 'off' ? { CHAINGRAPH_API_ADMISSION: 'off' } : {}),
+        ...extraEnv,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }
+  );
   let log = '';
   child.stdout.on('data', (data) => {
     log += data;
@@ -163,7 +190,9 @@ const startApi = async () => {
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  const admissionLine = log.split('\n').find((line) => line.startsWith('admission:'));
+  const admissionLine = log
+    .split('\n')
+    .find((line) => line.startsWith('admission:'));
   return { admissionLine, child };
 };
 
@@ -171,28 +200,39 @@ const startApi = async () => {
 const pct = (xs, p) =>
   xs.length === 0
     ? null
-    : [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor((p / 100) * xs.length))];
+    : [...xs].sort((a, b) => a - b)[
+        Math.min(xs.length - 1, Math.floor((p / 100) * xs.length))
+      ];
 const classify = (status, body) => {
   const error = body?.errors?.[0];
   const code = error?.extensions?.code;
   if (status === 503 || code === 'OVERLOADED') return 'OVERLOADED';
   if (code === 'REQUEST_ABORTED' || code === 'QUERY_TIMEOUT') return code;
-  if (/MEMORY_LIMIT|memory limit/iu.test(String(error?.message ?? ''))) return 'MEMORY_LIMIT';
+  if (/MEMORY_LIMIT|memory limit/iu.test(String(error?.message ?? '')))
+    return 'MEMORY_LIMIT';
   return 'other';
 };
 const one = async (document, stream) => {
   const started = performance.now();
   try {
     const res = await fetch(apiUrl, {
-      body: JSON.stringify({ query: document.query, variables: document.variables }),
+      body: JSON.stringify({
+        query: document.query,
+        variables: document.variables,
+      }),
       headers: { 'content-type': 'application/json' },
       method: 'POST',
       signal: AbortSignal.timeout(timeoutMs),
     });
     const body = await res.json().catch(() => undefined);
-    const ok = res.status === 200 && body !== undefined && !(body.errors?.length);
+    const ok = res.status === 200 && body !== undefined && !body.errors?.length;
     return {
-      err: ok ? undefined : String(body?.errors?.[0]?.message ?? `HTTP ${res.status}`).slice(0, 160),
+      err: ok
+        ? undefined
+        : String(body?.errors?.[0]?.message ?? `HTTP ${res.status}`).slice(
+            0,
+            160
+          ),
       id: document.id,
       kind: ok ? 'ok' : classify(res.status, body),
       ms: performance.now() - started,
@@ -218,10 +258,14 @@ const summarise = (results, documents) => {
     (classes[r.kind] ??= []).push(r.ms);
   }
   const kinds = {};
-  for (const r of results.filter((x) => !x.ok)) kinds[r.err] = (kinds[r.err] ?? 0) + 1;
+  for (const r of results.filter((x) => !x.ok))
+    kinds[r.err] = (kinds[r.err] ?? 0) + 1;
   return {
     errorClasses: Object.fromEntries(
-      Object.entries(classes).map(([k, ms]) => [k, { n: ms.length, p50: pct(ms, 50), p95: pct(ms, 95) }])
+      Object.entries(classes).map(([k, ms]) => [
+        k,
+        { n: ms.length, p50: pct(ms, 50), p95: pct(ms, 95) },
+      ])
     ),
     errorKinds: kinds,
     errors: results.length - ok.length,
@@ -230,7 +274,13 @@ const summarise = (results, documents) => {
     p95: pct(ok, 95),
     p99: pct(ok, 99),
     p95PerDoc: Object.fromEntries(
-      documents.map((d) => [d.id, pct(results.filter((r) => r.id === d.id && r.ok).map((r) => r.ms), 95)])
+      documents.map((d) => [
+        d.id,
+        pct(
+          results.filter((r) => r.id === d.id && r.ok).map((r) => r.ms),
+          95
+        ),
+      ])
     ),
     sent: results.length,
   };
@@ -247,10 +297,17 @@ const stream = async (documents, rate, name, pending) => {
   }
 };
 const ch = async (sql) => {
-  const res = await fetch(`${chUrl}/?default_format=JSONEachRow`, { body: sql, method: 'POST' });
+  const res = await fetch(`${chUrl}/?default_format=JSONEachRow`, {
+    body: sql,
+    method: 'POST',
+  });
   const text = await res.text();
   if (!res.ok) throw new Error(text);
-  return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  return text
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 };
 /* ClickHouse CPU-s and statements of the API between two instants (query_log) */
 const serverCost = async (fromMs, toMs) => {
@@ -261,23 +318,72 @@ const serverCost = async (fromMs, toMs) => {
       max(query_duration_ms) AS max_ms
     FROM system.query_log WHERE type != 'QueryStart' AND query_id LIKE 'cgapi-%'
       AND current_database = '${db}'
-      AND event_time_microseconds >= fromUnixTimestamp64Milli(${Math.floor(fromMs)})
-      AND event_time_microseconds <= fromUnixTimestamp64Milli(${Math.ceil(toMs)})`);
+      AND event_time_microseconds >= fromUnixTimestamp64Milli(${Math.floor(
+        fromMs
+      )})
+      AND event_time_microseconds <= fromUnixTimestamp64Milli(${Math.ceil(
+        toMs
+      )})`);
   return row;
 };
 const settle = async () => {
   /* wait for the server to be quiet (no API statement running) before the next level */
   for (let attempt = 0; attempt < 120; attempt += 1) {
-    const [row] = await ch("SELECT count() AS n FROM system.processes WHERE query_id LIKE 'cgapi-%'");
+    const [row] = await ch(
+      "SELECT count() AS n FROM system.processes WHERE query_id LIKE 'cgapi-%'"
+    );
     if (Number(row.n) === 0) return;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 };
+/* CPU seconds of the API process and its workers (ps cputime) */
+const apiCpuSeconds = (pid) => {
+  try {
+    let children = [];
+    try {
+      children = execFileSync('pgrep', ['-P', String(pid)], {
+        encoding: 'utf8',
+      })
+        .split('\n')
+        .filter(Boolean);
+    } catch {
+      /* no workers */
+    }
+    return [String(pid), ...children].reduce((sum, p) => {
+      const text = execFileSync('ps', ['-o', 'time=', '-p', p], {
+        encoding: 'utf8',
+      }).trim();
+      const parts = text.split(/[:.]/u).map(Number);
+      /* [[dd-]hh:]mm:ss.cc */
+      const [cc, ss, mm, hh = 0] = [
+        parts.at(-1),
+        parts.at(-2),
+        parts.at(-3),
+        parts.at(-4),
+      ];
+      return sum + (hh * 3600 + mm * 60 + ss + cc / 100);
+    }, 0);
+  } catch {
+    return Number.NaN;
+  }
+};
+const gateState = async () => {
+  try {
+    const res = await fetch(apiUrl.replace('/graphql', '/admission'));
+    return res.ok ? await res.json() : undefined;
+  } catch {
+    return undefined;
+  }
+};
+let apiPid;
 const run = async (label, streams) => {
   await settle();
   const pending = [];
   const fromMs = Date.now();
-  await Promise.all(streams.map((s) => stream(s.documents, s.rate, s.name, pending)));
+  const cpuBefore = apiCpuSeconds(apiPid);
+  await Promise.all(
+    streams.map((s) => stream(s.documents, s.rate, s.name, pending))
+  );
   const results = await Promise.all(pending);
   const toMs = Date.now();
   const all = [...new Set(streams.flatMap((s) => s.documents))];
@@ -287,36 +393,77 @@ const run = async (label, streams) => {
     ...summarise(results, all),
     ...(streams.length > 1
       ? Object.fromEntries(
-          streams.map((s) => [s.name, summarise(results.filter((r) => r.stream === s.name), s.documents)])
+          streams.map((s) => [
+            s.name,
+            summarise(
+              results.filter((r) => r.stream === s.name),
+              s.documents
+            ),
+          ])
         )
       : {}),
     server: await serverCost(fromMs, toMs),
+    apiCpuSeconds: apiCpuSeconds(apiPid) - cpuBefore,
+    gate: await gateState(),
   };
   const classes =
     Object.entries(row.errorClasses)
-      .map(([k, v]) => `${k} ${v.n} (p50 ${v.p50?.toFixed(0)} p95 ${v.p95?.toFixed(0)} ms)`)
+      .map(
+        ([k, v]) =>
+          `${k} ${v.n} (p50 ${v.p50?.toFixed(0)} p95 ${v.p95?.toFixed(0)} ms)`
+      )
       .join(', ') || 'none';
   console.log(
-    `${arm} ${label}: sent ${row.sent}, ok ${row.ok}, errors ${row.errors} [${classes}], p50 ${row.p50?.toFixed(0)} p95 ${row.p95?.toFixed(0)} p99 ${row.p99?.toFixed(0)} ms; server ${row.server.cpu_s} CPU-s, ${row.server.statements} statements, ${row.server.memory_limit} MEMORY_LIMIT`
+    `${arm} ${label}: sent ${row.sent}, ok ${row.ok}, errors ${
+      row.errors
+    } [${classes}], p50 ${row.p50?.toFixed(0)} p95 ${row.p95?.toFixed(
+      0
+    )} p99 ${row.p99?.toFixed(0)} ms; server ${row.server.cpu_s} CPU-s, ${
+      row.server.statements
+    } statements, ${
+      row.server.memory_limit
+    } MEMORY_LIMIT; API process ${row.apiCpuSeconds.toFixed(1)} CPU-s`
   );
   for (const s of streams.length > 1 ? streams : []) {
     const part = row[s.name];
     console.log(
-      `  ${s.name}: ok ${part.ok}/${part.sent} p50 ${part.p50?.toFixed(0)} p95 ${part.p95?.toFixed(0)} ms, errors ${JSON.stringify(part.errorClasses)}`
+      `  ${s.name}: ok ${part.ok}/${part.sent} p50 ${part.p50?.toFixed(
+        0
+      )} p95 ${part.p95?.toFixed(0)} ms, errors ${JSON.stringify(
+        part.errorClasses
+      )}`
     );
   }
   return row;
 };
 
 const { admissionLine, child } = await startApi();
-console.log(`${arm}: ${admissionLine ?? '(no admission line)'} build ${build} db ${db}`);
-const report = { arm, admissionLine, build, db, env: extraEnv, rows: [], seconds, timeoutS: timeoutMs / 1000 };
+apiPid = child.pid;
+console.log(
+  `${arm}: ${admissionLine ?? '(no admission line)'} build ${build} db ${db}`
+);
+const report = {
+  arm,
+  admissionLine,
+  build,
+  db,
+  env: extraEnv,
+  rows: [],
+  seconds,
+  timeoutS: timeoutMs / 1000,
+};
 try {
   /* warm-up: every document once */
-  for (const document of [...a1Mix, ...lightMix, ...heavyMix]) await one(document, 'warm');
+  for (let round = 0; round < warmRounds; round += 1) {
+    for (const document of [...a1Mix, ...lightMix, ...heavyMix])
+      await one(document, 'warm');
+  }
+  await new Promise((resolve) => setTimeout(resolve, warmWaitS * 1000));
   if (shapes.includes('a1')) {
     for (const rate of a1Levels) {
-      report.rows.push(await run(`a1 ${rate} qps`, [{ documents: a1Mix, name: 'mix', rate }]));
+      report.rows.push(
+        await run(`a1 ${rate} qps`, [{ documents: a1Mix, name: 'mix', rate }])
+      );
     }
   }
   if (shapes.includes('a3')) {

@@ -1,216 +1,1028 @@
-/* eslint-disable functional/no-throw-statement, @typescript-eslint/no-magic-numbers, max-classes-per-file, camelcase, @typescript-eslint/naming-convention, complexity, functional/no-mixed-type, @typescript-eslint/parameter-properties, max-params, functional/no-try-statement, @typescript-eslint/member-ordering */
-// cspell:ignore clickhouse EWMA
+/* eslint-disable functional/no-throw-statement, @typescript-eslint/no-magic-numbers, max-classes-per-file, camelcase, @typescript-eslint/naming-convention, complexity, @typescript-eslint/parameter-properties, max-params, functional/no-try-statement, @typescript-eslint/member-ordering, functional/no-let, functional/no-loop-statement, max-lines */
+// cspell:ignore clickhouse EWMA utilisation misprediction mispredicted unticketed
 /**
- * Admission control of the API's ClickHouse statements (fix pass 4,
- * docs/clickhouse-port/fix-pass-4.md §3b).
+ * Admission control of API requests (fix pass 8,
+ * docs/clickhouse-port/fix-pass-8.md; replaces the per-statement lanes of
+ * fix passes 4–7).
  *
- * Every data statement passes a gate before it is sent. Two lanes:
- * - `light`: statements whose shape has been cheap (or is new);
- * - `heavy`: every shape whose recent cost (an EWMA per statement shape:
- *   label + SQL text, parameters excluded) is at least `heavyRows`, and
- *   aggregates until their shape has been measured. The cost is the rows a
- *   statement reads as ClickHouse reports them (`X-ClickHouse-Summary`:
- *   the larger of `read_rows` and `total_rows_to_read`), which does not
- *   grow with load as wall time does (a wall-time rule moved every shape to
- *   the heavy lane under load in the local measurement, fix-pass-4.md); a
- *   statement that times out or runs out of memory counts as heavy.
- * Each lane has a concurrency limit, a bounded queue and a bounded wait.
- * A statement that finds its lane's queue full, or waits longer than the
- * lane allows, fails at once with OVERLOADED (HTTP 503, Retry-After): a fast,
- * explicit error instead of a slow timeout, and no unbounded backlog. A
- * request that goes away while its statement waits leaves the queue
- * (`signal`). Heavy statements can never take the light lane's slots, so
- * cheap lookups keep their latency while heavy ones queue or are refused.
- * On the ClickHouse side each lane has its own settings (`priority`,
- * optionally a `workload`).
+ * The mainnet session of 2026-10-13 showed per-statement admission failing
+ * at scale: a refusal landed only after a request's earlier statements had
+ * run (OVERLOADED after seconds), statement counts said nothing about CPU,
+ * and the binding resource at 20 QPS was not ClickHouse (≤ 16 of 48 cores
+ * busy) but the API process's one event loop (light documents whose
+ * statements took ~10 ms waited 15 s). So:
  *
- * Fix pass 7 (docs/clickhouse-port/fix-pass-7.md §1; the mainnet soak of
- * 2026-10-13 was worse with admission than without):
- * - refusals are fast: a lane's wait is bounded at 250 ms, and a statement
- *   whose predicted wait (from the running statements' ages and the lane's
- *   recent statement time) is over the bound is refused at once instead
- *   of after the wait;
- * - heavy statements are not capped at a fixed `max_threads` (the server's
- *   default: every core; ClickHouse's CPU slot scheduler shares the cores
- *   between running statements), and they get the lower `priority` only
- *   under contention (`contendedAt`): a heavy statement admitted while the
- *   heavy lane is nearly full, or after waiting in its queue. Priority
- *   always on protected light statements but slowed heavy ones at loads
- *   the server carries (local load test: worse than admission off);
- *   priority never on left light statements at p95 ~1 s under overload;
- * - a statement is heavy from 10 M rows read (was 1 M: mainnet point reads
- *   of 1–3 M rows, ~0.1 CPU-s, queued behind 12 CPU-s statements);
- * - lanes are wider: light = cores, heavy = cores / 2.
- * Lane sizes follow the ClickHouse
- * server's cores (`laneConcurrencyForCores`); a cluster-wide backstop across
- * API pods is the API user's `max_concurrent_queries_for_user`
- * (store/clickhouse/api-user.ts). Trusted documents get no lane of their
- * own: a trusted document's statement that reads ≥ `heavyRows` shares the
- * heavy lane (owner decision 2026-10-12, fix-pass-5.md §4).
+ * - **Request level.** A request is admitted or refused once, before any
+ *   statement (or snapshot read) runs, in ~1 ms; an admitted request is
+ *   never refused part-way. Response-cache hits are not admitted at all
+ *   (they cost neither resource).
+ * - **Predicted cost.** Each request's cost is predicted from its plan key
+ *   (document hash + operation + nodes + the magnitude of its numeric and
+ *   list variables), falling back to the document, then to its root fields,
+ *   then to a default: an EWMA of what such requests cost, in two
+ *   resources: ClickHouse CPU-seconds (from `system.query_log`, polled for
+ *   the API's own statements; rows read × a learned CPU per row until then
+ *   or when the log is not readable) and event-loop milliseconds of this
+ *   process (the loop's busy time, attributed to the requests not waiting
+ *   for ClickHouse).
+ * - **CPU budgets, not counts.** Per resource a token budget refills at a
+ *   rate (ClickHouse: server cores × target utilisation / API processes;
+ *   event loop: target utilisation × 1 s/s) up to a short burst. An
+ *   admitted request is charged its prediction; the charge is reconciled
+ *   with the measured cost when it is known. A budget may go into debt
+ *   (a heavy request is admitted while its budget is positive), so a single
+ *   request larger than the burst still runs, and the debt refuses the next
+ *   ones until repaid.
+ * - **Light reserve.** Each budget is split: light requests (predicted
+ *   below `lightMaxCpuMs` and `lightMaxLoopMs`) have their own share
+ *   (`lightShare`); heavy requests can never spend it, but every unused
+ *   token of either share overflows into the other, so heavy requests use
+ *   the whole budget when light ones are idle, and light ones borrow idle
+ *   heavy tokens.
+ * - **Fast refusals.** A request whose budget is exhausted is refused at
+ *   once: OVERLOADED, HTTP 503, Retry-After = the budget's time to repay.
+ * - **Backstops kept.** Heavy requests in flight per process are capped
+ *   (`heavyMaxInFlight`), an event loop busier than `loopGuard` refuses heavy
+ *   requests whatever the budget says (a misprediction must not stall the
+ *   loop), the API user's `max_concurrent_queries_for_user` bounds the
+ *   statements of every pod, and a request whose client goes away has its
+ *   statements cancelled (db.ts).
+ *
+ * Statements outside a request (live-query re-runs, snapshot and watermark
+ * reads) are never refused; their measured cost is charged to the budgets.
  */
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 
-import { GraphQLError } from 'graphql';
+import type { DocumentNode, OperationDefinitionNode } from 'graphql';
+import { getOperationAST, GraphQLError, Kind, print } from 'graphql';
 
-export type Lane = 'heavy' | 'light';
+export type RequestClass = 'heavy' | 'light';
 
-export interface LaneLimits {
-  /** Statements of the lane running at once (per API process). */
-  maxConcurrent: number;
-  /** Statements waiting for a slot; one more is refused (OVERLOADED). */
-  maxQueued: number;
-  /** Longest wait for a slot, ms; longer is refused (OVERLOADED). */
-  maxWaitMs: number;
-  /** ClickHouse settings of the lane's statements (`max_threads`, `priority`, `workload` …). */
-  settings: { [name: string]: number | string };
+/** A request's cost in the two budgeted resources. */
+export interface RequestCost {
+  /** ClickHouse CPU (user + system), seconds. */
+  cpuSeconds: number;
+  /** This process's event loop, milliseconds. */
+  loopMs: number;
+}
+
+export interface BudgetOptions {
+  /** Tokens per second (CPU-seconds per second, or loop milliseconds per second). */
+  ratePerSecond: number;
+  /** Capacity, seconds of `ratePerSecond`. */
+  burstSeconds: number;
+  /** The light requests' share of rate and capacity (0–1). */
+  lightShare: number;
 }
 
 export interface AdmissionOptions {
-  /** Off: no gate (every statement is sent at once, as before fix pass 4). */
+  /** Off: every request runs at once (no prediction, no charge). */
   enabled: boolean;
-  light: LaneLimits;
-  heavy: LaneLimits;
-  /** A shape whose cost EWMA (rows read) reaches this is heavy. */
-  heavyRows: number;
-  /** Seconds a client is told to wait (Retry-After) when refused. */
-  retryAfterSeconds: number;
-  /** Shapes remembered (least recently used dropped). */
-  maxShapes: number;
-  /**
-   * Settings added to a heavy statement admitted under contention (default
-   * `{ max_threads: 4, priority: 2 }`, threads derived from the cores: about
-   * 2 cores per heavy slot; ClickHouse pauses it while light statements, at
-   * priority 1, run).
-   */
-  contendedSettings: { [name: string]: number | string };
-  /**
-   * Heavy statements running (itself included) from which a newly admitted
-   * one is contended, as a fraction of the heavy slots (default 1: it took
-   * the last slot); a statement that waited in the queue is always
-   * contended.
-   */
-  contendedAt: number;
-  /**
-   * The cores the lane sizes were derived from and where that number came
-   * from (`env`: CHAINGRAPH_API_CLICKHOUSE_CORES, `clickhouse`: the
-   * server's `max_threads` for the API user, `default`: neither, the
-   * static defaults); for the startup log.
-   */
+  /** ClickHouse CPU budget of this process. */
+  clickhouse: BudgetOptions;
+  /** Event-loop budget of this process. */
+  loop: BudgetOptions;
+  /** A request predicted at most this (CPU ms) and `lightMaxLoopMs` is light. */
+  lightMaxCpuMs: number;
+  /** A request predicted at most this (loop ms) and `lightMaxCpuMs` is light. */
+  lightMaxLoopMs: number;
+  /** Heavy requests in flight at most (this process). */
+  heavyMaxInFlight: number;
+  /** Loop utilisation (last ~0.5 s) from which heavy requests are refused regardless of the budget (0–1; 1: never). */
+  loopGuard: number;
+  /** The prediction for a request nothing is known about (counted heavy unless under both light bounds). */
+  unknownCost: RequestCost;
+  /** ClickHouse CPU per row read until measured, seconds. */
+  defaultCpuPerRow: number;
+  /** Where the measured ClickHouse CPU comes from: `query_log` (exact, lagging) or `rows` (estimate). */
+  cpuSource: 'query_log' | 'rows';
+  /** Seconds a client is told to wait at least (Retry-After). */
+  minRetryAfterSeconds: number;
+  /** Plan keys remembered (least recently used dropped). */
+  maxKeys: number;
+  /** ClickHouse settings of light and heavy requests' statements. */
+  settings: { [cls in RequestClass]: { [name: string]: number | string } };
+  /** The sizing inputs (startup log). */
   sizing?: {
     cores: number | undefined;
     source: 'clickhouse' | 'default' | 'env';
+    processes: number;
+    cpuTarget: number;
+    loopTarget: number;
   };
 }
 
-/** Light statements at once per core of the ClickHouse server. */
-export const lightConcurrentPerCore = 1;
+/** Fraction of the ClickHouse server's cores the API's requests may use on average. */
+export const defaultCpuTarget = 0.75;
 
-/** The light lane never gets fewer slots than this (small servers). */
-export const minLightConcurrent = 8;
+/** Fraction of the event loop the requests may use on average. */
+export const defaultLoopTarget = 0.85;
 
-/** Heavy queue length per heavy slot when the sizes are derived (24 at 24 slots). */
-export const heavyQueuedPerSlot = 1;
-
-/**
- * Heavy slots per core with the server's default threads: one heavy
- * statement per 2 cores (24 at 48 cores). Not a thread budget: under
- * contention ClickHouse shares the cores between them.
- */
-export const heavyConcurrentPerCore = 0.5;
-
-/** Longest wait for a slot in either lane by default, ms (fix-pass-7.md §1: refusals must be fast, under 250 ms). */
-export const defaultMaxWaitMs = 250;
+/** Cores assumed when the server's are unknown. */
+export const defaultCores = 48;
 
 /**
- * Lane sizes from the ClickHouse server's cores (owner decision 2026-10-12,
- * fix-pass-4.md §8; revised in fix-pass-7.md §1). Heavy: with the server's
- * default threads (`heavyMaxThreads` 0, the default) max(2, round(cores /
- * 2)): 24 at 48 cores, 7 at 14; with a fixed `heavyMaxThreads` max(1,
- * round(cores / heavyMaxThreads)) as before. Light = max(8, cores): light
- * statements are point and range lookups of ~10–60 ms, mostly one thread;
- * under load they slow down, and half a slot per core (fix pass 5) refused
- * them in the local overload test. At 48 cores: 48 light, 24 heavy. The
- * heavy queue is 1 per heavy slot (24 at 24).
+ * Defaults (one process, 48 cores): ClickHouse 36 CPU-s/s with a 2 s burst,
+ * the loop 850 ms/s with a 0.5 s burst (the loop is FIFO: a burst of loop
+ * work is latency for everyone), a quarter of each for light requests;
+ * light = predicted ≤ 250 CPU-ms and ≤ 25 loop-ms; a request never seen
+ * 250 CPU-ms and 20 loop-ms (heavy: over neither bound but not proven light);
+ * heavy requests in flight ≤ 24; heavy refused while the loop is ≥ 95 % busy.
  */
-export const laneConcurrencyForCores = (
-  cores: number,
-  heavyMaxThreads: number
-) => {
-  const usableCores = Math.max(1, Math.floor(cores));
+export const defaultAdmissionOptions: AdmissionOptions = {
+  clickhouse: {
+    burstSeconds: 2,
+    lightShare: 0.25,
+    ratePerSecond: defaultCores * defaultCpuTarget,
+  },
+  cpuSource: 'query_log',
+  defaultCpuPerRow: 0.3e-6,
+  enabled: true,
+  heavyMaxInFlight: 24,
+  lightMaxCpuMs: 250,
+  lightMaxLoopMs: 25,
+  loop: {
+    burstSeconds: 0.5,
+    lightShare: 0.25,
+    ratePerSecond: 1000 * defaultLoopTarget,
+  },
+  loopGuard: 0.95,
+  maxKeys: 10_000,
+  minRetryAfterSeconds: 1,
+  settings: { heavy: {}, light: {} },
+  unknownCost: { cpuSeconds: 0.25, loopMs: 20 },
+};
+
+/** Options for an embedded API (tests, tools): no admission. */
+export const disabledAdmissionOptions: AdmissionOptions = {
+  ...defaultAdmissionOptions,
+  enabled: false,
+};
+
+/* ------------------------------------------------------------------ */
+/* errors                                                               */
+/* ------------------------------------------------------------------ */
+
+/** The error code of a refused request. */
+export const overloadedCode = 'OVERLOADED';
+
+/** The error code of a statement of a request whose client went away. */
+export const requestAbortedCode = 'REQUEST_ABORTED';
+
+export type RefusalReason = 'clickhouse' | 'in_flight' | 'loop_guard' | 'loop';
+
+export const overloadedError = (
+  cls: RequestClass,
+  reason: RefusalReason,
+  detail: string,
+  retryAfterSeconds: number
+) =>
+  new GraphQLError(
+    `The API is overloaded (${cls} request: ${detail}); retry after ${retryAfterSeconds} s.`,
+    {
+      extensions: {
+        code: overloadedCode,
+        http: {
+          headers: { 'Retry-After': String(retryAfterSeconds) },
+          status: 503,
+        },
+        lane: cls,
+        reason,
+        retryAfterSeconds,
+      },
+    }
+  );
+
+export const requestAbortedError = () =>
+  new GraphQLError(
+    'The request was abandoned by its client; its statements were dropped or cancelled.',
+    { extensions: { code: requestAbortedCode } }
+  );
+
+/* ------------------------------------------------------------------ */
+/* the budget of one resource                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A token budget split into a light and a heavy share. Each share refills
+ * at its part of the rate up to its part of the capacity; what a full share
+ * would gain overflows into the other. Levels may go negative (debt).
+ */
+export class Budget {
+  readonly level: { [cls in RequestClass]: number };
+
+  private readonly rate: { [cls in RequestClass]: number };
+
+  private readonly capacity: { [cls in RequestClass]: number };
+
+  private at: number;
+
+  constructor(options: BudgetOptions, now = performance.now()) {
+    const share = Math.min(1, Math.max(0, options.lightShare));
+    const capacity = options.ratePerSecond * options.burstSeconds;
+    this.rate = {
+      heavy: options.ratePerSecond * (1 - share),
+      light: options.ratePerSecond * share,
+    };
+    this.capacity = { heavy: capacity * (1 - share), light: capacity * share };
+    this.level = { ...this.capacity };
+    this.at = now;
+  }
+
+  /** Add the tokens earned since the last call (overflow between the shares). */
+  refill(now = performance.now()) {
+    const seconds = Math.max(0, (now - this.at) / 1000);
+    this.at = Math.max(this.at, now);
+    if (seconds === 0) return;
+    const gained = {
+      heavy: this.rate.heavy * seconds,
+      light: this.rate.light * seconds,
+    };
+    const room = (cls: RequestClass) =>
+      Math.max(0, this.capacity[cls] - this.level[cls]);
+    const spill = {
+      heavy: Math.max(0, gained.heavy - room('heavy')),
+      light: Math.max(0, gained.light - room('light')),
+    };
+    this.level.heavy = Math.min(
+      this.capacity.heavy,
+      this.level.heavy + gained.heavy + spill.light
+    );
+    this.level.light = Math.min(
+      this.capacity.light,
+      this.level.light + gained.light + spill.heavy
+    );
+  }
+
+  /**
+   * Charge `cost` for a request of class `cls`, if allowed: a light request
+   * from its share while that is positive, else from the heavy share if
+   * that holds the whole cost; a heavy request from its share while that is
+   * positive. Returns the share charged, or undefined (refused).
+   */
+  take(cls: RequestClass, cost: number): RequestClass | undefined {
+    if (this.level[cls] > 0) {
+      this.level[cls] -= cost;
+      return cls;
+    }
+    if (cls === 'light' && this.level.heavy >= cost) {
+      this.level.heavy -= cost;
+      return 'heavy';
+    }
+    return undefined;
+  }
+
+  /** Give back (a positive `amount`) or charge more (a negative one) to a share. */
+  adjust(cls: RequestClass, amount: number) {
+    this.level[cls] = Math.min(this.capacity[cls], this.level[cls] + amount);
+  }
+
+  /** Seconds until a refused request of `cls` would be admitted (at least 0). */
+  secondsToPositive(cls: RequestClass) {
+    const deficit = -this.level[cls];
+    return deficit <= 0 ? 0 : deficit / Math.max(1e-9, this.rate[cls]);
+  }
+
+  /** Levels as fractions of the capacities (stats). */
+  fill() {
+    return {
+      heavy: this.level.heavy / Math.max(1e-9, this.capacity.heavy),
+      light: this.level.light / Math.max(1e-9, this.capacity.light),
+    };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* the cost model                                                       */
+/* ------------------------------------------------------------------ */
+
+/** The keys a request's cost is predicted by, most specific first. */
+export interface PlanKeys {
+  /** Document + operation + nodes + variable magnitudes. */
+  plan: string;
+  /** Document + operation. */
+  document: string;
+  /** The operation's root fields. */
+  roots: string;
+}
+
+const sha = (text: string) =>
+  createHash('sha256').update(text).digest('hex').slice(0, 32);
+
+const documentHashes = new WeakMap<DocumentNode, string>();
+
+/** sha256 of a parsed document's printed text (cached per parsed document). */
+export const documentHash = (document: DocumentNode) => {
+  let hash = documentHashes.get(document);
+  if (hash === undefined) {
+    hash = sha(print(document));
+    documentHashes.set(document, hash);
+  }
+  return hash;
+};
+
+const byText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Magnitude class of a number (0, then log2 buckets). */
+const magnitude = (value: number) =>
+  value <= 0 ? 0 : Math.ceil(Math.log2(value + 1));
+
+/**
+ * What of a variable value changes a request's cost: numbers by magnitude
+ * (a `limit` of 10 vs 10,000), lists by length magnitude (a list of hashes),
+ * objects by their fields; strings not at all (a hash is a hash).
+ */
+const variableShape = (value: unknown, depth = 0): unknown => {
+  if (depth > 4) return '…';
+  if (typeof value === 'number') return magnitude(value);
+  if (typeof value === 'bigint') return magnitude(Number(value));
+  if (Array.isArray(value)) return `[${magnitude(value.length)}]`;
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as { [key: string]: unknown })
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, item]) => [key, variableShape(item, depth + 1)])
+    );
+  }
+  if (typeof value === 'boolean') return value;
+  return '';
+};
+
+/** The plan keys of one request. */
+export const planKeys = (
+  document: DocumentNode,
+  operationName: string | null | undefined,
+  variables: { [name: string]: unknown } | null | undefined,
+  nodeNames: readonly string[]
+): PlanKeys => {
+  const operation: OperationDefinitionNode | null | undefined = getOperationAST(
+    document,
+    operationName ?? undefined
+  );
+  const roots = (operation?.selectionSet.selections ?? [])
+    .map((selection) =>
+      selection.kind === Kind.FIELD ? selection.name.value : '…'
+    )
+    .sort(byText)
+    .join(',');
+  const documentKey = `${documentHash(document)}:${operationName ?? ''}`;
   return {
-    heavy:
-      heavyMaxThreads > 0
-        ? Math.max(1, Math.round(usableCores / heavyMaxThreads))
-        : Math.max(2, Math.round(usableCores * heavyConcurrentPerCore)),
-    light: Math.max(
-      minLightConcurrent,
-      Math.floor(usableCores * lightConcurrentPerCore)
-    ),
+    document: `d:${documentKey}`,
+    plan: `p:${documentKey}:${[...nodeNames]
+      .sort(byText)
+      .join(',')}:${JSON.stringify(variableShape(variables ?? {}))}`,
+    roots: `r:${operation?.operation ?? 'query'}:${roots}`,
   };
 };
 
+interface Estimate {
+  cpuSeconds: number;
+  loopMs: number;
+  samples: number;
+}
+
+/** Weight of a new observation in the cost EWMAs. */
+const costAlpha = 0.3;
+
 /**
- * Defaults (per API process) when the server's cores are unknown: the
- * lane sizes of a 48-core server (`laneConcurrencyForCores(48, 0)`): 48
- * light and 24 heavy statements at once; queues of 256 / 24, waits of at
- * most 250 ms (refused at once when the predicted wait is longer). Light
- * statements run at priority 1; heavy ones with the server's default
- * threads, at priority 2 only when contended. A shape is heavy from 10 M
- * rows read on average (fix-pass-7.md §1; 1 M before).
+ * Cost EWMAs per key (insertion order = recency). The budgets are
+ * reconciled with measured costs, so the model predicts the mean, not a
+ * bound.
  */
-export const defaultAdmissionOptions: AdmissionOptions = {
-  contendedAt: 1,
-  contendedSettings: { max_threads: 4, priority: 2 },
-  enabled: true,
-  heavy: {
-    maxConcurrent: 24,
-    maxQueued: 24,
-    maxWaitMs: defaultMaxWaitMs,
-    settings: {},
-  },
-  heavyRows: 10_000_000,
-  light: {
-    maxConcurrent: 48,
-    maxQueued: 256,
-    maxWaitMs: defaultMaxWaitMs,
-    settings: { priority: 1 },
-  },
-  maxShapes: 10_000,
-  retryAfterSeconds: 2,
+export class CostModel {
+  private readonly estimates = new Map<string, Estimate>();
+
+  constructor(private readonly maxKeys: number) {}
+
+  /** The prediction for `keys`: the most specific key with a sample, and which. */
+  predict(
+    keys: PlanKeys
+  ): { cost: RequestCost; source: keyof PlanKeys } | undefined {
+    for (const source of ['plan', 'document', 'roots'] as const) {
+      const estimate = this.estimates.get(keys[source]);
+      if (estimate !== undefined) {
+        return {
+          cost: { cpuSeconds: estimate.cpuSeconds, loopMs: estimate.loopMs },
+          source,
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Record a measured cost under every key of the request. `cpuSeed`: the
+   * CPU is an estimate awaiting its measurement: it only seeds a key that
+   * has none (the measurement is observed when it arrives).
+   */
+  observe(keys: PlanKeys, cost: RequestCost, cpuSeed = false) {
+    for (const key of [keys.plan, keys.document, keys.roots]) {
+      const before = this.estimates.get(key);
+      this.estimates.delete(key);
+      const blend = (old: number | undefined, value: number) =>
+        old === undefined ? value : old * (1 - costAlpha) + value * costAlpha;
+      this.estimates.set(key, {
+        cpuSeconds:
+          cpuSeed && before !== undefined
+            ? before.cpuSeconds
+            : blend(before?.cpuSeconds, cost.cpuSeconds),
+        loopMs: blend(before?.loopMs, cost.loopMs),
+        samples: (before?.samples ?? 0) + 1,
+      });
+    }
+    while (this.estimates.size > this.maxKeys) {
+      const oldest = this.estimates.keys().next().value;
+      if (oldest === undefined) break;
+      this.estimates.delete(oldest);
+    }
+  }
+
+  get size() {
+    return this.estimates.size;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* tickets                                                              */
+/* ------------------------------------------------------------------ */
+
+/** One statement of a request (or a statement outside one). */
+export interface StatementRecord {
+  queryId: string;
+  shape: string;
+  rows: number;
+  /** Measured CPU, s (`query_log`); undefined until known. */
+  cpuSeconds?: number;
+  /** When the statement finished (performance.now()), for the ledger's patience. */
+  finishedAt?: number;
+  /** Outside a request: the CPU estimate it was charged when it finished. */
+  chargedCpu?: number;
+}
+
+/** An admitted request: what it was charged, and what it costs. */
+export class Ticket {
+  /** Statements sent, finished or not. */
+  readonly statements: StatementRecord[] = [];
+
+  /** Statements waiting for ClickHouse (sent, response not started). */
+  waiting = 0;
+
+  /** Loop milliseconds attributed so far. */
+  loopMs = 0;
+
+  /** Finished (response written or execution done). */
+  finished = false;
+
+  /** CPU charged to the ClickHouse budget so far (prediction, then estimates). */
+  chargedCpu: number;
+
+  /** Loop ms charged to the loop budget so far. */
+  chargedLoop: number;
+
+  constructor(
+    readonly keys: PlanKeys | undefined,
+    readonly cls: RequestClass,
+    readonly predicted: RequestCost,
+    /** The share each budget was charged from (a light request may borrow heavy tokens). */
+    readonly shares: { clickhouse: RequestClass; loop: RequestClass },
+    readonly startedAt: number
+  ) {
+    this.chargedCpu = predicted.cpuSeconds;
+    this.chargedLoop = predicted.loopMs;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* stats                                                                */
+/* ------------------------------------------------------------------ */
+
+export interface AdmissionStats {
+  admitted: { [cls in RequestClass]: number };
+  refused: { [reason in RefusalReason]: number };
+  /** Requests whose cost had no sample of their own plan key. */
+  unknownPlans: number;
+  inFlight: { [cls in RequestClass]: number };
+  peakInFlight: { [cls in RequestClass]: number };
+  /** Statements with a measured CPU from `query_log`. */
+  ledgerResolved: number;
+  /** Statements whose `query_log` row never came (estimate kept). */
+  ledgerExpired: number;
+  /** The ledger's last error, if it stopped. */
+  ledgerError?: string;
+  /** Statements outside requests (live re-runs) charged. */
+  unticketed: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* the gate                                                             */
+/* ------------------------------------------------------------------ */
+
+/** Reads measured CPU (µs) of statements by query id; a missing id: not logged yet. */
+export type CpuReader = (
+  queryIds: readonly string[]
+) => Promise<Map<string, number>>;
+
+/** Loop busy time since the previous call, ms (default: `performance.eventLoopUtilization`). */
+export type LoopMeter = () => { activeMs: number; elapsedMs: number };
+
+const defaultLoopMeter = (): LoopMeter => {
+  let last = performance.eventLoopUtilization();
+  return () => {
+    const now = performance.eventLoopUtilization();
+    const delta = performance.eventLoopUtilization(now, last);
+    last = now;
+    return { activeMs: delta.active, elapsedMs: delta.active + delta.idle };
+  };
 };
 
-const nonNegativeInteger = (
+/** How long the ledger waits for a statement's `query_log` row before keeping the estimate, ms. */
+export const ledgerPatienceMs = 60_000;
+
+/** Ledger poll period, ms. */
+export const ledgerPollMs = 2_000;
+
+/** Loop attribution period, ms. */
+export const loopTickMs = 100;
+
+/** The admission gate of one API process. */
+export class Admission {
+  readonly stats: AdmissionStats = {
+    admitted: { heavy: 0, light: 0 },
+    inFlight: { heavy: 0, light: 0 },
+    ledgerExpired: 0,
+    ledgerResolved: 0,
+    peakInFlight: { heavy: 0, light: 0 },
+    refused: { clickhouse: 0, in_flight: 0, loop: 0, loop_guard: 0 },
+    unknownPlans: 0,
+    unticketed: 0,
+  };
+
+  readonly budgets: { clickhouse: Budget; loop: Budget };
+
+  readonly model: CostModel;
+
+  /** CPU per row read, seconds: global and per statement shape (learned from the ledger). */
+  private cpuPerRow: number;
+
+  private readonly cpuPerRowByShape = new Map<string, number>();
+
+  /** Requests in flight (loop attribution). */
+  private readonly active = new Set<Ticket>();
+
+  /** Statements awaiting their measured CPU, with their ticket (undefined: outside a request). */
+  private readonly pending = new Map<
+    string,
+    { statement: StatementRecord; ticket: Ticket | undefined }
+  >();
+
+  /** Loop utilisation of the last ~0.5 s (EWMA of the ticks). */
+  loopUtilisation = 0;
+
+  private tickTimer: NodeJS.Timeout | undefined;
+
+  private pollTimer: NodeJS.Timeout | undefined;
+
+  private ledgerBusy = false;
+
+  private cpuReader: CpuReader | undefined;
+
+  private readonly meter: LoopMeter;
+
+  constructor(
+    readonly options: AdmissionOptions = defaultAdmissionOptions,
+    meter?: LoopMeter
+  ) {
+    this.budgets = {
+      clickhouse: new Budget(options.clickhouse),
+      loop: new Budget(options.loop),
+    };
+    this.model = new CostModel(options.maxKeys);
+    this.cpuPerRow = options.defaultCpuPerRow;
+    this.meter = meter ?? defaultLoopMeter();
+  }
+
+  /** Start the loop attribution tick and (with a reader and `cpuSource` query_log) the ledger. Timers do not hold the process. */
+  start(cpuReader?: CpuReader) {
+    if (!this.options.enabled || this.tickTimer !== undefined) return;
+    this.cpuReader =
+      this.options.cpuSource === 'query_log' ? cpuReader : undefined;
+    this.meter();
+    this.tickTimer = setInterval(() => {
+      this.tick();
+    }, loopTickMs);
+    this.tickTimer.unref();
+    if (this.cpuReader !== undefined) {
+      this.pollTimer = setInterval(() => {
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        this.pollLedger();
+      }, ledgerPollMs);
+      this.pollTimer.unref();
+    }
+  }
+
+  stop() {
+    clearInterval(this.tickTimer);
+    clearInterval(this.pollTimer);
+    this.tickTimer = undefined;
+    this.pollTimer = undefined;
+  }
+
+  /** Where measured CPU comes from now (`rows` after the ledger stopped). */
+  get cpuSource() {
+    return this.cpuReader === undefined ? 'rows' : 'query_log';
+  }
+
+  /** The class of a predicted cost. */
+  classOf(cost: RequestCost): RequestClass {
+    return cost.cpuSeconds * 1000 <= this.options.lightMaxCpuMs &&
+      cost.loopMs <= this.options.lightMaxLoopMs
+      ? 'light'
+      : 'heavy';
+  }
+
+  /**
+   * The prediction for a request and its class: the model's, or the
+   * default for a request nothing is known about (always heavy: it may be
+   * anything, and only the heavy share may go deep into debt).
+   */
+  predict(keys: PlanKeys | undefined) {
+    const predicted = keys === undefined ? undefined : this.model.predict(keys);
+    const cost = predicted?.cost ?? this.options.unknownCost;
+    return {
+      cls: predicted === undefined ? ('heavy' as const) : this.classOf(cost),
+      cost,
+      source: predicted?.source ?? ('default' as const),
+    };
+  }
+
+  /**
+   * Admit a request (or throw OVERLOADED at once). `keys` undefined: a
+   * request the model cannot key (charged the default).
+   */
+  admit(keys: PlanKeys | undefined, now = performance.now()): Ticket {
+    const { cls, cost, source } = this.predict(keys);
+    const refuse = (reason: RefusalReason, detail: string, wait: number) => {
+      this.stats.refused[reason] += 1;
+      const retryAfter = Math.max(
+        this.options.minRetryAfterSeconds,
+        Math.min(60, Math.ceil(wait))
+      );
+      return overloadedError(cls, reason, detail, retryAfter);
+    };
+    if (
+      cls === 'heavy' &&
+      this.stats.inFlight.heavy >= this.options.heavyMaxInFlight
+    ) {
+      throw refuse(
+        'in_flight',
+        `${this.stats.inFlight.heavy} heavy requests in flight`,
+        1
+      );
+    }
+    if (cls === 'heavy' && this.loopUtilisation >= this.options.loopGuard) {
+      throw refuse(
+        'loop_guard',
+        `event loop ${Math.round(this.loopUtilisation * 100)} % busy`,
+        1
+      );
+    }
+    const { clickhouse, loop } = this.budgets;
+    clickhouse.refill(now);
+    loop.refill(now);
+    const chShare = clickhouse.take(cls, cost.cpuSeconds);
+    if (chShare === undefined) {
+      throw refuse(
+        'clickhouse',
+        `ClickHouse CPU budget spent, predicted ${cost.cpuSeconds.toFixed(
+          2
+        )} CPU-s`,
+        clickhouse.secondsToPositive(cls)
+      );
+    }
+    const loopShare = loop.take(cls, cost.loopMs);
+    if (loopShare === undefined) {
+      clickhouse.adjust(chShare, cost.cpuSeconds);
+      throw refuse(
+        'loop',
+        `event loop budget spent, predicted ${Math.round(cost.loopMs)} ms`,
+        loop.secondsToPositive(cls)
+      );
+    }
+    if (source !== 'plan') this.stats.unknownPlans += 1;
+    const ticket = new Ticket(
+      keys,
+      cls,
+      cost,
+      { clickhouse: chShare, loop: loopShare },
+      now
+    );
+    this.stats.admitted[cls] += 1;
+    this.stats.inFlight[cls] += 1;
+    this.stats.peakInFlight[cls] = Math.max(
+      this.stats.peakInFlight[cls],
+      this.stats.inFlight[cls]
+    );
+    this.active.add(ticket);
+    return ticket;
+  }
+
+  /** CPU estimate of a finished statement from its rows (until measured). */
+  estimateCpu(shape: string, rows: number) {
+    return rows * (this.cpuPerRowByShape.get(shape) ?? this.cpuPerRow);
+  }
+
+  /**
+   * A statement finished (its rows known). Inside a request it is part of
+   * the ticket; outside one (a live re-run) it is charged now.
+   */
+  statementFinished(
+    ticket: Ticket | undefined,
+    statement: StatementRecord,
+    now = performance.now()
+  ) {
+    if (!this.options.enabled) return;
+    statement.finishedAt = now;
+    if (this.cpuReader !== undefined) {
+      this.pending.set(statement.queryId, { statement, ticket });
+    }
+    if (ticket === undefined) {
+      this.stats.unticketed += 1;
+      const estimate = this.estimateCpu(statement.shape, statement.rows);
+      statement.chargedCpu = estimate;
+      this.budgets.clickhouse.refill(now);
+      this.budgets.clickhouse.adjust(
+        estimate * 1000 <= this.options.lightMaxCpuMs ? 'light' : 'heavy',
+        -estimate
+      );
+    }
+  }
+
+  /**
+   * The request ended (response written, or execution done without one):
+   * the loop charge is reconciled with the attributed time, the CPU charge
+   * with the statements' estimates (measured CPU follows from the ledger),
+   * and the model learns what is known.
+   */
+  finish(ticket: Ticket, now = performance.now()) {
+    if (ticket.finished) return;
+    ticket.finished = true;
+    this.active.delete(ticket);
+    this.stats.inFlight[ticket.cls] -= 1;
+    const { clickhouse, loop } = this.budgets;
+    clickhouse.refill(now);
+    loop.refill(now);
+    this.recharge(ticket, 'loop', ticket.loopMs);
+    const cpu = this.ticketCpu(ticket);
+    this.recharge(ticket, 'clickhouse', cpu);
+    if (ticket.keys !== undefined) {
+      /* the CPU is learned when every statement is measured (an estimate only seeds a new key) */
+      this.model.observe(
+        ticket.keys,
+        { cpuSeconds: cpu, loopMs: ticket.loopMs },
+        !this.allMeasured(ticket)
+      );
+    }
+  }
+
+  /**
+   * Replace what a ticket was charged in one budget by `actual`: the
+   * charge is given back to the share it came from, and the actual cost
+   * taken from that share, or from the heavy one when the request turned
+   * out heavy (a mispredicted light request must not put the light share
+   * into debt).
+   */
+  private recharge(
+    ticket: Ticket,
+    budget: 'clickhouse' | 'loop',
+    actual: number
+  ) {
+    const charged =
+      budget === 'clickhouse' ? ticket.chargedCpu : ticket.chargedLoop;
+    const heavyNow =
+      budget === 'clickhouse'
+        ? actual * 1000 > this.options.lightMaxCpuMs
+        : actual > this.options.lightMaxLoopMs;
+    const from = ticket.shares[budget];
+    const to = heavyNow ? 'heavy' : from;
+    this.budgets[budget].adjust(from, charged);
+    this.budgets[budget].adjust(to, -actual);
+    ticket.shares[budget] = to;
+    if (budget === 'clickhouse') ticket.chargedCpu = actual;
+    else ticket.chargedLoop = actual;
+  }
+
+  /** The request's CPU: measured where known, else estimated from rows. */
+  private ticketCpu(ticket: Ticket) {
+    return ticket.statements.reduce(
+      (sum, statement) =>
+        sum +
+        (statement.cpuSeconds ??
+          this.estimateCpu(statement.shape, statement.rows)),
+      0
+    );
+  }
+
+  private allMeasured(ticket: Ticket) {
+    return (
+      this.cpuReader === undefined ||
+      ticket.statements.every(
+        (statement) =>
+          statement.cpuSeconds !== undefined ||
+          !this.pending.has(statement.queryId)
+      )
+    );
+  }
+
+  /**
+   * One loop attribution period: the busy time goes to the requests not
+   * waiting for ClickHouse, in proportion to their predicted loop time (a
+   * light request queued behind a heavy one's decoding is not charged for
+   * it; the sum is exact either way).
+   */
+  tick() {
+    const { activeMs, elapsedMs } = this.meter();
+    if (elapsedMs > 0) {
+      const utilisation = Math.min(1, activeMs / elapsedMs);
+      this.loopUtilisation = this.loopUtilisation * 0.8 + utilisation * 0.2;
+    }
+    const working = [...this.active].filter((ticket) => ticket.waiting === 0);
+    if (working.length === 0) return;
+    const weight = (ticket: Ticket) => Math.max(1, ticket.predicted.loopMs);
+    const total = working.reduce((sum, ticket) => sum + weight(ticket), 0);
+    working.forEach((ticket) => {
+      ticket.loopMs += (activeMs * weight(ticket)) / total;
+    });
+  }
+
+  /** Read measured CPU of pending statements; reconcile budgets and the model. */
+  async pollLedger(now = performance.now()) {
+    if (this.cpuReader === undefined || this.ledgerBusy) return;
+    if (this.pending.size === 0) return;
+    this.ledgerBusy = true;
+    try {
+      const ids = [...this.pending.keys()].slice(0, 2_000);
+      const measured = await this.cpuReader(ids);
+      this.budgets.clickhouse.refill(now);
+      const touched = new Set<Ticket>();
+      for (const id of ids) {
+        const entry = this.pending.get(id);
+        const micros = measured.get(id);
+        if (entry !== undefined && micros === undefined) {
+          this.expireIfStale(id, entry, now, touched);
+        }
+        if (entry !== undefined && micros !== undefined) {
+          this.resolve(id, entry, micros, touched);
+        }
+      }
+      for (const ticket of touched) this.reconcileMeasured(ticket);
+    } catch (error: unknown) {
+      /* no grant on system.query_log (an older API user profile): estimates from rows from now on */
+      this.stats.ledgerError = String(error).slice(0, 200);
+      this.cpuReader = undefined;
+      this.pending.clear();
+      clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    } finally {
+      this.ledgerBusy = false;
+    }
+  }
+
+  /** A statement's measured CPU: the estimate replaced, the CPU per row learned. */
+  private resolve(
+    id: string,
+    entry: { statement: StatementRecord; ticket: Ticket | undefined },
+    micros: number,
+    touched: Set<Ticket>
+  ) {
+    this.pending.delete(id);
+    this.stats.ledgerResolved += 1;
+    const { statement, ticket } = entry;
+    const cpu = micros / 1e6;
+    const estimate =
+      statement.chargedCpu ?? this.estimateCpu(statement.shape, statement.rows);
+    statement.cpuSeconds = cpu;
+    this.learnCpuPerRow(statement.shape, statement.rows, cpu);
+    if (ticket === undefined) {
+      /* a statement outside a request was charged its estimate */
+      this.budgets.clickhouse.adjust(
+        estimate * 1000 <= this.options.lightMaxCpuMs ? 'light' : 'heavy',
+        estimate - cpu
+      );
+    } else {
+      touched.add(ticket);
+    }
+  }
+
+  /** Give up on a statement whose `query_log` row did not come within `ledgerPatienceMs` (its estimate stays). */
+  private expireIfStale(
+    id: string,
+    entry: { statement: StatementRecord; ticket: Ticket | undefined },
+    now: number,
+    touched: Set<Ticket>
+  ) {
+    if (now - (entry.statement.finishedAt ?? now) <= ledgerPatienceMs) return;
+    this.pending.delete(id);
+    this.stats.ledgerExpired += 1;
+    if (entry.ticket !== undefined) touched.add(entry.ticket);
+  }
+
+  /** A finished request whose statements' CPU became known: reconcile and learn. */
+  private reconcileMeasured(ticket: Ticket) {
+    if (!ticket.finished) return;
+    const cpu = this.ticketCpu(ticket);
+    this.recharge(ticket, 'clickhouse', cpu);
+    if (ticket.keys !== undefined && this.allMeasured(ticket)) {
+      this.model.observe(ticket.keys, {
+        cpuSeconds: cpu,
+        loopMs: ticket.loopMs,
+      });
+    }
+  }
+
+  private learnCpuPerRow(shape: string, rows: number, cpu: number) {
+    if (rows < 1_000) return;
+    const ratio = cpu / rows;
+    this.cpuPerRow = this.cpuPerRow * 0.9 + ratio * 0.1;
+    const before = this.cpuPerRowByShape.get(shape);
+    this.cpuPerRowByShape.delete(shape);
+    this.cpuPerRowByShape.set(
+      shape,
+      before === undefined
+        ? ratio
+        : before * (1 - costAlpha) + ratio * costAlpha
+    );
+    while (this.cpuPerRowByShape.size > this.options.maxKeys) {
+      const oldest = this.cpuPerRowByShape.keys().next().value;
+      if (oldest === undefined) break;
+      this.cpuPerRowByShape.delete(oldest);
+    }
+  }
+
+  /** The gate's state for `GET /admission` (server.ts). */
+  snapshot() {
+    const now = performance.now();
+    this.budgets.clickhouse.refill(now);
+    this.budgets.loop.refill(now);
+    return {
+      budgets: {
+        clickhouse: this.budgets.clickhouse.fill(),
+        loop: this.budgets.loop.fill(),
+      },
+      cpuPerRow: this.cpuPerRow,
+      cpuSource: this.cpuSource,
+      enabled: this.options.enabled,
+      loopUtilisation: this.loopUtilisation,
+      modelKeys: this.model.size,
+      pendingStatements: this.pending.size,
+      stats: this.stats,
+    };
+  }
+
+  /** Statements awaiting their measured CPU (tests, stats). */
+  get pendingStatements() {
+    return this.pending.size;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* configuration                                                        */
+/* ------------------------------------------------------------------ */
+
+const nonNegativeNumber = (
   env: NodeJS.ProcessEnv,
   name: string,
-  fallback: number
+  fallback: number,
+  { integer = false, max = Number.POSITIVE_INFINITY } = {}
 ) => {
   const raw = env[name];
   if (raw === undefined || raw === '') return fallback;
   const value = Number(raw);
-  if (!Number.isInteger(value) || value < 0) {
-    throw new Error(`${name} must be an integer >= 0.`);
+  if (
+    !Number.isFinite(value) ||
+    value < 0 ||
+    value > max ||
+    (integer && !Number.isInteger(value))
+  ) {
+    throw new Error(
+      `${name} must be ${integer ? 'an integer' : 'a number'} >= 0${
+        Number.isFinite(max) ? ` and <= ${max}` : ''
+      }.`
+    );
   }
   return value;
 };
 
-const laneSettingsFromEnv = (
-  env: NodeJS.ProcessEnv,
-  prefix: string,
-  fallback: LaneLimits['settings']
-) => {
-  const settings: LaneLimits['settings'] = { ...fallback };
-  const threads = env[`${prefix}_MAX_THREADS`];
-  if (threads !== undefined && threads !== '') {
-    const value = nonNegativeInteger(env, `${prefix}_MAX_THREADS`, 0);
-    if (value === 0) delete settings.max_threads;
-    else settings.max_threads = value;
-  }
-  const priority = env[`${prefix}_PRIORITY`];
-  if (priority !== undefined && priority !== '') {
-    const value = nonNegativeInteger(env, `${prefix}_PRIORITY`, 0);
-    if (value === 0) delete settings.priority;
-    else settings.priority = value;
-  }
+const classSettingsFromEnv = (env: NodeJS.ProcessEnv, prefix: string) => {
+  const settings: { [name: string]: number | string } = {};
+  const threads = nonNegativeNumber(env, `${prefix}_MAX_THREADS`, 0, {
+    integer: true,
+  });
+  if (threads > 0) settings.max_threads = threads;
+  const priority = nonNegativeNumber(env, `${prefix}_PRIORITY`, 0, {
+    integer: true,
+  });
+  if (priority > 0) settings.priority = priority;
   const workload = env[`${prefix}_WORKLOAD`];
   if (workload !== undefined && workload !== '') {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(workload)) {
@@ -223,32 +1035,42 @@ const laneSettingsFromEnv = (
 
 /**
  * From the environment (all optional):
- * CHAINGRAPH_API_ADMISSION (`on` | `off`, default on);
- * CHAINGRAPH_API_CLICKHOUSE_CORES: the cores the lane sizes are derived
- * from (default: `serverCores`, the ClickHouse server's `max_threads` for
- * the API user, read at startup; without either the static defaults);
- * CHAINGRAPH_API_LIGHT_… / CHAINGRAPH_API_HEAVY_…: MAX_CONCURRENT (default
- * derived from the cores, `laneConcurrencyForCores`), MAX_QUEUED, MAX_WAIT_MS;
- * MAX_THREADS (0 or unset: the server's default),
- * _PRIORITY (0: none; for the heavy lane the priority of CONTENDED heavy
- * statements, default 2), _WORKLOAD (a ClickHouse workload name);
- * CHAINGRAPH_API_HEAVY_CONTENDED_AT (heavy statements running as a
- * fraction of the heavy slots from which a newly admitted one is contended,
- * default 1; 0: always), CHAINGRAPH_API_HEAVY_ROWS;
- * CHAINGRAPH_API_RETRY_AFTER_SECONDS.
+ * - CHAINGRAPH_API_ADMISSION `on` | `off` (default on);
+ * - CHAINGRAPH_API_CLICKHOUSE_CORES: the server's cores (default
+ *   `serverCores`, its `max_threads` for the API user; else 48);
+ * - CHAINGRAPH_API_PROCESSES: API processes sharing the server (pods ×
+ *   workers; default 1 × `workers`): the CPU budget is divided by it;
+ * - CHAINGRAPH_API_CPU_TARGET (0.75), CHAINGRAPH_API_LOOP_TARGET (0.85):
+ *   the budgets' rates as fractions of the cores and of the loop;
+ * - CHAINGRAPH_API_LIGHT_SHARE (0.25), CHAINGRAPH_API_BURST_SECONDS (2),
+ *   CHAINGRAPH_API_LOOP_BURST_SECONDS (0.5);
+ * - CHAINGRAPH_API_LIGHT_MAX_CPU_MS (250), CHAINGRAPH_API_LIGHT_MAX_LOOP_MS
+ *   (25): the light class;
+ * - CHAINGRAPH_API_HEAVY_MAX_IN_FLIGHT (default cores / 2 / processes, at
+ *   least 2), CHAINGRAPH_API_LOOP_GUARD (0.95);
+ * - CHAINGRAPH_API_UNKNOWN_CPU_MS (250), CHAINGRAPH_API_UNKNOWN_LOOP_MS (20);
+ * - CHAINGRAPH_API_CPU_SOURCE `query_log` | `rows` (default query_log; the
+ *   API user needs SELECT on system.query_log, else rows are used);
+ * - CHAINGRAPH_API_LIGHT_… / CHAINGRAPH_API_HEAVY_… MAX_THREADS, PRIORITY, WORKLOAD: ClickHouse
+ *   settings of each class's statements (default none: the server's);
+ * - CHAINGRAPH_API_RETRY_AFTER_SECONDS: the least Retry-After (1).
  */
 export const admissionOptionsFromEnv = (
   env: NodeJS.ProcessEnv = process.env,
-  serverCores?: number
+  serverCores?: number,
+  workers = 1
 ): AdmissionOptions => {
   const flag = env.CHAINGRAPH_API_ADMISSION ?? 'on';
   if (flag !== 'on' && flag !== 'off' && flag !== '') {
     throw new Error(`CHAINGRAPH_API_ADMISSION must be 'on' or 'off'.`);
   }
-  const envCores = nonNegativeInteger(
+  const envCores = nonNegativeNumber(
     env,
     'CHAINGRAPH_API_CLICKHOUSE_CORES',
-    0
+    0,
+    {
+      integer: true,
+    }
   );
   const knownServerCores =
     serverCores !== undefined &&
@@ -257,125 +1079,121 @@ export const admissionOptionsFromEnv = (
       ? serverCores
       : undefined;
   const cores = envCores > 0 ? envCores : knownServerCores;
-  const sizing: NonNullable<AdmissionOptions['sizing']> = {
-    cores,
-    source:
-      envCores > 0
-        ? 'env'
-        : knownServerCores === undefined
-        ? 'default'
-        : 'clickhouse',
-  };
-  const heavySettings = laneSettingsFromEnv(
-    env,
-    'CHAINGRAPH_API_HEAVY',
-    defaultAdmissionOptions.heavy.settings
+  const processes = Math.max(
+    1,
+    nonNegativeNumber(env, 'CHAINGRAPH_API_PROCESSES', Math.max(1, workers), {
+      integer: true,
+    })
   );
-  /* the heavy lane's priority applies under contention only (fix-pass-7.md §1) */
-  const contendedPriority = nonNegativeInteger(
+  const cpuTarget = nonNegativeNumber(
     env,
-    'CHAINGRAPH_API_HEAVY_PRIORITY',
-    Number(defaultAdmissionOptions.contendedSettings.priority ?? 0)
+    'CHAINGRAPH_API_CPU_TARGET',
+    defaultCpuTarget,
+    { max: 4 }
   );
-  const contendedAtRaw = env.CHAINGRAPH_API_HEAVY_CONTENDED_AT;
-  const contendedAt =
-    contendedAtRaw === undefined || contendedAtRaw === ''
-      ? defaultAdmissionOptions.contendedAt
-      : Number(contendedAtRaw);
-  if (!Number.isFinite(contendedAt) || contendedAt < 0) {
-    throw new Error('CHAINGRAPH_API_HEAVY_CONTENDED_AT must be a number >= 0.');
+  const loopTarget = nonNegativeNumber(
+    env,
+    'CHAINGRAPH_API_LOOP_TARGET',
+    defaultLoopTarget,
+    { max: 1 }
+  );
+  const lightShare = nonNegativeNumber(
+    env,
+    'CHAINGRAPH_API_LIGHT_SHARE',
+    defaultAdmissionOptions.clickhouse.lightShare,
+    { max: 1 }
+  );
+  const usableCores = cores ?? defaultCores;
+  const cpuSource = env.CHAINGRAPH_API_CPU_SOURCE ?? 'query_log';
+  if (cpuSource !== 'query_log' && cpuSource !== 'rows') {
+    throw new Error(`CHAINGRAPH_API_CPU_SOURCE must be 'query_log' or 'rows'.`);
   }
-  const derived =
-    cores === undefined
-      ? undefined
-      : laneConcurrencyForCores(
-          cores,
-          typeof heavySettings.max_threads === 'number'
-            ? heavySettings.max_threads
-            : 0
-        );
-  const lane = (name: 'HEAVY' | 'LIGHT', defaults: LaneLimits) => {
-    const prefix = `CHAINGRAPH_API_${name}`;
-    const fallback: LaneLimits =
-      derived === undefined
-        ? defaults
-        : {
-            ...defaults,
-            maxConcurrent: name === 'HEAVY' ? derived.heavy : derived.light,
-            /*
-             * the heavy queue holds about 2 statements per slot (24 at 12):
-             * a deeper queue only turns fast refusals into long waits
-             */
-            maxQueued:
-              name === 'HEAVY'
-                ? derived.heavy * heavyQueuedPerSlot
-                : defaults.maxQueued,
-          };
-    const limits: LaneLimits = {
-      maxConcurrent: nonNegativeInteger(
-        env,
-        `${prefix}_MAX_CONCURRENT`,
-        fallback.maxConcurrent
-      ),
-      maxQueued: nonNegativeInteger(
-        env,
-        `${prefix}_MAX_QUEUED`,
-        fallback.maxQueued
-      ),
-      maxWaitMs: nonNegativeInteger(
-        env,
-        `${prefix}_MAX_WAIT_MS`,
-        fallback.maxWaitMs
-      ),
-      settings: laneSettingsFromEnv(env, prefix, fallback.settings),
-    };
-    if (name === 'HEAVY') delete limits.settings.priority;
-    if (limits.maxConcurrent < 1) {
-      throw new Error(`${prefix}_MAX_CONCURRENT must be at least 1.`);
-    }
-    return limits;
-  };
-  const heavy = lane('HEAVY', defaultAdmissionOptions.heavy);
-  /*
-   * contended heavy statements share the cores: about 2 cores' worth of
-   * threads per heavy slot (4 at 48 cores / 24 slots), unless set (0: none)
-   */
-  const contendedThreads = nonNegativeInteger(
-    env,
-    'CHAINGRAPH_API_HEAVY_CONTENDED_MAX_THREADS',
-    cores === undefined
-      ? Number(defaultAdmissionOptions.contendedSettings.max_threads ?? 0)
-      : Math.min(
-          Math.max(2, Math.round((2 * cores) / heavy.maxConcurrent)),
-          typeof heavy.settings.max_threads === 'number'
-            ? heavy.settings.max_threads
-            : Number.POSITIVE_INFINITY
-        )
-  );
   return {
-    contendedAt,
-    contendedSettings: {
-      ...(contendedThreads === 0 ? {} : { max_threads: contendedThreads }),
-      ...(contendedPriority === 0 ? {} : { priority: contendedPriority }),
-    },
-    enabled: flag !== 'off',
-    heavy,
-    heavyRows: nonNegativeInteger(
-      env,
-      'CHAINGRAPH_API_HEAVY_ROWS',
-      defaultAdmissionOptions.heavyRows
-    ),
-    light: lane('LIGHT', defaultAdmissionOptions.light),
-    maxShapes: defaultAdmissionOptions.maxShapes,
-    retryAfterSeconds: Math.max(
-      1,
-      nonNegativeInteger(
+    clickhouse: {
+      burstSeconds: nonNegativeNumber(
         env,
-        'CHAINGRAPH_API_RETRY_AFTER_SECONDS',
-        defaultAdmissionOptions.retryAfterSeconds
+        'CHAINGRAPH_API_BURST_SECONDS',
+        defaultAdmissionOptions.clickhouse.burstSeconds
+      ),
+      lightShare,
+      ratePerSecond: (usableCores * cpuTarget) / processes,
+    },
+    cpuSource,
+    defaultCpuPerRow: defaultAdmissionOptions.defaultCpuPerRow,
+    enabled: flag !== 'off',
+    heavyMaxInFlight: Math.max(
+      1,
+      nonNegativeNumber(
+        env,
+        'CHAINGRAPH_API_HEAVY_MAX_IN_FLIGHT',
+        Math.max(2, Math.round(usableCores / 2 / processes)),
+        { integer: true }
       )
     ),
-    sizing,
+    lightMaxCpuMs: nonNegativeNumber(
+      env,
+      'CHAINGRAPH_API_LIGHT_MAX_CPU_MS',
+      defaultAdmissionOptions.lightMaxCpuMs
+    ),
+    lightMaxLoopMs: nonNegativeNumber(
+      env,
+      'CHAINGRAPH_API_LIGHT_MAX_LOOP_MS',
+      defaultAdmissionOptions.lightMaxLoopMs
+    ),
+    loop: {
+      burstSeconds: nonNegativeNumber(
+        env,
+        'CHAINGRAPH_API_LOOP_BURST_SECONDS',
+        defaultAdmissionOptions.loop.burstSeconds
+      ),
+      lightShare,
+      ratePerSecond: 1000 * loopTarget,
+    },
+    loopGuard: nonNegativeNumber(
+      env,
+      'CHAINGRAPH_API_LOOP_GUARD',
+      defaultAdmissionOptions.loopGuard,
+      { max: 1 }
+    ),
+    maxKeys: defaultAdmissionOptions.maxKeys,
+    minRetryAfterSeconds: Math.max(
+      1,
+      nonNegativeNumber(
+        env,
+        'CHAINGRAPH_API_RETRY_AFTER_SECONDS',
+        defaultAdmissionOptions.minRetryAfterSeconds,
+        { integer: true }
+      )
+    ),
+    settings: {
+      heavy: classSettingsFromEnv(env, 'CHAINGRAPH_API_HEAVY'),
+      light: classSettingsFromEnv(env, 'CHAINGRAPH_API_LIGHT'),
+    },
+    sizing: {
+      cores,
+      cpuTarget,
+      loopTarget,
+      processes,
+      source:
+        envCores > 0
+          ? 'env'
+          : knownServerCores === undefined
+          ? 'default'
+          : 'clickhouse',
+    },
+    unknownCost: {
+      cpuSeconds:
+        nonNegativeNumber(
+          env,
+          'CHAINGRAPH_API_UNKNOWN_CPU_MS',
+          defaultAdmissionOptions.unknownCost.cpuSeconds * 1000
+        ) / 1000,
+      loopMs: nonNegativeNumber(
+        env,
+        'CHAINGRAPH_API_UNKNOWN_LOOP_MS',
+        defaultAdmissionOptions.unknownCost.loopMs
+      ),
+    },
   };
 };
 
@@ -415,361 +1233,41 @@ export const readClickHouseServerLimits = async (client: {
   }
 };
 
+const settingsText = (settings: { [name: string]: number | string }) =>
+  Object.entries(settings)
+    .map(([name, value]) => `${name} ${String(value)}`)
+    .join(',') || 'server default';
+
 /** One line describing the admission sizing, for the API's startup log. */
 export const admissionSummary = (
   options: AdmissionOptions,
-  backstop: number | undefined
+  backstop: number | undefined,
+  cpuSource?: string
 ) =>
-  `admission: ${options.enabled ? 'on' : 'off'} cores=${
+  `admission: ${options.enabled ? 'on' : 'off'} (request level) cores=${
     options.sizing?.cores ?? 'unknown'
-  } (${options.sizing?.source ?? 'default'}) light=${
-    options.light.maxConcurrent
-  } heavy=${options.heavy.maxConcurrent} heavy_max_threads=${String(
-    options.heavy.settings.max_threads ?? 'server default'
-  )} heavy_contended=${options.contendedAt}:${
-    Object.entries(options.contendedSettings)
-      .map(([name, value]) => `${name} ${String(value)}`)
-      .join(',') || 'none'
-  } heavy_rows=${options.heavyRows} max_wait_ms=${options.light.maxWaitMs}/${
-    options.heavy.maxWaitMs
-  } max_concurrent_queries_for_user=${
+  } (${options.sizing?.source ?? 'default'}) processes=${
+    options.sizing?.processes ?? 1
+  } cpu_budget=${options.clickhouse.ratePerSecond.toFixed(1)} CPU-s/s burst ${
+    options.clickhouse.burstSeconds
+  } s loop_budget=${Math.round(options.loop.ratePerSecond)} ms/s burst ${
+    options.loop.burstSeconds
+  } s light_share=${options.clickhouse.lightShare} light<=${
+    options.lightMaxCpuMs
+  } CPU-ms,${options.lightMaxLoopMs} loop-ms heavy_in_flight=${
+    options.heavyMaxInFlight
+  } loop_guard=${options.loopGuard} unknown=${Math.round(
+    options.unknownCost.cpuSeconds * 1000
+  )} CPU-ms,${options.unknownCost.loopMs} loop-ms cpu_source=${
+    cpuSource ?? options.cpuSource
+  } light_settings=${settingsText(
+    options.settings.light
+  )} heavy_settings=${settingsText(
+    options.settings.heavy
+  )} max_concurrent_queries_for_user=${
     backstop === undefined ? 'unknown' : backstop === 0 ? '0 (none)' : backstop
   }`;
-
-/** The error code of a refused statement. */
-export const overloadedCode = 'OVERLOADED';
-
-/** The error code of a statement of a request whose client went away. */
-export const requestAbortedCode = 'REQUEST_ABORTED';
-
-export const overloadedError = (
-  lane: Lane,
-  reason: string,
-  retryAfterSeconds: number
-) =>
-  new GraphQLError(
-    `The API is overloaded (${lane} statements: ${reason}); retry after ${retryAfterSeconds} s.`,
-    {
-      extensions: {
-        code: overloadedCode,
-        http: {
-          headers: { 'Retry-After': String(retryAfterSeconds) },
-          status: 503,
-        },
-        lane,
-        retryAfterSeconds,
-      },
-    }
-  );
-
-export const requestAbortedError = () =>
-  new GraphQLError(
-    'The request was abandoned by its client; its statements were dropped or cancelled.',
-    { extensions: { code: requestAbortedCode } }
-  );
-
-export interface LaneStats {
-  running: number;
-  queued: number;
-  admitted: number;
-  /** Refused: queue full. */
-  rejectedFull: number;
-  /** Refused: waited longer than allowed. */
-  rejectedWait: number;
-  /** Refused at once: the predicted wait was longer than allowed. */
-  rejectedPredicted: number;
-  /** Left the queue because the request went away. */
-  abandoned: number;
-  /** Highest `running` seen. */
-  peakRunning: number;
-  /** Highest `queued` seen. */
-  peakQueued: number;
-}
-
-const emptyStats = (): LaneStats => ({
-  abandoned: 0,
-  admitted: 0,
-  peakQueued: 0,
-  peakRunning: 0,
-  queued: 0,
-  rejectedFull: 0,
-  rejectedPredicted: 0,
-  rejectedWait: 0,
-  running: 0,
-});
-
-/** A slot taken: when, the lane's running statements then (itself included), and whether it waited. */
-interface Slot {
-  at: number;
-  running: number;
-  queued: boolean;
-}
-
-interface Waiter {
-  resolve: (slot: Slot) => void;
-  reject: (error: unknown) => void;
-  timer: NodeJS.Timeout | undefined;
-  onAbort: () => void;
-  signal: AbortSignal | undefined;
-}
-
-/** One lane: a counting semaphore with a bounded FIFO queue. */
-class LaneGate {
-  readonly stats = emptyStats();
-
-  /** Recent statement time of the lane (EWMA, ms; undefined until one finished). */
-  serviceMs: number | undefined;
-
-  private readonly queue: Waiter[] = [];
-
-  /** Start times of the running statements. */
-  private readonly running: Slot[] = [];
-
-  /**
-   * The wait a statement joining the queue now can expect (0 until the lane
-   * has a measured statement time S): a running statement younger than S is
-   * expected to end in S − its age, an older one in its age again (a
-   * statement that has run long is likely a long one: heavy statements'
-   * times spread over 10×); position p in the queue gets the p-th slot to
-   * free (sorted), and every further round of slots adds S.
-   */
-  predictedWaitMs(now = Date.now()) {
-    const service = this.serviceMs;
-    if (service === undefined || this.running.length === 0) return 0;
-    const remaining = this.running
-      .map((slot) => {
-        const age = now - slot.at;
-        return age < service ? service - age : age;
-      })
-      .sort((a, b) => a - b);
-    const position = this.queue.length;
-    return (
-      remaining[position % remaining.length]! +
-      Math.floor(position / remaining.length) * service
-    );
-  }
-
-  constructor(
-    readonly lane: Lane,
-    private readonly limits: LaneLimits,
-    private readonly retryAfterSeconds: number
-  ) {}
-
-  /**
-   * Wait for a slot (or fail fast); the caller must `release()` once done.
-   * Resolves with the lane's running statements at the moment it took the
-   * slot (itself included).
-   */
-  async acquire(signal?: AbortSignal): Promise<Slot> {
-    if (signal?.aborted === true) throw requestAbortedError();
-    if (
-      this.stats.running < this.limits.maxConcurrent &&
-      this.queue.length === 0
-    ) {
-      return this.take(false);
-    }
-    if (this.queue.length >= this.limits.maxQueued) {
-      this.stats.rejectedFull += 1;
-      throw overloadedError(
-        this.lane,
-        `${this.stats.running} running, ${this.queue.length} queued`,
-        this.retryAfterSeconds
-      );
-    }
-    const predicted = this.predictedWaitMs();
-    if (predicted > this.limits.maxWaitMs) {
-      /* refuse now rather than after the wait (fix-pass-7.md §1) */
-      this.stats.rejectedPredicted += 1;
-      throw overloadedError(
-        this.lane,
-        `${this.stats.running} running, ${
-          this.queue.length
-        } queued, predicted wait ${Math.round(predicted)} ms > ${
-          this.limits.maxWaitMs
-        } ms`,
-        this.retryAfterSeconds
-      );
-    }
-    return new Promise<Slot>((resolve, reject) => {
-      const waiter: Waiter = {
-        onAbort: () => {
-          this.remove(waiter);
-          this.stats.abandoned += 1;
-          reject(requestAbortedError());
-        },
-        reject,
-        resolve,
-        signal,
-        timer: undefined,
-      };
-      waiter.timer = setTimeout(() => {
-        this.remove(waiter);
-        this.stats.rejectedWait += 1;
-        reject(
-          overloadedError(
-            this.lane,
-            `no slot within ${this.limits.maxWaitMs} ms`,
-            this.retryAfterSeconds
-          )
-        );
-      }, this.limits.maxWaitMs);
-      signal?.addEventListener('abort', waiter.onAbort, { once: true });
-      this.queue.push(waiter);
-      this.stats.queued = this.queue.length;
-      this.stats.peakQueued = Math.max(
-        this.stats.peakQueued,
-        this.queue.length
-      );
-    });
-  }
-
-  /** Free `slot`; `measured`: its time counts as the lane's service time (not a failed or abandoned statement). */
-  release(slot: Slot, measured = true) {
-    const ms = Date.now() - slot.at;
-    if (measured) {
-      this.serviceMs =
-        this.serviceMs === undefined ? ms : this.serviceMs * 0.8 + ms * 0.2;
-    }
-    const index = this.running.indexOf(slot);
-    if (index >= 0) this.running.splice(index, 1);
-    this.stats.running -= 1;
-    const next = this.queue.shift();
-    this.stats.queued = this.queue.length;
-    if (next === undefined) return;
-    clearTimeout(next.timer);
-    next.signal?.removeEventListener('abort', next.onAbort);
-    next.resolve(this.take(true));
-  }
-
-  private take(queued: boolean): Slot {
-    this.stats.running += 1;
-    this.stats.admitted += 1;
-    this.stats.peakRunning = Math.max(
-      this.stats.peakRunning,
-      this.stats.running
-    );
-    const slot = { at: Date.now(), queued, running: this.stats.running };
-    this.running.push(slot);
-    return slot;
-  }
-
-  private remove(waiter: Waiter) {
-    clearTimeout(waiter.timer);
-    waiter.signal?.removeEventListener('abort', waiter.onAbort);
-    const index = this.queue.indexOf(waiter);
-    if (index >= 0) this.queue.splice(index, 1);
-    this.stats.queued = this.queue.length;
-  }
-}
 
 /** The statement shape a cost is remembered by: label + SQL text (no parameter values). */
 export const statementShape = (label: string, sql: string) =>
   createHash('sha256').update(label).update('\0').update(sql).digest('hex');
-
-/** The gate of one API process. */
-export class Admission {
-  readonly lanes: { [lane in Lane]: LaneGate };
-
-  /** Cost EWMA per statement shape, rows read (insertion order = recency). */
-  private readonly costs = new Map<string, number>();
-
-  constructor(readonly options: AdmissionOptions = defaultAdmissionOptions) {
-    this.lanes = {
-      heavy: new LaneGate('heavy', options.heavy, options.retryAfterSeconds),
-      light: new LaneGate('light', options.light, options.retryAfterSeconds),
-    };
-  }
-
-  /**
-   * The ClickHouse settings of a statement admitted to `lane` (`slot`: the
-   * lane's running statements then, itself included, and whether it
-   * waited in the queue): the lane's settings, plus `contendedSettings`
-   * for a contended heavy statement (it waited, or the heavy lane holds at
-   * least `contendedAt` × its slots).
-   */
-  laneSettings(
-    lane: Lane,
-    slot: Pick<Slot, 'queued' | 'running'>
-  ): LaneLimits['settings'] {
-    const { settings } = this.options[lane];
-    const contended =
-      slot.queued ||
-      slot.running >=
-        Math.max(
-          1,
-          Math.ceil(this.options.contendedAt * this.options.heavy.maxConcurrent)
-        );
-    if (lane !== 'heavy' || !contended) return settings;
-    return { ...settings, ...this.options.contendedSettings };
-  }
-
-  /** The lane of a statement: heavy for shapes with a heavy history and for unmeasured aggregates. */
-  laneOf(shape: string, aggregate: boolean): Lane {
-    const cost = this.costs.get(shape);
-    if (cost === undefined) return aggregate ? 'heavy' : 'light';
-    return cost >= this.options.heavyRows ? 'heavy' : 'light';
-  }
-
-  /** The cost recorded for a statement that timed out or ran out of memory. */
-  get failedCost() {
-    return Math.max(1, this.options.heavyRows) * 10;
-  }
-
-  /** Record a statement's cost (rows read). */
-  record(shape: string, rows: number) {
-    const before = this.costs.get(shape);
-    this.costs.delete(shape);
-    /* a costly run counts at once; cheap runs bring a heavy shape back slowly */
-    this.costs.set(
-      shape,
-      before === undefined || rows > before ? rows : before * 0.7 + rows * 0.3
-    );
-    if (this.costs.size > this.options.maxShapes) {
-      const oldest = this.costs.keys().next().value;
-      if (oldest !== undefined) this.costs.delete(oldest);
-    }
-  }
-
-  /**
-   * Run `send` once the statement is admitted to its lane, with the lane's
-   * ClickHouse settings; `send` reports the rows the statement read
-   * (`report`), and a statement that failed with `costly(error)` true
-   * counts as heavy. Without admission (`enabled` false) `send` runs at
-   * once with no extra settings.
-   */
-  async run<T>(
-    shape: string,
-    aggregate: boolean,
-    signal: AbortSignal | undefined,
-    send: (
-      settings: LaneLimits['settings'],
-      report: (rows: number) => void
-    ) => Promise<T>,
-    costly: (error: unknown) => boolean = () => false
-  ): Promise<T> {
-    const report = (rows: number) => {
-      this.record(shape, rows);
-    };
-    if (!this.options.enabled) {
-      if (signal?.aborted === true) throw requestAbortedError();
-      return send({}, report);
-    }
-    const lane = this.laneOf(shape, aggregate);
-    const gate = this.lanes[lane];
-    const slot = await gate.acquire(signal);
-    const outcome = { failed: false };
-    try {
-      return await send(this.laneSettings(lane, slot), report);
-    } catch (error: unknown) {
-      outcome.failed = true;
-      /* an abandoned statement's failure says nothing about its cost */
-      if (signal?.aborted !== true && costly(error)) {
-        this.record(shape, this.failedCost);
-      }
-      throw error;
-    } finally {
-      /* a failed or abandoned statement's time says nothing about the lane's */
-      gate.release(slot, !outcome.failed);
-    }
-  }
-}

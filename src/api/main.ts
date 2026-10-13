@@ -25,19 +25,25 @@
  *   statement; over budget, ClickHouse stops the statement and the API
  *   answers a QUERY_TIMEOUT error. The ClickHouse client's request timeout is
  *   the larger budget plus a margin, and a timed-out read is not retried;
- * - admission control (admission.ts, fix-pass-4.md): data statements pass a
- *   light or a heavy lane with a concurrency limit, a bounded queue and a
- *   bounded wait; over them the API answers OVERLOADED (HTTP 503,
+ * - admission control (admission.ts, fix-pass-8.md): each query request is
+ *   admitted or refused before any statement runs, by its predicted
+ *   ClickHouse CPU and event-loop time against two token budgets
+ *   (ClickHouse: the server's cores × CHAINGRAPH_API_CPU_TARGET / API
+ *   processes; the loop: CHAINGRAPH_API_LOOP_TARGET), light requests with a
+ *   reserved share; refused, the API answers OVERLOADED (HTTP 503,
  *   Retry-After) at once. CHAINGRAPH_API_ADMISSION=off disables it. The
- *   lane sizes are derived at startup from the ClickHouse server's cores
- *   (`max_threads` of the API user; CHAINGRAPH_API_CLICKHOUSE_CORES
- *   overrides), logged in one `admission:` line;
- *   CHAINGRAPH_API_{LIGHT,HEAVY}_{MAX_CONCURRENT,MAX_QUEUED,MAX_WAIT_MS,
- *   MAX_THREADS,PRIORITY,WORKLOAD}, CHAINGRAPH_API_HEAVY_ROWS and
- *   CHAINGRAPH_API_RETRY_AFTER_SECONDS tune it;
- * - a request whose client goes away has its queued statements dropped and
+ *   cores are read at startup (`max_threads` of the API user;
+ *   CHAINGRAPH_API_CLICKHOUSE_CORES overrides); one `admission:` line logs
+ *   the sizing; admissionOptionsFromEnv lists the tuning variables;
+ * - CHAINGRAPH_API_WORKERS (default 1): worker processes sharing the port
+ *   (node:cluster), each with its own event loop and its share of the
+ *   ClickHouse budget: a single loop is the API's limit at mainnet scale
+ *   (fix-pass-8.md §2);
+ * - a request whose client goes away has its unsent statements dropped and
  *   its running ones cancelled (KILL QUERY by query_id).
  */
+import cluster from 'node:cluster';
+
 import {
   ClickHouseClient,
   clickHouseConfigFromEnv,
@@ -59,8 +65,21 @@ import { createApi, listen } from './server.js';
 
 const defaultPort = 4000;
 
+/** CHAINGRAPH_API_WORKERS: worker processes (default 1: no cluster). */
+const workersFromEnv = (env: NodeJS.ProcessEnv) => {
+  const raw = env.CHAINGRAPH_API_WORKERS;
+  if (raw === undefined || raw === '') return 1;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error('CHAINGRAPH_API_WORKERS must be an integer >= 1.');
+  }
+  return value;
+};
+
 const main = async () => {
   const { env } = process;
+  const workers = workersFromEnv(env);
   const statementTimeouts = statementTimeoutsFromEnv(env);
   const client = new ClickHouseClient({
     ...clickHouseConfigFromEnv(env),
@@ -70,11 +89,20 @@ const main = async () => {
   });
   /* lane sizes follow the ClickHouse server's cores (fix-pass-4.md §8) */
   const serverLimits = await readClickHouseServerLimits(client);
-  const admission = admissionOptionsFromEnv(env, serverLimits.maxThreads);
-  // eslint-disable-next-line no-console
-  console.log(
-    admissionSummary(admission, serverLimits.maxConcurrentQueriesForUser)
+  const admission = admissionOptionsFromEnv(
+    env,
+    serverLimits.maxThreads,
+    workers
   );
+  if (cluster.isPrimary || cluster.worker?.id === 1) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `${admissionSummary(
+        admission,
+        serverLimits.maxConcurrentQueriesForUser
+      )} workers=${workers}`
+    );
+  }
   const trusted = env.CHAINGRAPH_API_TRUSTED_DOCUMENTS;
   const api = createApi(client, {
     ...(env.CHAINGRAPH_API_AGENT_URL === undefined
@@ -127,8 +155,29 @@ const main = async () => {
   process.once('SIGTERM', stop);
 };
 
-main().catch((error: unknown) => {
-  // eslint-disable-next-line no-console
-  console.error(error);
-  process.exitCode = 1;
-});
+const workerCount = workersFromEnv(process.env);
+if (workerCount > 1 && cluster.isPrimary) {
+  /* the primary only forks (and replaces a worker that exits); workers share the port */
+  Array.from({ length: workerCount }).forEach(() => cluster.fork());
+  cluster.on('exit', (worker, code, signal) => {
+    // eslint-disable-next-line no-console
+    console.error(
+      `API worker ${String(worker.process.pid)} exited (${String(
+        signal || code
+      )}); starting another`
+    );
+    cluster.fork();
+  });
+  const stopAll = () => {
+    cluster.removeAllListeners('exit');
+    Object.values(cluster.workers ?? {}).forEach((worker) => worker?.kill());
+  };
+  process.once('SIGINT', stopAll);
+  process.once('SIGTERM', stopAll);
+} else {
+  main().catch((error: unknown) => {
+    // eslint-disable-next-line no-console
+    console.error(error);
+    process.exitCode = 1;
+  });
+}
