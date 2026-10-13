@@ -613,7 +613,7 @@ const walkInOrder = async (
 };
 
 e2e(
-  '[e2e] transactions pages over candidates (fix-pass-6.md §2): the candidate window, capped (page found in it, or the fallback to every candidate) and not, ASC and DESC, equals the evaluator in id order, has_more exact',
+  '[e2e] transactions pages over candidates (fix-pass-6.md §2): the candidate window, capped (page found in it, or the fallback statement over every candidate) and not, ASC and DESC, equals the evaluator in id order, has_more exact',
   async (t) => {
     t.timeout(300_000);
     const env = await setup(t, 'g2_cand_window');
@@ -686,9 +686,19 @@ e2e(
     env.api.db.candidateWindowRows = candidateWindowRows;
     recorder.stop();
     t.true(nonEmpty >= 4, 'several filters select more than a page');
+    const data = recorder.events.filter((event) => event.kind === 'data');
     t.true(
-      recorder.events.some((event) => event.sql.includes('__cand_ids')),
+      data.some((event) => event.sql.includes('__cand_window')),
       'the window is used'
+    );
+    t.true(
+      data.some(
+        (event) =>
+          event.label === 'transactions' &&
+          !event.sql.includes('__cand_window') &&
+          event.sql.includes('candidates_')
+      ),
+      'and its fallback (the full statement) is taken'
     );
   }
 );

@@ -218,26 +218,37 @@ const acceptedInIdOrder = async (
 };
 
 /**
- * The root condition of a `transactions` page in internal-id order over a
- * materialized candidate set `cand` (transaction_hash,
- * transaction_internal_id), checking only the candidates the page can
- * contain (fix-pass-6.md §2). Exact, so the page and `has_more` are too:
- * - the first `window` distinct candidate ids in `dir` order (within the id
- *   bounds) bound a window: every candidate up to the last of them;
+ * The root condition of a `transactions` page in internal-id order that
+ * checks only the candidates the page can contain (fix-pass-6.md §2), over
+ * the candidate set `candidates` (a subquery of transaction_hash,
+ * transaction_internal_id):
+ * - the first `window` distinct candidates in `dir` id order (within the id
+ *   bounds), kept as a statement-level scalar array: the window, i.e. every
+ *   candidate up to the last of them;
  * - the page of the window (the transaction rows, the node's acceptance and
- *   the rest of the filter, all restricted to the window's candidates): if it
- *   has `need` rows, or the window holds every candidate, it is the page,
- *   since no candidate before the window's end was skipped;
- * - else the whole candidate set as before (a constant condition: the branch
- *   not taken reads nothing).
- * The acceptance and filter reads cost one granule per candidate (per part,
- * by hash), so a page of 10,000 among some 60,000 candidates (mainnet L33)
- * reads a sixth. `checks(among, amongIds)` gets the window's hashes and their
- * internal ids, so each read can take the id path (fix-pass-6.md §5).
+ *   the rest of the filter, all restricted to the window's candidates);
+ * - the condition holds for the rows of that page if it has `need` rows or
+ *   the window holds every candidate (then it is the page: no candidate
+ *   before the window's end was skipped), and for no row otherwise (one
+ *   scalar: every scalar reference in the root costs lookups in each level).
+ * An empty result is therefore either the true answer (no candidate
+ * matches) or "undecided": the caller runs the full statement then
+ * (`runTransactions`). The acceptance and filter reads cost one granule per
+ * candidate (per part, by hash), so a page of 10,000 among some 60,000
+ * candidates (mainnet L33) reads a sixth. `checks(among, amongIds)` gets the
+ * window's hashes and their internal ids, so each read can take the id path
+ * (fix-pass-6.md §5).
+ *
+ * The candidates are evaluated once (into the window array), not as a
+ * MATERIALIZED CTE: ClickHouse 26.8 evaluates such a CTE once per subquery
+ * scope that reads it (chipnet L33: 18 reads of output / spend). The
+ * fallback is a separate statement because a fallback branch in this one
+ * (the candidates again under a constant condition) multiplied the
+ * scalar-cache lookups of the arrays (chipnet L33: 937, ~0.7 s of analysis).
  */
 const candidateWindow = (
   sql: Sql,
-  cand: string,
+  candidates: string,
   checks: (among: string, amongIds: string) => string[],
   idBounds: { _gt?: bigint; _lt?: bigint },
   dir: 'ASC' | 'DESC',
@@ -252,34 +263,25 @@ const candidateWindow = (
     'UInt64',
     idBounds
   );
-  const ids = sql.scalar(
-    '__cand_ids',
-    `SELECT groupArray(transaction_internal_id) FROM (SELECT DISTINCT transaction_internal_id FROM ${cand}${
+  const first = sql.scalar(
+    '__cand_window',
+    `SELECT (groupArray(transaction_hash), groupArray(transaction_internal_id)) FROM (SELECT transaction_hash, transaction_internal_id FROM (${candidates})${
       onIds.length === 0 ? '' : ` WHERE ${onIds.join(' AND ')}`
-    } ORDER BY transaction_internal_id ${dir} LIMIT ${k})`
+    } ORDER BY transaction_internal_id ${dir} LIMIT 1 BY transaction_internal_id LIMIT ${k})`
   );
-  const capped = `length(${ids}) = ${k}`;
-  const windowed = `NOT ${capped} OR transaction_internal_id ${
-    dir === 'ASC' ? '<=' : '>='
-  } ${ids}[-1]`;
+  /* the window's page, or no row when it does not decide the page */
   const page = sql.scalar(
     '__cand_page',
-    `SELECT (groupArray(hash), groupArray(internal_id)) FROM (SELECT hash, internal_id FROM ${sql.view(
+    `SELECT if(length(tupleElement(${first}, 2)) < ${k} OR length(__h) >= ${needed}, __h, []) FROM (SELECT groupArray(hash) AS __h FROM (SELECT hash, internal_id FROM ${sql.view(
       'transaction_at'
     )} WHERE ${checks(
-      `SELECT transaction_hash FROM ${cand} WHERE ${windowed}`,
-      `SELECT transaction_internal_id FROM ${cand} WHERE ${windowed}`
+      `SELECT arrayJoin(tupleElement(${first}, 1))`,
+      `SELECT arrayJoin(tupleElement(${first}, 2))`
     )
       .map((part) => `(${part})`)
-      .join(' AND ')} ORDER BY internal_id ${dir} LIMIT ${needed})`
+      .join(' AND ')} ORDER BY internal_id ${dir} LIMIT ${needed}))`
   );
-  const enough = `(NOT ${capped} OR length(tupleElement(${page}, 1)) >= ${needed})`;
-  return `(${enough} AND hash IN (SELECT arrayJoin(tupleElement(${page}, 1))) AND internal_id IN (SELECT arrayJoin(tupleElement(${page}, 2)))) OR (NOT ${enough} AND ${checks(
-    `SELECT transaction_hash FROM ${cand} WHERE NOT ${enough}`,
-    `SELECT transaction_internal_id FROM ${cand} WHERE NOT ${enough}`
-  )
-    .map((part) => `(${part})`)
-    .join(' AND ')})`;
+  return `hash IN (SELECT arrayJoin(${page}))`;
 };
 
 export const runTransactions = async (
@@ -288,50 +290,51 @@ export const runTransactions = async (
   args: TransactionsArgs,
   sels: readonly Sel[]
 ): Promise<Page> => {
-  const { sql, ctx } = env;
   const explicit = orderTerms(transactionOrder, args.order_by);
   const order = rootOrder(
     explicit,
     [term('internal_id', args.order ?? 'ASC')],
     [term('internal_id', args.order ?? 'ASC')]
   );
-  const candidates = transactionCandidates(sql, args.where, ctx.node);
-  /*
-   * Candidates (a positive, selective conjunct of the filter) are
-   * materialized once: the transaction rows, the acceptance check and every
-   * per-transaction semi-join of the filter read only them, by key.
-   */
-  const cand =
-    candidates === undefined ? undefined : sql.cte('candidates', candidates);
   const range = {
     _gt: args.after_internal_id ?? undefined,
     _lt: args.before ?? undefined,
   };
-  const bounds = numericComparison(sql, 'internal_id', 'UInt64', range);
-  /*
-   * The transaction rows among the candidates `among` (hashes) / `amongIds`
-   * (their internal ids: both bound the read, ClickHouse takes the key or
-   * p_id, whichever selects fewer granules), the node's acceptance and the
-   * filter.
-   */
-  const checks = (among: string, amongIds: string) => [
-    `hash IN (${among})`,
-    `internal_id IN (${amongIds})`,
-    ...(impliesAcceptance(args.where)
-      ? []
-      : [`hash IN (${sql.accepted(ctx.node, among, amongIds)})`]),
-    ...bounds,
-    transactionPredicate(sql, args.where, ctx.node, among),
-  ];
   const keyset =
     typeof args.cursor === 'string' && args.cursor !== '' ? args.cursor : '';
+  /*
+   * Candidates (a positive, selective conjunct of the filter): the
+   * transaction rows, the acceptance check and every per-transaction
+   * semi-join of the filter read only them, by key. A page in id order first
+   * checks a window of them (`candidateWindow`); otherwise, or when the
+   * window cannot decide, they are materialized once (a statement-level CTE)
+   * and all checked.
+   */
   if (
-    cand !== undefined &&
     explicit === undefined &&
     (args.offset ?? 0) === 0 &&
-    keyset === ''
+    keyset === '' &&
+    transactionCandidates(env.sql.fresh(), args.where, env.ctx.node) !==
+      undefined
   ) {
-    return pageOf(
+    const { sql, ctx } = env;
+    const candidates = transactionCandidates(sql, args.where, ctx.node)!;
+    const bounds = numericComparison(sql, 'internal_id', 'UInt64', range);
+    /*
+     * The transaction rows among the window's candidates (hashes and their
+     * internal ids: both bound the read, ClickHouse takes the key or p_id,
+     * whichever selects fewer granules), the node's acceptance and the filter.
+     */
+    const checks = (among: string, amongIds: string) => [
+      `hash IN (${among})`,
+      `internal_id IN (${amongIds})`,
+      ...(impliesAcceptance(args.where)
+        ? []
+        : [`hash IN (${sql.accepted(ctx.node, among, amongIds)})`]),
+      ...bounds,
+      transactionPredicate(sql, args.where, ctx.node, among),
+    ];
+    const page = await pageOf(
       env,
       label,
       TransactionEntity,
@@ -339,14 +342,13 @@ export const runTransactions = async (
       [
         candidateWindow(
           sql,
-          cand,
+          candidates,
           checks,
           range,
           args.order ?? 'ASC',
           args.limit + 1,
           env.db.candidateWindowRows(args.limit + 1)
         ),
-        ...bounds,
       ],
       order,
       { ...args, after: args.cursor },
@@ -354,9 +356,39 @@ export const runTransactions = async (
       maxLimits.transactions,
       (_row, values) => values[0]!
     );
+    if (page.nodes.length > 0) return page;
+    /* empty: no candidate matches, or the window could not decide */
+    const sqlAll = sql.fresh();
+    return fullTransactionsPage(
+      { ...env, ctx: { ...ctx, sql: sqlAll }, sql: sqlAll },
+      label,
+      args,
+      sels,
+      explicit,
+      order,
+      range
+    );
   }
+  return fullTransactionsPage(env, label, args, sels, explicit, order, range);
+};
+
+/** A `transactions` page checking every candidate (or the whole acceptance set). */
+const fullTransactionsPage = async (
+  env: RootEnv,
+  label: string,
+  args: TransactionsArgs,
+  sels: readonly Sel[],
+  explicit: OrderTerm[] | undefined,
+  order: readonly OrderTerm[],
+  range: { _gt?: bigint; _lt?: bigint }
+): Promise<Page> => {
+  const { sql, ctx } = env;
+  const candidates = transactionCandidates(sql, args.where, ctx.node);
+  const bounds = numericComparison(sql, 'internal_id', 'UInt64', range);
   const among =
-    cand === undefined ? undefined : `SELECT transaction_hash FROM ${cand}`;
+    candidates === undefined
+      ? undefined
+      : `SELECT transaction_hash FROM ${sql.cte('candidates', candidates)}`;
   return pageOf(
     env,
     label,

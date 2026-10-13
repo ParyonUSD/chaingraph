@@ -254,6 +254,18 @@ export class Sql {
     )})`;
   }
 
+  /**
+   * A new statement builder over the same request snapshot (nodes, policy,
+   * node resolver, caps): no bound client values, no WITH items. For a
+   * second statement of one root (roots.ts `runTransactions`).
+   */
+  fresh() {
+    const next = new Sql(this.snapshot, this.others, this.utxoSetPolicy);
+    next.nodeIdOf = this.nodeIdOf;
+    next.authchainMaxBranches = this.authchainMaxBranches;
+    return next;
+  }
+
   /** Bind a value; returns its `{pN:Type}` placeholder. */
   bind(value: unknown, type: string) {
     const name = `p${this.next}`;
