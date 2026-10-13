@@ -9,6 +9,14 @@
 --            mempool) and not spent by any transaction the node accepts.
 -- Every fact is per node: the value is the same F1g test that
 -- unspent_output(node) evaluates live, stored for every node at once.
+-- Rows that exist when the column is added read '{}' (a constant default is
+-- kept in the catalog: no table rewrite, no WAL per row) and rows inserted
+-- later read NULL. A pre-tracking value (an output of a transaction at or below
+-- the tracking start) is trusted only once the backfill is complete; until
+-- then the query root answers with the live F1g predicate. The backfill
+-- (unspent_node_ids_backfill_prepare / _batch) writes only the rows whose
+-- value is not '{}' or may differ from what is stored: most outputs are spent
+-- by a transaction every node accepts and keep the '{}' they already read.
 --
 -- Ingestion stays append-only. Outputs are inserted with NULL; nothing is
 -- added to `input`. The only write-path triggers are two statement-level
@@ -47,8 +55,12 @@
 -- is always exact; above a backlog threshold (unspent_tracking_settings) it
 -- falls back to F1g.
 
-ALTER TABLE output ADD COLUMN unspent_node_ids integer[];
-COMMENT ON COLUMN output.unspent_node_ids IS 'Per-node unspent set (CHAINGRAPH_UNSPENT_NODE_IDS): NULL = not processed yet; otherwise the sorted internal ids of the nodes for which the output is unspent (created by a transaction the node accepts, no spender the node accepts). Maintained by the agent''s tracking job; read through unspent_output_stored(node_name).';
+-- Existing rows read the default '{}' (PostgreSQL >= 11 stores a constant
+-- default once, in pg_attribute.attmissingval); dropping the default at once
+-- makes every later insert NULL (the agent's inserts name their columns).
+ALTER TABLE output ADD COLUMN unspent_node_ids integer[] DEFAULT '{}';
+ALTER TABLE output ALTER COLUMN unspent_node_ids DROP DEFAULT;
+COMMENT ON COLUMN output.unspent_node_ids IS 'Per-node unspent set (CHAINGRAPH_UNSPENT_NODE_IDS): NULL = not processed yet; otherwise the sorted internal ids of the nodes for which the output is unspent (created by a transaction the node accepts, no spender the node accepts). Rows that existed when the column was added read ''{}'' until the backfill has processed them: values of outputs created at or below the tracking start are used only once the backfill is complete. Maintained by the agent''s tracking job; read through unspent_output_stored(node_name).';
 
 CREATE TABLE unspent_tracking_events (
   id bigserial PRIMARY KEY,
@@ -67,10 +79,11 @@ CREATE TABLE unspent_tracking_progress (
   block_internal_id bigint NOT NULL,
   consumed_event_id bigint NOT NULL DEFAULT 0,
   backfill_transaction_internal_id bigint NOT NULL DEFAULT 0,
+  backfill_prefix integer NOT NULL DEFAULT 0,
   updated_at timestamp NOT NULL DEFAULT now(),
   CONSTRAINT unspent_tracking_progress_pkey PRIMARY KEY (partition_index)
 );
-COMMENT ON TABLE unspent_tracking_progress IS 'Unspent tracking job watermarks, one row per partition (outpoint hash range): inputs of transactions up to input_transaction_internal_id, blocks up to block_internal_id and events up to consumed_event_id are processed for the partition''s outputs; pre-tracking outputs of transactions up to backfill_transaction_internal_id are backfilled. Not tracked by Hasura.';
+COMMENT ON TABLE unspent_tracking_progress IS 'Unspent tracking job watermarks, one row per partition (outpoint hash range): inputs of transactions up to input_transaction_internal_id, blocks up to block_internal_id and events up to consumed_event_id are processed for the partition''s outputs. Backfill: outputs whose transaction hash starts below the two-byte prefix backfill_prefix (an integer, 0-65536) are backfilled; backfill_transaction_internal_id is set to the tracking start once the partition''s whole range is (0 before). Not tracked by Hasura.';
 
 CREATE TABLE unspent_tracking_settings (
   id boolean PRIMARY KEY DEFAULT true CHECK (id),
@@ -85,7 +98,7 @@ CREATE TABLE unspent_tracking_settings (
   watch_consumed_event_id bigint NOT NULL DEFAULT 0
 );
 INSERT INTO unspent_tracking_settings DEFAULT VALUES;
-COMMENT ON TABLE unspent_tracking_settings IS 'Unspent tracking state and read thresholds (written by the agent from CHAINGRAPH_UNSPENT_NODE_IDS_* settings). tracking_start_*: outputs of earlier transactions are pre-tracking (NULL until backfilled); backfill_complete: every partition''s backfill cursor passed the tracking start, so no pre-tracking output is NULL (status only: reads derive it from the cursors, never from this flag); rebuild_required: tracking was stopped (stored values may be stale), so pre-tracking outputs are recomputed whatever their value, and reads use the live F1g predicate until that backfill is complete and the job has passed rebuild_through_transaction_internal_id (the highest transaction id when tracking restarted). Reads correct a backlog of up to hash_max_transactions unprocessed transactions with one hashed set, up to fallback_transactions with per-row probes, and fall back to the live F1g predicate above it (or above fallback_events unconsumed events). Not tracked by Hasura.';
+COMMENT ON TABLE unspent_tracking_settings IS 'Unspent tracking state and read thresholds (written by the agent from CHAINGRAPH_UNSPENT_NODE_IDS_* settings). tracking_start_*: outputs of earlier transactions are pre-tracking (their values are used once backfilled); backfill_complete: every partition''s backfill covered its whole range, so every pre-tracking value is exact (status only: reads derive it from the cursors, never from this flag); rebuild_required: tracking was stopped (stored values may be stale; the backfill takes every value that is not ''{}''), and reads use the live F1g predicate until that backfill is complete and the job has passed rebuild_through_transaction_internal_id (the highest transaction id when tracking restarted). Reads correct a backlog of up to hash_max_transactions unprocessed transactions with one hashed set, up to fallback_transactions with per-row probes, and fall back to the live F1g predicate above it (or above fallback_events unconsumed events). Not tracked by Hasura.';
 
 CREATE TABLE unspent_tracking_watch (
   transaction_internal_id bigint NOT NULL,
@@ -110,6 +123,46 @@ CREATE TABLE unspent_tracking_skipped (
   CONSTRAINT unspent_tracking_skipped_pkey PRIMARY KEY (outpoint_transaction_hash, outpoint_index, transaction_internal_id)
 );
 COMMENT ON TABLE unspent_tracking_skipped IS 'Inputs the tracking job passed while their output row did not exist (a stall over the limit, or child-before-parent across the start of tracking): the output is fully recomputed (never fast-pathed) when it arrives. Not tracked by Hasura.';
+
+-- Backfill state, written once by unspent_node_ids_backfill_prepare (one
+-- REPEATABLE READ snapshot, "the preparation") and emptied when the backfill
+-- is complete (or tracking stops).
+CREATE TABLE unspent_tracking_backfill (
+  id boolean PRIMARY KEY DEFAULT true CHECK (id),
+  node_ids integer[] NOT NULL,
+  full_node_ids integer[] NOT NULL,
+  transaction_floor bigint NOT NULL,
+  block_floor bigint NOT NULL,
+  event_floor bigint NOT NULL,
+  prepared_at timestamp NOT NULL DEFAULT now(),
+  stats jsonb
+);
+COMMENT ON TABLE unspent_tracking_backfill IS 'The prepared backfill (one row while a backfill is prepared and not complete): node_ids = the node table at the preparation; full_node_ids = the "full set", the most common set of nodes accepting a block; transaction / block / event floors = settled sequence values read before the preparation (later transactions, blocks and events are re-checked by every batch). Not tracked by Hasura.';
+CREATE TABLE unspent_tracking_backfill_nodes (
+  node_internal_id integer NOT NULL,
+  floor_blocks bigint NOT NULL,
+  CONSTRAINT unspent_tracking_backfill_nodes_pkey PRIMARY KEY (node_internal_id)
+);
+COMMENT ON TABLE unspent_tracking_backfill_nodes IS 'Per node, its node_block rows at or below the block floor as of the event floor (unspent_node_ids_backfill_node_blocks at the preparation): a batch stops ("stale") if the number changed, i.e. a node gained or lost such a block without an event. Not tracked by Hasura.';
+CREATE TABLE unspent_tracking_backfill_transactions (
+  internal_id bigint NOT NULL,
+  hash bytea NOT NULL,
+  CONSTRAINT unspent_tracking_backfill_transactions_pkey PRIMARY KEY (internal_id)
+);
+CREATE INDEX unspent_tracking_backfill_transactions_hash ON unspent_tracking_backfill_transactions (hash);
+COMMENT ON TABLE unspent_tracking_backfill_transactions IS 'Transactions (at or below the transaction floor) not certainly accepted by exactly the full set at the preparation: in no block accepted by exactly the full set, or in a block accepted by a node outside it. Their outputs, and the outputs they spend, are recomputed exactly. Not tracked by Hasura.';
+CREATE TABLE unspent_tracking_backfill_spends (
+  outpoint_transaction_hash bytea NOT NULL,
+  outpoint_index bigint NOT NULL,
+  CONSTRAINT unspent_tracking_backfill_spends_pkey PRIMARY KEY (outpoint_transaction_hash, outpoint_index)
+);
+COMMENT ON TABLE unspent_tracking_backfill_spends IS 'Outpoints spent by unspent_tracking_backfill_transactions (recomputed exactly). Not tracked by Hasura.';
+CREATE TABLE unspent_tracking_backfill_rows (
+  transaction_hash bytea NOT NULL,
+  output_index bigint NOT NULL,
+  CONSTRAINT unspent_tracking_backfill_rows_pkey PRIMARY KEY (transaction_hash, output_index)
+);
+COMMENT ON TABLE unspent_tracking_backfill_rows IS 'Outputs whose stored value was not ''{}'' at the preparation (NULL: saved after the column was added; or a value left by an earlier tracking run): written whatever their new value. Not tracked by Hasura.';
 
 -- Release events: statement-level, one INSERT ... SELECT per DELETE, whichever
 -- code path deletes the rows (re-org, mempool drop, replacement, cascade,
@@ -425,32 +478,226 @@ $$;
 COMMENT ON FUNCTION unspent_node_ids_run_batch (integer, integer, bigint, bigint, bigint, integer, integer, integer, bigint) IS 'One batch of the unspent tracking job for one partition (outpoint hash range). Call in a REPEATABLE READ transaction with settled limits; see migration 1791500000000_unspent_node_ids.';
 
 -- Backfill of pre-tracking outputs (created by transactions at or below the
--- tracking start) for one partition: the next `max_transactions` transactions
--- above the partition's backfill cursor; every NULL output of this partition
--- among them (every output, after a stop: rebuild_required) is fully
--- recomputed and written, '{}' included, so no pre-tracking output is left
--- NULL behind the cursor (an output whose spenders exist but are accepted by
--- no node is unspent for the nodes accepting its creator). Call in a
--- REPEATABLE READ transaction. The backfill is complete once every
--- partition's cursor has passed the tracking start
--- (unspent_node_ids_backfill_pending).
-CREATE FUNCTION unspent_node_ids_backfill_batch (part integer, part_count integer, max_transactions integer)
+-- tracking start). Values of these outputs are used only once every
+-- partition's backfill is complete (until then the query root answers with
+-- the live F1g predicate), so the backfill may leave a row as it is only if
+-- its stored value is exact.
+--
+-- Most outputs need no write: they read '{}' (the column default for rows
+-- that existed when the column was added) and they are spent by a transaction
+-- every node accepts. The backfill writes only the others:
+--   (1) unspent_node_ids_backfill_prepare, once, in one REPEATABLE READ
+--       snapshot (the preparation), with settled floors (transaction, block,
+--       event sequence values read before it):
+--       - the full set F: the most common set of nodes accepting a block
+--         (on a database with one chain: every node);
+--       - M (unspent_tracking_backfill_transactions): transactions up to the
+--         transaction floor that are not certainly accepted by exactly F: in
+--         no block accepted by exactly F, or in a block accepted by a node
+--         outside F (set-based: one anti-join of transaction against
+--         block_transaction, plus the transactions of the other blocks);
+--       - the outpoints M spends (unspent_tracking_backfill_spends);
+--       - the rows whose stored value is not '{}' (NULL: saved after the
+--         column was added; or values left by an earlier run, after a stop)
+--         (unspent_tracking_backfill_rows; one sequential scan of output);
+--       - per node, its node_block rows at or below the block floor.
+--   (2) unspent_node_ids_backfill_batch, per partition, a range of two-byte
+--       transaction hash prefixes per batch, in a REPEATABLE READ snapshot S
+--       that holds the partition's progress row (so the batch is serialised
+--       with the partition's job batches). With X = M plus the transactions
+--       whose acceptance may have changed since the preparation (those of
+--       events above the event floor, of blocks above the block floor, with a
+--       node_transaction row now, and above the transaction floor):
+--       - exact recompute (unspent_node_ids_recompute) of the outputs in the
+--         range created by X or spent by X;
+--       - outputs in the range with no spending input at all (a merge
+--         anti-join of the output_pkey and spent_by_index ranges) whose
+--         creator is not in X: written F;
+--       - rows of unspent_tracking_backfill_rows in the range that are in
+--         neither group: written '{}';
+--       - every other output in the range keeps its value ('{}').
+-- Why every other output is exact at S: it has a spending input, its creator
+-- C is not in X and no spender is in X. C not in M means C was, at the
+-- preparation, in a block accepted by exactly F, in no block accepted by a
+-- node outside F, and (C not in X) since then no event touched C or its
+-- blocks, no later block contains it and it has no node_transaction row: the
+-- nodes accepting C at S are exactly F. A spender s not in X is likewise
+-- accepted at S by every node of F. So no node accepts C without accepting a
+-- spender: the value is '{}'. Its stored value is '{}' too: it was '{}' at the
+-- preparation (else it is in unspent_tracking_backfill_rows), and a job batch
+-- that wrote it since recomputed it from a state where C and s had the same
+-- acceptance (any change is an event, a block or a mempool row, all in X),
+-- i.e. '{}' again. Likewise an output with no spender whose creator is not in
+-- X is unspent for exactly F. Losses of acceptance always write an event (the
+-- release triggers), and the agent writes an "accepted" event whenever it adds
+-- a node_block row to an existing block or a node_transaction row to an
+-- existing transaction; a batch stops ("stale") if the node table changed or a
+-- node's node_block rows at or below the block floor changed in a way its
+-- events do not account for (then unspent_node_ids_backfill_reset).
+-- Events above the event floor are kept while the backfill is prepared.
+-- Whatever the batch writes is computed from S and commits with the
+-- partition's progress row, so later job batches of the partition see it, and
+-- every acceptance change committed after S is still ahead of them.
+-- A node's node_block rows at or below the block floor, as of the event floor:
+-- the rows now, minus those added by "accepted" events above the floor, plus
+-- those removed by "released" events above it. Constant while every change
+-- writes its event (the release triggers; the agent's re-acceptance paths).
+CREATE FUNCTION unspent_node_ids_backfill_node_blocks (node_id bigint, block_floor bigint, event_floor bigint)
+  RETURNS bigint LANGUAGE sql STABLE AS $$
+  SELECT (SELECT count(*) FROM node_block nb WHERE nb.node_internal_id = node_id AND nb.block_internal_id <= block_floor)
+       - (SELECT count(*) FROM unspent_tracking_events e
+            WHERE e.id > event_floor AND e.node_internal_id = node_id AND e.event_kind = 'accepted'
+              AND e.block_internal_id <= block_floor)
+       + (SELECT count(*) FROM unspent_tracking_events e
+            WHERE e.id > event_floor AND e.node_internal_id = node_id AND e.event_kind = 'released'
+              AND e.block_internal_id <= block_floor)
+$$;
+
+CREATE FUNCTION unspent_node_ids_backfill_prepare (transaction_floor bigint, block_floor bigint, event_floor bigint)
   RETURNS jsonb LANGUAGE plpgsql
-  SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off SET jit = off AS $$
+  SET jit = off SET plan_cache_mode = force_custom_plan AS $$
+DECLARE
+  zero_hash constant bytea := '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea;
+  start_tx bigint;
+  full_ids integer[];
+  current_node_ids integer[];
+  n_full_blocks bigint := 0;
+  n_unblocked bigint := 0;
+  n_other bigint := 0;
+  n_spends bigint := 0;
+  n_rows bigint := 0;
+  started timestamp := clock_timestamp();
+  stats jsonb;
+BEGIN
+  IF NOT pg_try_advisory_xact_lock(1970172789) THEN
+    RETURN jsonb_build_object('busy', true);
+  END IF;
+  SELECT tracking_start_transaction_internal_id INTO start_tx FROM unspent_tracking_settings;
+  IF start_tx IS NULL OR NOT EXISTS (SELECT 1 FROM unspent_tracking_progress) THEN
+    RETURN jsonb_build_object('uninitialized', true);
+  END IF;
+  IF EXISTS (SELECT 1 FROM unspent_tracking_backfill) THEN
+    RETURN jsonb_build_object('prepared', true);
+  END IF;
+  IF NOT unspent_node_ids_backfill_pending() THEN
+    RETURN jsonb_build_object('done', true);
+  END IF;
+  SELECT COALESCE(array_agg(n.internal_id::integer ORDER BY n.internal_id), '{}') INTO current_node_ids FROM node n;
+  SELECT s.ids INTO full_ids
+    FROM (SELECT array_agg(nb.node_internal_id::integer ORDER BY nb.node_internal_id) AS ids
+            FROM node_block nb GROUP BY nb.block_internal_id) s
+    GROUP BY s.ids ORDER BY count(*) DESC, s.ids LIMIT 1;
+  full_ids := COALESCE(full_ids, '{}');
+  DROP TABLE IF EXISTS pg_temp.unspent_node_ids_full_blocks;
+  CREATE TEMP TABLE unspent_node_ids_full_blocks (id bigint PRIMARY KEY) ON COMMIT DROP;
+  INSERT INTO unspent_node_ids_full_blocks (id)
+    SELECT nb.block_internal_id FROM node_block nb GROUP BY nb.block_internal_id
+      HAVING array_agg(nb.node_internal_id::integer ORDER BY nb.node_internal_id) = full_ids;
+  GET DIAGNOSTICS n_full_blocks = ROW_COUNT;
+  ANALYZE pg_temp.unspent_node_ids_full_blocks;
+  -- M (a): in no block at all (dropped or mempool-only transactions)
+  INSERT INTO unspent_tracking_backfill_transactions (internal_id, hash)
+    SELECT t.internal_id, t.hash FROM transaction t
+      WHERE t.internal_id <= transaction_floor
+        AND NOT EXISTS (SELECT 1 FROM block_transaction bt WHERE bt.transaction_internal_id = t.internal_id);
+  GET DIAGNOSTICS n_unblocked = ROW_COUNT;
+  -- M (b): in a block not accepted by exactly F, and in no block accepted by
+  -- exactly F or in a block accepted by a node outside F
+  INSERT INTO unspent_tracking_backfill_transactions (internal_id, hash)
+    SELECT DISTINCT bt.transaction_internal_id, t.hash
+      FROM block b
+      JOIN block_transaction bt ON bt.block_internal_id = b.internal_id
+      JOIN transaction t ON t.internal_id = bt.transaction_internal_id
+      WHERE NOT EXISTS (SELECT 1 FROM pg_temp.unspent_node_ids_full_blocks f WHERE f.id = b.internal_id)
+        AND bt.transaction_internal_id <= transaction_floor
+        AND (EXISTS (SELECT 1 FROM node_block nb
+                       WHERE nb.block_internal_id = b.internal_id AND NOT (nb.node_internal_id::integer = ANY (full_ids)))
+             OR NOT EXISTS (SELECT 1 FROM block_transaction bt2
+                              JOIN pg_temp.unspent_node_ids_full_blocks f ON f.id = bt2.block_internal_id
+                              WHERE bt2.transaction_internal_id = bt.transaction_internal_id))
+    ON CONFLICT ON CONSTRAINT unspent_tracking_backfill_transactions_pkey DO NOTHING;
+  GET DIAGNOSTICS n_other = ROW_COUNT;
+  INSERT INTO unspent_tracking_backfill_spends (outpoint_transaction_hash, outpoint_index)
+    SELECT DISTINCT i.outpoint_transaction_hash, i.outpoint_index
+      FROM unspent_tracking_backfill_transactions m
+      JOIN input i ON i.transaction_internal_id = m.internal_id
+      WHERE i.outpoint_transaction_hash <> zero_hash;
+  GET DIAGNOSTICS n_spends = ROW_COUNT;
+  INSERT INTO unspent_tracking_backfill_rows (transaction_hash, output_index)
+    SELECT o.transaction_hash, o.output_index FROM output o
+      WHERE o.unspent_node_ids IS DISTINCT FROM '{}'::integer[];
+  GET DIAGNOSTICS n_rows = ROW_COUNT;
+  INSERT INTO unspent_tracking_backfill_nodes (node_internal_id, floor_blocks)
+    SELECT n.internal_id, unspent_node_ids_backfill_node_blocks(n.internal_id, block_floor, event_floor)
+      FROM node n;
+  stats := jsonb_build_object('fullNodeIds', full_ids, 'fullBlocks', n_full_blocks,
+    'transactions', n_unblocked + n_other, 'unblockedTransactions', n_unblocked, 'otherBlockTransactions', n_other,
+    'spends', n_spends, 'rows', n_rows,
+    'ms', round(extract(epoch FROM clock_timestamp() - started) * 1000));
+  INSERT INTO unspent_tracking_backfill (node_ids, full_node_ids, transaction_floor, block_floor, event_floor, stats)
+    VALUES (current_node_ids, full_ids, transaction_floor, block_floor, event_floor, stats);
+  ANALYZE unspent_tracking_backfill_transactions;
+  ANALYZE unspent_tracking_backfill_spends;
+  ANALYZE unspent_tracking_backfill_rows;
+  RETURN stats;
+END;
+$$;
+COMMENT ON FUNCTION unspent_node_ids_backfill_prepare (bigint, bigint, bigint) IS 'Prepare the backfill of pre-tracking outputs (once; call in a REPEATABLE READ transaction with settled sequence values); see migration 1791500000000_unspent_node_ids.';
+
+-- Forget the prepared backfill (a batch found it stale): the partitions whose
+-- backfill is not complete restart from the beginning of their range after a
+-- new preparation (done partitions stay done: their values were exact at
+-- their snapshots, and every later change is the job's).
+CREATE FUNCTION unspent_node_ids_backfill_reset ()
+  RETURNS boolean LANGUAGE plpgsql SET lock_timeout = '2s' AS $$
+DECLARE
+  start_tx bigint;
+BEGIN
+  LOCK TABLE unspent_tracking_progress IN EXCLUSIVE MODE;
+  SELECT tracking_start_transaction_internal_id INTO start_tx FROM unspent_tracking_settings;
+  DELETE FROM unspent_tracking_backfill;
+  TRUNCATE unspent_tracking_backfill_nodes, unspent_tracking_backfill_transactions,
+    unspent_tracking_backfill_spends, unspent_tracking_backfill_rows;
+  UPDATE unspent_tracking_progress SET backfill_prefix = 0, updated_at = now()
+    WHERE backfill_transaction_internal_id < COALESCE(start_tx, 0);
+  RETURN true;
+END;
+$$;
+
+-- One backfill batch of partition `part`: the next `max_prefixes` two-byte
+-- transaction hash prefixes of the partition's range (see above). Call in a
+-- REPEATABLE READ transaction after unspent_node_ids_backfill_prepare.
+CREATE FUNCTION unspent_node_ids_backfill_batch (part integer, part_count integer, max_prefixes integer)
+  RETURNS jsonb LANGUAGE plpgsql
+  SET jit = off SET plan_cache_mode = force_custom_plan AS $$
 DECLARE
   cursor_tx bigint;
-  upper_tx bigint;
   start_tx bigint;
-  rebuild boolean;
   stored_count integer;
-  n_affected bigint := 0;
+  prefix integer;
+  bf unspent_tracking_backfill;
+  range_start integer;
+  range_end integer;
+  p1 integer;
+  p2 integer;
+  lo bytea;
+  hi bytea;
+  n_dynamic bigint := 0;
+  n_exact bigint := 0;
+  n_no_spender bigint := 0;
+  n_full bigint := 0;
+  n_reset bigint := 0;
   n_changed bigint := 0;
+  clock timestamp := clock_timestamp();
+  ms_select numeric := 0;
+  ms_exact numeric := 0;
+  ms_write numeric := 0;
 BEGIN
   IF NOT pg_try_advisory_xact_lock(1970172786, part) THEN
     RETURN jsonb_build_object('busy', true);
   END IF;
-  SELECT tracking_start_transaction_internal_id, rebuild_required INTO start_tx, rebuild FROM unspent_tracking_settings;
-  SELECT p.backfill_transaction_internal_id, p.partition_count INTO cursor_tx, stored_count
+  SELECT tracking_start_transaction_internal_id INTO start_tx FROM unspent_tracking_settings;
+  SELECT p.backfill_transaction_internal_id, p.partition_count, p.backfill_prefix INTO cursor_tx, stored_count, prefix
     FROM unspent_tracking_progress p WHERE p.partition_index = part FOR UPDATE;
   IF NOT FOUND OR start_tx IS NULL THEN
     RETURN jsonb_build_object('uninitialized', true);
@@ -461,32 +708,123 @@ BEGIN
   IF cursor_tx >= start_tx THEN
     RETURN jsonb_build_object('done', true, 'backfillWatermark', cursor_tx);
   END IF;
-  upper_tx := LEAST(cursor_tx + GREATEST(max_transactions, 1), start_tx);
-  PERFORM unspent_node_ids_temp_tables();
-  INSERT INTO unspent_node_ids_affected (h, i)
-    SELECT o.transaction_hash, o.output_index
-      FROM transaction t
-      CROSS JOIN LATERAL (SELECT transaction_hash, output_index, unspent_node_ids AS stored FROM output
-                            WHERE output.transaction_hash = t.hash OFFSET 0) o
-      WHERE t.internal_id > cursor_tx AND t.internal_id <= upper_tx
-        AND ((get_byte(t.hash, 0) * part_count) >> 8) = part AND (o.stored IS NULL OR rebuild);
-  GET DIAGNOSTICS n_affected = ROW_COUNT;
-  IF n_affected > 0 THEN
-    n_changed := unspent_node_ids_recompute();
+  SELECT * INTO bf FROM unspent_tracking_backfill;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('unprepared', true);
   END IF;
-  UPDATE unspent_tracking_progress SET backfill_transaction_internal_id = upper_tx, updated_at = now()
+  IF bf.node_ids IS DISTINCT FROM (SELECT COALESCE(array_agg(n.internal_id::integer ORDER BY n.internal_id), '{}') FROM node n)
+     OR EXISTS (
+       SELECT 1 FROM unspent_tracking_backfill_nodes bn
+         WHERE unspent_node_ids_backfill_node_blocks(bn.node_internal_id, bf.block_floor, bf.event_floor)
+               <> bn.floor_blocks) THEN
+    RETURN jsonb_build_object('stale', true);
+  END IF;
+  -- the partition's first hash bytes: ((byte * part_count) >> 8) = part
+  range_start := ((part * 256 + part_count - 1) / part_count) * 256;
+  range_end := (((part + 1) * 256 + part_count - 1) / part_count) * 256;
+  p1 := GREATEST(prefix, range_start);
+  p2 := LEAST(p1 + GREATEST(max_prefixes, 1), range_end);
+  IF p1 < range_end THEN
+    lo := decode(lpad(to_hex(p1), 4, '0'), 'hex');
+    hi := CASE WHEN p2 < 65536 THEN decode(lpad(to_hex(p2), 4, '0'), 'hex') ELSE decode(repeat('ff', 33), 'hex') END;
+    PERFORM unspent_node_ids_temp_tables();
+    CREATE TEMP TABLE IF NOT EXISTS unspent_node_ids_dynamic (id bigint NOT NULL, hash bytea NOT NULL) ON COMMIT DELETE ROWS;
+    CREATE TEMP TABLE IF NOT EXISTS unspent_node_ids_no_spender (h bytea NOT NULL, i bigint NOT NULL) ON COMMIT DELETE ROWS;
+    -- X beyond M: acceptance may have changed since the preparation
+    INSERT INTO unspent_node_ids_dynamic (id, hash)
+      SELECT x.id, t.hash
+        FROM (SELECT e.transaction_internal_id AS id FROM unspent_tracking_events e
+                WHERE e.id > bf.event_floor AND e.transaction_internal_id IS NOT NULL
+              UNION
+              SELECT bt.transaction_internal_id FROM unspent_tracking_events e
+                JOIN block_transaction bt ON bt.block_internal_id = e.block_internal_id
+                WHERE e.id > bf.event_floor
+              UNION
+              SELECT bt.transaction_internal_id FROM block b
+                JOIN block_transaction bt ON bt.block_internal_id = b.internal_id
+                WHERE b.internal_id > bf.block_floor
+              UNION
+              SELECT nt.transaction_internal_id FROM node_transaction nt
+              UNION
+              SELECT t2.internal_id FROM transaction t2 WHERE t2.internal_id > bf.transaction_floor) x
+        JOIN transaction t ON t.internal_id = x.id;
+    GET DIAGNOSTICS n_dynamic = ROW_COUNT;
+    ANALYZE pg_temp.unspent_node_ids_dynamic;
+    -- exact: created by X or spent by X
+    INSERT INTO unspent_node_ids_affected (h, i)
+      SELECT o.transaction_hash, o.output_index FROM unspent_tracking_backfill_transactions m
+        JOIN output o ON o.transaction_hash = m.hash
+        WHERE m.hash >= lo AND m.hash < hi
+      UNION ALL
+      SELECT o.transaction_hash, o.output_index FROM pg_temp.unspent_node_ids_dynamic d
+        JOIN output o ON o.transaction_hash = d.hash
+        WHERE d.hash >= lo AND d.hash < hi
+      UNION ALL
+      SELECT s.outpoint_transaction_hash, s.outpoint_index FROM unspent_tracking_backfill_spends s
+        WHERE s.outpoint_transaction_hash >= lo AND s.outpoint_transaction_hash < hi
+      UNION ALL
+      SELECT i.outpoint_transaction_hash, i.outpoint_index FROM pg_temp.unspent_node_ids_dynamic d
+        JOIN input i ON i.transaction_internal_id = d.id
+        WHERE i.outpoint_transaction_hash >= lo AND i.outpoint_transaction_hash < hi;
+    GET DIAGNOSTICS n_exact = ROW_COUNT;
+    -- no spending input at all (both index ranges, merged)
+    INSERT INTO unspent_node_ids_no_spender (h, i)
+      SELECT o.transaction_hash, o.output_index FROM output o
+        WHERE o.transaction_hash >= lo AND o.transaction_hash < hi
+          AND NOT EXISTS (SELECT 1 FROM input i
+                            WHERE i.outpoint_transaction_hash = o.transaction_hash AND i.outpoint_index = o.output_index
+                              AND i.outpoint_transaction_hash >= lo AND i.outpoint_transaction_hash < hi);
+    GET DIAGNOSTICS n_no_spender = ROW_COUNT;
+    ms_select := round(extract(epoch FROM clock_timestamp() - clock) * 1000);
+    clock := clock_timestamp();
+    IF n_exact > 0 THEN
+      n_changed := unspent_node_ids_recompute();
+    END IF;
+    ms_exact := round(extract(epoch FROM clock_timestamp() - clock) * 1000);
+    clock := clock_timestamp();
+    -- no spender, creator not in X: unspent for exactly F
+    UPDATE output o SET unspent_node_ids = bf.full_node_ids
+      FROM (SELECT n.h, n.i FROM pg_temp.unspent_node_ids_no_spender n
+              WHERE NOT EXISTS (SELECT 1 FROM unspent_tracking_backfill_transactions m WHERE m.hash = n.h)
+                AND NOT EXISTS (SELECT 1 FROM pg_temp.unspent_node_ids_dynamic d WHERE d.hash = n.h)
+              ORDER BY n.h, n.i OFFSET 0) v
+      WHERE o.transaction_hash = v.h AND o.output_index = v.i
+        AND o.unspent_node_ids IS DISTINCT FROM bf.full_node_ids;
+    GET DIAGNOSTICS n_full = ROW_COUNT;
+    -- stored with another value at the preparation, spent and outside X: '{}'
+    UPDATE output o SET unspent_node_ids = '{}'
+      FROM (SELECT r.transaction_hash AS h, r.output_index AS i FROM unspent_tracking_backfill_rows r
+              WHERE r.transaction_hash >= lo AND r.transaction_hash < hi
+                AND NOT EXISTS (SELECT 1 FROM pg_temp.unspent_node_ids_affected a
+                                  WHERE a.h = r.transaction_hash AND a.i = r.output_index)
+                AND NOT EXISTS (SELECT 1 FROM pg_temp.unspent_node_ids_no_spender n
+                                  WHERE n.h = r.transaction_hash AND n.i = r.output_index)
+              ORDER BY r.transaction_hash, r.output_index OFFSET 0) v
+      WHERE o.transaction_hash = v.h AND o.output_index = v.i
+        AND o.unspent_node_ids IS DISTINCT FROM '{}'::integer[];
+    GET DIAGNOSTICS n_reset = ROW_COUNT;
+    ms_write := round(extract(epoch FROM clock_timestamp() - clock) * 1000);
+  ELSE
+    p2 := range_end;
+  END IF;
+  UPDATE unspent_tracking_progress
+    SET backfill_prefix = p2,
+        backfill_transaction_internal_id = CASE WHEN p2 >= range_end THEN start_tx ELSE backfill_transaction_internal_id END,
+        updated_at = now()
     WHERE partition_index = part;
-  RETURN jsonb_build_object('previousBackfillWatermark', cursor_tx, 'backfillWatermark', upper_tx,
-    'affected', n_affected, 'changed', n_changed, 'done', upper_tx >= start_tx);
+  RETURN jsonb_build_object('previousPrefix', p1, 'prefix', p2, 'rangeEnd', range_end,
+    'dynamic', n_dynamic, 'exact', n_exact, 'noSpender', n_no_spender, 'full', n_full, 'reset', n_reset,
+    'changed', n_changed + n_full + n_reset, 'done', p2 >= range_end,
+    'msSelect', ms_select, 'msExact', ms_exact, 'msWrite', ms_write);
 END;
 $$;
+COMMENT ON FUNCTION unspent_node_ids_backfill_batch (integer, integer, integer) IS 'One backfill batch of one partition (a range of two-byte transaction hash prefixes). Call in a REPEATABLE READ transaction after unspent_node_ids_backfill_prepare; see migration 1791500000000_unspent_node_ids.';
 
--- Backfill of one scope (a token category and/or a 25-byte locking bytecode
--- prefix): every NULL output of the scope, recomputed and written ('{}'
--- included). For targeted backfills (tests, lab); a full backfill uses
--- unspent_node_ids_backfill_batch. It does not advance the backfill cursors:
--- the query root keeps answering the remaining NULL outputs live (it never
--- reads a NULL as spent), so a scoped backfill cannot hide an unspent output.
+-- Recompute every output of one scope (a token category and/or a 25-byte
+-- locking bytecode prefix) from scratch. For targeted fills (tests, lab); a
+-- full backfill uses unspent_node_ids_backfill_prepare / _batch. It does not
+-- advance the backfill cursors: the query root uses pre-tracking values only
+-- once the full backfill is complete.
 CREATE FUNCTION unspent_node_ids_backfill_scope (category bytea, bytecode_prefix bytea)
   RETURNS bigint LANGUAGE plpgsql
   SET enable_hashjoin = off SET enable_mergejoin = off SET jit = off AS $$
@@ -495,8 +833,7 @@ BEGIN
   DELETE FROM unspent_node_ids_affected;
   INSERT INTO unspent_node_ids_affected (h, i)
     SELECT o.transaction_hash, o.output_index FROM output o
-      WHERE o.unspent_node_ids IS NULL
-        AND (category IS NULL OR o.token_category = category)
+      WHERE (category IS NULL OR o.token_category = category)
         AND (bytecode_prefix IS NULL OR substring(o.locking_bytecode, 0, 26) = bytecode_prefix);
   RETURN unspent_node_ids_recompute();
 END;
@@ -504,20 +841,21 @@ $$;
 
 -- Start tracking (no-op if already started) with `part_count` partitions; the
 -- watermarks start at the given settled sequence values. Outputs of earlier
--- transactions stay NULL (pre-tracking) until backfilled; from genesis (0, 0)
--- there is nothing to backfill. The partitions do not consume the events up
+-- transactions (pre-tracking) keep whatever they store ('{}' or NULL) and are
+-- used only once the backfill is complete; from genesis (0, 0) there is
+-- nothing to backfill. The partitions do not consume the events up
 -- to `event_watermark` (settled): they predate tracking, and every output they
--- concern is either unprocessed (NULL: answered live, then backfilled with
--- the current state) or processed later from the current state. The watch
+-- concern is either pre-tracking (answered live, then backfilled from the
+-- current state) or processed later from the current state. The watch
 -- pass does read them: a transaction released before tracking started (from
 -- when the agent enabled the release-event triggers) is watched like any
 -- other, so a later re-acceptance through a path that writes no event still
 -- reaches outputs processed after the start (e.g. the output of a parent saved
 -- after tracking started, spent by a released child saved before).
--- there is nothing to backfill. After a stop (rebuild_required), values
--- written before the stop may be stale: rebuild_through is set to the highest
--- transaction id now, and reads use F1g until the job has passed it and the
--- backfill (which then recomputes every pre-tracking output) is complete.
+-- After a stop (rebuild_required), values written before the stop may be
+-- stale: rebuild_through is set to the highest transaction id now, and reads
+-- use F1g until the job has passed it and the backfill is complete (the
+-- backfill takes every row whose value is not '{}', so stale values too).
 CREATE FUNCTION unspent_node_ids_initialize (part_count integer, input_watermark bigint, block_watermark bigint,
   event_watermark bigint DEFAULT 0)
   RETURNS boolean LANGUAGE plpgsql AS $$
@@ -535,6 +873,9 @@ BEGIN
         rebuild_through_transaction_internal_id = CASE WHEN rebuild_required
           THEN GREATEST(input_watermark, (SELECT COALESCE(max(internal_id), 0) FROM transaction)) END,
         watch_consumed_event_id = 0;
+  DELETE FROM unspent_tracking_backfill;
+  TRUNCATE unspent_tracking_backfill_nodes, unspent_tracking_backfill_transactions,
+    unspent_tracking_backfill_spends, unspent_tracking_backfill_rows;
   INSERT INTO unspent_tracking_progress (partition_index, partition_count, input_transaction_internal_id,
       block_internal_id, consumed_event_id, backfill_transaction_internal_id)
     SELECT p, part_count, input_watermark, block_watermark, event_watermark, 0 FROM generate_series(0, part_count - 1) p;
@@ -684,6 +1025,9 @@ BEGIN
   DELETE FROM unspent_tracking_events;
   DELETE FROM unspent_tracking_watch;
   DELETE FROM unspent_tracking_skipped;
+  DELETE FROM unspent_tracking_backfill;
+  TRUNCATE unspent_tracking_backfill_nodes, unspent_tracking_backfill_transactions,
+    unspent_tracking_backfill_spends, unspent_tracking_backfill_rows;
   UPDATE unspent_tracking_settings
     SET tracking_start_transaction_internal_id = NULL,
         tracking_start_block_internal_id = NULL,
@@ -696,7 +1040,9 @@ END;
 $$;
 
 -- Events consumed by every partition and by the watch pass (READ COMMITTED,
--- after a round).
+-- after a round), except those above a prepared backfill's event floor (its
+-- batches re-check their transactions). Once the backfill is complete, its
+-- state is emptied.
 CREATE FUNCTION unspent_node_ids_delete_consumed_events ()
   RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
@@ -704,11 +1050,17 @@ DECLARE
 BEGIN
   DELETE FROM unspent_tracking_events
     WHERE id <= LEAST((SELECT COALESCE(min(consumed_event_id), 0) FROM unspent_tracking_progress),
-                      (SELECT watch_consumed_event_id FROM unspent_tracking_settings));
+                      (SELECT watch_consumed_event_id FROM unspent_tracking_settings),
+                      COALESCE((SELECT b.event_floor FROM unspent_tracking_backfill b), 9223372036854775807));
   GET DIAGNOSTICS deleted = ROW_COUNT;
   IF NOT (SELECT backfill_complete FROM unspent_tracking_settings)
      AND NOT unspent_node_ids_backfill_pending() THEN
     UPDATE unspent_tracking_settings SET backfill_complete = true;
+  END IF;
+  IF EXISTS (SELECT 1 FROM unspent_tracking_backfill) AND NOT unspent_node_ids_backfill_pending() THEN
+    DELETE FROM unspent_tracking_backfill;
+    TRUNCATE unspent_tracking_backfill_nodes, unspent_tracking_backfill_transactions,
+      unspent_tracking_backfill_spends, unspent_tracking_backfill_rows;
   END IF;
   IF (SELECT rebuild_required FROM unspent_tracking_settings) AND NOT unspent_node_ids_rebuild_pending() THEN
     UPDATE unspent_tracking_settings SET rebuild_required = false, rebuild_through_transaction_internal_id = NULL;
@@ -725,7 +1077,8 @@ $$;
 --   'probe'    backlog <= fallback_transactions: one spent_by_index probe per
 --              stored row;
 --   'fallback' larger backlog, too many events, tracking not started (or
---              stopped), or a rebuild after a stop in progress: the live F1g
+--              stopped), the backfill of pre-tracking outputs not complete,
+--              or a rebuild after a stop in progress: the live F1g
 --              predicate.
 -- `SET chaingraph.unspent_read_tier = hash|probe|fallback` forces a tier
 -- (tests and measurements).
@@ -747,6 +1100,11 @@ BEGIN
   IF s.rebuild_required AND unspent_node_ids_rebuild_pending() THEN
     RETURN 'fallback';
   END IF;
+  -- pre-tracking values are used only once the backfill is complete (a '{}'
+  -- read from the column default may be an output nobody has processed yet)
+  IF unspent_node_ids_backfill_pending() THEN
+    RETURN 'fallback';
+  END IF;
   IF forced IN ('hash', 'probe', 'fallback') THEN
     RETURN forced;
   END IF;
@@ -765,11 +1123,12 @@ BEGIN
 END;
 $$;
 
--- Whether pre-tracking outputs may still be NULL: some partition's backfill
--- cursor has not passed the tracking start (or tracking has not started).
--- Derived from the cursors, which only the backfill advances after writing
--- every output behind them, never from a settable flag: while it is true the
--- query root answers every NULL output live, so a NULL is never read as spent.
+-- Whether pre-tracking values may still be unprocessed (the column default
+-- '{}', NULL, or stale): some partition's backfill has not covered its whole
+-- range (or tracking has not started). Derived from the cursors, which only
+-- the backfill advances after writing every output behind them, never from a
+-- settable flag: while it is true the read tier is "fallback" (the live F1g
+-- predicate), so an unprocessed value is never read.
 CREATE FUNCTION unspent_node_ids_backfill_pending ()
   RETURNS boolean LANGUAGE sql STABLE AS $$
   SELECT NOT COALESCE((SELECT min(p.backfill_transaction_internal_id) FROM unspent_tracking_progress p)
@@ -974,8 +1333,6 @@ $$;
 --   planner matches them.
 -- Shared arms (node resolved once):
 --   (b1) unprocessed outputs of transactions above the minimum input watermark;
---   (b2) pre-tracking NULL outputs while the backfill is incomplete (the
---        caller's own index: token_category_index, output_search_index);
 --   (d1) outputs spent by released transactions the node no longer accepts;
 --   (d2) outputs of transactions the node started accepting;
 --   (f)  F1g, instead of every other arm, when the read tier is "fallback" or
@@ -1056,13 +1413,6 @@ BEGIN
     SELECT * FROM output WHERE output.transaction_hash = b.hash OFFSET 0) o
   WHERE o.unspent_node_ids IS NULL
     AND (SELECT unspent_node_ids_stored_path(node_name))
-    AND %1$s
-  UNION ALL
-  SELECT o.* FROM output o
-  WHERE o.unspent_node_ids IS NULL
-    AND (SELECT unspent_node_ids_backfill_pending())
-    AND (SELECT unspent_node_ids_stored_path(node_name))
-    AND NOT (o.transaction_hash IN (SELECT b.hash FROM unspent_node_ids_backlog_transactions() b))
     AND %1$s
   UNION ALL
   SELECT o.* FROM unspent_node_ids_released_spends((SELECT n.internal_id FROM node n WHERE n.name = node_name)) r

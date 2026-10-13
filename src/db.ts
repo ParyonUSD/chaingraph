@@ -15,6 +15,9 @@ import type {
 } from './components/unspent-node-ids.js';
 import {
   backfillBatchSql,
+  backfillPrepareSql,
+  backfillResetSql,
+  backfillStateSql,
   batchDidWork,
   batchReachedLimits,
   blockReacceptedEventsSql,
@@ -1651,7 +1654,7 @@ const runBackfillBatch = async (
     const raw = (
       await client.query<{ result: { [key: string]: unknown } }>(
         backfillBatchSql,
-        [partition, partitionCount, unspentNodeIds.backfillTransactions]
+        [partition, partitionCount, unspentNodeIds.backfillPrefixes]
       )
     ).rows[0]!.result;
     await client.query('COMMIT;');
@@ -1660,6 +1663,63 @@ const runBackfillBatch = async (
     await client.query('ROLLBACK;');
     if (isSerializationFailure(err)) {
       return undefined;
+    }
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
+  }
+};
+
+/**
+ * Prepare the backfill once, in its own REPEATABLE READ transaction, at the
+ * settled limits (floors). Returns whether a prepared backfill is pending.
+ */
+const prepareBackfill = async (
+  client: pg.PoolClient,
+  limits: SettledLimits
+) => {
+  const [state] = (
+    await client.query<{ pending: boolean; prepared: boolean }>(
+      backfillStateSql
+    )
+  ).rows;
+  if (state === undefined || !state.pending) {
+    return false;
+  }
+  if (state.prepared) {
+    return true;
+  }
+  const start = Date.now();
+  await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ;');
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const raw = (
+      await client.query<{ result: { [key: string]: unknown } }>(
+        backfillPrepareSql,
+        [limits.transactionLimit, limits.blockLimit, limits.eventLimit]
+      )
+    ).rows[0]!.result;
+    await client.query('COMMIT;');
+    if (raw.busy === true || raw.uninitialized === true || raw.done === true) {
+      return false;
+    }
+    if (raw.prepared !== true) {
+      unspentTrackingLog.info(
+        `Unspent tracking backfill prepared in ${
+          Date.now() - start
+        } ms: full node set ${JSON.stringify(raw.fullNodeIds)} (${String(
+          raw.fullBlocks
+        )} blocks); ${String(raw.transactions)} transactions, ${String(
+          raw.spends
+        )} outpoints they spend and ${String(
+          raw.rows
+        )} stored values not '{}' are recomputed exactly.`
+      );
+    }
+    return true;
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    if (isSerializationFailure(err)) {
+      return false;
     }
     // eslint-disable-next-line functional/no-throw-statement
     throw err;
@@ -1715,12 +1775,12 @@ const ensureInitialized = async (
       `Unspent tracking job: tracking started at ${
         unspentNodeIds.startAtGenesis
           ? 'genesis'
-          : `transaction ${limits.transactionLimit} / block ${limits.blockLimit}; earlier outputs stay unprocessed (NULL) until backfilled`
+          : `transaction ${limits.transactionLimit} / block ${limits.blockLimit}; the stored values of earlier outputs are used once backfilled`
       } (${partitionCount} partitions).`
     );
     if (!unspentNodeIds.startAtGenesis && !unspentNodeIds.backfill) {
       unspentTrackingLog.warn(
-        'Unspent tracking job: CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false, so outputs saved before tracking started stay NULL, and unspent_output_stored answers them with the live predicate (exact, but as slow as unspent_output) until a backfill completes (unspent_tracking_settings.backfill_complete).'
+        'Unspent tracking job: CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false, so outputs saved before tracking started are not backfilled, and unspent_output_stored answers with the live predicate (exact, but as slow as unspent_output) until a backfill completes (unspent_tracking_settings.backfill_complete).'
       );
     }
     return;
@@ -1885,12 +1945,13 @@ export const runUnspentNodeIdsJobPass = async (
       if (
         (options.backfill ?? (unspentNodeIds.backfill || rebuildRequired)) &&
         summary.caughtUp &&
-        Date.now() - start < maxMs
+        Date.now() - start < maxMs &&
+        (await prepareBackfill(coordinator, limits))
       ) {
         const backfillResults = await Promise.all(
           Array.from({ length: partitionCount }, async (_, partition) => {
             const client = await unspentNodeIdsJobPool.connect();
-            const state = { batches: 0, changed: 0 };
+            const state = { batches: 0, changed: 0, stale: false };
             // eslint-disable-next-line functional/no-try-statement
             try {
               const loop = async (): Promise<void> => {
@@ -1902,11 +1963,14 @@ export const runUnspentNodeIdsJobPass = async (
                 state.batches += 1;
                 if (raw !== undefined) {
                   state.changed += Number(raw.changed ?? 0);
+                  state.stale = raw.stale === true;
                   if (
                     raw.done === true ||
                     raw.busy === true ||
                     raw.uninitialized === true ||
-                    raw.repartition === true
+                    raw.repartition === true ||
+                    raw.unprepared === true ||
+                    raw.stale === true
                   ) {
                     return undefined;
                   }
@@ -1928,6 +1992,21 @@ export const runUnspentNodeIdsJobPass = async (
           (sum, p) => sum + p.changed,
           0
         );
+        if (backfillResults.some((p) => p.stale)) {
+          /*
+           * The node table or block acceptance changed in a way the prepared
+           * backfill cannot account for: prepare again (next pass).
+           */
+          unspentTrackingLog.warn(
+            'Unspent tracking backfill: the prepared state is stale (the node table changed, or a node gained blocks without "accepted" events); the partitions not yet complete restart after a new preparation.'
+          );
+          await coordinator.query(backfillResetSql).catch((err: unknown) => {
+            if (!isLockNotAvailable(err)) {
+              // eslint-disable-next-line functional/no-throw-statement
+              throw err;
+            }
+          });
+        }
         await coordinator.query(deleteConsumedEventsSql);
       }
       return summary;

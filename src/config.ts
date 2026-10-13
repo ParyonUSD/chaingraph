@@ -50,7 +50,7 @@ const expectedOptions = [
   'CHAINGRAPH_TRUSTED_NODES',
   'CHAINGRAPH_UNSPENT_NODE_IDS',
   'CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL',
-  'CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL_TRANSACTIONS',
+  'CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL_PREFIXES',
   'CHAINGRAPH_UNSPENT_NODE_IDS_BATCH_INPUTS',
   'CHAINGRAPH_UNSPENT_NODE_IDS_CONNECTIONS',
   'CHAINGRAPH_UNSPENT_NODE_IDS_DURING_SYNC',
@@ -468,9 +468,9 @@ const nonNegativeIntegerSetting = (
  */
 const unspentNodeIds = {
   backfill: booleanSetting('CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL', false),
-  backfillTransactions: nonNegativeIntegerSetting(
-    'CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL_TRANSACTIONS',
-    20_000,
+  backfillPrefixes: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL_PREFIXES',
+    64,
     1
   ),
   batchInputs: nonNegativeIntegerSetting(

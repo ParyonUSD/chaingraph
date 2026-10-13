@@ -164,7 +164,15 @@ export const parseWatchPassResult = (raw: {
   ...(raw.uninitialized === true ? { uninitialized: true } : {}),
   watched: Number(raw.watched ?? 0),
 });
+/**
+ * Backfill: the preparation (once, REPEATABLE READ, settled transaction /
+ * block / event floors), one batch of one partition (REPEATABLE READ), and the
+ * reset of a prepared backfill a batch found stale.
+ */
+export const backfillPrepareSql = /* sql */ `SELECT unspent_node_ids_backfill_prepare($1::bigint, $2::bigint, $3::bigint) AS result;`;
 export const backfillBatchSql = /* sql */ `SELECT unspent_node_ids_backfill_batch($1::integer, $2::integer, $3::integer) AS result;`;
+export const backfillResetSql = /* sql */ `SELECT unspent_node_ids_backfill_reset() AS reset;`;
+export const backfillStateSql = /* sql */ `SELECT unspent_node_ids_backfill_pending() AS pending, EXISTS (SELECT 1 FROM unspent_tracking_backfill) AS prepared;`;
 /**
  * Whether the job must backfill whatever CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL
  * says: a rebuild after a stop (until it completes, reads use the live

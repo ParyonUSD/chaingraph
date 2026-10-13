@@ -18,6 +18,9 @@ DROP FUNCTION IF EXISTS unspent_node_ids_initialize (integer, bigint, bigint, bi
 DROP FUNCTION IF EXISTS unspent_node_ids_initialize (integer, bigint, bigint);
 DROP FUNCTION IF EXISTS unspent_node_ids_backfill_scope (bytea, bytea);
 DROP FUNCTION IF EXISTS unspent_node_ids_backfill_batch (integer, integer, integer);
+DROP FUNCTION IF EXISTS unspent_node_ids_backfill_reset ();
+DROP FUNCTION IF EXISTS unspent_node_ids_backfill_prepare (bigint, bigint, bigint);
+DROP FUNCTION IF EXISTS unspent_node_ids_backfill_node_blocks (bigint, bigint, bigint);
 DROP FUNCTION IF EXISTS unspent_node_ids_run_batch (integer, integer, bigint, bigint, bigint, integer, integer, integer, bigint);
 -- signatures of earlier drafts of this migration (lab databases)
 DROP FUNCTION IF EXISTS unspent_node_ids_run_batch (integer, integer, bigint, bigint, integer, integer, integer, bigint, boolean);
@@ -29,6 +32,11 @@ DROP TRIGGER IF EXISTS trigger_unspent_tracking_node_block_delete ON node_block;
 DROP TRIGGER IF EXISTS trigger_unspent_tracking_node_transaction_delete ON node_transaction;
 DROP FUNCTION IF EXISTS trigger_unspent_tracking_node_block_delete ();
 DROP FUNCTION IF EXISTS trigger_unspent_tracking_node_transaction_delete ();
+DROP TABLE IF EXISTS unspent_tracking_backfill_rows;
+DROP TABLE IF EXISTS unspent_tracking_backfill_spends;
+DROP TABLE IF EXISTS unspent_tracking_backfill_transactions;
+DROP TABLE IF EXISTS unspent_tracking_backfill_nodes;
+DROP TABLE IF EXISTS unspent_tracking_backfill;
 DROP TABLE IF EXISTS unspent_tracking_skipped;
 DROP TABLE IF EXISTS unspent_tracking_nodes;
 DROP TABLE IF EXISTS unspent_tracking_watch;

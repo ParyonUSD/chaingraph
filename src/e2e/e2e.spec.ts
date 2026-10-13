@@ -841,6 +841,12 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'token_category_index',
     'transaction_hash_key',
     'transaction_pkey',
+    'unspent_tracking_backfill_nodes_pkey',
+    'unspent_tracking_backfill_pkey',
+    'unspent_tracking_backfill_rows_pkey',
+    'unspent_tracking_backfill_spends_pkey',
+    'unspent_tracking_backfill_transactions_hash',
+    'unspent_tracking_backfill_transactions_pkey',
     'unspent_tracking_events_pkey',
     'unspent_tracking_nodes_pkey',
     'unspent_tracking_progress_pkey',
@@ -4411,6 +4417,429 @@ test.serial(
       await holder.query('ROLLBACK;');
       await holder.end();
       await other.end();
+    }
+  }
+);
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): backfill from the column default writes only what can be unspent, exact under changes during the backfill`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    t.timeout(unspentTestTimeoutMs);
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const db = await deferredDbModule('unspent-fast-backfill');
+    const hash = (byte: string) => `ec${byte.repeat(31)}`;
+    const zeroHash = '00'.repeat(32);
+    const coinbaseIndex = 0xffffffff;
+    const transaction = (
+      byte: string,
+      spends: [string, number][],
+      outputCount = 2,
+      isCoinbase = false
+    ): ChaingraphTransaction => ({
+      hash: hash(byte),
+      inputs: spends.map(([outpointTransactionHash, outpointIndex]) => ({
+        outpointIndex,
+        outpointTransactionHash,
+        sequenceNumber: 0,
+        unlockingBytecode: '51',
+      })),
+      isCoinbase,
+      locktime: 0,
+      outputs: Array.from({ length: outputCount }, () => ({
+        lockingBytecode: '51',
+        valueSatoshis: 1000n,
+      })),
+      sizeBytes: 60,
+      version: 2,
+    });
+    const blockHeight = 999_700;
+    const block = (byte: string, transactions: ChaingraphTransaction[]) => ({
+      bits: 0,
+      hash: hash(byte),
+      height: blockHeight,
+      merkleRoot: '00'.repeat(32),
+      nonce: 0,
+      previousBlockHash: '00'.repeat(32),
+      sizeBytes: 0,
+      timestamp: 0,
+      transactions,
+      version: 1,
+    });
+    const nodes = await deferredNodes();
+    const [nodeA, nodeB] = [nodes[0]!.id, nodes[1]!.id];
+    const saveBlockFor = async (
+      blockToSave: ChaingraphBlock,
+      nodeIds: number[]
+    ) =>
+      db.saveBlock({
+        block: blockToSave,
+        nodeAcceptances: nodeIds.map((nodeInternalId) => ({
+          acceptedAt: new Date(),
+          nodeInternalId,
+          nodeName: 'fast-backfill',
+        })),
+        transactionCache: new Map() as unknown as Parameters<
+          typeof db.saveBlock
+        >[0]['transactionCache'],
+      });
+    const mempool = async (
+      transactionToSave: ChaingraphTransaction,
+      nodeIds: number[]
+    ) =>
+      db.saveTransactionForNodes(
+        transactionToSave,
+        nodeIds.map((nodeInternalId) => ({
+          nodeInternalId,
+          validatedAt: new Date(),
+        }))
+      );
+    const transactionId = async (byte: string) =>
+      Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+            [hexToBin(hash(byte))]
+          )
+        ).rows[0]!.id
+      );
+    const drop = async (byte: string, nodeInternalId: number) =>
+      db.archiveMempoolTransaction({
+        nodeInternalId,
+        replacedAt: new Date(),
+        transactionInternalId: await transactionId(byte),
+      });
+    const stored = async (byte: string, index: number) =>
+      (
+        await client.query<{ ids: number[] | null }>(
+          /* sql */ `SELECT unspent_node_ids AS ids FROM output WHERE transaction_hash = $1 AND output_index = $2;`,
+          [hexToBin(hash(byte)), index]
+        )
+      ).rows[0]!.ids;
+    const count = async (sql: string) =>
+      Number((await client.query<{ n: string }>(sql)).rows[0]!.n);
+    const trackingTriggers = async (enabled: boolean) =>
+      client.query(
+        configureTrackingTriggersSql(enabled, {
+          // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
+          trigger_unspent_tracking_node_block_delete: !enabled,
+          // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
+          trigger_unspent_tracking_node_transaction_delete: !enabled,
+        }).join(' ')
+      );
+    const readTier = async () =>
+      (
+        await client.query<{ tier: string }>(
+          `SELECT unspent_node_ids_read_tier() AS tier;`
+        )
+      ).rows[0]!.tier;
+    const pending = async () =>
+      (
+        await client.query<{ pending: boolean }>(
+          `SELECT unspent_node_ids_backfill_pending() AS pending;`
+        )
+      ).rows[0]!.pending;
+    const partitionCount = async () =>
+      count(`SELECT count(*) AS n FROM unspent_tracking_progress;`);
+    const runBatch = async (partition: number, partitions: number) => {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ;');
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        const result = (
+          await client.query<{ result: { [key: string]: unknown } }>(
+            /* sql */ `SELECT unspent_node_ids_backfill_batch($1::integer, $2::integer, 256) AS result;`,
+            [partition, partitions]
+          )
+        ).rows[0]!.result;
+        await client.query('COMMIT;');
+        return result;
+      } catch (err) {
+        await client.query('ROLLBACK;');
+        // eslint-disable-next-line functional/no-throw-statement
+        throw err;
+      }
+    };
+    const runPartition = async (
+      partition: number,
+      partitions: number,
+      remaining = 10_000
+    ): Promise<{ [key: string]: unknown }> => {
+      const result = await runBatch(partition, partitions);
+      return result.done === true || remaining <= 0
+        ? result
+        : runPartition(partition, partitions, remaining - 1);
+    };
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      /*
+       * Tracking stopped, every stored value reset to '{}': the state of a
+       * database whose rows existed when the migration added the column with
+       * its default (not a rebuild). Rows saved from now on are NULL.
+       */
+      await trackingTriggers(false);
+      await client.query(`SELECT unspent_node_ids_stop();`);
+      await client.query(
+        `UPDATE output SET unspent_node_ids = '{}' WHERE unspent_node_ids IS DISTINCT FROM '{}';`
+      );
+      await client.query(
+        `UPDATE unspent_tracking_settings SET rebuild_required = false;`
+      );
+      /*
+       * Fixtures saved while tracking is off (no events), one edge case per
+       * output of f0 (accepted by nodes A and B).
+       */
+      await saveBlockFor(
+        block('b0', [transaction('f0', [[hash('ff'), 0]], 12)]),
+        [nodeA, nodeB]
+      );
+      // f0:0 dropped mempool spender (re-accepted after the preparation)
+      await mempool(transaction('d1', [[hash('f0'), 0]]), [nodeA]);
+      await drop('d1', nodeA);
+      // f0:1 spender in a block both nodes removed (re-org)
+      const reorged = block('b1', [transaction('e1', [[hash('f0'), 1]])]);
+      await saveBlockFor(reorged, [nodeA, nodeB]);
+      await db.removeStaleBlocksForNode(nodeA, [reorged.hash]);
+      await db.removeStaleBlocksForNode(nodeB, [reorged.hash]);
+      // f0:2 spender accepted by node A only (its mempool)
+      await mempool(transaction('51', [[hash('f0'), 2]]), [nodeA]);
+      // f0:3 double spend: the winner in a block of node A, the loser dropped from B's mempool
+      await saveBlockFor(block('b2', [transaction('71', [[hash('f0'), 3]])]), [
+        nodeA,
+      ]);
+      await mempool(transaction('72', [[hash('f0'), 3]]), [nodeB]);
+      await drop('72', nodeB);
+      // f0:4 spent in a block both nodes accept (the common case)
+      await saveBlockFor(block('b3', [transaction('a4', [[hash('f0'), 4]])]), [
+        nodeA,
+        nodeB,
+      ]);
+      /*
+       * f0:5 unspent; f0:6 .. f0:11 spent during the backfill. Coinbase: cb:0
+       * unspent, cb:1 spent in a block both nodes accept.
+       */
+      await saveBlockFor(
+        block('b4', [
+          transaction('cb', [[zeroHash, coinbaseIndex]], 2, true),
+          transaction('c1', [[hash('cb'), 1]]),
+        ]),
+        [nodeA, nodeB]
+      );
+      // created by a transaction no node accepts (dropped), one output spent by B's mempool
+      await mempool(transaction('91', [[hash('fe'), 0]]), [nodeA]);
+      await drop('91', nodeA);
+      await mempool(transaction('92', [[hash('91'), 0]]), [nodeB]);
+      // created in a block only node A accepts (node B accepts it via headers during the backfill)
+      const lagging = block('b5', [transaction('61', [[hash('fd'), 0]])]);
+      await saveBlockFor(lagging, [nodeA]);
+      // created in a block both accept (node B drops it during the backfill)
+      const dropped = block('b6', [transaction('31', [[hash('fc'), 0]])]);
+      await saveBlockFor(dropped, [nodeA, nodeB]);
+      /*
+       * Tracking starts at the tip: every pre-tracking value ('{}' from the
+       * default, NULL for the fixtures) is unprocessed, so reads use F1g.
+       */
+      await trackingTriggers(true);
+      await db.runUnspentNodeIdsJobPass({
+        backfill: false,
+        maxMs: 60_000,
+        settleWaitMs: 2_000,
+      });
+      t.true(await pending(), 'backfill pending');
+      t.is(await readTier(), 'fallback', 'backfill pending: F1g');
+      t.is(await stored('f0', 5), null, 'fixtures saved after the default');
+      await client.query('ANALYZE;');
+      await compareDeferredQueryRoot(t, 'fast backfill: pending');
+      // values before the backfill, to check what it writes
+      await client.query(/* sql */ `
+        CREATE TEMP TABLE fast_backfill_before AS
+          SELECT transaction_hash, output_index, unspent_node_ids FROM output;`);
+      const outputsBefore = await count(
+        `SELECT count(*) AS n FROM fast_backfill_before;`
+      );
+      // cspell:ignore xact xmin
+      const preparedAtXid = (
+        await client.query<{ xid: string }>(
+          `SELECT (pg_current_xact_id()::text::bigint % 4294967296)::text AS xid;`
+        )
+      ).rows[0]!.xid;
+      /*
+       * Preparation (settled floors: this test is the only writer).
+       */
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ;');
+      const prepared = (
+        await client.query<{ result: { [key: string]: unknown } }>(/* sql */ `
+          SELECT unspent_node_ids_backfill_prepare(
+            (SELECT max(internal_id) FROM transaction),
+            (SELECT max(internal_id) FROM block),
+            (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq)) AS result;`)
+      ).rows[0]!.result;
+      await client.query('COMMIT;');
+      t.log({ prepared });
+      t.true(Number(prepared.rows) > 0, 'NULL rows (saved after the default)');
+      t.true(
+        Number(prepared.transactions) > 0,
+        'transactions not accepted by exactly the full set'
+      );
+      /*
+       * Changes after the preparation: a re-acceptance (an "accepted"
+       * event), a spend in a new block, a mempool spend, a re-org, an
+       * existing block accepted via headers (an "accepted" event).
+       */
+      await mempool(transaction('d1', [[hash('f0'), 0]]), [nodeA]);
+      await saveBlockFor(block('b7', [transaction('a6', [[hash('f0'), 6]])]), [
+        nodeA,
+        nodeB,
+      ]);
+      await mempool(transaction('87', [[hash('f0'), 7]]), [nodeB]);
+      await db.removeStaleBlocksForNode(nodeB, [dropped.hash]);
+      await db.acceptBlocksViaHeaders(
+        nodeB,
+        [{ hash: lagging.hash, height: blockHeight }],
+        new Date()
+      );
+      // half of the partitions run their whole backfill now
+      const partitions = await partitionCount();
+      const firstHalf = Array.from(
+        { length: Math.ceil(partitions / 2) },
+        (_, partition) => partition
+      );
+      const firstResults = await firstHalf.reduce<
+        Promise<{ [key: string]: unknown }[]>
+      >(
+        async (chain, partition) =>
+          chain.then(async (results) => [
+            ...results,
+            await runPartition(partition, partitions),
+          ]),
+        Promise.resolve([])
+      );
+      t.true(
+        firstResults.every((result) => result.done === true),
+        JSON.stringify(firstResults)
+      );
+      t.true(await pending(), 'still pending: other partitions');
+      t.is(await readTier(), 'fallback', 'partly backfilled: F1g');
+      await compareDeferredQueryRoot(t, 'fast backfill: half done');
+      /*
+       * A node gains a block below the floor without an "accepted" event (a
+       * path the preparation cannot account for): the next batch reports the
+       * preparation stale.
+       */
+      await client.query(
+        /* sql */ `INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
+          SELECT $1::bigint, internal_id, now() FROM block WHERE hash = $2;`,
+        [nodeB, hexToBin(hash('b2'))]
+      );
+      const lastPartition = partitions - 1;
+      t.true(
+        (await runBatch(lastPartition, partitions)).stale === true,
+        'stale preparation detected'
+      );
+      /*
+       * The agent's pass (reset, a new preparation, the remaining
+       * partitions) while blocks and mempool transactions keep arriving.
+       */
+      const backfillPasses = async (remaining: number): Promise<number> => {
+        await db.runUnspentNodeIdsJobPass({
+          backfill: true,
+          maxMs: 60_000,
+          settleWaitMs: 2_000,
+        });
+        return (await pending()) && remaining > 0
+          ? backfillPasses(remaining - 1)
+          : remaining;
+      };
+      const concurrentSaves = async () => {
+        await saveBlockFor(
+          block('b8', [transaction('a8', [[hash('f0'), 8]])]),
+          [nodeA]
+        );
+        await mempool(transaction('89', [[hash('f0'), 9]]), [nodeA, nodeB]);
+        await saveBlockFor(
+          block('b9', [
+            transaction('aa', [[hash('f0'), 10]]),
+            transaction('89', [[hash('f0'), 9]]),
+          ]),
+          [nodeA, nodeB]
+        );
+        await mempool(transaction('ab', [[hash('f0'), 11]]), [nodeB]);
+        await drop('51', nodeA);
+      };
+      await Promise.all([backfillPasses(50), concurrentSaves()]);
+      await backfillPasses(50);
+      t.false(await pending(), 'backfill complete');
+      t.true(
+        (
+          await client.query<{ done: boolean }>(
+            `SELECT backfill_complete AS done FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.done
+      );
+      t.is(
+        await count(
+          `SELECT count(*) AS n FROM unspent_tracking_backfill_transactions;`
+        ),
+        0,
+        'backfill state emptied'
+      );
+      await drainDeferred(t, db, 'fast backfill complete');
+      t.not(await readTier(), 'fallback', 'backfill complete: stored set');
+      t.is(
+        await count(
+          `SELECT count(*) AS n FROM output WHERE unspent_node_ids IS NULL;`
+        ),
+        0,
+        'no output left NULL'
+      );
+      await client.query('ANALYZE;');
+      await compareDeferredStored(t, 'fast backfill complete (whole table)', 0);
+      await compareDeferredQueryRoot(t, 'fast backfill complete (whole table)');
+      // spot checks (two nodes: A and B)
+      const both = [nodeA, nodeB].sort((x, y) => x - y);
+      t.deepEqual(await stored('f0', 0), [nodeB], 'f0:0 re-accepted spender');
+      t.deepEqual(
+        await stored('f0', 1),
+        both,
+        'f0:1 spender removed by a re-org'
+      );
+      t.deepEqual(await stored('f0', 2), both, 'f0:2 spender dropped');
+      t.deepEqual(await stored('f0', 4), [], 'f0:4 spent by both');
+      t.deepEqual(await stored('f0', 5), both, 'f0:5 unspent');
+      t.deepEqual(await stored('cb', 0), both, 'coinbase output unspent');
+      t.deepEqual(await stored('cb', 1), [], 'coinbase output spent');
+      t.deepEqual(await stored('91', 1), [], 'creator accepted by no node');
+      t.deepEqual(await stored('92', 0), [nodeB], 'mempool of node B');
+      t.deepEqual(await stored('61', 0), both, 'block accepted via headers');
+      t.deepEqual(await stored('31', 0), [nodeA], 'block dropped by node B');
+      /*
+       * The backfill never rewrote a row whose value stays '{}' (outside the
+       * rows the changes above touched): the default is kept, not rewritten.
+       */
+      const rewrittenEmpty = await count(/* sql */ `
+        SELECT count(*) AS n FROM output o
+          JOIN fast_backfill_before b ON b.transaction_hash = o.transaction_hash AND b.output_index = o.output_index
+          WHERE b.unspent_node_ids = '{}' AND o.unspent_node_ids = '{}'
+            AND o.xmin::text::bigint > ${preparedAtXid}
+            AND substring(o.transaction_hash FROM 1 FOR 1) <> '\\xec'::bytea;`);
+      const written = await count(/* sql */ `
+        SELECT count(*) AS n FROM output o WHERE o.xmin::text::bigint > ${preparedAtXid};`);
+      t.log({ outputsBefore, written });
+      t.is(rewrittenEmpty, 0, 'rows staying {} are never rewritten');
+      t.true(written < outputsBefore, `${written} of ${outputsBefore} written`);
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS fast_backfill_before;`);
+      await db.pool.end();
+      await db.unspentNodeIdsJobPool.end();
+      if (originalPostgresConnectionString !== undefined) {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
     }
   }
 );
