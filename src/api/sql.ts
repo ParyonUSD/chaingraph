@@ -199,6 +199,24 @@ export class Sql {
    */
   readonly withItems: string[] = [];
 
+  /**
+   * Rows of `body` (selecting `columns`, in that order) computed once, as a
+   * statement-level scalar array, returned as a subquery with those columns.
+   * Unlike a `MATERIALIZED` CTE, which ClickHouse 26.8 evaluates once per
+   * subquery scope that reads it (both sides of a join, a nested IN), the
+   * scalar is evaluated once per statement (fix-pass-6.md §4). For row sets
+   * of the size of a level (they become a constant of the statement).
+   */
+  arrayRows(prefix: string, body: string, columns: readonly string[]) {
+    const name = this.scalar(
+      `__${prefix}`,
+      `SELECT groupArray(tuple(${columns.join(', ')})) FROM (${body})`
+    );
+    return `(SELECT ${columns
+      .map((column, index) => `tupleElement(__r, ${index + 1}) AS ${column}`)
+      .join(', ')} FROM (SELECT arrayJoin(${name}) AS __r))`;
+  }
+
   /** A statement-level `MATERIALIZED` CTE of `body`; returns its name. */
   cte(prefix: string, body: string) {
     const name = this.uniqueName(prefix);

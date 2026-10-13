@@ -844,8 +844,17 @@ export const TransactionEntity: Entity = {
           return `SELECT transaction_hash, block_internal_id, toUInt32(0) AS height,
           toFixedString('', 32) AS block_hash, transaction_index FROM (${inclusions})`;
         }
-        /* the inclusions once (a statement-level CTE), then their blocks' heights and hashes */
-        const rows = c.sql.cte('incl', inclusions);
+        /*
+         * The inclusions once (a statement-level scalar array: a MATERIALIZED
+         * CTE read by both sides of the join below is evaluated twice on
+         * ClickHouse 26.8, i.e. block_transaction read twice; fix-pass-6.md
+         * §4), then their blocks' heights and hashes.
+         */
+        const rows = c.sql.arrayRows('incl', inclusions, [
+          'block_internal_id',
+          'transaction_hash',
+          'transaction_index',
+        ]);
         return `SELECT bt.transaction_hash AS transaction_hash, bt.block_internal_id AS block_internal_id,
           b.height AS height, b.hash AS block_hash, bt.transaction_index AS transaction_index
         FROM ${rows} AS bt
