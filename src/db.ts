@@ -425,51 +425,262 @@ SELECT encode(transaction.hash, 'hex') AS "hash",
   }
 };
 
-/**
- * Archive a single node_transaction row. Existing history triggers handle any
- * same-node descendants with the same replaced_at timestamp.
- */
-export const archiveMempoolTransaction = async ({
-  nodeInternalId,
-  replacedAt,
-  transactionInternalId,
-}: {
+export interface MempoolTransactionExpiry {
   nodeInternalId: number;
   replacedAt: Date;
   transactionInternalId: number;
-}) => {
-  const client = await pool.connect();
-  // eslint-disable-next-line functional/no-try-statement
-  try {
-    const result = await client.query<{
-      archivedCount: number;
-    }>(
-      /* sql */ `
-WITH deleted_row AS (
+}
+
+// cspell:words xact unnest
+const deadlockDetectedCode = '40P01';
+const serializationFailureCode = '40001';
+const isRetriedConflict = (err: unknown) =>
+  [deadlockDetectedCode, serializationFailureCode].includes(
+    (err as { code?: string } | undefined)?.code ?? ''
+  );
+const expiryRetryLimit = 6;
+const expiryRetryBaseMs = 50;
+const expiryBatchSize = 500;
+/**
+ * Advisory lock key serializing mempool expiry across every agent sharing the
+ * database (the agent also runs expiry batches one at a time).
+ */
+const expiryAdvisoryLockKey = 1970172700;
+
+/**
+ * Archive expired node_transaction rows in one statement. Existing history
+ * triggers handle any same-node descendants: those not in the batch get the
+ * replaced_at of their archived ancestor.
+ *
+ * A row is left in place (not returned) if the transaction, or a conflicting
+ * spend of one of its outpoints, is already in a block accepted by the same
+ * node: {@link archiveMempoolTransactionsAcceptedByBlocks} archives those with
+ * the correct replaced_at (NULL or the block's accepted_at). The guard is part
+ * of the statement that locks and deletes the row, so it is evaluated against
+ * the row being archived, not a read taken earlier: a row inserted after the
+ * agent's accepted-block archive but before its expiry scan would otherwise be
+ * archived as expired/replaced even though it is confirmed.
+ *
+ * Deadlocks: archiving a mempool transaction also archives its descendants
+ * (the history trigger's recursive cascade), so concurrent single-row expiries
+ * of a parent and of its descendants lock the same rows in opposite orders
+ * (each locks its own row, then the cascade waits for the other's) and
+ * deadlock; a restarted agent's stale mempool, expiring all at once on every
+ * pool connection, live-locked this way. Expiry therefore runs one batch at a
+ * time (see {@link expireMempoolTransaction}), under a transaction-level
+ * advisory lock (also across agents sharing the database), locks its rows in (node, transaction) order before deleting
+ * them, and retries a deadlock or serialization failure against other writers
+ * (block acceptance, double-spend replacement) with backoff.
+ */
+export const archiveMempoolTransactions = async (
+  expiries: MempoolTransactionExpiry[]
+): Promise<MempoolTransactionExpiry[]> => {
+  if (expiries.length === 0) {
+    return [];
+  }
+  const sorted = [...expiries].sort(
+    (a, b) =>
+      a.nodeInternalId - b.nodeInternalId ||
+      a.transactionInternalId - b.transactionInternalId
+  );
+  const archiveOnce = async () => {
+    const client = await pool.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      const result = await client.query<{
+        nodeInternalId: string;
+        transactionInternalId: string;
+      }>(
+        /* sql */ `
+WITH serialized AS (
+    -- volatile, so materialized: scanned (and the lock taken) before any
+    -- joined row can be produced, i.e. before any row lock below
+    SELECT pg_advisory_xact_lock($4::bigint)
+),
+expiry AS (
+    SELECT node_internal_id, transaction_internal_id, replaced_at
+      FROM serialized
+      CROSS JOIN unnest($1::smallint[], $2::bigint[], $3::timestamp[])
+        AS expiry (node_internal_id, transaction_internal_id, replaced_at)
+),
+locked AS (
+    SELECT node_transaction.node_internal_id,
+           node_transaction.transaction_internal_id,
+           expiry.replaced_at
+      FROM expiry
+      JOIN node_transaction
+        ON node_transaction.node_internal_id = expiry.node_internal_id
+       AND node_transaction.transaction_internal_id = expiry.transaction_internal_id
+      WHERE NOT EXISTS (
+          SELECT 1
+            FROM block_transaction
+            JOIN node_block
+              ON node_block.node_internal_id = expiry.node_internal_id
+             AND node_block.block_internal_id = block_transaction.block_internal_id
+            WHERE block_transaction.transaction_internal_id = expiry.transaction_internal_id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+            FROM input mempool_input
+            JOIN input accepted_input
+              ON accepted_input.outpoint_transaction_hash = mempool_input.outpoint_transaction_hash
+             AND accepted_input.outpoint_index = mempool_input.outpoint_index
+             AND accepted_input.transaction_internal_id != expiry.transaction_internal_id
+            JOIN block_transaction
+              ON block_transaction.transaction_internal_id = accepted_input.transaction_internal_id
+            JOIN node_block
+              ON node_block.node_internal_id = expiry.node_internal_id
+             AND node_block.block_internal_id = block_transaction.block_internal_id
+            WHERE mempool_input.transaction_internal_id = expiry.transaction_internal_id
+              AND mempool_input.outpoint_transaction_hash != '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
+        )
+      ORDER BY node_transaction.node_internal_id, node_transaction.transaction_internal_id
+      FOR UPDATE OF node_transaction
+),
+deleted_rows AS (
     DELETE FROM node_transaction
-      WHERE node_internal_id = $1
-        AND transaction_internal_id = $2
-      RETURNING node_internal_id,
-                transaction_internal_id,
-                validated_at,
-                ${dateToTimestampWithoutTimezone(replacedAt)} AS replaced_at
+      USING locked
+      WHERE node_transaction.node_internal_id = locked.node_internal_id
+        AND node_transaction.transaction_internal_id = locked.transaction_internal_id
+      RETURNING node_transaction.node_internal_id,
+                node_transaction.transaction_internal_id,
+                node_transaction.validated_at,
+                locked.replaced_at
 ),
 inserted_history AS (
     INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id, validated_at, replaced_at)
       SELECT node_internal_id, transaction_internal_id, validated_at, replaced_at
-        FROM deleted_row
-      RETURNING transaction_internal_id
+        FROM deleted_rows
+      RETURNING node_internal_id, transaction_internal_id
 )
-SELECT COUNT(*)::integer AS "archivedCount" FROM inserted_history;
+SELECT node_internal_id::text AS "nodeInternalId",
+       transaction_internal_id::text AS "transactionInternalId"
+  FROM inserted_history;
 `,
-      [nodeInternalId, transactionInternalId]
-    );
-    return result.rows[0]!.archivedCount;
-  } finally {
-    client.release();
-  }
+        [
+          sorted.map((expiry) => expiry.nodeInternalId),
+          sorted.map((expiry) => expiry.transactionInternalId),
+          sorted.map((expiry) => expiry.replacedAt.toISOString()),
+          expiryAdvisoryLockKey,
+        ]
+      );
+      const archived = new Set(
+        result.rows.map(
+          (row) => `${row.nodeInternalId}:${row.transactionInternalId}`
+        )
+      );
+      return sorted.filter((expiry) =>
+        archived.has(`${expiry.nodeInternalId}:${expiry.transactionInternalId}`)
+      );
+    } finally {
+      client.release();
+    }
+  };
+  const attempt = async (retry: number): Promise<MempoolTransactionExpiry[]> =>
+    archiveOnce().catch(async (err: unknown) => {
+      if (!isRetriedConflict(err) || retry >= expiryRetryLimit) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw err;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-magic-numbers
+      const backoffMs = expiryRetryBaseMs * 2 ** retry * (1 + Math.random());
+      await new Promise((resolve) => {
+        setTimeout(resolve, backoffMs);
+      });
+      return attempt(retry + 1);
+    });
+  return attempt(0);
 };
 
+/**
+ * Archive a single expired node_transaction row (see
+ * {@link archiveMempoolTransactions}); returns the number archived (0 or 1).
+ */
+export const archiveMempoolTransaction = async (
+  expiry: MempoolTransactionExpiry
+) => (await archiveMempoolTransactions([expiry])).length;
+
+const pendingExpiries = new Map<
+  string,
+  {
+    expiry: MempoolTransactionExpiry;
+    settle: {
+      reject: (err: unknown) => void;
+      resolve: (archived: boolean) => void;
+    }[];
+  }
+>();
+// eslint-disable-next-line functional/no-let, @typescript-eslint/init-declarations
+let expiryDrain: Promise<void> | undefined;
+
+const drainExpiries = async (): Promise<void> => {
+  const batch = [...pendingExpiries.entries()].slice(0, expiryBatchSize);
+  if (batch.length === 0) {
+    return undefined;
+  }
+  batch.forEach(([key]) => pendingExpiries.delete(key));
+  await archiveMempoolTransactions(batch.map(([, entry]) => entry.expiry))
+    .then((archived) => {
+      const archivedKeys = new Set(
+        archived.map(
+          (expiry) => `${expiry.nodeInternalId}:${expiry.transactionInternalId}`
+        )
+      );
+      batch.forEach(([key, entry]) => {
+        entry.settle.forEach(({ resolve }) => {
+          resolve(archivedKeys.has(key));
+        });
+      });
+    })
+    .catch((err: unknown) => {
+      batch.forEach(([, entry]) => {
+        entry.settle.forEach(({ reject }) => {
+          reject(err);
+        });
+      });
+    });
+  return drainExpiries();
+};
+
+const startExpiryDrain = () => {
+  if (expiryDrain !== undefined) {
+    return;
+  }
+  expiryDrain = new Promise<void>((started) => {
+    // let every timer firing in this tick join the first batch
+    setImmediate(started);
+  })
+    .then(drainExpiries)
+    .finally(() => {
+      expiryDrain = undefined;
+      if (pendingExpiries.size > 0) {
+        startExpiryDrain();
+      }
+    });
+};
+
+/**
+ * Queue an expired mempool transaction for archiving; resolves `true` if it was
+ * archived, `false` if it was left in place (already gone, or accepted by a
+ * block for the node). Expiries run one batch at a time (up to
+ * {@link expiryBatchSize} rows per statement): when many fire at once (a
+ * restarted agent's stale mempool) they are archived in a few ordered
+ * statements on one connection instead of one racing statement per pool
+ * connection.
+ */
+export const expireMempoolTransaction = async (
+  expiry: MempoolTransactionExpiry
+) =>
+  new Promise<boolean>((resolve, reject) => {
+    const key = `${expiry.nodeInternalId}:${expiry.transactionInternalId}`;
+    const pending = pendingExpiries.get(key);
+    if (pending === undefined) {
+      pendingExpiries.set(key, { expiry, settle: [{ reject, resolve }] });
+    } else {
+      pending.settle.push({ reject, resolve });
+    }
+    startExpiryDrain();
+  });
 /**
  * Create or update one or more trusted node in the Chaingraph database,
  * returning it's internal ID.
