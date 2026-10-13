@@ -699,8 +699,8 @@ const storedTotals = async (
   return addTotals(new Map(), rows);
 };
 
-/** Outputs per chunk a whole-set check aims at (memory per statement ~1-2 GiB, fix-pass-7.md §5). */
-export const checkOutputsPerChunk = 4_000_000;
+/** Outputs per chunk a whole-set check aims at (memory per statement a few GiB, fix-pass-7.md §5). */
+export const checkOutputsPerChunk = 8_000_000;
 
 /**
  * Chunks for a whole-set check of this database: the smallest power of two
@@ -831,7 +831,7 @@ const rowDigest = `cityHash64(toString(tuple(transaction_internal_id, value_sato
  *
  * Whole set, memory bounded (fix-pass-7.md §5): the outpoints are compared
  * row for row per hash range of their transaction (`options.chunks`, by
- * default ~4 M outputs per range: a few GiB per statement on mainnet, where
+ * default ~8 M outputs per range: a few GiB per statement on mainnet, where
  * the single-statement form needed more than 280 GiB); the per-category totals of
  * the reference are summed over the ranges and compared with the stored
  * totals. A statement that fails (memory, time) fails the check: it throws,
@@ -888,30 +888,42 @@ export const checkUtxoSet = async (
       withChanges,
     });
     const chunkReference = unspentInHashRangeSql(pinned, range);
-    const diff = await client.query<{ kind: string; key: string }>(
-      `${rows.withClause()}SELECT kind, key FROM (
-         SELECT if(r.k = '', 'extra', if(s.k = '', 'missing', 'mismatched')) AS kind,
-                if(r.k = '', s.k, r.k) AS key
-         FROM (SELECT ${rowKey} AS k, ${rowDigest} AS d FROM (${chunkReference})) AS r
-         FULL OUTER JOIN (SELECT ${rowKey} AS k, ${rowDigest} AS d FROM (${stored})) AS s
-           ON r.k = s.k
-         WHERE r.k = '' OR s.k = '' OR r.d != s.d)
-       ORDER BY kind, key LIMIT 3 BY kind
+    /*
+     * one pass over the reference per chunk: the row-for-row comparison
+     * (up to 3 keys of each kind per category) and the reference's
+     * per-category totals, grouped by the reference row's category ('' for
+     * stored rows the reference lacks)
+     */
+    const compared = await client.query<
+      TotalsRow & { missing: string[]; extra: string[]; mismatched: string[] }
+    >(
+      `${rows.withClause()}SELECT if(r.k = '', '', lower(hex(r.cat))) AS c,
+         toString(countIf(r.k != '')) AS n, toString(sumIf(r.v, r.k != '')) AS v,
+         toString(countIf(r.k != '' AND isNotNull(r.f))) AS fn,
+         toString(sumIf(toInt128(ifNull(r.f, 0)), r.k != '')) AS fa,
+         toString(countIf(r.k != '' AND isNotNull(r.cap))) AS nn,
+         groupArrayIf(3)(r.k, r.k != '' AND s.k = '') AS missing,
+         groupArrayIf(3)(s.k, r.k = '') AS extra,
+         groupArrayIf(3)(r.k, r.k != '' AND s.k != '' AND r.d != s.d) AS mismatched
+       FROM (SELECT ${rowKey} AS k, ${rowDigest} AS d, token_category AS cat, value_satoshis AS v,
+               fungible_token_amount AS f, nonfungible_token_capability AS cap FROM (${chunkReference})) AS r
+       FULL OUTER JOIN (SELECT ${rowKey} AS k, ${rowDigest} AS d FROM (${stored})) AS s
+         ON r.k = s.k
+       GROUP BY c
        SETTINGS join_use_nulls = 0`,
       chunkParams,
       settings
     );
-    for (const row of diff) {
-      const list = found[row.kind as keyof typeof found];
-      if (list.length < 20) list.push(row.key);
+    for (const row of compared) {
+      for (const kind of ['extra', 'mismatched', 'missing'] as const) {
+        for (const key of row[kind]) {
+          if (found[kind].length < 20) found[kind].push(key);
+        }
+      }
     }
     addTotals(
       reference,
-      await client.query<TotalsRow>(
-        totalsRowsSql(chunkReference),
-        chunkParams,
-        settings
-      )
+      compared.filter((row) => row.c !== '')
     );
     const broken = await client.query<{ key: string }>(
       `SELECT concat(${rowKey}, ' sum ', toString(sum(sign))) AS key FROM utxo_set
