@@ -136,7 +136,11 @@ const pageOf = async (
   args: PageArgs,
   sels: readonly Sel[],
   max: number,
-  cursorOf?: (row: Row, values: string[]) => string
+  cursorOf?: (row: Row, values: string[]) => string,
+  extra?: {
+    values: { readonly [name: string]: string };
+    onExtra: (extra: { [name: string]: unknown } | undefined) => void;
+  }
 ): Promise<Page> => {
   checkLimit(args.limit, max);
   const offset = checkOffset(args.offset);
@@ -145,6 +149,7 @@ const pageOf = async (
     env.ctx,
     {
       entity,
+      extra: extra?.values,
       limit: args.limit + 1,
       offset,
       order,
@@ -155,7 +160,15 @@ const pageOf = async (
     },
     sels
   );
-  return runPage(env.db, label, env.sql, compiled, args.limit, cursorOf);
+  return runPage(
+    env.db,
+    label,
+    env.sql,
+    compiled,
+    args.limit,
+    cursorOf,
+    extra?.onExtra
+  );
 };
 
 /* ------------------------------------------------------------------ */
@@ -221,30 +234,25 @@ const acceptedInIdOrder = async (
  * The root condition of a `transactions` page in internal-id order that
  * checks only the candidates the page can contain (fix-pass-6.md §2), over
  * the candidate set `candidates` (a subquery of transaction_hash,
- * transaction_internal_id):
- * - the first `window` distinct candidates in `dir` id order (within the id
- *   bounds), kept as a statement-level scalar array: the window, i.e. every
- *   candidate up to the last of them;
- * - the page of the window (the transaction rows, the node's acceptance and
- *   the rest of the filter, all restricted to the window's candidates);
- * - the condition holds for the rows of that page if it has `need` rows or
- *   the window holds every candidate (then it is the page: no candidate
- *   before the window's end was skipped), and for no row otherwise (one
- *   scalar: every scalar reference in the root costs lookups in each level).
- * An empty result is therefore either the true answer (no candidate
- * matches) or "undecided": the caller runs the full statement then
- * (`runTransactions`). The acceptance and filter reads cost one granule per
- * candidate (per part, by hash), so a page of 10,000 among some 60,000
- * candidates (mainnet L33) reads a sixth. `checks(among, amongIds)` gets the
- * window's hashes and their internal ids, so each read can take the id path
- * (fix-pass-6.md §5).
+ * transaction_internal_id): the first `window` distinct candidates in `dir`
+ * id order (within the id bounds), kept as a statement-level scalar array,
+ * i.e. every candidate up to the last of them. The page over them (the
+ * transaction rows, the node's acceptance and the rest of the filter, all
+ * restricted to the window) is the page if it has `need` rows or the window
+ * holds every candidate (`capped` false): no candidate before the window's
+ * end was skipped. Otherwise the caller runs the full statement
+ * (`runTransactions`). Returns the condition and the `capped` expression.
  *
- * The candidates are evaluated once (into the window array), not as a
- * MATERIALIZED CTE: ClickHouse 26.8 evaluates such a CTE once per subquery
- * scope that reads it (chipnet L33: 18 reads of output / spend). The
- * fallback is a separate statement because a fallback branch in this one
- * (the candidates again under a constant condition) multiplied the
- * scalar-cache lookups of the arrays (chipnet L33: 937, ~0.7 s of analysis).
+ * The acceptance and filter reads cost one granule per candidate (per part,
+ * by hash), so a page of 10,000 among some 60,000 candidates (mainnet L33)
+ * reads a sixth. `checks(among, amongIds)` gets the window's hashes and their
+ * internal ids, so each read can take the id path (fix-pass-6.md §5). The
+ * candidates are evaluated once (into the array), not as a MATERIALIZED CTE:
+ * ClickHouse 26.8 evaluates such a CTE once per subquery scope that reads it
+ * (chipnet L33: 18 reads of output / spend). The fallback is a separate
+ * statement: spelt out in this one (the candidates again under a constant
+ * condition) it multiplied the scalar-cache lookups of the arrays (chipnet
+ * L33: 937, ~0.7 s of analysis).
  */
 const candidateWindow = (
   sql: Sql,
@@ -252,11 +260,9 @@ const candidateWindow = (
   checks: (among: string, amongIds: string) => string[],
   idBounds: { _gt?: bigint; _lt?: bigint },
   dir: 'ASC' | 'DESC',
-  need: number,
   window: number
 ) => {
   const k = sql.bind(window, 'UInt64');
-  const needed = sql.bind(need, 'UInt64');
   const onIds = numericComparison(
     sql,
     'transaction_internal_id',
@@ -269,20 +275,13 @@ const candidateWindow = (
       onIds.length === 0 ? '' : ` WHERE ${onIds.join(' AND ')}`
     } ORDER BY transaction_internal_id ${dir} LIMIT 1 BY transaction_internal_id LIMIT ${k})`
   );
-  /* the window's page, or no row when it does not decide the page */
-  const page = sql.scalar(
-    '__cand_page',
-    `SELECT if(length(tupleElement(${first}, 2)) < ${k} OR length(__h) >= ${needed}, (__h, __i), ([], [])) FROM (SELECT groupArray(hash) AS __h, groupArray(internal_id) AS __i FROM (SELECT hash, internal_id FROM ${sql.view(
-      'transaction_at'
-    )} WHERE ${checks(
+  return {
+    capped: `toUInt8(length(tupleElement(${first}, 2)) = ${k})`,
+    where: checks(
       `SELECT arrayJoin(tupleElement(${first}, 1))`,
       `SELECT arrayJoin(tupleElement(${first}, 2))`
-    )
-      .map((part) => `(${part})`)
-      .join(' AND ')} ORDER BY internal_id ${dir} LIMIT ${needed}))`
-  );
-  /* the page's rows by hash and by internal id (the key or p_id, as above) */
-  return `hash IN (SELECT arrayJoin(tupleElement(${page}, 1))) AND internal_id IN (SELECT arrayJoin(tupleElement(${page}, 2)))`;
+    ),
+  };
 };
 
 /** A `transactions` page checking every candidate (or the whole acceptance set). */
@@ -378,30 +377,45 @@ export const runTransactions = async (
       ...bounds,
       transactionPredicate(sql, args.where, ctx.node, among),
     ];
+    const window = candidateWindow(
+      sql,
+      candidates,
+      checks,
+      range,
+      args.order ?? 'ASC',
+      env.db.candidateWindowRows(args.limit + 1)
+    );
+    const seen: { capped?: unknown } = {};
     const page = await pageOf(
       env,
       label,
       TransactionEntity,
       sql.view('transaction_at'),
-      [
-        candidateWindow(
-          sql,
-          candidates,
-          checks,
-          range,
-          args.order ?? 'ASC',
-          args.limit + 1,
-          env.db.candidateWindowRows(args.limit + 1)
-        ),
-      ],
+      window.where,
       order,
       { ...args, after: args.cursor },
       sels,
       maxLimits.transactions,
-      (_row, values) => values[0]!
+      (_row, values) => values[0]!,
+      {
+        onExtra: (extra) => {
+          seen.capped = extra?.cappedWindow;
+        },
+        values: { cappedWindow: window.capped },
+      }
     );
-    if (page.nodes.length > 0) return page;
-    /* empty: no candidate matches, or the window could not decide */
+    /*
+     * Decided: a full page (limit + 1 rows: has_more), or a window holding
+     * every candidate. Not decided: a capped window short of the page, or an
+     * empty page without levels (no row carries `cappedWindow`).
+     */
+    if (
+      page.has_more ||
+      (seen.capped !== undefined && Number(seen.capped) === 0)
+    ) {
+      return page;
+    }
+    /* the window could not decide: every candidate */
     const sqlAll = sql.fresh();
     return fullTransactionsPage(
       { ...env, ctx: { ...ctx, sql: sqlAll }, sql: sqlAll },

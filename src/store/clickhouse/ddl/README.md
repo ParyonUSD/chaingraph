@@ -62,7 +62,9 @@ engine as written. VersionedCollapsingMergeTree appends `version` to the sorting
 `pending_spend`, `input_stand_in` and `input_stand_in_resolution` were removed on 2026-10-11 (item 28).
 
 Projections (060): `block.p_height (height)`, `transaction.p_id (internal_id)`,
-`block_transaction.p_tx (transaction_hash)`, `output.p_script (locking_bytecode_prefix)`,
+`block_transaction.p_tx (transaction_hash)`, `block_transaction.p_txid (transaction_internal_id)` (2026-10-13,
+docs/clickhouse-port/fix-pass-6.md §6: inclusions by id probe one time-ordered part, by hash every part),
+`output.p_script (locking_bytecode_prefix)`,
 `output.p_category (token_category, nonfungible_token_commitment_key)`,
 `input.p_outpoint (outpoint_transaction_hash, outpoint_index)`, `tx_acceptance.p_node_height (node_internal_id, height,
 transaction_internal_id)`, and in 070 `spend.p_category (token_category, nonfungible_token_commitment_key)`. All full-column except `input.p_outpoint`, which is slim (outpoint, input key, `commit_seq`) at

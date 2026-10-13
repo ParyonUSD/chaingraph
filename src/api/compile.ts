@@ -605,6 +605,13 @@ export interface RootQuery {
   /** Rows to fetch (page size + 1 for `has_more`); undefined: all. */
   limit?: number;
   offset?: number;
+  /**
+   * Statement-level values returned next to the rows (`name` → SQL over the
+   * statement's WITH scalars), e.g. whether a candidate window was capped.
+   * Without a relationship level they come with each row, so an empty page
+   * has none.
+   */
+  extra?: { readonly [name: string]: string };
 }
 
 export interface CompiledRoot {
@@ -613,6 +620,8 @@ export interface CompiledRoot {
   decode: (rows: { [column: string]: unknown }[]) => {
     rows: Row[];
     cursors: string[][];
+    /** `RootQuery.extra` as returned (undefined: no result row carried them). */
+    extra?: { [name: string]: unknown };
   };
 }
 
@@ -698,12 +707,21 @@ export const compileRoot = (
       );
     }
   };
+  const extraNames = Object.keys(root.extra ?? {});
+  const extraColumns = extraNames.map(
+    (name) => `${root.extra![name]!} AS ${name}`
+  );
+  const extraOf = (row: { [column: string]: unknown } | undefined) =>
+    extraNames.length === 0 || row === undefined
+      ? undefined
+      : Object.fromEntries(extraNames.map((name) => [name, row[name]]));
   if (st.keyWidths.size === 0) {
     /* no relationship: the page itself, one row per root row */
     sql.withItems.splice(reserved, 1);
-    const cursorColumns = root.order.map(
-      (term, index) => `${cursorExpr(term)} AS __c${index}`
-    );
+    const cursorColumns = [
+      ...root.order.map((term, index) => `${cursorExpr(term)} AS __c${index}`),
+      ...extraColumns,
+    ];
     return {
       decode: (rows) => {
         checkCap(rows.length);
@@ -713,6 +731,7 @@ export const compileRoot = (
           cursors: rows.map((row) =>
             root.order.map((_, index) => String(row[`__c${index}`]))
           ),
+          extra: extraOf(rows[0]),
           rows: rows.map((row) =>
             plan.decode(tupleValues(row.__row).slice(1), none, count)
           ),
@@ -749,12 +768,14 @@ export const compileRoot = (
         cursors: tuples.map((tuple) =>
           root.order.map((_, index) => String(tuple[1 + cursorStart + index]))
         ),
+        extra: extraOf(row),
         rows: decoded,
       };
     },
-    sql: `${sql.withClause()}SELECT __page, ${[...st.keyWidths.keys()].join(
-      ', '
-    )}${
+    sql: `${sql.withClause()}SELECT __page, ${[
+      ...st.keyWidths.keys(),
+      ...extraColumns,
+    ].join(', ')}${
       st.pipelineOutputs.length === 0
         ? ''
         : ` FROM ${st.pipelineOutputs
@@ -853,11 +874,13 @@ export const runPage = async (
   sql: Sql,
   compiled: CompiledRoot,
   limit: number,
-  cursorOf?: (row: Row, values: string[]) => string
+  cursorOf?: (row: Row, values: string[]) => string,
+  onExtra?: (extra: { [name: string]: unknown } | undefined) => void
 ): Promise<Page> => {
-  const { cursors, rows } = compiled.decode(
+  const { cursors, rows, extra } = compiled.decode(
     await db.query(label, compiled.sql, sql.params)
   );
+  onExtra?.(extra);
   const nodes = rows.slice(0, limit);
   const last = nodes.length - 1;
   return {
