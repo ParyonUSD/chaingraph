@@ -4844,6 +4844,150 @@ test.serial(
   }
 );
 
+/**
+ * A plan node of `EXPLAIN (FORMAT JSON)` (auto_explain), as far as read here.
+ */
+interface PlanNode {
+  /* eslint-disable @typescript-eslint/naming-convention */
+  'Index Cond'?: string;
+  'Node Type': string;
+  Plans?: PlanNode[];
+  'Recheck Cond'?: string;
+  'Relation Name'?: string;
+  /* eslint-enable @typescript-eslint/naming-convention */
+}
+const planNodes = (node: PlanNode): PlanNode[] => [
+  node,
+  ...(node.Plans ?? []).flatMap(planNodes),
+];
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): backfill preparation probes stay keyed under mainnet-scale statistics`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    // cspell:ignore indrelid relpages reltuples rolname rolsuper
+    const superuser = (
+      await client.query<{ superuser: boolean }>(
+        `SELECT rolsuper AS superuser FROM pg_roles WHERE rolname = current_user;`
+      )
+    ).rows[0]!.superuser;
+    if (!superuser) {
+      t.log('skipped: needs a superuser (auto_explain, pg_class statistics)');
+      t.pass();
+      return;
+    }
+    /*
+     * On mainnet the preparation's spends and "other blocks" statements
+     * walked whole indexes (input_pkey, spent_by_index) or scanned whole
+     * tables, because the planner's estimates for the big tables dwarfed the
+     * small driving sets (M, the other blocks); test data is far too small to
+     * show it. So, in a transaction that is rolled back: every big table (and
+     * its indexes) is made to look 100,000 times larger, a backfill is made
+     * pending, and the preparation runs with auto_explain reporting the plan
+     * of each statement it runs. Every access to a big table in those two
+     * statements must be a keyed index probe, driven from the small side.
+     */
+    const plans: { query: string; plan: PlanNode }[] = [];
+    const onNotice = (notice: { message?: string }) => {
+      const message = notice.message ?? '';
+      const start = message.indexOf('{');
+      if (!message.startsWith('duration:') || start < 0) {
+        return;
+      }
+      const parsed = JSON.parse(message.slice(start)) as {
+        /* eslint-disable @typescript-eslint/naming-convention */
+        Plan: PlanNode;
+        'Query Text': string;
+        /* eslint-enable @typescript-eslint/naming-convention */
+      };
+      plans.push({ plan: parsed.Plan, query: parsed['Query Text'] });
+    };
+    const bigTables = [
+      'block',
+      'block_transaction',
+      'input',
+      'node_block',
+      'output',
+      'transaction',
+    ];
+    await client.query('BEGIN;');
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await client.query(`ANALYZE ${bigTables.join(', ')};`);
+      await client.query(
+        /* sql */ `
+        UPDATE pg_class SET relpages = GREATEST(relpages, 1), reltuples = GREATEST(reltuples, 1) * 100000
+          WHERE oid IN (SELECT c.oid FROM pg_class c WHERE c.relname = ANY ($1::text[])
+                        UNION ALL
+                        SELECT i.indexrelid FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
+                          WHERE c.relname = ANY ($1::text[]));`,
+        [bigTables]
+      );
+      // a pending backfill, not prepared
+      await client.query(/* sql */ `
+        DELETE FROM unspent_tracking_backfill;
+        UPDATE unspent_tracking_progress SET backfill_transaction_internal_id = 0, backfill_prefix = 0;`);
+      await client.query(/* sql */ `
+        LOAD 'auto_explain';
+        SET LOCAL auto_explain.log_min_duration = 0;
+        SET LOCAL auto_explain.log_nested_statements = on;
+        SET LOCAL auto_explain.log_format = json;
+        SET LOCAL auto_explain.log_level = notice;
+        SET LOCAL client_min_messages = notice;`);
+      client.on('notice', onNotice);
+      const prepared = (
+        await client.query<{ result: { [key: string]: unknown } }>(/* sql */ `
+          SELECT unspent_node_ids_backfill_prepare(
+            (SELECT max(internal_id) FROM transaction),
+            (SELECT max(internal_id) FROM block),
+            (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq)) AS result;`)
+      ).rows[0]!.result;
+      client.removeListener('notice', onNotice);
+      t.log({ prepared });
+      t.true(Number(prepared.transactions) > 0, 'M is not empty');
+    } finally {
+      client.removeListener('notice', onNotice);
+      await client.query('ROLLBACK;');
+    }
+    const keyed = (label: string, plan: PlanNode, driver: string) => {
+      const scans = planNodes(plan).filter(
+        (node) =>
+          node['Relation Name'] !== undefined &&
+          node['Node Type'] !== 'ModifyTable'
+      );
+      t.is(
+        scans[0]?.['Relation Name'],
+        driver,
+        `${label}: driven from ${driver}`
+      );
+      scans
+        .filter((node) => bigTables.includes(node['Relation Name']!))
+        .forEach((node) => {
+          t.true(
+            ['Index Scan', 'Index Only Scan'].includes(node['Node Type']) &&
+              node['Index Cond'] !== undefined,
+            `${label}: ${node['Node Type']} on ${node[
+              'Relation Name'
+            ]!} must be a keyed probe\n${JSON.stringify(plan, undefined, 1)}`
+          );
+        });
+    };
+    const statement = (marker: string) =>
+      plans.find(({ query }) => query.includes(marker));
+    const otherBlocks = statement('unspent_node_ids_other_blocks ob');
+    const spends = statement('INSERT INTO unspent_tracking_backfill_spends');
+    t.not(otherBlocks, undefined, 'plan of the other-blocks statement');
+    t.not(spends, undefined, 'plan of the spends statement');
+    keyed('other blocks', otherBlocks!.plan, 'unspent_node_ids_other_blocks');
+    keyed('spends', spends!.plan, 'unspent_tracking_backfill_transactions');
+  }
+);
+
 /* eslint-enable @typescript-eslint/no-magic-numbers */
 /* eslint-enable max-params, require-atomic-updates, @typescript-eslint/no-shadow, prefer-destructuring */
 
