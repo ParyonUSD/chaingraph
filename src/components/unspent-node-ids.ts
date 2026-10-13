@@ -309,6 +309,33 @@ export const batchReachedLimits = (
   result.blockWatermark >= limits.blockLimit;
 
 /**
+ * Whether a partition's tracking lets the backfill run: it reached the
+ * settled limits, or it has nothing left to do now but wait for a missing
+ * parent output (a child saved before its parent: stalled, up to
+ * CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS per transaction). A partition still
+ * working through a backlog (the pass ran out of time) holds the backfill
+ * back, so catch-ups keep priority.
+ *
+ * Stalls do not hold it back: the backfill only recomputes pre-tracking
+ * outputs from the current state, which does not depend on how far tracking
+ * has walked (later spends and acceptance changes are re-applied by tracking,
+ * recomputing from scratch), and a mempool child-before-parent resolves only
+ * when the parent arrives or the stall cap passes. Gating on it let one
+ * stalled partition (of 64, after a restart reloaded the mempool) block the
+ * whole backfill for the stall cap, again for every new stalled transaction
+ * (2026-10-13 backfill lab: no backfill for 13 minutes).
+ */
+export const readyForBackfill = (partition: {
+  caughtUp: boolean;
+  last: BatchResult | undefined;
+  settled: boolean;
+}) =>
+  partition.caughtUp ||
+  (partition.settled &&
+    partition.last?.stalledAt !== null &&
+    partition.last?.stalledAt !== undefined);
+
+/**
  * Stall bookkeeping (child-before-parent): a partition stops before a
  * transaction with an input whose output row does not exist yet, and retries
  * next pass. Once one stall has lasted `stallMaxMs`, every missing-output

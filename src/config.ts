@@ -519,7 +519,7 @@ const unspentNodeIds = {
     configuration.CHAINGRAPH_UNSPENT_NODE_IDS_DURING_SYNC !== 'run',
   stallMaxMs: nonNegativeIntegerSetting(
     'CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS',
-    600_000
+    60_000
   ),
   startAtGenesis: configuration.CHAINGRAPH_UNSPENT_NODE_IDS_START === 'genesis',
 };

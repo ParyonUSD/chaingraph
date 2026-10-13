@@ -3046,7 +3046,7 @@ const concurrencyTransaction = (
 const e2eDefaultStallMaxMs = '2000';
 /*
  * The job modules imported by the tests read it from the environment; the
- * production default (10 minutes) would make every stall in the scenario
+ * production default (1 minute) would make every stall in the scenario
  * below sleep for 10 minutes.
  */
 process.env.CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS ??= e2eDefaultStallMaxMs;
@@ -3191,6 +3191,8 @@ const drainDeferred = async (
   const first = await db.drainUnspentNodeIdsJob(120_000);
   const stalled = first.stalled;
   if (stalled) {
+    // a stall (child saved before its parent) does not hold the backfill back
+    t.true(first.backfillReady, `${label}: backfill not gated by the stall`);
     await compareDeferredQueryRoot(t, `${label} (job stalled)`, filter);
     await deferredSleep(deferredStallMaxMs + 100);
     const second = await db.drainUnspentNodeIdsJob(120_000);
@@ -4985,6 +4987,109 @@ test.serial(
     t.not(spends, undefined, 'plan of the spends statement');
     keyed('other blocks', otherBlocks!.plan, 'unspent_node_ids_other_blocks');
     keyed('spends', spends!.plan, 'unspent_tracking_backfill_transactions');
+  }
+);
+
+/**
+ * Re-partitioning preserves progress: each new partition (a range of first
+ * hash bytes) starts at the minimum watermarks of the old partitions whose
+ * ranges overlap its own, not at the global minimum (the 2026-10-13 lab: a
+ * change from 32 to 64 partitions restarted every partition from the lowest
+ * watermark).
+ */
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): repartition starts each partition at the overlapping old watermarks`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    const progress = async () =>
+      (
+        await client.query<{
+          backfill: string;
+          block: string;
+          consumed: string;
+          count: number;
+          input: string;
+          partition: number;
+        }>(/* sql */ `
+SELECT partition_index AS partition, partition_count AS count,
+       input_transaction_internal_id::text AS input, block_internal_id::text AS block,
+       consumed_event_id::text AS consumed, backfill_transaction_internal_id::text AS backfill
+  FROM unspent_tracking_progress ORDER BY partition_index;`)
+      ).rows;
+    const repartition = async (count: number) =>
+      (
+        await client.query<{ repartitioned: boolean }>(
+          /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`,
+          [count]
+        )
+      ).rows[0]!.repartitioned;
+    /**
+     * Old partition p of n covers first bytes b with floor(b * n / 256) = p: the
+     * expected start of new partition q of m is the minimum over the old
+     * partitions sharing a byte with it (the global minimum if it has none).
+     */
+    const expected = (
+      old: {
+        block: string;
+        consumed: string;
+        input: string;
+        backfill: string;
+      }[],
+      m: number
+    ) =>
+      Array.from({ length: m }, (_, q) => {
+        const overlapping = Array.from({ length: 256 }, (_b, b) => b)
+          .filter((b) => Math.floor((b * m) / 256) === q)
+          .map((b) => old[Math.floor((b * old.length) / 256)]!);
+        const from = overlapping.length === 0 ? old : overlapping;
+        const min = (key: 'backfill' | 'block' | 'consumed' | 'input') =>
+          String(Math.min(...from.map((row) => Number(row[key]))));
+        return {
+          backfill: min('backfill'),
+          block: min('block'),
+          consumed: min('consumed'),
+          count: m,
+          input: min('input'),
+          partition: q,
+        };
+      });
+    await client.query('BEGIN;');
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      const initial = (await progress()).length;
+      t.true(initial > 0, 'tracking initialized');
+      if (initial !== 4) {
+        t.true(await repartition(4), 'to 4 partitions');
+      }
+      // distinct, non-monotonic watermarks per partition
+      await client.query(/* sql */ `
+UPDATE unspent_tracking_progress
+  SET input_transaction_internal_id = 1000 + 10 * ((partition_index * 7) % 4),
+      block_internal_id = 500 + (partition_index * 3) % 4,
+      consumed_event_id = 100 + (partition_index * 5) % 4,
+      backfill_transaction_internal_id = 10 + partition_index;`);
+      const transitions = [8, 3, 5, 300, 2];
+      await transitions.reduce(async (previous, m) => {
+        await previous;
+        const before = await progress();
+        t.true(await repartition(m), `to ${m} partitions`);
+        const after = await progress();
+        t.deepEqual(after, expected(before, m), `${before.length} to ${m}`);
+        t.is(
+          Math.min(...after.map((row) => Number(row.input))),
+          Math.min(...before.map((row) => Number(row.input))),
+          'global minimum unchanged'
+        );
+      }, Promise.resolve());
+      t.false(await repartition(2), 'unchanged count: no-op');
+    } finally {
+      await client.query('ROLLBACK;');
+    }
   }
 );
 
