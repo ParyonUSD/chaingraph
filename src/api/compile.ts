@@ -277,14 +277,12 @@ export interface Row {
   [relations]?: { [responseKey: string]: unknown };
 }
 
+/* A symbol key: unseen by JSON / Object.keys, a plain store (defineProperty per row: ~10 % of decoding; fix-pass-8b.md §4). */
 const withRelations = (
   record: { [key: string]: unknown },
   values: { [key: string]: unknown }
 ) => {
-  Object.defineProperty(record, relations, {
-    enumerable: false,
-    value: values,
-  });
+  (record as Row)[relations] = values;
   return record as Row;
 };
 
@@ -340,6 +338,16 @@ class Statement {
   /** The arrays of pipeline levels (`recursive`): one-row subqueries of the final SELECT. */
   readonly pipelineOutputs: string[] = [];
 
+  /**
+   * Per level: tuple width and the positions (1-based, prefix included) the
+   * TypeScript side reads. The others carry link columns for the levels
+   * below (raw hashes, internal ids) and are sent as NULL (`outputColumn`).
+   */
+  readonly levelOutputs = new Map<
+    string,
+    { width: number; client: ReadonlySet<number> }
+  >();
+
   constructor(readonly sql: Sql) {}
 
   levelName(keyWidth: number) {
@@ -357,8 +365,15 @@ interface LevelPlan {
   elements: string[];
   /** Raw columns the level row must carry. */
   needs: Set<string>;
-  /** Tuple elements (after the prefix) → decoded row. */
-  decode: (values: unknown[], data: LevelData, count: { rows: number }) => Row;
+  /** Positions (0-based, in `elements`) the decoder reads. */
+  clientPositions: Set<number>;
+  /** Tuple elements (from `offset`, after the prefix) → decoded row. */
+  decode: (
+    values: readonly unknown[],
+    offset: number,
+    data: LevelData,
+    count: { rows: number }
+  ) => Row;
 }
 
 /** A key column as text, for matching parent and child rows in TypeScript (lossless for bytes). */
@@ -369,6 +384,15 @@ const keyOf = (values: readonly unknown[]) =>
   values.some((value) => value === null || value === undefined)
     ? undefined
     : values.map(String).join('\u0000');
+
+/** `keyOf` of `width` values of `tuple` from `start`, without copying them (one column: the value itself). */
+const keyAt = (tuple: readonly unknown[], start: number, width: number) => {
+  if (width === 1) {
+    const value = tuple[start];
+    return value === null || value === undefined ? undefined : String(value);
+  }
+  return keyOf(tuple.slice(start, start + width));
+};
 
 const nestedLimitCap = 100_000;
 
@@ -427,6 +451,7 @@ const planLevel = (
 ): LevelPlan => {
   const elements: string[] = [];
   const needs = new Set<string>();
+  const clientPositions = new Set<number>();
   const element = (sql: string) => {
     const existing = elements.indexOf(sql);
     if (existing !== -1) return existing;
@@ -434,7 +459,8 @@ const planLevel = (
     return elements.length - 1;
   };
   const decoders: ((
-    values: unknown[],
+    values: readonly unknown[],
+    offset: number,
     record: { [key: string]: unknown },
     related: { [key: string]: unknown },
     data: LevelData,
@@ -445,11 +471,12 @@ const planLevel = (
     const field = entity.fields[sel.name]!;
     if (field.kind === 'scalar') {
       const position = element(field.sql);
+      clientPositions.add(position);
       referencedColumns(field.sql, entity.columns).forEach((column) =>
         needs.add(column)
       );
-      decoders.push((values, record) => {
-        record[sel.name] = values[position] ?? null;
+      decoders.push((values, base, record) => {
+        record[sel.name] = values[base + position] ?? null;
       });
       return;
     }
@@ -480,6 +507,7 @@ const planLevel = (
     const parentKeyPositions = field.parentKeys.map((column) =>
       element(keyText(column))
     );
+    parentKeyPositions.forEach((position) => clientPositions.add(position));
     const link = pipeline
       ? `SELECT ${linkColumns.join(', ')} FROM ${level}_rows`
       : `SELECT ${linkColumns
@@ -553,6 +581,15 @@ const planLevel = (
       bounds.length === 0 ? '' : ` WHERE ${bounds.join(' AND ')}`
     }`;
     const array = `groupArray(tuple(${childTuple.join(', ')}))`;
+    st.levelOutputs.set(child, {
+      client: new Set([
+        ...Array.from({ length: childPrefix }, (_, index) => index + 1),
+        ...[...plan.clientPositions].map(
+          (position) => childPrefix + position + 1
+        ),
+      ]),
+      width: childTuple.length,
+    });
     if (childPipeline) {
       sql.withItems[reserved] = [
         ...added,
@@ -567,23 +604,39 @@ const planLevel = (
         `(SELECT ${array} FROM (${body})) AS ${child}`,
       ].join(',\n');
     }
-    decoders.push((values, _record, related, data, count) => {
-      const key = keyOf(parentKeyPositions.map((position) => values[position]));
-      const tuples = key === undefined ? [] : data.get(child)?.get(key) ?? [];
-      const items = tuples.map((tuple) => {
-        count.rows += 1;
-        return plan.decode(tuple.slice(childPrefix), data, count);
-      });
-      related[sel.key] = field.many ? items : items[0] ?? null;
+    const childData = (data: LevelData) => data.get(child);
+    decoders.push((values, base, _record, related, data, count) => {
+      const key =
+        parentKeyPositions.length === 1
+          ? keyAt(values, base + parentKeyPositions[0]!, 1)
+          : keyOf(
+              parentKeyPositions.map((position) => values[base + position])
+            );
+      const tuples = key === undefined ? undefined : childData(data)?.get(key);
+      if (tuples === undefined) {
+        related[sel.key] = field.many ? [] : null;
+        return;
+      }
+      count.rows += tuples.length;
+      if (!field.many) {
+        related[sel.key] = plan.decode(tuples[0]!, childPrefix, data, count);
+        return;
+      }
+      const items = new Array<Row>(tuples.length);
+      for (let index = 0; index < tuples.length; index += 1) {
+        items[index] = plan.decode(tuples[index]!, childPrefix, data, count);
+      }
+      related[sel.key] = items;
     });
   });
   return {
-    decode: (values, data, count) => {
+    clientPositions,
+    decode: (values, base, data, count) => {
       const record: { [key: string]: unknown } = {};
       const related: { [key: string]: unknown } = {};
-      decoders.forEach((decode) => {
-        decode(values, record, related, data, count);
-      });
+      for (const decode of decoders) {
+        decode(values, base, record, related, data, count);
+      }
       return withRelations(record, related);
     },
     elements,
@@ -637,28 +690,57 @@ const cursorExpr = (term: OrderTerm) => {
   }
 };
 
+/** Suffix of a level's result column when link-only tuple elements are sent as NULL. */
+const outputSuffix = '_c';
+
+/** The level a result column holds (`__l3` or `__l3_c`). */
+const levelOf = (column: string) =>
+  column.endsWith(outputSuffix)
+    ? column.slice(0, -outputSuffix.length)
+    : column;
+
+/**
+ * A level's array as a result column: elements no decoder reads (link
+ * columns of the levels below: raw hashes, internal ids) replaced by NULL.
+ * L35's inputs level carried every outpoint hash raw next to its hex text
+ * (25 % of the level's bytes; fix-pass-8b.md §4).
+ */
+const outputColumn = (
+  name: string,
+  output: { width: number; client: ReadonlySet<number> } | undefined
+) => {
+  if (output === undefined || output.client.size >= output.width) return name;
+  const items = Array.from({ length: output.width }, (_, index) =>
+    output.client.has(index + 1) ? `tupleElement(__t, ${index + 1})` : 'NULL'
+  );
+  return `arrayMap(__t -> tuple(${items.join(
+    ', '
+  )}), ${name}) AS ${name}${outputSuffix}`;
+};
+
 /** `__lN` arrays of a result row → child tuples grouped by parent key, in row-number order. */
 const levelData = (
   row: { [column: string]: unknown },
   keyWidths: ReadonlyMap<string, number>
 ): LevelData => {
   const data: LevelData = new Map();
-  Object.entries(row).forEach(([name, value]) => {
-    if (!name.startsWith('__l')) return;
+  Object.entries(row).forEach(([column, value]) => {
+    if (!column.startsWith('__l')) return;
+    const name = levelOf(column);
     const groups = new Map<string, unknown[][]>();
-    (Array.isArray(value) ? value : []).forEach((item) => {
+    /* [__rn, key texts…, elements…] */
+    const keyLength = keyWidths.get(name) ?? 0;
+    const items = Array.isArray(value) ? (value as unknown[]) : [];
+    for (const item of items) {
       const tuple = tupleValues(item);
-      /* [__rn, key texts…, elements…] */
-      const keyLength = keyWidths.get(name) ?? 0;
-      const key = keyOf(tuple.slice(1, 1 + keyLength));
-      if (key === undefined) return;
-      const group = groups.get(key);
-      if (group === undefined) groups.set(key, [tuple]);
-      else group.push(tuple);
+      const key = keyAt(tuple, 1, keyLength);
+      const group = key === undefined ? undefined : groups.get(key);
+      if (group !== undefined) group.push(tuple);
+      else if (key !== undefined) groups.set(key, [tuple]);
+    }
+    groups.forEach((group) => {
+      if (group.length > 1) group.sort((a, b) => Number(a[0]) - Number(b[0]));
     });
-    groups.forEach((group) =>
-      group.sort((a, b) => Number(a[0]) - Number(b[0]))
-    );
     data.set(name, groups);
   });
   return data;
@@ -733,7 +815,7 @@ export const compileRoot = (
           ),
           extra: extraOf(rows[0]),
           rows: rows.map((row) =>
-            plan.decode(tupleValues(row.__row).slice(1), none, count)
+            plan.decode(tupleValues(row.__row), 1, none, count)
           ),
         };
       },
@@ -752,17 +834,24 @@ export const compileRoot = (
   )})) FROM (SELECT *, row_number() OVER (${
     order === '' ? '' : `ORDER BY ${order}`
   }) AS __pos FROM (${page}))) AS __page`;
+  const pageOutput = {
+    client: new Set([
+      1,
+      ...[...plan.clientPositions].map((position) => position + 2),
+      ...root.order.map((_, index) => cursorStart + index + 2),
+    ]),
+    width: 1 + elements.length,
+  };
   return {
     decode: (rows) => {
       const [row] = rows;
-      const tuples = (Array.isArray(row?.__page) ? row.__page : [])
+      const pageColumn = row?.__page_c ?? row?.__page;
+      const tuples = (Array.isArray(pageColumn) ? pageColumn : [])
         .map(tupleValues)
         .sort((a, b) => Number(a[0]) - Number(b[0]));
       const data = levelData(row ?? {}, st.keyWidths);
       const count = { rows: tuples.length };
-      const decoded = tuples.map((tuple) =>
-        plan.decode(tuple.slice(1), data, count)
-      );
+      const decoded = tuples.map((tuple) => plan.decode(tuple, 1, data, count));
       checkCap(count.rows);
       return {
         cursors: tuples.map((tuple) =>
@@ -772,8 +861,11 @@ export const compileRoot = (
         rows: decoded,
       };
     },
-    sql: `${sql.withClause()}SELECT __page, ${[
-      ...st.keyWidths.keys(),
+    sql: `${sql.withClause()}SELECT ${[
+      outputColumn('__page', pageOutput),
+      ...[...st.keyWidths.keys()].map((name) =>
+        outputColumn(name, st.levelOutputs.get(name))
+      ),
       ...extraColumns,
     ].join(', ')}${
       st.pipelineOutputs.length === 0

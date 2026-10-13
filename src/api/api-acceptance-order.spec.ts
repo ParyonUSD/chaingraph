@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-loop-statement, no-await-in-loop, functional/no-let, functional/no-throw-statement, complexity */
-// cspell:ignore clickhouse
+// cspell:ignore clickhouse txid
 /**
  * Unselective per-node roots (owner decision 2026-10-11, item 3):
  * `transactions(node:)` pages in internal-id order with no filter use the
@@ -154,8 +154,13 @@ e2e(
 
     t.deepEqual(
       await env.api.db.storeFeatures(),
-      { acceptanceByIdProjection: true, utxoSet: true },
-      'the projection (and the stored UTXO set tables) are noticed'
+      {
+        acceptanceByIdProjection: true,
+        inclusionsByIdProjection: true,
+        inputsByIdProjection: true,
+        utxoSet: true,
+      },
+      'the projections (and the stored UTXO set tables) are noticed'
     );
     const recorder = recordQueries(env.api);
     await env.gql(
@@ -178,6 +183,33 @@ e2e(
     env.api.db.acceptanceWindowRows = acceptanceWindowRows;
     env.api.db.forceFeatures = { acceptanceByIdProjection: false };
     await check(t, env, 'id range (no projection)');
+    env.api.db.forceFeatures = undefined;
+
+    /*
+     * Inputs by id alone only while EVERY part has input.p_txid
+     * (fix-pass-8b.md §1): a part without it would be read whole. The
+     * inputs of a page are the same either way.
+     */
+    env.api.db.featureTtlMs = 0;
+    const inputsQuery = `query { transactions(node: "${one}", limit: 100) { nodes { hash inputs { input_index outpoint_transaction_hash outpoint_index } } } }`;
+    const byId = await env.gql(inputsQuery);
+    await env.client.command('ALTER TABLE input DROP PROJECTION p_txid');
+    await env.client.command(
+      'ALTER TABLE input ADD PROJECTION p_txid (SELECT transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index, sequence_number, commit_seq ORDER BY transaction_internal_id)'
+    );
+    t.false(
+      (await env.api.db.storeFeatures()).inputsByIdProjection,
+      'parts without the projection (added, not materialized): by hash and id'
+    );
+    t.deepEqual(await env.gql(inputsQuery), byId, 'same inputs by hash');
+    await env.client.command(
+      'ALTER TABLE input MATERIALIZE PROJECTION p_txid SETTINGS mutations_sync = 2'
+    );
+    t.true(
+      (await env.api.db.storeFeatures()).inputsByIdProjection,
+      'materialized in every part: by id alone'
+    );
+    env.api.db.featureTtlMs = 60_000;
 
     /* the DDL tool: the optional item is materialized once on a table with rows, never on a re-apply */
     const server = { url: e2eClickHouseUrl! };

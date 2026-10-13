@@ -89,6 +89,7 @@ import type {
   TimestampComparison,
   TransactionFilter,
 } from './sql.js';
+import { readsByIdFrom } from './sql.js';
 
 export { maxLimits } from './roots.js';
 
@@ -2088,13 +2089,13 @@ builder.subscriptionType({
             return context.hub.subscribe(
               liveTopicKey(info, nodeId),
               nodeId,
-              async (snapshot) =>
-                perNodeRoots[name]!.run(
-                  liveEnv(context.db, snapshot, nodeName),
-                  name,
-                  args,
-                  info
-                )
+              async (snapshot) => {
+                const env = liveEnv(context.db, snapshot, nodeName);
+                env.sql.readsById = readsByIdFrom(
+                  await context.db.storeFeatures()
+                );
+                return perNodeRoots[name]!.run(env, name, args, info);
+              }
             );
           },
         } as never),

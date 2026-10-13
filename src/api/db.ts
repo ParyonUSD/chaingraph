@@ -1,5 +1,5 @@
 /* eslint-disable camelcase, functional/no-throw-statement, @typescript-eslint/parameter-properties, @typescript-eslint/naming-convention, complexity, max-classes-per-file, @typescript-eslint/no-magic-numbers, @typescript-eslint/member-ordering, max-params, functional/no-try-statement */
-// cspell:ignore clickhouse cgapi
+// cspell:ignore clickhouse cgapi txid
 /**
  * The API's access to ClickHouse: query counters (tests assert one
  * `readSnapshot` per request and per subscription re-run, and count data
@@ -45,6 +45,7 @@ import {
   defaultAuthchainMaxBranches,
   defaultUtxoSetMaxLagRows,
   defaultUtxoSetPolicy,
+  readsByIdFrom,
   Sql,
 } from './sql.js';
 
@@ -207,6 +208,10 @@ export interface ApiStats {
 export interface StoreFeatures {
   /** tx_acceptance has the projection p_node_tx (ddl/optional/p_node_tx.sql). */
   acceptanceByIdProjection: boolean;
+  /** Every active part of `input` has p_txid (`Sql.readsById`). */
+  inputsByIdProjection?: boolean;
+  /** Every active part of `block_transaction` has p_txid (`Sql.readsById`). */
+  inclusionsByIdProjection?: boolean;
   /**
    * The database has the stored UTXO set's tables (ddl/090_utxo_set.sql):
    * snapshots then read each node's mark (whether a node has a set yet is
@@ -266,13 +271,25 @@ export class ApiDb {
       this.features === undefined ||
       now - this.features.at > this.featureTtlMs
     ) {
+      /* by id: the projection in EVERY active part (a part without it would be read whole) */
+      const everyPart = (
+        table: string
+      ) => `(SELECT count() > 0 AND countIf(NOT has(projections, 'p_txid')) = 0
+         FROM system.parts WHERE database = currentDatabase() AND table = '${table}' AND active)`;
       const sql = `SELECT
         (SELECT count() FROM system.projections
          WHERE database = currentDatabase() AND table = 'tx_acceptance' AND name = 'p_node_tx') AS n,
         (SELECT count() FROM system.tables
-         WHERE database = currentDatabase() AND name = 'utxo_watermark') AS u`;
+         WHERE database = currentDatabase() AND name = 'utxo_watermark') AS u,
+        ${everyPart('input')} AS i,
+        ${everyPart('block_transaction')} AS b`;
       const value = this.client
-        .query<{ n: number | string; u: number | string }>(sql)
+        .query<{
+          n: number | string;
+          u: number | string;
+          i: number | string;
+          b: number | string;
+        }>(sql)
         .then((rows) => {
           this.onQuery?.({
             kind: 'storeFeatures',
@@ -282,6 +299,8 @@ export class ApiDb {
           });
           return {
             acceptanceByIdProjection: Number(rows[0]?.n ?? 0) > 0,
+            inclusionsByIdProjection: Number(rows[0]?.b ?? 0) > 0,
+            inputsByIdProjection: Number(rows[0]?.i ?? 0) > 0,
             utxoSet: Number(rows[0]?.u ?? 0) > 0,
           };
         });
@@ -632,13 +651,15 @@ export class PinnedSnapshot {
   async statement(node?: string): Promise<StatementEnv> {
     if (this.preset !== undefined) {
       await this.get(node);
-      return singleNodeEnv(
+      const env = singleNodeEnv(
         this.preset,
         this.nodeNames[0],
         this.db.maxResultRows,
         this.db.utxoSetPolicy,
         this.db.authchainMaxBranches
       );
+      env.sql.readsById = readsByIdFrom(await this.db.storeFeatures());
+      return env;
     }
     const snapshot = await this.get(node);
     const multi = await this.pending!;
@@ -653,6 +674,7 @@ export class PinnedSnapshot {
     };
     sql.nodeIdOf = nodeId;
     sql.authchainMaxBranches = this.db.authchainMaxBranches;
+    sql.readsById = readsByIdFrom(await this.db.storeFeatures());
     return {
       ctx: {
         maxRows: this.db.maxResultRows,

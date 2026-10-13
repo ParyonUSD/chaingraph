@@ -1,5 +1,5 @@
 /* eslint-disable camelcase, @typescript-eslint/naming-convention, complexity, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, max-params, no-underscore-dangle, max-lines, @typescript-eslint/no-use-before-define, functional/no-let, functional/no-loop-statement, @typescript-eslint/member-ordering */
-// cspell:ignore clickhouse unhex seqs nfts unindexed analysed
+// cspell:ignore clickhouse unhex seqs nfts unindexed analysed txid
 /**
  * SQL building blocks of the v2 API (Phase 2): a parameter binder and the
  * filter compilers for the typed `where` inputs.
@@ -150,6 +150,23 @@ const chunks = <T>(values: readonly T[], size = maxListChunk): T[][] => {
   return out.length === 0 ? [[]] : out;
 };
 
+/** Which relationship levels read by internal id alone (`Sql.readsById`). */
+export interface ReadsById {
+  /** block_inclusions: block_transaction.p_txid materialized in every part. */
+  inclusions: boolean;
+  /** inputs: input.p_txid materialized in every part. */
+  inputs: boolean;
+}
+
+/** `ReadsById` from the store features (absent: off). */
+export const readsByIdFrom = (features: {
+  inclusionsByIdProjection?: boolean;
+  inputsByIdProjection?: boolean;
+}): ReadsById => ({
+  inclusions: features.inclusionsByIdProjection === true,
+  inputs: features.inputsByIdProjection === true,
+});
+
 export class Sql {
   readonly params: { [name: string]: unknown };
 
@@ -181,6 +198,18 @@ export class Sql {
    * statement environment sets it to the request's pinned nodes).
    */
   nodeIdOf: ((name: string) => number) | undefined;
+
+  /**
+   * Relationship reads by internal id alone (`readsByIdFrom`): every active
+   * part of `input` / `block_transaction` has its p_txid projection, so the
+   * inputs and block-inclusion levels read `transaction_internal_id IN …`
+   * without the hash set next to it. With both conditions ClickHouse
+   * analysed the hash set against the base key of every part and the id set
+   * against p_txid before choosing (mainnet L17: key CPU 0.8 to 1.45 s;
+   * fix-pass-8b.md §1). Default off: a part without the projection would
+   * read every row of the table by id.
+   */
+  readsById: ReadsById = { inclusions: false, inputs: false };
 
   /** `nodeIdOf`, failing when the statement has no node resolver. */
   resolveNode(name: string) {
@@ -296,6 +325,7 @@ export class Sql {
     const next = new Sql(this.snapshot, this.others, this.utxoSetPolicy);
     next.nodeIdOf = this.nodeIdOf;
     next.authchainMaxBranches = this.authchainMaxBranches;
+    next.readsById = this.readsById;
     return next;
   }
 
@@ -1891,15 +1921,30 @@ export const transactionPredicate = (
      * hash, on every row about it): a block range's transactions are an id
      * range, read through transaction.p_id instead of a hash set that touches
      * every granule of the table (X16; fix-pass-6.md §3).
+     *
+     * The mempool rows are a second read (UNION ALL), not an OR: an OR with
+     * a non-key atom (`block_internal_id`) made the key analysis of
+     * p_node_height and p_node_tx a generic exclusion search over every mark
+     * of the node (mainnet node 1: ~410k marks each, 0.2-0.5 s of key CPU on
+     * every block_window document, L1/L4-L8/L10/L11; fix-pass-8b.md §1).
+     * Each read is a conjunction: a binary search on (node, height). Mempool
+     * rows carry height 0 (both writers: mempool-commit.ts and the golden
+     * backfill), which bounds their read to the node's height-0 range.
      */
-    parts.push(
-      `internal_id IN (SELECT transaction_internal_id FROM ${sql.nodeView(
+    const accepted = (condition: string) =>
+      `SELECT transaction_internal_id FROM ${sql.nodeView(
         'tx_acceptance_at',
         node,
-        `${restrict('transaction_hash')}(${
-          mempool ? any([all(heights), 'block_internal_id = 0']) : all(heights)
-        })`
-      )})`
+        `${restrict('transaction_hash')}${condition}`
+      )}`;
+    parts.push(
+      `internal_id IN (${accepted(`(${all(heights)})`)}${
+        mempool
+          ? ` UNION ALL ${accepted(
+              `block_internal_id = 0 AND ${baseHeight} = 0`
+            )}`
+          : ''
+      })`
     );
   }
   if (given(filter.in_block)) {

@@ -1,5 +1,5 @@
-/* eslint-disable functional/no-let, @typescript-eslint/parameter-properties, max-classes-per-file, @typescript-eslint/member-ordering, @typescript-eslint/no-magic-numbers, functional/no-mixed-type, functional/no-try-statement, no-negated-condition */
-// cspell:ignore clickhouse serialised Pothos
+/* eslint-disable complexity, functional/no-loop-statement, functional/no-let, @typescript-eslint/parameter-properties, max-classes-per-file, @typescript-eslint/member-ordering, @typescript-eslint/no-magic-numbers, functional/no-mixed-type, functional/no-try-statement, no-negated-condition */
+// cspell:ignore clickhouse serialised serialising Pothos
 /**
  * Live queries driven by the visibility watermark (S4).
  *
@@ -31,6 +31,62 @@ export const resultKey = (value: unknown): string =>
       ? item
       : { ...(item as object), relationships: related };
   });
+
+const relatedOf = (value: object): unknown =>
+  (value as { [relations]?: unknown })[relations];
+
+/**
+ * Whether two results are equal, prefetched relationships included (what
+ * `resultKey` of each would compare), without serialising either: a walk
+ * that stops at the first difference. A 10,000-row page's `resultKey` took
+ * ~20 ms locally and was on the path of every first payload
+ * (fix-pass-8b.md §4).
+ */
+export const sameResult = (a: unknown, b: unknown): boolean => {
+  if (a === b) return true;
+  if (typeof a === 'bigint' || typeof b === 'bigint') {
+    return String(a) === String(b);
+  }
+  if (
+    a === null ||
+    b === null ||
+    typeof a !== 'object' ||
+    typeof b !== 'object'
+  ) {
+    return false;
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    for (let index = 0; index < a.length; index += 1) {
+      if (!sameResult(a[index], b[index])) return false;
+    }
+    return true;
+  }
+  const plain = (value: object) => {
+    const prototype: unknown = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  };
+  /* anything but plain records (none expected): as resultKey compares it */
+  if (!plain(a) || !plain(b)) return resultKey(a) === resultKey(b);
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (let index = 0; index < keysA.length; index += 1) {
+    const key = keysA[index]!;
+    if (key !== keysB[index]) return false;
+    if (
+      !sameResult(
+        (a as { [key: string]: unknown })[key],
+        (b as { [key: string]: unknown })[key]
+      )
+    ) {
+      return false;
+    }
+  }
+  return sameResult(relatedOf(a) ?? null, relatedOf(b) ?? null);
+};
 
 type Runner = (snapshot: VisibilitySnapshot) => Promise<unknown>;
 
@@ -98,7 +154,8 @@ interface Topic {
   computedVisible: bigint;
   /** Watermark of the result last pushed (or -1). */
   deliveredVisible: bigint;
-  deliveredKey: string | undefined;
+  /** A result was pushed (`latest` holds it). */
+  delivered: boolean;
   latest: unknown;
   running: boolean;
   next: VisibilitySnapshot | undefined;
@@ -163,7 +220,7 @@ export class LiveHub {
     if (topic === undefined) {
       topic = {
         computedVisible: -1n,
-        deliveredKey: undefined,
+        delivered: false,
         deliveredVisible: -1n,
         deliveries: [],
         key,
@@ -192,7 +249,7 @@ export class LiveHub {
           this.advance(nodeId, snapshot);
         })
         .catch((error: unknown) => this.options.onError?.(error));
-    } else if (current.deliveredKey !== undefined) {
+    } else if (current.delivered) {
       sink.push(current.latest);
     }
     this.start();
@@ -275,10 +332,10 @@ export class LiveHub {
       .then((result) => {
         this.stats.lastRunMs = performance.now() - started;
         if (snapshot.visible <= topic.deliveredVisible) return;
-        const key = resultKey(result);
         topic.deliveredVisible = snapshot.visible;
-        if (key === topic.deliveredKey) return;
-        topic.deliveredKey = key;
+        /* the first result is pushed as is; later ones when they changed */
+        if (topic.delivered && sameResult(result, topic.latest)) return;
+        topic.delivered = true;
         topic.latest = result;
         topic.deliveries.push(snapshot.visible);
         const fanOut = performance.now();
