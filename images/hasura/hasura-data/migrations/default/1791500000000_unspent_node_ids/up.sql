@@ -494,9 +494,19 @@ COMMENT ON FUNCTION unspent_node_ids_run_batch (integer, integer, bigint, bigint
 --       - M (unspent_tracking_backfill_transactions): transactions up to the
 --         transaction floor that are not certainly accepted by exactly F: in
 --         no block accepted by exactly F, or in a block accepted by a node
---         outside F (set-based: one anti-join of transaction against
---         block_transaction, plus the transactions of the other blocks);
---       - the outpoints M spends (unspent_tracking_backfill_spends);
+--         outside F. Found from the blocks: one pass over node_block gives
+--         each block's node set; the "other" blocks (not accepted by exactly
+--         F: stale blocks, another network's) are few on a single-chain
+--         database. Their transactions are read with keyed probes driven
+--         from the other blocks, plus one anti-join of transaction against
+--         block_transaction for the transactions in no block at all;
+--       - the outpoints M spends (unspent_tracking_backfill_spends), with
+--         keyed probes driven from M;
+-- Statements whose cost must follow a small driving set (the other blocks,
+-- M) take their probes through LATERAL subqueries with OFFSET 0: the planner
+-- cannot reorder or flatten them, so the plan is a nested loop driven by the
+-- small side whatever the statistics say (on mainnet, with another network's
+-- transactions in M, the planner's estimates walked whole indexes instead).
 --       - the rows whose stored value is not '{}' (NULL: saved after the
 --         column was added; or values left by an earlier run, after a stop)
 --         (unspent_tracking_backfill_rows; one sequential scan of output);
@@ -566,7 +576,10 @@ DECLARE
   n_other bigint := 0;
   n_spends bigint := 0;
   n_rows bigint := 0;
+  n_other_blocks bigint := 0;
   started timestamp := clock_timestamp();
+  clock timestamp := clock_timestamp();
+  steps jsonb := '{}';
   stats jsonb;
 BEGIN
   IF NOT pg_try_advisory_xact_lock(1970172789) THEN
@@ -583,59 +596,88 @@ BEGIN
     RETURN jsonb_build_object('done', true);
   END IF;
   SELECT COALESCE(array_agg(n.internal_id::integer ORDER BY n.internal_id), '{}') INTO current_node_ids FROM node n;
-  SELECT s.ids INTO full_ids
-    FROM (SELECT array_agg(nb.node_internal_id::integer ORDER BY nb.node_internal_id) AS ids
-            FROM node_block nb GROUP BY nb.block_internal_id) s
-    GROUP BY s.ids ORDER BY count(*) DESC, s.ids LIMIT 1;
+  -- each block's node set (one pass over node_block)
+  CREATE TEMP TABLE IF NOT EXISTS unspent_node_ids_block_nodes (id bigint PRIMARY KEY, ids integer[] NOT NULL) ON COMMIT DROP;
+  INSERT INTO unspent_node_ids_block_nodes (id, ids)
+    SELECT nb.block_internal_id, array_agg(nb.node_internal_id::integer ORDER BY nb.node_internal_id)
+      FROM node_block nb GROUP BY nb.block_internal_id;
+  ANALYZE pg_temp.unspent_node_ids_block_nodes;
+  SELECT bn.ids INTO full_ids FROM pg_temp.unspent_node_ids_block_nodes bn
+    GROUP BY bn.ids ORDER BY count(*) DESC, bn.ids LIMIT 1;
   full_ids := COALESCE(full_ids, '{}');
   CREATE TEMP TABLE IF NOT EXISTS unspent_node_ids_full_blocks (id bigint PRIMARY KEY) ON COMMIT DROP;
   INSERT INTO unspent_node_ids_full_blocks (id)
-    SELECT nb.block_internal_id FROM node_block nb GROUP BY nb.block_internal_id
-      HAVING array_agg(nb.node_internal_id::integer ORDER BY nb.node_internal_id) = full_ids;
+    SELECT bn.id FROM pg_temp.unspent_node_ids_block_nodes bn WHERE bn.ids = full_ids;
   GET DIAGNOSTICS n_full_blocks = ROW_COUNT;
   ANALYZE pg_temp.unspent_node_ids_full_blocks;
+  -- the other blocks: not accepted by exactly F (accepted by no node, by a
+  -- part of F, or by a node outside F: `outside`)
+  CREATE TEMP TABLE IF NOT EXISTS unspent_node_ids_other_blocks (id bigint PRIMARY KEY, outside boolean NOT NULL) ON COMMIT DROP;
+  INSERT INTO unspent_node_ids_other_blocks (id, outside)
+    SELECT b.internal_id, COALESCE(NOT (bn.ids <@ full_ids), false)
+      FROM block b LEFT JOIN pg_temp.unspent_node_ids_block_nodes bn ON bn.id = b.internal_id
+      WHERE bn.ids IS DISTINCT FROM full_ids;
+  GET DIAGNOSTICS n_other_blocks = ROW_COUNT;
+  ANALYZE pg_temp.unspent_node_ids_other_blocks;
+  steps := steps || jsonb_build_object('blocks', round(extract(epoch FROM clock_timestamp() - clock) * 1000));
+  clock := clock_timestamp();
   -- M (a): in no block at all (dropped or mempool-only transactions)
   INSERT INTO unspent_tracking_backfill_transactions (internal_id, hash)
     SELECT t.internal_id, t.hash FROM transaction t
       WHERE t.internal_id <= transaction_floor
         AND NOT EXISTS (SELECT 1 FROM block_transaction bt WHERE bt.transaction_internal_id = t.internal_id);
   GET DIAGNOSTICS n_unblocked = ROW_COUNT;
-  -- M (b): in a block not accepted by exactly F, and in no block accepted by
-  -- exactly F or in a block accepted by a node outside F
+  steps := steps || jsonb_build_object('unblocked', round(extract(epoch FROM clock_timestamp() - clock) * 1000));
+  clock := clock_timestamp();
+  -- M (b): in an other block, and in a block accepted by a node outside F or
+  -- in no block accepted by exactly F. Driven from the other blocks: per
+  -- block, its block_transaction range (primary key), then per transaction
+  -- one probe of block_inclusions_index (only for blocks with no node
+  -- outside F) and one of transaction_pkey for the hash.
   INSERT INTO unspent_tracking_backfill_transactions (internal_id, hash)
-    SELECT DISTINCT bt.transaction_internal_id, t.hash
-      FROM block b
-      JOIN block_transaction bt ON bt.block_internal_id = b.internal_id
-      JOIN transaction t ON t.internal_id = bt.transaction_internal_id
-      WHERE NOT EXISTS (SELECT 1 FROM pg_temp.unspent_node_ids_full_blocks f WHERE f.id = b.internal_id)
-        AND bt.transaction_internal_id <= transaction_floor
-        AND (EXISTS (SELECT 1 FROM node_block nb
-                       WHERE nb.block_internal_id = b.internal_id AND NOT (nb.node_internal_id::integer = ANY (full_ids)))
-             OR NOT EXISTS (SELECT 1 FROM block_transaction bt2
-                              JOIN pg_temp.unspent_node_ids_full_blocks f ON f.id = bt2.block_internal_id
-                              WHERE bt2.transaction_internal_id = bt.transaction_internal_id))
+    SELECT x.id, t.hash
+      FROM pg_temp.unspent_node_ids_other_blocks ob
+      CROSS JOIN LATERAL (SELECT bt.transaction_internal_id AS id FROM block_transaction bt
+                            WHERE bt.block_internal_id = ob.id AND bt.transaction_internal_id <= transaction_floor
+                            OFFSET 0) x
+      CROSS JOIN LATERAL (SELECT tx.hash FROM transaction tx WHERE tx.internal_id = x.id OFFSET 0) t
+      WHERE ob.outside
+         OR NOT EXISTS (SELECT 1 FROM (SELECT bt2.block_internal_id FROM block_transaction bt2
+                                         WHERE bt2.transaction_internal_id = x.id OFFSET 0) i
+                          CROSS JOIN LATERAL (SELECT 1 FROM pg_temp.unspent_node_ids_full_blocks f
+                                                WHERE f.id = i.block_internal_id OFFSET 0) full_block)
     ON CONFLICT ON CONSTRAINT unspent_tracking_backfill_transactions_pkey DO NOTHING;
   GET DIAGNOSTICS n_other = ROW_COUNT;
+  steps := steps || jsonb_build_object('otherBlocks', round(extract(epoch FROM clock_timestamp() - clock) * 1000));
+  clock := clock_timestamp();
+  -- the outpoints M spends: per transaction of M, its input_pkey range
+  -- (statistics for M first: the batches join it too)
+  ANALYZE unspent_tracking_backfill_transactions;
   INSERT INTO unspent_tracking_backfill_spends (outpoint_transaction_hash, outpoint_index)
-    SELECT DISTINCT i.outpoint_transaction_hash, i.outpoint_index
+    SELECT i.outpoint_transaction_hash, i.outpoint_index
       FROM unspent_tracking_backfill_transactions m
-      JOIN input i ON i.transaction_internal_id = m.internal_id
-      WHERE i.outpoint_transaction_hash <> zero_hash;
+      CROSS JOIN LATERAL (SELECT input.outpoint_transaction_hash, input.outpoint_index FROM input
+                            WHERE input.transaction_internal_id = m.internal_id
+                              AND input.outpoint_transaction_hash <> zero_hash
+                            OFFSET 0) i
+    ON CONFLICT ON CONSTRAINT unspent_tracking_backfill_spends_pkey DO NOTHING;
   GET DIAGNOSTICS n_spends = ROW_COUNT;
+  steps := steps || jsonb_build_object('spends', round(extract(epoch FROM clock_timestamp() - clock) * 1000));
+  clock := clock_timestamp();
   INSERT INTO unspent_tracking_backfill_rows (transaction_hash, output_index)
     SELECT o.transaction_hash, o.output_index FROM output o
       WHERE o.unspent_node_ids IS DISTINCT FROM '{}'::integer[];
   GET DIAGNOSTICS n_rows = ROW_COUNT;
+  steps := steps || jsonb_build_object('rows', round(extract(epoch FROM clock_timestamp() - clock) * 1000));
   INSERT INTO unspent_tracking_backfill_nodes (node_internal_id, floor_blocks)
     SELECT n.internal_id, unspent_node_ids_backfill_node_blocks(n.internal_id, block_floor, event_floor)
       FROM node n;
-  stats := jsonb_build_object('fullNodeIds', full_ids, 'fullBlocks', n_full_blocks,
+  stats := jsonb_build_object('fullNodeIds', full_ids, 'fullBlocks', n_full_blocks, 'otherBlocks', n_other_blocks,
     'transactions', n_unblocked + n_other, 'unblockedTransactions', n_unblocked, 'otherBlockTransactions', n_other,
     'spends', n_spends, 'rows', n_rows,
-    'ms', round(extract(epoch FROM clock_timestamp() - started) * 1000));
+    'ms', round(extract(epoch FROM clock_timestamp() - started) * 1000), 'msSteps', steps);
   INSERT INTO unspent_tracking_backfill (node_ids, full_node_ids, transaction_floor, block_floor, event_floor, stats)
     VALUES (current_node_ids, full_ids, transaction_floor, block_floor, event_floor, stats);
-  ANALYZE unspent_tracking_backfill_transactions;
   ANALYZE unspent_tracking_backfill_spends;
   ANALYZE unspent_tracking_backfill_rows;
   RETURN stats;
