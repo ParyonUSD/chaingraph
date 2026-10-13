@@ -73,7 +73,13 @@ ALTER TABLE cg.input ADD PROJECTION IF NOT EXISTS p_txid
     ORDER BY transaction_internal_id
 );
 
+-- p_node_height: a node's acceptance rows by height (block filters below the collapse, fix-pass-6.md §3). The key
+-- stops at height (fix-pass-7.md §2): with a trailing transaction_internal_id, the window reads' `transaction_internal_id
+-- IN (ids)` (for p_node_tx) was a key condition of this projection too; a set on its third column excludes no range in
+-- which the height varies, so ClickHouse's generic exclusion search walked every mark of the node in every part before
+-- choosing p_node_tx (mainnet: ~90 ms of key analysis per statement, small documents 2-3x slower). Readers filter
+-- this projection by node and height only.
 ALTER TABLE cg.tx_acceptance ADD PROJECTION IF NOT EXISTS p_node_height
 (
-    SELECT * ORDER BY (node_internal_id, height, transaction_internal_id)
+    SELECT * ORDER BY (node_internal_id, height)
 );
