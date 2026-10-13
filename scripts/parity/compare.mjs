@@ -105,24 +105,26 @@ const integerOption = (name, minimum = 0) => {
   return Number(raw);
 };
 
-/** Hash-prefix chunks: `count` must be 16^k (k = 1..4); returns [{ label, lo, hi? }]. */
+/**
+ * Hash-prefix chunks: `count` must be a power of two from 2 to 65536 (fix-pass-7.md §7; it was 16^k only, and
+ * the GKE kit's `--utxo-chunks 64` was refused). Ranges by the leading 16 bits; labels are the shortest hex prefix of
+ * each range's start (unchanged for 16, 256, 4096, 65536). Returns [{ label, lo, hi? }].
+ */
 const hashChunks = (count, labelPrefix) => {
-  const nibbles = Math.round(Math.log(count) / Math.log(16));
-  if (16 ** nibbles !== count || nibbles < 1 || nibbles > 4)
-    fail(`chunk count ${count} must be 16, 256, 4096 or 65536`);
-  return Array.from({ length: count }, (_, index) => {
-    const prefix = index.toString(16).padStart(nibbles, '0');
-    const next =
-      index + 1 < count
-        ? (index + 1).toString(16).padStart(nibbles, '0')
-        : undefined;
-    return {
-      hi: next === undefined ? undefined : next.padEnd(64, '0'),
-      kind: 'hash',
-      label: `${labelPrefix}:${prefix}`,
-      lo: prefix.padEnd(64, '0'),
-    };
-  });
+  const bits = Math.round(Math.log2(count));
+  if (2 ** bits !== count || bits < 1 || bits > 16)
+    fail(`chunk count ${count} must be a power of two from 2 to 65536`);
+  const step = 65536 / count;
+  const digits = Math.ceil(bits / 4);
+  const bound = (index) => (index * step).toString(16).padStart(4, '0').padEnd(64, '0');
+  return Array.from({ length: count }, (_, index) => ({
+    hi: index + 1 < count ? bound(index + 1) : undefined,
+    kind: 'hash',
+    label: `${labelPrefix}:${Math.floor((index * step) / 16 ** (4 - digits))
+      .toString(16)
+      .padStart(digits, '0')}`,
+    lo: bound(index),
+  }));
 };
 
 const heightChunks = (from, to, size, kind) => {
