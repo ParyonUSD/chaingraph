@@ -369,12 +369,21 @@ export const runTransactions = async (
      * internal ids: both bound the read, ClickHouse takes the key or p_id,
      * whichever selects fewer granules), the node's acceptance and the filter.
      */
+    /* with p_node_tx the window's acceptance is read by id alone (fix-pass-7.md §2) */
+    const { acceptanceByIdProjection } = await env.db.storeFeatures();
     const checks = (among: string, amongIds: string) => [
       `hash IN (${among})`,
       `internal_id IN (${amongIds})`,
       ...(impliesAcceptance(args.where)
         ? []
-        : [`hash IN (${sql.accepted(ctx.node, among, amongIds)})`]),
+        : [
+            `hash IN (${sql.accepted(
+              ctx.node,
+              among,
+              amongIds,
+              acceptanceByIdProjection
+            )})`,
+          ]),
       ...bounds,
       transactionPredicate(sql, args.where, ctx.node, among),
     ];

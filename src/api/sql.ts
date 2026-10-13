@@ -423,17 +423,26 @@ export class Sql {
    * p_node_tx selects fewer granules. Acceptance rows are written in commit
    * (time) order, so their parts overlap in hash: a hash is looked up in
    * every part, an id in the one part of its time (fix-pass-6.md §5).
+   * `idsOnly` (p_node_tx present): the ids alone bound the read, so the hash
+   * set is not analysed against every part of the base table's key as well
+   * (time-ordered parts: ~3,000 index steps per part for a few hundred
+   * hashes; fix-pass-7.md §2). Exact: one id per hash, and the caller
+   * compares hashes.
    */
-  accepted(node?: number, among?: string, amongIds?: string) {
+  accepted(node?: number, among?: string, amongIds?: string, idsOnly = false) {
+    const ids =
+      amongIds === undefined
+        ? undefined
+        : `tx_acceptance.transaction_internal_id IN (${amongIds})`;
     return `SELECT transaction_hash FROM ${this.nodeView(
       'tx_acceptance_at',
       node,
       among === undefined
         ? undefined
+        : idsOnly && ids !== undefined
+        ? ids
         : `transaction_hash IN (${among})${
-            amongIds === undefined
-              ? ''
-              : ` AND tx_acceptance.transaction_internal_id IN (${amongIds})`
+            ids === undefined ? '' : ` AND ${ids}`
           }`
     )}`;
   }
