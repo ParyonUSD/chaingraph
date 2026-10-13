@@ -4417,6 +4417,109 @@ test.serial(
   }
 );
 
+/**
+ * Re-partitioning preserves progress: each new partition (a range of first
+ * hash bytes) starts at the minimum watermarks of the old partitions whose
+ * ranges overlap its own, not at the global minimum (the 2026-10-13 lab: a
+ * change from 32 to 64 partitions restarted every partition from the lowest
+ * watermark).
+ */
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): repartition starts each partition at the overlapping old watermarks`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    const progress = async () =>
+      (
+        await client.query<{
+          backfill: string;
+          block: string;
+          consumed: string;
+          count: number;
+          input: string;
+          partition: number;
+        }>(/* sql */ `
+SELECT partition_index AS partition, partition_count AS count,
+       input_transaction_internal_id::text AS input, block_internal_id::text AS block,
+       consumed_event_id::text AS consumed, backfill_transaction_internal_id::text AS backfill
+  FROM unspent_tracking_progress ORDER BY partition_index;`)
+      ).rows;
+    const repartition = async (count: number) =>
+      (
+        await client.query<{ repartitioned: boolean }>(
+          /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`,
+          [count]
+        )
+      ).rows[0]!.repartitioned;
+    /**
+     * Old partition p of n covers first bytes b with floor(b * n / 256) = p: the
+     * expected start of new partition q of m is the minimum over the old
+     * partitions sharing a byte with it (the global minimum if it has none).
+     */
+    const expected = (
+      old: {
+        block: string;
+        consumed: string;
+        input: string;
+        backfill: string;
+      }[],
+      m: number
+    ) =>
+      Array.from({ length: m }, (_, q) => {
+        const overlapping = Array.from({ length: 256 }, (_b, b) => b)
+          .filter((b) => Math.floor((b * m) / 256) === q)
+          .map((b) => old[Math.floor((b * old.length) / 256)]!);
+        const from = overlapping.length === 0 ? old : overlapping;
+        const min = (key: 'backfill' | 'block' | 'consumed' | 'input') =>
+          String(Math.min(...from.map((row) => Number(row[key]))));
+        return {
+          backfill: min('backfill'),
+          block: min('block'),
+          consumed: min('consumed'),
+          count: m,
+          input: min('input'),
+          partition: q,
+        };
+      });
+    await client.query('BEGIN;');
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      const initial = (await progress()).length;
+      t.true(initial > 0, 'tracking initialized');
+      if (initial !== 4) {
+        t.true(await repartition(4), 'to 4 partitions');
+      }
+      // distinct, non-monotonic watermarks per partition
+      await client.query(/* sql */ `
+UPDATE unspent_tracking_progress
+  SET input_transaction_internal_id = 1000 + 10 * ((partition_index * 7) % 4),
+      block_internal_id = 500 + (partition_index * 3) % 4,
+      consumed_event_id = 100 + (partition_index * 5) % 4,
+      backfill_transaction_internal_id = 10 + partition_index;`);
+      const transitions = [8, 3, 5, 300, 2];
+      await transitions.reduce(async (previous, m) => {
+        await previous;
+        const before = await progress();
+        t.true(await repartition(m), `to ${m} partitions`);
+        const after = await progress();
+        t.deepEqual(after, expected(before, m), `${before.length} to ${m}`);
+        t.is(
+          Math.min(...after.map((row) => Number(row.input))),
+          Math.min(...before.map((row) => Number(row.input))),
+          'global minimum unchanged'
+        );
+      }, Promise.resolve());
+      t.false(await repartition(2), 'unchanged count: no-op');
+    } finally {
+      await client.query('ROLLBACK;');
+    }
+  }
+);
+
 /* eslint-enable @typescript-eslint/no-magic-numbers */
 /* eslint-enable max-params, require-atomic-updates, @typescript-eslint/no-shadow, prefer-destructuring */
 

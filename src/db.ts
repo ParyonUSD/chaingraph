@@ -1928,7 +1928,7 @@ const ensureInitialized = async (
     partitionStalls.clear();
     partitionSkipThrough.clear();
     unspentTrackingLog.info(
-      `Unspent tracking job: re-partitioned into ${partitionCount} partitions (every partition restarts from the lowest watermark).`
+      `Unspent tracking job: re-partitioned into ${partitionCount} partitions (each starts at the lowest watermarks of the old partitions overlapping its hash range).`
     );
   }
 };

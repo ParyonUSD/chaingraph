@@ -551,9 +551,15 @@ BEGIN
 END;
 $$;
 
--- Change the number of partitions: every new partition restarts from the
--- minimum of the old watermarks (re-processing is idempotent). Events above
--- the minimum consumed id are kept (deletion uses the minimum).
+-- Change the number of partitions, preserving progress: a partition is a
+-- range of first hash bytes (((byte * count) >> 8) = partition), so each new
+-- partition starts at the minimum watermarks (input, block, consumed event,
+-- backfill cursor) of the old partitions whose byte ranges overlap its own:
+-- every row in its range was processed by one of them up to at least that
+-- point (re-processing is idempotent). A new partition with no byte of its
+-- own (more than 256 partitions), or old rows that are not one consistent
+-- partitioning, start at the global minimum. The global minimum is
+-- unchanged, so the query root and event deletion are unaffected.
 -- Called before every pass: when the count is unchanged it returns without
 -- taking the table lock. The EXCLUSIVE lock conflicts with the row lock every
 -- batch holds on its progress row, so a queued request would wait for the
@@ -564,6 +570,7 @@ CREATE FUNCTION unspent_node_ids_repartition (part_count integer)
   RETURNS boolean LANGUAGE plpgsql SET lock_timeout = '2s' AS $$
 DECLARE
   current_count integer;
+  consistent boolean;
   w bigint;
   wb bigint;
   consumed bigint;
@@ -576,16 +583,32 @@ BEGIN
   END IF;
   LOCK TABLE unspent_tracking_progress IN EXCLUSIVE MODE;
   SELECT min(partition_count), min(input_transaction_internal_id), min(block_internal_id), min(consumed_event_id),
-         min(backfill_transaction_internal_id)
-    INTO current_count, w, wb, consumed, backfilled FROM unspent_tracking_progress;
+         min(backfill_transaction_internal_id),
+         min(partition_count) = max(partition_count) AND count(*) = min(partition_count)
+           AND count(DISTINCT partition_index) = count(*)
+           AND min(partition_index) = 0 AND max(partition_index) = min(partition_count) - 1
+    INTO current_count, w, wb, consumed, backfilled, consistent FROM unspent_tracking_progress;
   IF current_count IS NULL OR (current_count = part_count AND
       (SELECT count(*) FROM unspent_tracking_progress) = part_count) THEN
     RETURN false;
   END IF;
-  DELETE FROM unspent_tracking_progress;
+  WITH old AS (
+    DELETE FROM unspent_tracking_progress
+      RETURNING partition_index, input_transaction_internal_id, block_internal_id, consumed_event_id,
+                backfill_transaction_internal_id
+  )
   INSERT INTO unspent_tracking_progress (partition_index, partition_count, input_transaction_internal_id,
       block_internal_id, consumed_event_id, backfill_transaction_internal_id)
-    SELECT p, part_count, w, wb, consumed, backfilled FROM generate_series(0, part_count - 1) p;
+    SELECT q, part_count, COALESCE(o.min_w, w), COALESCE(o.min_wb, wb), COALESCE(o.min_consumed, consumed),
+           COALESCE(o.min_backfilled, backfilled)
+      FROM generate_series(0, part_count - 1) q
+      LEFT JOIN LATERAL (
+        SELECT min(old.input_transaction_internal_id) AS min_w, min(old.block_internal_id) AS min_wb,
+               min(old.consumed_event_id) AS min_consumed, min(old.backfill_transaction_internal_id) AS min_backfilled
+          FROM generate_series(0, 255) b
+          JOIN old ON old.partition_index = ((b * current_count) >> 8)
+          WHERE consistent AND ((b * part_count) >> 8) = q
+      ) o ON true;
   RETURN true;
 END;
 $$;
