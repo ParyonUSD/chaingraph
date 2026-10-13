@@ -21,8 +21,27 @@
  * request that goes away while its statement waits leaves the queue
  * (`signal`). Heavy statements can never take the light lane's slots, so
  * cheap lookups keep their latency while heavy ones queue or are refused.
- * On the ClickHouse side each lane has its own settings (`max_threads`,
- * `priority`, optionally a `workload`). Lane sizes follow the ClickHouse
+ * On the ClickHouse side each lane has its own settings (`priority`,
+ * optionally a `workload`).
+ *
+ * Fix pass 7 (docs/clickhouse-port/fix-pass-7.md §1; the mainnet soak of
+ * 2026-10-13 was worse with admission than without):
+ * - refusals are fast: a lane's wait is bounded at 250 ms, and a statement
+ *   whose predicted wait (from the running statements' ages and the lane's
+ *   recent statement time) is over the bound is refused at once instead
+ *   of after the wait;
+ * - heavy statements are not capped at a fixed `max_threads` (the server's
+ *   default: every core; ClickHouse's CPU slot scheduler shares the cores
+ *   between running statements), and they get the lower `priority` only
+ *   under contention (`contendedAt`): a heavy statement admitted while the
+ *   heavy lane is nearly full, or after waiting in its queue. Priority
+ *   always on protected light statements but slowed heavy ones at loads
+ *   the server carries (local load test: worse than admission off);
+ *   priority never on left light statements at p95 ~1 s under overload;
+ * - a statement is heavy from 10 M rows read (was 1 M: mainnet point reads
+ *   of 1–3 M rows, ~0.1 CPU-s, queued behind 12 CPU-s statements);
+ * - lanes are wider: light = cores, heavy = cores / 2.
+ * Lane sizes follow the ClickHouse
  * server's cores (`laneConcurrencyForCores`); a cluster-wide backstop across
  * API pods is the API user's `max_concurrent_queries_for_user`
  * (store/clickhouse/api-user.ts). Trusted documents get no lane of their
@@ -58,6 +77,20 @@ export interface AdmissionOptions {
   /** Shapes remembered (least recently used dropped). */
   maxShapes: number;
   /**
+   * Settings added to a heavy statement admitted under contention (default
+   * `{ max_threads: 4, priority: 2 }`, threads derived from the cores: about
+   * 2 cores per heavy slot; ClickHouse pauses it while light statements, at
+   * priority 1, run).
+   */
+  contendedSettings: { [name: string]: number | string };
+  /**
+   * Heavy statements running (itself included) from which a newly admitted
+   * one is contended, as a fraction of the heavy slots (default 1: it took
+   * the last slot); a statement that waited in the queue is always
+   * contended.
+   */
+  contendedAt: number;
+  /**
    * The cores the lane sizes were derived from and where that number came
    * from (`env`: CHAINGRAPH_API_CLICKHOUSE_CORES, `clickhouse`: the
    * server's `max_threads` for the API user, `default`: neither, the
@@ -70,40 +103,45 @@ export interface AdmissionOptions {
 }
 
 /** Light statements at once per core of the ClickHouse server. */
-export const lightConcurrentPerCore = 0.5;
+export const lightConcurrentPerCore = 1;
 
 /** The light lane never gets fewer slots than this (small servers). */
 export const minLightConcurrent = 8;
 
-/** Heavy queue length per heavy slot when the sizes are derived (24 at 6 slots). */
-export const heavyQueuedPerSlot = 4;
+/** Heavy queue length per heavy slot when the sizes are derived (24 at 24 slots). */
+export const heavyQueuedPerSlot = 1;
 
-/** Heavy statements' `max_threads` unless CHAINGRAPH_API_HEAVY_MAX_THREADS says otherwise. */
-export const defaultHeavyMaxThreads = 8;
+/**
+ * Heavy slots per core with the server's default threads: one heavy
+ * statement per 2 cores (24 at 48 cores). Not a thread budget: under
+ * contention ClickHouse shares the cores between them.
+ */
+export const heavyConcurrentPerCore = 0.5;
+
+/** Longest wait for a slot in either lane by default, ms (fix-pass-7.md §1: refusals must be fast, under 250 ms). */
+export const defaultMaxWaitMs = 250;
 
 /**
  * Lane sizes from the ClickHouse server's cores (owner decision 2026-10-12,
- * fix-pass-4.md §8): heavy = max(1, round(cores / heavy max_threads)), so
- * the heavy lane at full occupancy asks for about every core once and no
- * more (a heavy statement is CPU bound and uses all its threads; rounding,
- * not flooring, keeps two heavy slots on a 14-core server where one left
- * half the cores idle in the local overload test, fix-pass-5.md); light =
- * max(8, floor(cores × 0.5)): light statements are point and range lookups
- * of ~40–60 ms, mostly one thread and partly waiting on marks and reads, so
- * half a slot per core keeps them below the core count while heavy ones run
- * (they also have the higher `priority`). At 48 cores: 24 light, 6 heavy ×
- * 8 threads, the measured defaults. The heavy queue is then 4 per heavy
- * slot (24 at 6). `heavyMaxThreads` 0 (the server's
- * default, i.e. every core) gives one heavy slot.
+ * fix-pass-4.md §8; revised in fix-pass-7.md §1). Heavy: with the server's
+ * default threads (`heavyMaxThreads` 0, the default) max(2, round(cores /
+ * 2)): 24 at 48 cores, 7 at 14; with a fixed `heavyMaxThreads` max(1,
+ * round(cores / heavyMaxThreads)) as before. Light = max(8, cores): light
+ * statements are point and range lookups of ~10–60 ms, mostly one thread;
+ * under load they slow down, and half a slot per core (fix pass 5) refused
+ * them in the local overload test. At 48 cores: 48 light, 24 heavy. The
+ * heavy queue is 1 per heavy slot (24 at 24).
  */
 export const laneConcurrencyForCores = (
   cores: number,
   heavyMaxThreads: number
 ) => {
   const usableCores = Math.max(1, Math.floor(cores));
-  const threads = heavyMaxThreads > 0 ? heavyMaxThreads : usableCores;
   return {
-    heavy: Math.max(1, Math.round(usableCores / threads)),
+    heavy:
+      heavyMaxThreads > 0
+        ? Math.max(1, Math.round(usableCores / heavyMaxThreads))
+        : Math.max(2, Math.round(usableCores * heavyConcurrentPerCore)),
     light: Math.max(
       minLightConcurrent,
       Math.floor(usableCores * lightConcurrentPerCore)
@@ -112,26 +150,29 @@ export const laneConcurrencyForCores = (
 };
 
 /**
- * Defaults (per API process) when the server's cores are unknown: those of
- * a 48-core server (`laneConcurrencyForCores(48, 8)`): 24 light and 6 heavy statements at once;
- * queues of 256 / 24 waiting at most 5 s / 10 s. Heavy statements run with
- * at most 8 threads and a lower priority than light ones. A shape is heavy
- * from 1 M rows read on average (the F3 restatement of 2026-10-12: key
- * analysis is judged only below about 1 M rows read).
+ * Defaults (per API process) when the server's cores are unknown: the
+ * lane sizes of a 48-core server (`laneConcurrencyForCores(48, 0)`): 48
+ * light and 24 heavy statements at once; queues of 256 / 24, waits of at
+ * most 250 ms (refused at once when the predicted wait is longer). Light
+ * statements run at priority 1; heavy ones with the server's default
+ * threads, at priority 2 only when contended. A shape is heavy from 10 M
+ * rows read on average (fix-pass-7.md §1; 1 M before).
  */
 export const defaultAdmissionOptions: AdmissionOptions = {
+  contendedAt: 1,
+  contendedSettings: { max_threads: 4, priority: 2 },
   enabled: true,
   heavy: {
-    maxConcurrent: 6,
-    maxQueued: 24,
-    maxWaitMs: 10_000,
-    settings: { max_threads: defaultHeavyMaxThreads, priority: 2 },
-  },
-  heavyRows: 1_000_000,
-  light: {
     maxConcurrent: 24,
+    maxQueued: 24,
+    maxWaitMs: defaultMaxWaitMs,
+    settings: {},
+  },
+  heavyRows: 10_000_000,
+  light: {
+    maxConcurrent: 48,
     maxQueued: 256,
-    maxWaitMs: 5_000,
+    maxWaitMs: defaultMaxWaitMs,
     settings: { priority: 1 },
   },
   maxShapes: 10_000,
@@ -188,9 +229,13 @@ const laneSettingsFromEnv = (
  * the API user, read at startup; without either the static defaults);
  * CHAINGRAPH_API_LIGHT_… / CHAINGRAPH_API_HEAVY_…: MAX_CONCURRENT (default
  * derived from the cores, `laneConcurrencyForCores`), MAX_QUEUED, MAX_WAIT_MS;
- * MAX_THREADS (0: the server's default),
- * _PRIORITY (0: none), _WORKLOAD (a ClickHouse workload name);
- * CHAINGRAPH_API_HEAVY_ROWS; CHAINGRAPH_API_RETRY_AFTER_SECONDS.
+ * MAX_THREADS (0 or unset: the server's default),
+ * _PRIORITY (0: none; for the heavy lane the priority of CONTENDED heavy
+ * statements, default 2), _WORKLOAD (a ClickHouse workload name);
+ * CHAINGRAPH_API_HEAVY_CONTENDED_AT (heavy statements running as a
+ * fraction of the heavy slots from which a newly admitted one is contended,
+ * default 1; 0: always), CHAINGRAPH_API_HEAVY_ROWS;
+ * CHAINGRAPH_API_RETRY_AFTER_SECONDS.
  */
 export const admissionOptionsFromEnv = (
   env: NodeJS.ProcessEnv = process.env,
@@ -226,6 +271,20 @@ export const admissionOptionsFromEnv = (
     'CHAINGRAPH_API_HEAVY',
     defaultAdmissionOptions.heavy.settings
   );
+  /* the heavy lane's priority applies under contention only (fix-pass-7.md §1) */
+  const contendedPriority = nonNegativeInteger(
+    env,
+    'CHAINGRAPH_API_HEAVY_PRIORITY',
+    Number(defaultAdmissionOptions.contendedSettings.priority ?? 0)
+  );
+  const contendedAtRaw = env.CHAINGRAPH_API_HEAVY_CONTENDED_AT;
+  const contendedAt =
+    contendedAtRaw === undefined || contendedAtRaw === ''
+      ? defaultAdmissionOptions.contendedAt
+      : Number(contendedAtRaw);
+  if (!Number.isFinite(contendedAt) || contendedAt < 0) {
+    throw new Error('CHAINGRAPH_API_HEAVY_CONTENDED_AT must be a number >= 0.');
+  }
   const derived =
     cores === undefined
       ? undefined
@@ -244,8 +303,8 @@ export const admissionOptionsFromEnv = (
             ...defaults,
             maxConcurrent: name === 'HEAVY' ? derived.heavy : derived.light,
             /*
-             * the heavy queue holds about 4 statements per slot (24 at 6):
-             * a deeper queue only turns fast refusals into 10 s waits
+             * the heavy queue holds about 2 statements per slot (24 at 12):
+             * a deeper queue only turns fast refusals into long waits
              */
             maxQueued:
               name === 'HEAVY'
@@ -270,14 +329,37 @@ export const admissionOptionsFromEnv = (
       ),
       settings: laneSettingsFromEnv(env, prefix, fallback.settings),
     };
+    if (name === 'HEAVY') delete limits.settings.priority;
     if (limits.maxConcurrent < 1) {
       throw new Error(`${prefix}_MAX_CONCURRENT must be at least 1.`);
     }
     return limits;
   };
+  const heavy = lane('HEAVY', defaultAdmissionOptions.heavy);
+  /*
+   * contended heavy statements share the cores: about 2 cores' worth of
+   * threads per heavy slot (4 at 48 cores / 24 slots), unless set (0: none)
+   */
+  const contendedThreads = nonNegativeInteger(
+    env,
+    'CHAINGRAPH_API_HEAVY_CONTENDED_MAX_THREADS',
+    cores === undefined
+      ? Number(defaultAdmissionOptions.contendedSettings.max_threads ?? 0)
+      : Math.min(
+          Math.max(2, Math.round((2 * cores) / heavy.maxConcurrent)),
+          typeof heavy.settings.max_threads === 'number'
+            ? heavy.settings.max_threads
+            : Number.POSITIVE_INFINITY
+        )
+  );
   return {
+    contendedAt,
+    contendedSettings: {
+      ...(contendedThreads === 0 ? {} : { max_threads: contendedThreads }),
+      ...(contendedPriority === 0 ? {} : { priority: contendedPriority }),
+    },
     enabled: flag !== 'off',
-    heavy: lane('HEAVY', defaultAdmissionOptions.heavy),
+    heavy,
     heavyRows: nonNegativeInteger(
       env,
       'CHAINGRAPH_API_HEAVY_ROWS',
@@ -344,7 +426,13 @@ export const admissionSummary = (
     options.light.maxConcurrent
   } heavy=${options.heavy.maxConcurrent} heavy_max_threads=${String(
     options.heavy.settings.max_threads ?? 'server default'
-  )} max_concurrent_queries_for_user=${
+  )} heavy_contended=${options.contendedAt}:${
+    Object.entries(options.contendedSettings)
+      .map(([name, value]) => `${name} ${String(value)}`)
+      .join(',') || 'none'
+  } heavy_rows=${options.heavyRows} max_wait_ms=${options.light.maxWaitMs}/${
+    options.heavy.maxWaitMs
+  } max_concurrent_queries_for_user=${
     backstop === undefined ? 'unknown' : backstop === 0 ? '0 (none)' : backstop
   }`;
 
@@ -388,6 +476,8 @@ export interface LaneStats {
   rejectedFull: number;
   /** Refused: waited longer than allowed. */
   rejectedWait: number;
+  /** Refused at once: the predicted wait was longer than allowed. */
+  rejectedPredicted: number;
   /** Left the queue because the request went away. */
   abandoned: number;
   /** Highest `running` seen. */
@@ -403,12 +493,20 @@ const emptyStats = (): LaneStats => ({
   peakRunning: 0,
   queued: 0,
   rejectedFull: 0,
+  rejectedPredicted: 0,
   rejectedWait: 0,
   running: 0,
 });
 
+/** A slot taken: when, the lane's running statements then (itself included), and whether it waited. */
+interface Slot {
+  at: number;
+  running: number;
+  queued: boolean;
+}
+
 interface Waiter {
-  resolve: () => void;
+  resolve: (slot: Slot) => void;
   reject: (error: unknown) => void;
   timer: NodeJS.Timeout | undefined;
   onAbort: () => void;
@@ -419,7 +517,37 @@ interface Waiter {
 class LaneGate {
   readonly stats = emptyStats();
 
+  /** Recent statement time of the lane (EWMA, ms; undefined until one finished). */
+  serviceMs: number | undefined;
+
   private readonly queue: Waiter[] = [];
+
+  /** Start times of the running statements. */
+  private readonly running: Slot[] = [];
+
+  /**
+   * The wait a statement joining the queue now can expect (0 until the lane
+   * has a measured statement time S): a running statement younger than S is
+   * expected to end in S − its age, an older one in its age again (a
+   * statement that has run long is likely a long one: heavy statements'
+   * times spread over 10×); position p in the queue gets the p-th slot to
+   * free (sorted), and every further round of slots adds S.
+   */
+  predictedWaitMs(now = Date.now()) {
+    const service = this.serviceMs;
+    if (service === undefined || this.running.length === 0) return 0;
+    const remaining = this.running
+      .map((slot) => {
+        const age = now - slot.at;
+        return age < service ? service - age : age;
+      })
+      .sort((a, b) => a - b);
+    const position = this.queue.length;
+    return (
+      remaining[position % remaining.length]! +
+      Math.floor(position / remaining.length) * service
+    );
+  }
 
   constructor(
     readonly lane: Lane,
@@ -427,15 +555,18 @@ class LaneGate {
     private readonly retryAfterSeconds: number
   ) {}
 
-  /** Wait for a slot (or fail fast); the caller must `release()` once done. */
-  async acquire(signal?: AbortSignal): Promise<void> {
+  /**
+   * Wait for a slot (or fail fast); the caller must `release()` once done.
+   * Resolves with the lane's running statements at the moment it took the
+   * slot (itself included).
+   */
+  async acquire(signal?: AbortSignal): Promise<Slot> {
     if (signal?.aborted === true) throw requestAbortedError();
     if (
       this.stats.running < this.limits.maxConcurrent &&
       this.queue.length === 0
     ) {
-      this.take();
-      return;
+      return this.take(false);
     }
     if (this.queue.length >= this.limits.maxQueued) {
       this.stats.rejectedFull += 1;
@@ -445,7 +576,21 @@ class LaneGate {
         this.retryAfterSeconds
       );
     }
-    await new Promise<void>((resolve, reject) => {
+    const predicted = this.predictedWaitMs();
+    if (predicted > this.limits.maxWaitMs) {
+      /* refuse now rather than after the wait (fix-pass-7.md §1) */
+      this.stats.rejectedPredicted += 1;
+      throw overloadedError(
+        this.lane,
+        `${this.stats.running} running, ${
+          this.queue.length
+        } queued, predicted wait ${Math.round(predicted)} ms > ${
+          this.limits.maxWaitMs
+        } ms`,
+        this.retryAfterSeconds
+      );
+    }
+    return new Promise<Slot>((resolve, reject) => {
       const waiter: Waiter = {
         onAbort: () => {
           this.remove(waiter);
@@ -478,24 +623,34 @@ class LaneGate {
     });
   }
 
-  release() {
+  /** Free `slot`; `measured`: its time counts as the lane's service time (not a failed or abandoned statement). */
+  release(slot: Slot, measured = true) {
+    const ms = Date.now() - slot.at;
+    if (measured) {
+      this.serviceMs =
+        this.serviceMs === undefined ? ms : this.serviceMs * 0.8 + ms * 0.2;
+    }
+    const index = this.running.indexOf(slot);
+    if (index >= 0) this.running.splice(index, 1);
     this.stats.running -= 1;
     const next = this.queue.shift();
     this.stats.queued = this.queue.length;
     if (next === undefined) return;
     clearTimeout(next.timer);
     next.signal?.removeEventListener('abort', next.onAbort);
-    this.take();
-    next.resolve();
+    next.resolve(this.take(true));
   }
 
-  private take() {
+  private take(queued: boolean): Slot {
     this.stats.running += 1;
     this.stats.admitted += 1;
     this.stats.peakRunning = Math.max(
       this.stats.peakRunning,
       this.stats.running
     );
+    const slot = { at: Date.now(), queued, running: this.stats.running };
+    this.running.push(slot);
+    return slot;
   }
 
   private remove(waiter: Waiter) {
@@ -523,6 +678,29 @@ export class Admission {
       heavy: new LaneGate('heavy', options.heavy, options.retryAfterSeconds),
       light: new LaneGate('light', options.light, options.retryAfterSeconds),
     };
+  }
+
+  /**
+   * The ClickHouse settings of a statement admitted to `lane` (`slot`: the
+   * lane's running statements then, itself included, and whether it
+   * waited in the queue): the lane's settings, plus `contendedSettings`
+   * for a contended heavy statement (it waited, or the heavy lane holds at
+   * least `contendedAt` × its slots).
+   */
+  laneSettings(
+    lane: Lane,
+    slot: Pick<Slot, 'queued' | 'running'>
+  ): LaneLimits['settings'] {
+    const { settings } = this.options[lane];
+    const contended =
+      slot.queued ||
+      slot.running >=
+        Math.max(
+          1,
+          Math.ceil(this.options.contendedAt * this.options.heavy.maxConcurrent)
+        );
+    if (lane !== 'heavy' || !contended) return settings;
+    return { ...settings, ...this.options.contendedSettings };
   }
 
   /** The lane of a statement: heavy for shapes with a heavy history and for unmeasured aggregates. */
@@ -578,17 +756,20 @@ export class Admission {
     }
     const lane = this.laneOf(shape, aggregate);
     const gate = this.lanes[lane];
-    await gate.acquire(signal);
+    const slot = await gate.acquire(signal);
+    const outcome = { failed: false };
     try {
-      return await send(this.options[lane].settings, report);
+      return await send(this.laneSettings(lane, slot), report);
     } catch (error: unknown) {
+      outcome.failed = true;
       /* an abandoned statement's failure says nothing about its cost */
       if (signal?.aborted !== true && costly(error)) {
         this.record(shape, this.failedCost);
       }
       throw error;
     } finally {
-      gate.release();
+      /* a failed or abandoned statement's time says nothing about the lane's */
+      gate.release(slot, !outcome.failed);
     }
   }
 }

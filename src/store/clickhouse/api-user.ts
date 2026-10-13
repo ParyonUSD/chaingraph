@@ -4,8 +4,8 @@
  * The API's ClickHouse user and its settings profile (fix-pass-4.md §8,
  * owner decision 2026-10-12): a cluster-wide backstop on the statements the
  * API user may run at once, `max_concurrent_queries_for_user = pods ×
- * statementsPerPod + margin` (default `pods × 30 + 10`). The API's admission
- * gate limits each process (24 light + 6 heavy = 30 on a 48-core server);
+ * statementsPerPod + margin` (default `pods × 72 + 10`). The API's admission
+ * gate limits each process (48 light + 24 heavy = 72 on a 48-core server);
  * the backstop bounds all API pods together, so a mis-sized pod count or a
  * misbehaving process cannot flood the server. Over it ClickHouse refuses a
  * statement at once (code 202 TOO_MANY_SIMULTANEOUS_QUERIES). The margin
@@ -23,8 +23,8 @@ import { createHash } from 'node:crypto';
 /** The settings profile of the API user. */
 export const apiProfileName = 'chaingraph_api';
 
-/** Statements per API pod: the light + heavy lanes at 48 cores (admission.ts). */
-export const defaultStatementsPerPod = 30;
+/** Statements per API pod: the light + heavy lanes at 48 cores (admission.ts: 48 + 24 since fix pass 7). */
+export const defaultStatementsPerPod = 72;
 
 /** Statements outside the gate (watermark polls, live refreshes, kills). */
 export const defaultStatementsMargin = 10;
@@ -61,7 +61,7 @@ const positiveInteger = (
 
 /**
  * CHAINGRAPH_CLICKHOUSE_API_PODS (default 1),
- * CHAINGRAPH_CLICKHOUSE_API_STATEMENTS_PER_POD (default 30),
+ * CHAINGRAPH_CLICKHOUSE_API_STATEMENTS_PER_POD (default 72),
  * CHAINGRAPH_CLICKHOUSE_API_STATEMENTS_MARGIN (default 10).
  */
 export const apiUserBackstopFromEnv = (

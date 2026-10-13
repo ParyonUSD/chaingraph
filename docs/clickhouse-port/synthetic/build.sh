@@ -13,6 +13,9 @@
 #        the golden backfill (each part holds a hash range: a hash lookup probes one part);
 #   time: the same tables in 12 chunks of internal id (time order: every part spans the whole hash range, as a store
 #        synced live, or golden's tx_acceptance / block_transaction).
+#   golden: as golden mainnet (fix-pass-7.md): output / transaction hash-chunked, input in 12 chunks of the OUTPOINT
+#        hash (golden's 21-input transform: every part spans every spender hash, so a lookup by transaction hash probes
+#        all of them), tx_acceptance in 12 chunks of internal id (time order), block_transaction in 2 block-ordered parts.
 # Merges of the data tables are stopped so the parts stay as written (SYSTEM START MERGES to undo). Needs ~300 GiB.
 # Then: node build-utxo-set.mjs <worktree> <database> 1 (the stored UTXO set, ~15-20 min). Drop afterwards with
 # max_table_size_to_drop=0 (tables above 50 GB).
@@ -26,7 +29,9 @@ bash "$here/../../../src/store/clickhouse/ddl/apply.sh" "$url" "$db" > /dev/null
 while IFS= read -r line; do [[ -n "$line" ]] && curl -sS --fail-with-body "$url" --data-binary "$line"; done < "$here/udf.sql"
 for tbl in output input transaction tx_acceptance block_transaction spend; do q "SYSTEM STOP MERGES $db.$tbl"; done
 for ((c=0; c<chunks; c++)); do
-  if [[ $layout == hash ]]; then
+  a=$(( c * T / chunks )); n=$(( T / chunks ))
+  acc_rows="SELECT number + $a AS t FROM numbers($n)"
+  if [[ $layout == hash || $layout == golden ]]; then
     lo=$(( 256 * c / chunks )); hi=$(( 256 * (c + 1) / chunks - 1 ))
     from="numbers($T) WHERE reinterpretAsUInt8(substring(h6_tx(number), 1, 1)) BETWEEN $lo AND $hi"
     rows="SELECT number AS t FROM $from"
@@ -44,7 +49,7 @@ for ((c=0; c<chunks; c++)); do
   q "INSERT INTO $db.input (transaction_hash, input_index, transaction_internal_id, outpoint_transaction_hash, outpoint_index, sequence_number, unlocking_bytecode, commit_seq)
      SELECT h6_tx(t), j, t + 1, if(t % 330 = 0, toFixedString(repeat('\0', 32), 32), h6_tx(h6_prev(t, j))), if(t % 330 = 0, toUInt32(4294967295), h6_previdx(t, j)), toUInt32(4294967295), randomString(40), h6_seq(t) FROM ($txi)"
   q "INSERT INTO $db.tx_acceptance (transaction_hash, node_internal_id, block_internal_id, transaction_internal_id, height, accepted_at, sign, version, commit_seq)
-     SELECT h6_tx(t), toUInt32(1), intDiv(t, 330) + 1, t + 1, toUInt32(intDiv(t, 330)), toDateTime64(1500000000 + intDiv(t, 330) * 600, 3, 'UTC'), toInt8(1), h6_seq(t), h6_seq(t) FROM ($rows)"
+     SELECT h6_tx(t), toUInt32(1), intDiv(t, 330) + 1, t + 1, toUInt32(intDiv(t, 330)), toDateTime64(1500000000 + intDiv(t, 330) * 600, 3, 'UTC'), toInt8(1), h6_seq(t), h6_seq(t) FROM ($( [[ $layout == golden ]] && echo "$acc_rows" || echo "$rows" ))"
   q "INSERT INTO $db.transaction (hash, internal_id, version, locktime, size_bytes, is_coinbase, input_count, output_count, output_value_satoshis, commit_seq)
      SELECT h6_tx(t), t + 1, 2, 0, toUInt32(200 + cityHash64(t, 'sz') % 800), t % 330 = 0, toUInt32(h6_nin(t)), toUInt32(h6_nout(t)), toInt64(cityHash64(t, 'ov') % 1000000000), h6_seq(t) FROM ($rows)"
   if [[ $layout == time ]]; then
@@ -52,13 +57,25 @@ for ((c=0; c<chunks; c++)); do
        SELECT intDiv(t, 330) + 1, toUInt32(t % 330), t + 1, h6_tx(t), h6_seq(t) FROM ($rows)"
   fi
 done
-if [[ $layout == hash ]]; then
+if [[ $layout == hash || $layout == golden ]]; then
   # golden: 2 parts in block order
   for ((c=0; c<2; c++)); do
     a=$(( c * T / 2 )); n=$(( T / 2 ))
     q "INSERT INTO $db.block_transaction (block_internal_id, transaction_index, transaction_internal_id, transaction_hash, commit_seq)
        SELECT intDiv(t, 330) + 1, toUInt32(t % 330), t + 1, h6_tx(t), h6_seq(t) FROM (SELECT number + $a AS t FROM numbers($n))"
   done
+fi
+if [[ $layout == golden ]]; then
+  # golden's input parts are chunked by outpoint hash (the 21-input transform), not by the spender's hash
+  echo "$(date -u +%H:%M:%S) input by outpoint hash"
+  q "CREATE TABLE $db.input_o AS $db.input"
+  q "SYSTEM STOP MERGES $db.input_o"
+  for ((c=0; c<chunks; c++)); do
+    lo=$(( 256 * c / chunks )); hi=$(( 256 * (c + 1) / chunks - 1 ))
+    q "INSERT INTO $db.input_o SELECT * FROM $db.input WHERE reinterpretAsUInt8(substring(outpoint_transaction_hash, 1, 1)) BETWEEN $lo AND $hi"
+  done
+  q "EXCHANGE TABLES $db.input AND $db.input_o"
+  curl -sS --fail-with-body "$url/?max_table_size_to_drop=0" --data-binary "DROP TABLE $db.input_o"
 fi
 echo "$(date -u +%H:%M:%S) spend"
 # the spend index directly from the generator (the spent output's attributes are known), 7 chunks by spender hash

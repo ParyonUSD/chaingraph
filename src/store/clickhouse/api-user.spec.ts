@@ -30,14 +30,14 @@ test('api user: backstop = pods x per pod + margin, from the environment', (t) =
   t.deepEqual(apiUserBackstopFromEnv({}), {
     margin: 10,
     pods: 1,
-    statementsPerPod: 30,
+    statementsPerPod: 72,
   });
-  t.is(apiMaxConcurrentQueries(apiUserBackstopFromEnv({})), 40);
+  t.is(apiMaxConcurrentQueries(apiUserBackstopFromEnv({})), 82);
   t.is(
     apiMaxConcurrentQueries(
       apiUserBackstopFromEnv({ CHAINGRAPH_CLICKHOUSE_API_PODS: '2' })
     ),
-    70
+    154
   );
   t.is(
     apiMaxConcurrentQueries(

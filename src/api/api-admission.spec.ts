@@ -187,9 +187,9 @@ test('admission: options from the environment', (t) => {
   t.is(parsed.heavy.maxConcurrent, 3);
   t.deepEqual(parsed.heavy.settings, {
     max_threads: 4,
-    priority: 2,
     workload: 'chaingraph_heavy',
   });
+  t.deepEqual(parsed.contendedSettings, { max_threads: 4, priority: 2 });
   t.is(parsed.heavyRows, 900);
   t.is(parsed.light.maxQueued, 10);
   t.deepEqual(parsed.light.settings, {});
@@ -203,38 +203,71 @@ test('admission: options from the environment', (t) => {
 });
 
 test('admission: lane sizes from the ClickHouse server cores', (t) => {
-  t.deepEqual(laneConcurrencyForCores(48, 8), { heavy: 6, light: 24 });
+  /* a fixed heavy max_threads keeps the fix-pass-5 rule for heavy slots */
+  t.deepEqual(laneConcurrencyForCores(48, 8), { heavy: 6, light: 48 });
+  t.deepEqual(laneConcurrencyForCores(14, 8), { heavy: 2, light: 14 });
+  t.deepEqual(laneConcurrencyForCores(3, 8), { heavy: 1, light: 8 });
+  /* the server's default threads (fix pass 7): heavy = cores / 2, light = cores */
   t.deepEqual(
     {
       heavy: defaultAdmissionOptions.heavy.maxConcurrent,
       light: defaultAdmissionOptions.light.maxConcurrent,
     },
-    laneConcurrencyForCores(48, 8),
+    laneConcurrencyForCores(48, 0),
     'the static defaults are the 48-core sizes'
   );
-  t.deepEqual(laneConcurrencyForCores(96, 8), { heavy: 12, light: 48 });
-  t.deepEqual(laneConcurrencyForCores(14, 8), { heavy: 2, light: 8 });
-  t.deepEqual(laneConcurrencyForCores(11, 8), { heavy: 1, light: 8 });
-  t.deepEqual(laneConcurrencyForCores(3, 8), { heavy: 1, light: 8 });
-  t.deepEqual(laneConcurrencyForCores(48, 0), { heavy: 1, light: 24 });
+  t.deepEqual(laneConcurrencyForCores(48, 0), { heavy: 24, light: 48 });
+  t.deepEqual(laneConcurrencyForCores(14, 0), { heavy: 7, light: 14 });
+  t.deepEqual(laneConcurrencyForCores(2, 0), { heavy: 2, light: 8 });
   const fromServer = admissionOptionsFromEnv({}, 32);
-  t.is(fromServer.light.maxConcurrent, 16);
-  t.is(fromServer.heavy.maxConcurrent, 4);
-  t.is(fromServer.heavy.maxQueued, 16, 'heavy queue: 4 per slot');
+  t.is(fromServer.light.maxConcurrent, 32);
+  t.is(fromServer.heavy.maxConcurrent, 16);
+  t.is(fromServer.heavy.maxQueued, 16, 'heavy queue: 1 per slot');
+  t.deepEqual(fromServer.heavy.settings, {}, 'no thread cap, no priority');
+  t.deepEqual(fromServer.contendedSettings, { max_threads: 4, priority: 2 });
+  t.is(fromServer.contendedAt, 1);
+  t.is(fromServer.heavy.maxWaitMs, 250);
+  t.is(fromServer.light.maxWaitMs, 250);
+  t.is(fromServer.heavyRows, 10_000_000);
   t.is(fromServer.light.maxQueued, 256);
   t.deepEqual(fromServer.sizing, { cores: 32, source: 'clickhouse' });
   const envCores = admissionOptionsFromEnv(
     { CHAINGRAPH_API_CLICKHOUSE_CORES: '64' },
     32
   );
-  t.is(envCores.light.maxConcurrent, 32);
-  t.is(envCores.heavy.maxConcurrent, 8);
+  t.is(envCores.light.maxConcurrent, 64);
+  t.is(envCores.heavy.maxConcurrent, 32);
   t.is(envCores.sizing?.source, 'env');
   const threads = admissionOptionsFromEnv(
-    { CHAINGRAPH_API_HEAVY_MAX_THREADS: '16' },
+    {
+      CHAINGRAPH_API_HEAVY_CONTENDED_AT: '0',
+      CHAINGRAPH_API_HEAVY_MAX_THREADS: '16',
+      CHAINGRAPH_API_HEAVY_PRIORITY: '3',
+    },
     48
   );
-  t.is(threads.heavy.maxConcurrent, 3, 'heavy follows its max_threads');
+  t.is(threads.heavy.maxConcurrent, 3, 'heavy follows a fixed max_threads');
+  t.deepEqual(threads.heavy.settings, { max_threads: 16 });
+  t.deepEqual(
+    threads.contendedSettings,
+    { max_threads: 16, priority: 3 },
+    'never more threads than the fixed cap'
+  );
+  t.is(threads.contendedAt, 0);
+  t.deepEqual(
+    admissionOptionsFromEnv(
+      {
+        CHAINGRAPH_API_HEAVY_CONTENDED_MAX_THREADS: '0',
+        CHAINGRAPH_API_HEAVY_PRIORITY: '0',
+      },
+      48
+    ).contendedSettings,
+    {},
+    'priority 0, threads 0: nothing changes under contention'
+  );
+  t.throws(() =>
+    admissionOptionsFromEnv({ CHAINGRAPH_API_HEAVY_CONTENDED_AT: 'x' })
+  );
   const overridden = admissionOptionsFromEnv(
     {
       CHAINGRAPH_API_HEAVY_MAX_CONCURRENT: '2',
@@ -245,12 +278,88 @@ test('admission: lane sizes from the ClickHouse server cores', (t) => {
   t.is(overridden.light.maxConcurrent, 5, 'explicit sizes win');
   t.is(overridden.heavy.maxConcurrent, 2);
   const unknown = admissionOptionsFromEnv({}, undefined);
-  t.is(unknown.light.maxConcurrent, 24);
+  t.is(unknown.light.maxConcurrent, 48);
   t.is(unknown.sizing?.source, 'default');
   t.regex(
     admissionSummary(fromServer, 70),
-    /^admission: on cores=32 \(clickhouse\) light=16 heavy=4 heavy_max_threads=8 max_concurrent_queries_for_user=70$/u
+    /^admission: on cores=32 \(clickhouse\) light=32 heavy=16 heavy_max_threads=server default heavy_contended=1:max_threads 4,priority 2 heavy_rows=10000000 max_wait_ms=250\/250 max_concurrent_queries_for_user=70$/u
   );
+});
+
+test('admission (fix pass 7): a statement whose predicted wait is over the bound is refused at once, not after the wait', async (t) => {
+  const admission = new Admission(
+    options({ maxConcurrent: 1, maxQueued: 10, maxWaitMs: 300 })
+  );
+  /* the lane's statements take ~200 ms */
+  await admission.run('a', false, undefined, async () => sleep(200));
+  t.true(admission.lanes.light.serviceMs! >= 150);
+  const hold = deferred();
+  const first = admission.run('a', false, undefined, async () => hold.promise);
+  /* position 1: ~200 ms predicted, within 300 ms: it queues */
+  const second = admission.run('a', false, undefined, async () => 'second');
+  await sleep(10);
+  t.is(admission.lanes.light.stats.queued, 1);
+  /* position 2: ~400 ms predicted: refused now */
+  const started = Date.now();
+  const third = await admission
+    .run('a', false, undefined, async () => 'third')
+    .catch((error: unknown) => error);
+  t.true(Date.now() - started < 50, 'refused in milliseconds');
+  t.is(codeOf(third), overloadedCode);
+  t.regex((third as GraphQLError).message, /predicted wait/u);
+  t.is(admission.lanes.light.stats.rejectedPredicted, 1);
+  hold.resolve();
+  await first;
+  t.is(await second, 'second');
+});
+
+test('admission (fix pass 7): heavy statements get the lower priority only under contention', async (t) => {
+  const admission = new Admission({
+    ...options({}, { maxConcurrent: 4, maxQueued: 4, settings: {} }, 1),
+    contendedAt: 0.75,
+    contendedSettings: { priority: 2 },
+  });
+  t.deepEqual(
+    admission.laneSettings('heavy', { queued: false, running: 1 }),
+    {}
+  );
+  t.deepEqual(
+    admission.laneSettings('heavy', { queued: false, running: 2 }),
+    {}
+  );
+  t.deepEqual(
+    admission.laneSettings('heavy', { queued: false, running: 3 }),
+    { priority: 2 },
+    '3 of 4 slots: contended'
+  );
+  t.deepEqual(
+    admission.laneSettings('heavy', { queued: true, running: 1 }),
+    { priority: 2 },
+    'it waited: contended'
+  );
+  t.deepEqual(
+    admission.laneSettings('light', { queued: true, running: 40 }),
+    defaultAdmissionOptions.light.settings,
+    'light statements keep their own settings'
+  );
+  /* through run: alone, then the third of four at once */
+  await admission.run('h', false, undefined, async (_s, report) => {
+    report(10);
+  });
+  const seen: (number | string | undefined)[] = [];
+  const hold = deferred();
+  const held = [1, 2].map(async () =>
+    admission.run('h', false, undefined, async (settings) => {
+      seen.push(settings.priority);
+      await hold.promise;
+    })
+  );
+  await admission.run('h', false, undefined, async (settings) => {
+    seen.push(settings.priority);
+  });
+  hold.resolve();
+  await Promise.all(held);
+  t.deepEqual(seen, [undefined, undefined, 2]);
 });
 
 e2e(
