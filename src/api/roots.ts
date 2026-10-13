@@ -800,13 +800,18 @@ export const runOutputsByTransactionHash = async (
   return runRows(env.db, label, sql, compiled);
 };
 
-/** The newest transaction internal_id visible in the request snapshot (node-agnostic). */
+/**
+ * The newest transaction internal_id visible in the request snapshot
+ * (node-agnostic): read in descending id order (transaction.p_id) until the
+ * first visible row, instead of max() over every row (mainnet: 420 M rows,
+ * seconds of CPU per L33 request; fix-pass-6.md §7).
+ */
 export const runTransactionWatermark = async (env: RootEnv, label: string) => {
-  const [row] = await env.db.query<{ id: string | null }>(
+  const [row] = await env.db.query<{ id: string }>(
     label,
-    `SELECT if(count() = 0, NULL, toString(max(internal_id))) AS id FROM ${env.sql.view(
+    `SELECT toString(internal_id) AS id FROM ${env.sql.view(
       'transaction_at'
-    )}`,
+    )} ORDER BY internal_id DESC LIMIT 1`,
     env.sql.params
   );
   return row?.id ?? null;
