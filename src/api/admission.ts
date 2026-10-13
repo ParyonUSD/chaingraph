@@ -149,6 +149,8 @@ export const defaultAdmissionOptions: AdmissionOptions = {
     lightShare: 0.25,
     ratePerSecond: defaultCores * defaultCpuTarget,
   },
+  contendedFill: 0.5,
+  contendedSettings: { max_threads: 4 },
   cpuSource: 'query_log',
   defaultCpuPerRow: 0.3e-6,
   enabled: true,
@@ -163,8 +165,6 @@ export const defaultAdmissionOptions: AdmissionOptions = {
   loopGuard: 0.95,
   maxKeys: 10_000,
   minRetryAfterSeconds: 1,
-  contendedFill: 0.5,
-  contendedSettings: { max_threads: 4 },
   settings: { heavy: {}, light: {} },
   unknownCost: { cpuSeconds: 0.25, loopMs: 20 },
 };
@@ -1049,11 +1049,11 @@ export class Admission {
       },
       cpuPerRow: this.cpuPerRow,
       cpuSource: this.cpuSource,
+      /* per document (hash prefix : operation): predicted CPU-s and loop ms */
+      documents: this.model.documents(),
       enabled: this.options.enabled,
       loopUtilisation: this.loopUtilisation,
       modelKeys: this.model.size,
-      /* per document (hash prefix : operation): predicted CPU-s and loop ms */
-      documents: this.model.documents(),
       pendingStatements: this.pending.size,
       stats: this.stats,
     };
@@ -1226,9 +1226,6 @@ export const admissionOptionsFromEnv = (
       lightShare,
       ratePerSecond: (usableCores * cpuTarget) / processes,
     },
-    cpuSource,
-    defaultCpuPerRow: defaultAdmissionOptions.defaultCpuPerRow,
-    enabled: flag !== 'off',
     contendedFill: nonNegativeNumber(
       env,
       'CHAINGRAPH_API_HEAVY_CONTENDED_FILL',
@@ -1237,6 +1234,9 @@ export const admissionOptionsFromEnv = (
     ),
     contendedSettings:
       contendedThreads === 0 ? {} : { max_threads: contendedThreads },
+    cpuSource,
+    defaultCpuPerRow: defaultAdmissionOptions.defaultCpuPerRow,
+    enabled: flag !== 'off',
     heavyMaxInFlight,
     lightMaxCpuMs: nonNegativeNumber(
       env,
