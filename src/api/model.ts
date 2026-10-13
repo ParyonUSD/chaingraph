@@ -871,12 +871,28 @@ export const TransactionEntity: Entity = {
           'transaction_hash',
           'transaction_index',
         ]);
+        /*
+         * Without a filter (which may compare the height) only a transaction
+         * with two or more inclusions has an order to decide: the blocks of
+         * those alone are read (block is ordered by hash, so a read by id
+         * scans the table: mainnet ~1.2 M rows per statement). Usually there
+         * are none and the empty set prunes every part; a single inclusion
+         * keeps height 0 and an empty hash, which order nothing
+         * (fix-pass-8b.md §2).
+         */
+        const filtered = args.where !== undefined && args.where !== null;
         return `SELECT bt.transaction_hash AS transaction_hash, bt.block_internal_id AS block_internal_id,
           b.height AS height, b.hash AS block_hash, bt.transaction_index AS transaction_index
         FROM ${rows} AS bt
-        INNER JOIN (SELECT internal_id, height, hash FROM ${c.sql.view(
+        ${
+          filtered ? 'INNER' : 'LEFT'
+        } JOIN (SELECT internal_id, height, hash FROM ${c.sql.view(
           'block_at'
-        )} WHERE internal_id IN (SELECT block_internal_id FROM ${rows})) AS b
+        )} WHERE internal_id IN (SELECT block_internal_id FROM ${rows}${
+          filtered
+            ? ''
+            : ` WHERE transaction_hash IN (SELECT transaction_hash FROM ${rows} GROUP BY transaction_hash HAVING count() > 1)`
+        })) AS b
           ON b.internal_id = bt.block_internal_id`;
       },
       target: () => BlockInclusionEntity,
