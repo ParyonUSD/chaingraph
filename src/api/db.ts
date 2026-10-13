@@ -379,7 +379,7 @@ export class ApiDb {
     const { hits } = this.snapshotCache;
     /* the request waits for ClickHouse meanwhile (loop attribution, admission.ts) */
     const ticket = requestScope.getStore()?.ticket;
-    if (ticket !== undefined) ticket.waiting += 1;
+    if (ticket !== undefined) this.admission.waiting(ticket, 1);
     try {
       const snapshot = await this.snapshotCache.read(
         nodeIds,
@@ -388,7 +388,7 @@ export class ApiDb {
       if (this.snapshotCache.hits > hits) this.stats.snapshotCacheHits += 1;
       return snapshot;
     } finally {
-      if (ticket !== undefined) ticket.waiting -= 1;
+      if (ticket !== undefined) this.admission.waiting(ticket, -1);
     }
   }
 
@@ -420,11 +420,11 @@ export class ApiDb {
       ticket?.statements.push(statement);
       /* waiting for ClickHouse until its response starts (loop attribution) */
       const wait = { open: ticket !== undefined };
-      if (ticket !== undefined) ticket.waiting += 1;
+      if (ticket !== undefined) admission.waiting(ticket, 1);
       const responded = () => {
         if (!wait.open || ticket === undefined) return;
         wait.open = false;
-        ticket.waiting -= 1;
+        admission.waiting(ticket, -1);
       };
       const kill = () => {
         this.cancelledStatements += 1;
@@ -438,7 +438,7 @@ export class ApiDb {
           {
             ...dataQuerySettings,
             ...(admission.options.enabled
-              ? admission.options.settings[ticket?.cls ?? 'light']
+              ? ticket?.settings ?? admission.options.settings.light
               : {}),
             max_execution_time: Math.max(1, Math.ceil(budgetMs / 1000)),
             timeout_overflow_mode: 'throw',

@@ -1,4 +1,4 @@
-/* eslint-disable complexity */
+/* eslint-disable complexity, no-process-exit, functional/no-let, @typescript-eslint/no-magic-numbers */
 // cspell:ignore clickhouse
 /**
  * `yarn api:dev`: the Chaingraph v2 API on CHAINGRAPH_API_HOST:CHAINGRAPH_API_PORT
@@ -149,7 +149,11 @@ const main = async () => {
     server
       .close()
       .then(async () => client.close())
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(() => {
+        /* a cluster worker exits once closed (its primary waits for it) */
+        if (cluster.isWorker) process.exit(0);
+      });
   };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
@@ -170,7 +174,18 @@ if (workerCount > 1 && cluster.isPrimary) {
   });
   const stopAll = () => {
     cluster.removeAllListeners('exit');
-    Object.values(cluster.workers ?? {}).forEach((worker) => worker?.kill());
+    const workers = Object.values(cluster.workers ?? {});
+    let running = workers.length;
+    cluster.on('exit', () => {
+      running -= 1;
+      if (running <= 0) process.exit(0);
+    });
+    workers.forEach((worker) => worker?.process.kill('SIGTERM'));
+    /* a worker that does not close in time is killed */
+    setTimeout(() => {
+      workers.forEach((worker) => worker?.process.kill('SIGKILL'));
+      process.exit(0);
+    }, 10_000).unref();
   };
   process.once('SIGINT', stopAll);
   process.once('SIGTERM', stopAll);

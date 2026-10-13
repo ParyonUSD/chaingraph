@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cspell:ignore clickhouse chipnet paryon synth
+// cspell:ignore clickhouse chipnet paryon synth worktree cgapi summarise cputime pgrep
 /**
  * Local admission load test (docs/clickhouse-port/fix-pass-7.md §1): the
  * mainnet session's A1 (uncached soak) and A3 (overload B) shapes against an
@@ -273,6 +273,11 @@ const summarise = (results, documents) => {
     p50: pct(ok, 50),
     p95: pct(ok, 95),
     p99: pct(ok, 99),
+    errorsPerDoc: Object.fromEntries(
+      documents
+        .map((d) => [d.id, results.filter((r) => r.id === d.id && !r.ok).length])
+        .filter(([, n]) => n > 0)
+    ),
     p95PerDoc: Object.fromEntries(
       documents.map((d) => [
         d.id,

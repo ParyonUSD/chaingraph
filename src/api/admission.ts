@@ -1,5 +1,5 @@
 /* eslint-disable functional/no-throw-statement, @typescript-eslint/no-magic-numbers, max-classes-per-file, camelcase, @typescript-eslint/naming-convention, complexity, @typescript-eslint/parameter-properties, max-params, functional/no-try-statement, @typescript-eslint/member-ordering, functional/no-let, functional/no-loop-statement, max-lines */
-// cspell:ignore clickhouse EWMA utilisation misprediction mispredicted unticketed
+// cspell:ignore clickhouse EWMA utilisation misprediction mispredicted unticketed uncontended
 /**
  * Admission control of API requests (fix pass 8,
  * docs/clickhouse-port/fix-pass-8.md; replaces the per-statement lanes of
@@ -103,6 +103,16 @@ export interface AdmissionOptions {
   maxKeys: number;
   /** ClickHouse settings of light and heavy requests' statements. */
   settings: { [cls in RequestClass]: { [name: string]: number | string } };
+  /**
+   * Settings added to a heavy request admitted under contention (its
+   * budget share below `contendedFill` of its capacity, or half the
+   * heavy in-flight cap taken): about 2 cores' worth of threads per heavy
+   * slot, so light statements find cores. An uncontended heavy request
+   * runs with the server's threads.
+   */
+  contendedSettings: { [name: string]: number | string };
+  /** Heavy-share fill (0–1) under which a newly admitted heavy request is contended. */
+  contendedFill: number;
   /** The sizing inputs (startup log). */
   sizing?: {
     cores: number | undefined;
@@ -114,7 +124,7 @@ export interface AdmissionOptions {
 }
 
 /** Fraction of the ClickHouse server's cores the API's requests may use on average. */
-export const defaultCpuTarget = 0.75;
+export const defaultCpuTarget = 0.9;
 
 /** Fraction of the event loop the requests may use on average. */
 export const defaultLoopTarget = 0.85;
@@ -123,16 +133,19 @@ export const defaultLoopTarget = 0.85;
 export const defaultCores = 48;
 
 /**
- * Defaults (one process, 48 cores): ClickHouse 36 CPU-s/s with a 2 s burst,
- * the loop 850 ms/s with a 0.5 s burst (the loop is FIFO: a burst of loop
- * work is latency for everyone), a quarter of each for light requests;
- * light = predicted ≤ 250 CPU-ms and ≤ 25 loop-ms; a request never seen
+ * Defaults (one process, 48 cores): ClickHouse 43.2 CPU-s/s (90 % of the
+ * cores) with a 4 s burst (a burst of ~173 CPU-s: mainnet's heaviest
+ * catalogue request, L15, is 59 CPU-s; a 2 s burst and a 75 % target refused
+ * at loads admission off carried, fix-pass-8.md §4), the loop 850 ms/s with a
+ * 1 s burst, a quarter of each for light requests;
+ * light = predicted ≤ 500 CPU-ms and ≤ 25 loop-ms (mainnet's light
+ * documents cost 0.09–0.29 CPU-s); a request never seen
  * 250 CPU-ms and 20 loop-ms (heavy: over neither bound but not proven light);
  * heavy requests in flight ≤ 24; heavy refused while the loop is ≥ 95 % busy.
  */
 export const defaultAdmissionOptions: AdmissionOptions = {
   clickhouse: {
-    burstSeconds: 2,
+    burstSeconds: 4,
     lightShare: 0.25,
     ratePerSecond: defaultCores * defaultCpuTarget,
   },
@@ -140,16 +153,18 @@ export const defaultAdmissionOptions: AdmissionOptions = {
   defaultCpuPerRow: 0.3e-6,
   enabled: true,
   heavyMaxInFlight: 24,
-  lightMaxCpuMs: 250,
+  lightMaxCpuMs: 500,
   lightMaxLoopMs: 25,
   loop: {
-    burstSeconds: 0.5,
+    burstSeconds: 1,
     lightShare: 0.25,
     ratePerSecond: 1000 * defaultLoopTarget,
   },
   loopGuard: 0.95,
   maxKeys: 10_000,
   minRetryAfterSeconds: 1,
+  contendedFill: 0.5,
+  contendedSettings: { max_threads: 4 },
   settings: { heavy: {}, light: {} },
   unknownCost: { cpuSeconds: 0.25, loopMs: 20 },
 };
@@ -441,6 +456,23 @@ export class CostModel {
   get size() {
     return this.estimates.size;
   }
+
+  /** Document keys with their estimates (`GET /admission`), most recent last, at most 200. */
+  documents() {
+    return Object.fromEntries(
+      [...this.estimates]
+        .filter(([key]) => key.startsWith('d:'))
+        .slice(-200)
+        .map(([key, estimate]) => [
+          key.slice(2, 10) + key.slice(key.lastIndexOf(':')),
+          {
+            cpuSeconds: Number(estimate.cpuSeconds.toFixed(3)),
+            loopMs: Number(estimate.loopMs.toFixed(1)),
+            samples: estimate.samples,
+          },
+        ])
+    );
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -473,6 +505,9 @@ export class Ticket {
 
   /** Finished (response written or execution done). */
   finished = false;
+
+  /** ClickHouse settings of the request's statements (its class's, plus the contended ones). */
+  settings: { [name: string]: number | string } = {};
 
   /** CPU charged to the ClickHouse budget so far (prediction, then estimates). */
   chargedCpu: number;
@@ -512,6 +547,8 @@ export interface AdmissionStats {
   ledgerError?: string;
   /** Statements outside requests (live re-runs) charged. */
   unticketed: number;
+  /** Heavy requests admitted under contention (`contendedSettings`). */
+  contended: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -549,6 +586,7 @@ export const loopTickMs = 100;
 export class Admission {
   readonly stats: AdmissionStats = {
     admitted: { heavy: 0, light: 0 },
+    contended: 0,
     inFlight: { heavy: 0, light: 0 },
     ledgerExpired: 0,
     ledgerResolved: 0,
@@ -710,6 +748,7 @@ export class Admission {
       );
     }
     if (source !== 'plan') this.stats.unknownPlans += 1;
+    this.account();
     const ticket = new Ticket(
       keys,
       cls,
@@ -717,6 +756,14 @@ export class Admission {
       { clickhouse: chShare, loop: loopShare },
       now
     );
+    const contended =
+      cls === 'heavy' &&
+      (clickhouse.fill().heavy < this.options.contendedFill ||
+        2 * this.stats.inFlight.heavy >= this.options.heavyMaxInFlight);
+    ticket.settings = contended
+      ? { ...this.options.settings[cls], ...this.options.contendedSettings }
+      : this.options.settings[cls];
+    if (contended) this.stats.contended += 1;
     this.stats.admitted[cls] += 1;
     this.stats.inFlight[cls] += 1;
     this.stats.peakInFlight[cls] = Math.max(
@@ -766,6 +813,7 @@ export class Admission {
    */
   finish(ticket: Ticket, now = performance.now()) {
     if (ticket.finished) return;
+    this.account();
     ticket.finished = true;
     this.active.delete(ticket);
     this.stats.inFlight[ticket.cls] -= 1;
@@ -812,8 +860,16 @@ export class Admission {
     else ticket.chargedLoop = actual;
   }
 
-  /** The request's CPU: measured where known, else estimated from rows. */
+  /**
+   * The request's CPU: the measured sum once every statement is measured
+   * (or given up on); before that, with a ledger, the charge stands (a
+   * known plan's prediction is a better guess than rows × CPU per row);
+   * without one, the rows estimate.
+   */
   private ticketCpu(ticket: Ticket) {
+    if (this.cpuReader !== undefined && !this.allMeasured(ticket)) {
+      return ticket.chargedCpu;
+    }
     return ticket.statements.reduce(
       (sum, statement) =>
         sum +
@@ -834,18 +890,22 @@ export class Admission {
     );
   }
 
+  /** Loop time measured since the last utilisation tick. */
+  private readonly window = { activeMs: 0, elapsedMs: 0 };
+
   /**
-   * One loop attribution period: the busy time goes to the requests not
-   * waiting for ClickHouse, in proportion to their predicted loop time (a
-   * light request queued behind a heavy one's decoding is not charged for
-   * it; the sum is exact either way).
+   * Attribute the loop's busy time since the last call: to the requests
+   * not waiting for ClickHouse, in proportion to their predicted loop time
+   * (a light request queued behind a heavy one's decoding is not charged
+   * for it; the sum is exact). Called at every transition (admitted, a
+   * statement sent, its response started, finished) and every tick, so a
+   * request shorter than a tick gets its share too.
    */
-  tick() {
+  account() {
     const { activeMs, elapsedMs } = this.meter();
-    if (elapsedMs > 0) {
-      const utilisation = Math.min(1, activeMs / elapsedMs);
-      this.loopUtilisation = this.loopUtilisation * 0.8 + utilisation * 0.2;
-    }
+    this.window.activeMs += activeMs;
+    this.window.elapsedMs += elapsedMs;
+    if (activeMs <= 0) return;
     const working = [...this.active].filter((ticket) => ticket.waiting === 0);
     if (working.length === 0) return;
     const weight = (ticket: Ticket) => Math.max(1, ticket.predicted.loopMs);
@@ -853,6 +913,24 @@ export class Admission {
     working.forEach((ticket) => {
       ticket.loopMs += (activeMs * weight(ticket)) / total;
     });
+  }
+
+  /** A request starts (1) or stops (-1) waiting for ClickHouse (db.ts). */
+  waiting(ticket: Ticket, delta: number) {
+    if (this.options.enabled) this.account();
+    ticket.waiting += delta;
+  }
+
+  /** One period: attribution, and the loop utilisation (EWMA, ~0.5 s). */
+  tick() {
+    this.account();
+    const { activeMs, elapsedMs } = this.window;
+    this.window.activeMs = 0;
+    this.window.elapsedMs = 0;
+    if (elapsedMs > 0) {
+      const utilisation = Math.min(1, activeMs / elapsedMs);
+      this.loopUtilisation = this.loopUtilisation * 0.8 + utilisation * 0.2;
+    }
   }
 
   /** Read measured CPU of pending statements; reconcile budgets and the model. */
@@ -974,6 +1052,8 @@ export class Admission {
       enabled: this.options.enabled,
       loopUtilisation: this.loopUtilisation,
       modelKeys: this.model.size,
+      /* per document (hash prefix : operation): predicted CPU-s and loop ms */
+      documents: this.model.documents(),
       pendingStatements: this.pending.size,
       stats: this.stats,
     };
@@ -1040,14 +1120,20 @@ const classSettingsFromEnv = (env: NodeJS.ProcessEnv, prefix: string) => {
  *   `serverCores`, its `max_threads` for the API user; else 48);
  * - CHAINGRAPH_API_PROCESSES: API processes sharing the server (pods ×
  *   workers; default 1 × `workers`): the CPU budget is divided by it;
- * - CHAINGRAPH_API_CPU_TARGET (0.75), CHAINGRAPH_API_LOOP_TARGET (0.85):
+ * - CHAINGRAPH_API_CPU_TARGET (0.9), CHAINGRAPH_API_LOOP_TARGET (0.85):
  *   the budgets' rates as fractions of the cores and of the loop;
- * - CHAINGRAPH_API_LIGHT_SHARE (0.25), CHAINGRAPH_API_BURST_SECONDS (2),
- *   CHAINGRAPH_API_LOOP_BURST_SECONDS (0.5);
- * - CHAINGRAPH_API_LIGHT_MAX_CPU_MS (250), CHAINGRAPH_API_LIGHT_MAX_LOOP_MS
+ * - CHAINGRAPH_API_LIGHT_SHARE (0.25), CHAINGRAPH_API_BURST_SECONDS (4: of
+ *   the whole server's rate, whatever the processes),
+ *   CHAINGRAPH_API_LOOP_BURST_SECONDS (1);
+ * - CHAINGRAPH_API_LIGHT_MAX_CPU_MS (500), CHAINGRAPH_API_LIGHT_MAX_LOOP_MS
  *   (25): the light class;
  * - CHAINGRAPH_API_HEAVY_MAX_IN_FLIGHT (default cores / 2 / processes, at
  *   least 2), CHAINGRAPH_API_LOOP_GUARD (0.95);
+ * - CHAINGRAPH_API_HEAVY_CONTENDED_FILL (0.5),
+ *   CHAINGRAPH_API_HEAVY_CONTENDED_MAX_THREADS (default 2 × cores / heavy
+ *   slots of the server, at least 2; 0: no cap): a heavy request admitted
+ *   while its share is below that fill, or half its in-flight cap is
+ *   taken, runs with that many threads;
  * - CHAINGRAPH_API_UNKNOWN_CPU_MS (250), CHAINGRAPH_API_UNKNOWN_LOOP_MS (20);
  * - CHAINGRAPH_API_CPU_SOURCE `query_log` | `rows` (default query_log; the
  *   API user needs SELECT on system.query_log, else rows are used);
@@ -1108,28 +1194,50 @@ export const admissionOptionsFromEnv = (
   if (cpuSource !== 'query_log' && cpuSource !== 'rows') {
     throw new Error(`CHAINGRAPH_API_CPU_SOURCE must be 'query_log' or 'rows'.`);
   }
+  const heavyMaxInFlight = Math.max(
+    1,
+    nonNegativeNumber(
+      env,
+      'CHAINGRAPH_API_HEAVY_MAX_IN_FLIGHT',
+      Math.max(2, Math.round(usableCores / 2 / processes)),
+      { integer: true }
+    )
+  );
+  /* about 2 cores' worth of threads per heavy slot of the server (4 at 48 cores / 24 slots) */
+  const contendedThreads = nonNegativeNumber(
+    env,
+    'CHAINGRAPH_API_HEAVY_CONTENDED_MAX_THREADS',
+    Math.max(2, Math.round((2 * usableCores) / (heavyMaxInFlight * processes))),
+    { integer: true }
+  );
   return {
     clickhouse: {
-      burstSeconds: nonNegativeNumber(
-        env,
-        'CHAINGRAPH_API_BURST_SECONDS',
-        defaultAdmissionOptions.clickhouse.burstSeconds
-      ),
+      /*
+       * the rate is this process's share, the burst the server's: each of n
+       * processes may burst like one (a per-process slice of the burst
+       * refused heavy requests two workers could have run, fix-pass-8.md §4)
+       */
+      burstSeconds:
+        nonNegativeNumber(
+          env,
+          'CHAINGRAPH_API_BURST_SECONDS',
+          defaultAdmissionOptions.clickhouse.burstSeconds
+        ) * processes,
       lightShare,
       ratePerSecond: (usableCores * cpuTarget) / processes,
     },
     cpuSource,
     defaultCpuPerRow: defaultAdmissionOptions.defaultCpuPerRow,
     enabled: flag !== 'off',
-    heavyMaxInFlight: Math.max(
-      1,
-      nonNegativeNumber(
-        env,
-        'CHAINGRAPH_API_HEAVY_MAX_IN_FLIGHT',
-        Math.max(2, Math.round(usableCores / 2 / processes)),
-        { integer: true }
-      )
+    contendedFill: nonNegativeNumber(
+      env,
+      'CHAINGRAPH_API_HEAVY_CONTENDED_FILL',
+      defaultAdmissionOptions.contendedFill,
+      { max: 1 }
     ),
+    contendedSettings:
+      contendedThreads === 0 ? {} : { max_threads: contendedThreads },
+    heavyMaxInFlight,
     lightMaxCpuMs: nonNegativeNumber(
       env,
       'CHAINGRAPH_API_LIGHT_MAX_CPU_MS',
@@ -1256,7 +1364,9 @@ export const admissionSummary = (
     options.lightMaxCpuMs
   } CPU-ms,${options.lightMaxLoopMs} loop-ms heavy_in_flight=${
     options.heavyMaxInFlight
-  } loop_guard=${options.loopGuard} unknown=${Math.round(
+  } heavy_contended=${options.contendedFill}:${settingsText(
+    options.contendedSettings
+  )} loop_guard=${options.loopGuard} unknown=${Math.round(
     options.unknownCost.cpuSeconds * 1000
   )} CPU-ms,${options.unknownCost.loopMs} loop-ms cpu_source=${
     cpuSource ?? options.cpuSource

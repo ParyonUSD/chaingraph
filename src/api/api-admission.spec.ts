@@ -1,5 +1,5 @@
-/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-let, functional/no-loop-statement, no-await-in-loop, functional/no-throw-statement */
-// cspell:ignore clickhouse EWMA mispredicted unticketed utilisation cgapi
+/* eslint-disable @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention, functional/no-let, functional/no-loop-statement, no-await-in-loop, functional/no-throw-statement, camelcase */
+// cspell:ignore clickhouse EWMA mispredicted unticketed utilisation cgapi uncontended
 /**
  * Request-level admission (fix pass 8, docs/clickhouse-port/fix-pass-8.md):
  * - a request is admitted or refused once, before any statement runs, by
@@ -148,7 +148,7 @@ test('admission: refuses at once when the budget is spent (503, Retry-After, the
   t.is(admission.stats.refused.clickhouse, 1);
   /* the in-flight cap, whatever the budget */
   const capped = new Admission(options({ heavyMaxInFlight: 1 }), quietMeter);
-  teach(capped, 'heavy', 0.5);
+  teach(capped, 'heavy', 2);
   const first = capped.admit(keys('heavy'), 0);
   const refusedCap = t.throws(() => capped.admit(keys('heavy'), 0));
   t.is((refusedCap as GraphQLError).extensions.reason, 'in_flight');
@@ -318,8 +318,8 @@ test('admission: the CPU ledger replaces estimates with system.query_log measure
   t.is(admission.pendingStatements, 1, 'awaiting its query_log row');
   t.is(
     admission.budgets.clickhouse.level.heavy,
-    8 - 0.3,
-    'estimate: 1 M rows × 0.3 µs'
+    8 - 1,
+    'until measured the prediction stands (not rows × CPU per row)'
   );
   /* a live re-run (no ticket) is charged its estimate at once */
   const live: StatementRecord = { queryId: 'b', rows: 2_000_000, shape: 's2' };
@@ -360,12 +360,53 @@ test('admission: the CPU ledger replaces estimates with system.query_log measure
   t.regex(denied.stats.ledgerError ?? '', /ACCESS_DENIED/u);
 });
 
+test('admission: a heavy request admitted under contention gets the contended settings; uncontended it runs with the server threads', (t) => {
+  const admission = new Admission(
+    options({
+      contendedSettings: { max_threads: 4 },
+      heavyMaxInFlight: 8,
+      settings: { heavy: {}, light: { priority: 1 } },
+    }),
+    quietMeter
+  );
+  teach(admission, 'heavy', 3);
+  teach(admission, 'light', 0.01);
+  t.deepEqual(admission.admit(keys('heavy'), 0).settings, {}, 'share full');
+  t.deepEqual(
+    admission.admit(keys('heavy'), 0).settings,
+    { max_threads: 4 },
+    'share 2 of 8: under half'
+  );
+  t.deepEqual(admission.admit(keys('light'), 0).settings, { priority: 1 });
+  t.is(admission.stats.contended, 1);
+  /* half the in-flight cap taken: contended whatever the budget */
+  const busy = new Admission(
+    options({ contendedSettings: { max_threads: 4 }, heavyMaxInFlight: 2 }),
+    quietMeter
+  );
+  teach(busy, 'heavy', 0.6);
+  t.deepEqual(busy.admit(keys('heavy'), 0).settings, {});
+  t.deepEqual(busy.admit(keys('heavy'), 0).settings, { max_threads: 4 });
+  t.deepEqual(
+    admissionOptionsFromEnv({}, 14).contendedSettings,
+    { max_threads: 4 },
+    '2 × 14 cores / 7 heavy slots'
+  );
+  t.deepEqual(
+    admissionOptionsFromEnv(
+      { CHAINGRAPH_API_HEAVY_CONTENDED_MAX_THREADS: '0' },
+      48
+    ).contendedSettings,
+    {}
+  );
+});
+
 test('admission: a busy event loop refuses heavy requests whatever the budget says; light ones still run', (t) => {
   const admission = new Admission(options(), () => ({
     activeMs: 100,
     elapsedMs: 100,
   }));
-  teach(admission, 'heavy', 0.5);
+  teach(admission, 'heavy', 1);
   teach(admission, 'light', 0.01);
   for (let index = 0; index < 20; index += 1) admission.tick();
   t.true(admission.loopUtilisation > 0.95);
@@ -376,14 +417,16 @@ test('admission: a busy event loop refuses heavy requests whatever the budget sa
 
 test('admission: options from the environment and the startup line', (t) => {
   const fromServer = admissionOptionsFromEnv({}, 48);
-  t.is(fromServer.clickhouse.ratePerSecond, 36, '48 cores × 0.75');
+  t.is(fromServer.clickhouse.ratePerSecond, 48 * 0.9, '48 cores × 0.9');
+  t.is(fromServer.clickhouse.burstSeconds, 4);
+  t.is(fromServer.loop.burstSeconds, 1);
   t.is(fromServer.loop.ratePerSecond, 850);
   t.is(fromServer.heavyMaxInFlight, 24);
   t.deepEqual(fromServer.settings, { heavy: {}, light: {} });
   t.is(fromServer.cpuSource, 'query_log');
   t.deepEqual(fromServer.sizing, {
     cores: 48,
-    cpuTarget: 0.75,
+    cpuTarget: 0.9,
     loopTarget: 0.85,
     processes: 1,
     source: 'clickhouse',
@@ -402,16 +445,18 @@ test('admission: options from the environment and the startup line', (t) => {
   t.is(shared.heavyMaxInFlight, 6);
   t.deepEqual(shared.settings.heavy, { priority: 2 });
   t.is(shared.lightMaxCpuMs, 100);
+  const workers = admissionOptionsFromEnv({}, 48, 4).clickhouse;
+  t.is(workers.ratePerSecond, 10.8, 'workers divide the rate');
   t.is(
-    admissionOptionsFromEnv({}, 48, 4).clickhouse.ratePerSecond,
-    9,
-    'workers divide the budget'
+    workers.ratePerSecond * workers.burstSeconds,
+    48 * 0.9 * 4,
+    'each process may burst like the server'
   );
   t.is(admissionOptionsFromEnv({}, undefined).sizing?.source, 'default');
   t.is(
     admissionOptionsFromEnv({ CHAINGRAPH_API_CLICKHOUSE_CORES: '64' }, 48)
       .clickhouse.ratePerSecond,
-    48
+    64 * 0.9
   );
   t.false(admissionOptionsFromEnv({ CHAINGRAPH_API_ADMISSION: 'off' }).enabled);
   t.throws(() => admissionOptionsFromEnv({ CHAINGRAPH_API_LOOP_TARGET: '2' }));
@@ -421,7 +466,7 @@ test('admission: options from the environment and the startup line', (t) => {
   );
   t.regex(
     admissionSummary(fromServer, 154),
-    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=36\.0 CPU-s\/s burst 2 s loop_budget=850 ms\/s burst 0\.5 s light_share=0\.25 light<=250 CPU-ms,25 loop-ms heavy_in_flight=24 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=server default heavy_settings=server default max_concurrent_queries_for_user=154$/u
+    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=43\.2 CPU-s\/s burst 4 s loop_budget=850 ms\/s burst 1 s light_share=0\.25 light<=500 CPU-ms,25 loop-ms heavy_in_flight=24 heavy_contended=0\.5:max_threads 4 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=server default heavy_settings=server default max_concurrent_queries_for_user=154$/u
   );
 });
 
