@@ -100,6 +100,15 @@ export const maxListChunk = 1_000;
  */
 export const acceptanceWindowRows = (need: number) => 8 * need + 1_000;
 
+/**
+ * Candidates a `transactions` page in internal-id order checks before it
+ * falls back to all of them (roots.ts `candidateWindow`): the `need` rows of
+ * the page plus a quarter and 100, for candidates the node does not accept or
+ * that fail the rest of the filter (fix-pass-6.md §2).
+ */
+export const candidateWindowRows = (need: number) =>
+  need + Math.ceil(need / 4) + 100;
+
 const chunks = <T>(values: readonly T[], size = maxListChunk): T[][] => {
   const out: T[][] = [];
   for (let start = 0; start < values.length; start += size) {
@@ -2080,13 +2089,6 @@ export const outputFilterIsSelective = (
       filter._or.length > 0 &&
       filter._or.every(outputFilterIsSelective)));
 
-/**
- * A subquery of candidate transaction hashes that every transaction matching
- * `filter` is among (a positive, selective conjunct), or undefined when the
- * filter has none. Used to restrict the acceptance check: reading the node's
- * acceptance rows of a few thousand candidates by key costs a fraction of
- * reading all of them (chipnet: 95 ms vs 420 ms for a busy category).
- */
 /** Positive output-side candidate sets of a filter and its `_and` parts (index reads by script, category, hash). */
 const outputSideCandidates = (
   sql: Sql,
@@ -2095,14 +2097,16 @@ const outputSideCandidates = (
 ): string[] => [
   ...(hasSelectiveHex(filter.hash) && !given(filter.hash?._prefix)
     ? [
-        `SELECT hash FROM ${sql.view('transaction_at')} WHERE ${all(
+        `SELECT hash AS transaction_hash, internal_id AS transaction_internal_id FROM ${sql.view(
+          'transaction_at'
+        )} WHERE ${all(
           hexComparison(sql, 'hash', 'hash', filter.hash!, 'hash')
         )}`,
       ]
     : []),
   ...(outputFilterIsSelective(filter.has_output)
     ? [
-        `SELECT transaction_hash FROM ${sql.view(
+        `SELECT transaction_hash, transaction_internal_id FROM ${sql.view(
           'output_at'
         )} WHERE ${outputPredicate(
           sql,
@@ -2117,6 +2121,17 @@ const outputSideCandidates = (
   ),
 ];
 
+/**
+ * A subquery of candidate transactions (`transaction_hash`,
+ * `transaction_internal_id`) that every transaction matching `filter` is
+ * among (a positive, selective conjunct), or undefined when the filter has
+ * none. Used to restrict the acceptance check: reading the node's acceptance
+ * rows of a few thousand candidates by key costs a fraction of reading all of
+ * them (chipnet: 95 ms vs 420 ms for a busy category). The internal ids (as
+ * stored on the output / spend rows) let a page in id order check only the
+ * candidates it can contain (roots.ts `candidateWindow`; fix-pass-6.md §2).
+ * A transaction may appear more than once.
+ */
 export const transactionCandidates = (
   sql: Sql,
   filter: TransactionFilter | null | undefined,
@@ -2139,7 +2154,7 @@ export const transactionCandidates = (
       .join(' INTERSECT ')})`;
   }
   if (given(filter.has_input) && requiresOutpoint(filter.has_input)) {
-    return `SELECT transaction_hash FROM ${spendRelationSql(
+    return `SELECT transaction_hash, transaction_internal_id FROM ${spendRelationSql(
       sql,
       spendRowPredicate(sql, filter.has_input, node)
     )}`;

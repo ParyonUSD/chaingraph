@@ -41,6 +41,7 @@ import type { UtxoSetPolicy } from './sql.js';
 import {
   acceptanceWindowRows,
   authchainTooWideCode,
+  candidateWindowRows,
   defaultAuthchainMaxBranches,
   defaultUtxoSetMaxLagRows,
   defaultUtxoSetPolicy,
@@ -234,6 +235,9 @@ export class ApiDb {
 
   /** Raw acceptance rows bounding an `acceptedInIdOrder` window (tests force the fallback with a small value). */
   acceptanceWindowRows: (need: number) => number = acceptanceWindowRows;
+
+  /** Candidates a `transactions` page in id order checks first (tests force the fallback with a small value). */
+  candidateWindowRows: (need: number) => number = candidateWindowRows;
 
   /** Tests: fix the features instead of reading them. */
   forceFeatures: StoreFeatures | undefined;

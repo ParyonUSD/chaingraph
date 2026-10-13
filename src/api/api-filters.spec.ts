@@ -35,6 +35,7 @@ import {
   loadOracle,
 } from './spec-oracle.js';
 import type { InputFilter, OutputFilter, TransactionFilter } from './sql.js';
+import { candidateWindowRows } from './sql.js';
 
 const e2e = e2eClickHouseUrl === undefined ? test.skip : test.serial;
 
@@ -575,5 +576,119 @@ e2e(
     env.store.holdUtxoSet(undefined);
     await env.store.catchUpUtxoSet();
     await check('caught up again', () => 'stored');
+  }
+);
+
+/** Every page of `transactions` in id order `order` (DESC pages with `before`); the hashes in page order. */
+const walkInOrder = async (
+  env: Env,
+  node: string,
+  where: unknown,
+  order: 'ASC' | 'DESC',
+  limit: number
+) => {
+  const hashes: string[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < 100; page += 1) {
+    const result: {
+      r: {
+        has_more: boolean;
+        end_cursor: string | null;
+        nodes: { hash: string }[];
+      };
+    } = await env.gql(
+      `query($node: String!, $where: TransactionFilter, $cursor: BigInt, $limit: Int!) {
+        r: transactions(node: $node, limit: $limit, order: ${order}, ${
+        order === 'ASC' ? 'after' : 'before'
+      }: $cursor, where: $where) { has_more end_cursor nodes { hash } }
+      }`,
+      { cursor, limit, node, where }
+    );
+    hashes.push(...result.r.nodes.map((row) => row.hash));
+    if (!result.r.has_more) return hashes;
+    if (result.r.nodes.length !== limit) throw new Error('short page');
+    cursor = result.r.end_cursor;
+  }
+  throw new Error('too many pages');
+};
+
+e2e(
+  '[e2e] transactions pages over candidates (fix-pass-6.md §2): the candidate window, capped (page found in it, or the fallback to every candidate) and not, ASC and DESC, equals the evaluator in id order, has_more exact',
+  async (t) => {
+    t.timeout(300_000);
+    const env = await setup(t, 'g2_cand_window');
+    const hashes = [
+      env.data.closeA.hash,
+      env.data.fin2.hash,
+      env.data.redeemB.hash,
+    ];
+    /* every filter here has candidates; the last two have conjuncts that fail many of them */
+    const filters: TransactionFilter[] = [
+      { has_output: { token_category: { _eq: paryon } } },
+      { has_input: { outpoint: { locking_bytecode: { _eq: loanScript } } } },
+      {
+        _or: [
+          { has_output: { token_category: { _eq: paryon } } },
+          { has_input: { outpoint: { token_category: { _eq: paryon } } } },
+        ],
+      },
+      { hash: { _in: hashes } },
+      { has_output: { locking_bytecode: { _prefix: '76a9' } } },
+      {
+        has_output: { token_category: { _eq: paryon } },
+        in_block: { height: { _in: [0, 2] } },
+      },
+      {
+        has_output: { locking_bytecode: { _prefix: '76a9' } },
+        in_mempool: true,
+      },
+    ];
+    const recorder = recordQueries(env.api);
+    let nonEmpty = 0;
+    for (const node of [one, two]) {
+      const oracle = await loadOracle(
+        env.client,
+        node === one ? env.nodes.node1 : env.nodes.node2
+      );
+      for (const filter of filters) {
+        const matching = [...oracle.transactions.values()]
+          .filter(
+            (transaction) =>
+              accepted(oracle, transaction.hash) &&
+              evalTransaction(oracle, transaction, filter) === true
+          )
+          .sort((a, b) =>
+            a.internal_id < b.internal_id
+              ? -1
+              : a.internal_id > b.internal_id
+              ? 1
+              : 0
+          )
+          .map((transaction) => transaction.hash);
+        if (matching.length > 2) nonEmpty += 1;
+        for (const window of [undefined, 1, 2, 3, 5]) {
+          env.api.db.candidateWindowRows =
+            window === undefined ? candidateWindowRows : () => window;
+          for (const limit of [1, 2]) {
+            for (const order of ['ASC', 'DESC'] as const) {
+              t.deepEqual(
+                await walkInOrder(env, node, variables(filter), order, limit),
+                order === 'ASC' ? matching : [...matching].reverse(),
+                `${node} window ${String(window)} limit ${limit} ${order} ${JSON.stringify(
+                  variables(filter)
+                )}`
+              );
+            }
+          }
+        }
+      }
+    }
+    env.api.db.candidateWindowRows = candidateWindowRows;
+    recorder.stop();
+    t.true(nonEmpty >= 4, 'several filters select more than a page');
+    t.true(
+      recorder.events.some((event) => event.sql.includes('__cand_ids')),
+      'the window is used'
+    );
   }
 );

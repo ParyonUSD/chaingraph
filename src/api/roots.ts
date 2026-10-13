@@ -217,6 +217,66 @@ const acceptedInIdOrder = async (
   )})`;
 };
 
+/**
+ * The root condition of a `transactions` page in internal-id order over a
+ * materialized candidate set `cand` (transaction_hash,
+ * transaction_internal_id), checking only the candidates the page can
+ * contain (fix-pass-6.md §2). Exact, so the page and `has_more` are too:
+ * - the first `window` distinct candidate ids in `dir` order (within the id
+ *   bounds) bound a window: every candidate up to the last of them;
+ * - the page of the window (the transaction rows, the node's acceptance and
+ *   the rest of the filter, all restricted to the window's candidates): if it
+ *   has `need` rows, or the window holds every candidate, it is the page,
+ *   since no candidate before the window's end was skipped;
+ * - else the whole candidate set as before (a constant condition: the branch
+ *   not taken reads nothing).
+ * The acceptance and filter reads cost one granule per candidate, so a page
+ * of 10,000 among 200,000 candidates (mainnet L33) reads a twentieth.
+ */
+const candidateWindow = (
+  sql: Sql,
+  cand: string,
+  checks: (among: string) => string[],
+  idBounds: { _gt?: bigint; _lt?: bigint },
+  dir: 'ASC' | 'DESC',
+  need: number,
+  window: number
+) => {
+  const k = sql.bind(window, 'UInt64');
+  const needed = sql.bind(need, 'UInt64');
+  const onIds = numericComparison(
+    sql,
+    'transaction_internal_id',
+    'UInt64',
+    idBounds
+  );
+  const ids = sql.scalar(
+    '__cand_ids',
+    `SELECT groupArray(transaction_internal_id) FROM (SELECT DISTINCT transaction_internal_id FROM ${cand}${
+      onIds.length === 0 ? '' : ` WHERE ${onIds.join(' AND ')}`
+    } ORDER BY transaction_internal_id ${dir} LIMIT ${k})`
+  );
+  const capped = `length(${ids}) = ${k}`;
+  const inWindow = `SELECT transaction_hash FROM ${cand} WHERE NOT ${capped} OR transaction_internal_id ${
+    dir === 'ASC' ? '<=' : '>='
+  } ${ids}[-1]`;
+  const page = sql.scalar(
+    '__cand_page',
+    `SELECT groupArray(hash) FROM (SELECT hash, internal_id FROM ${sql.view(
+      'transaction_at'
+    )} WHERE ${checks(inWindow)
+      .map((part) => `(${part})`)
+      .join(' AND ')} ORDER BY internal_id ${dir} LIMIT ${needed})`
+  );
+  const enough = `(NOT ${capped} OR length(${page}) >= ${needed})`;
+  const rest = `SELECT transaction_hash FROM ${cand} WHERE NOT ${enough}`;
+  return `(${enough} AND hash IN (SELECT arrayJoin(${page}))) OR (NOT ${enough} AND ${checks(
+    rest
+  )
+    .map((part) => `(${part})`)
+    .join(' AND ')})`;
+};
+
 export const runTransactions = async (
   env: RootEnv,
   label: string,
@@ -236,15 +296,56 @@ export const runTransactions = async (
    * materialized once: the transaction rows, the acceptance check and every
    * per-transaction semi-join of the filter read only them, by key.
    */
-  const among =
-    candidates === undefined
-      ? undefined
-      : `SELECT * FROM ${sql.cte('candidates', candidates)}`;
+  const cand =
+    candidates === undefined ? undefined : sql.cte('candidates', candidates);
   const range = {
     _gt: args.after_internal_id ?? undefined,
     _lt: args.before ?? undefined,
   };
   const bounds = numericComparison(sql, 'internal_id', 'UInt64', range);
+  /* the transaction rows among `among`, the node's acceptance and the filter */
+  const checks = (among: string) => [
+    `hash IN (${among})`,
+    ...(impliesAcceptance(args.where)
+      ? []
+      : [`hash IN (${sql.accepted(ctx.node, among)})`]),
+    ...bounds,
+    transactionPredicate(sql, args.where, ctx.node, among),
+  ];
+  const keyset =
+    typeof args.cursor === 'string' && args.cursor !== '' ? args.cursor : '';
+  if (
+    cand !== undefined &&
+    explicit === undefined &&
+    (args.offset ?? 0) === 0 &&
+    keyset === ''
+  ) {
+    return pageOf(
+      env,
+      label,
+      TransactionEntity,
+      sql.view('transaction_at'),
+      [
+        candidateWindow(
+          sql,
+          cand,
+          checks,
+          range,
+          args.order ?? 'ASC',
+          args.limit + 1,
+          env.db.candidateWindowRows(args.limit + 1)
+        ),
+        ...bounds,
+      ],
+      order,
+      { ...args, after: args.cursor },
+      sels,
+      maxLimits.transactions,
+      (_row, values) => values[0]!
+    );
+  }
+  const among =
+    cand === undefined ? undefined : `SELECT transaction_hash FROM ${cand}`;
   return pageOf(
     env,
     label,
@@ -777,7 +878,11 @@ export const rowSets = {
     where: TransactionFilter | null | undefined
   ): RowSet => {
     const { sql, ctx } = env;
-    const among = transactionCandidates(sql, where, ctx.node);
+    const candidates = transactionCandidates(sql, where, ctx.node);
+    const among =
+      candidates === undefined
+        ? undefined
+        : `SELECT transaction_hash FROM (${candidates})`;
     return {
       source: viewSource(sql.view('transaction_at')),
       where: [
