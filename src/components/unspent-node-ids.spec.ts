@@ -12,6 +12,7 @@ import {
   nodeIndexNamePattern,
   parseBatchResult,
   partitionOf,
+  readyForBackfill,
 } from './unspent-node-ids.js';
 
 test('nodeIndexDefinitions: three partial indexes per node, keyed on the node id', (t) => {
@@ -126,4 +127,30 @@ test('stall bookkeeping: skip only after the stall limit, monotonic', (t) => {
   t.is(nextSkipThrough(0, first, 2_000, 1_000, 100), 100);
   t.is(nextSkipThrough(150, first, 2_000, 1_000, 100), 150);
   t.is(nextSkipThrough(150, undefined, 9_000, 1_000, 200), 150);
+});
+
+test('readyForBackfill: caught up, or only waiting for a missing parent', (t) => {
+  const stalled = parseBatchResult({
+    blockWatermark: 5,
+    inputWatermark: 10,
+    previousBlockWatermark: 5,
+    previousInputWatermark: 10,
+    stalledAt: 11,
+  });
+  const idle = parseBatchResult({
+    blockWatermark: 5,
+    inputWatermark: 20,
+    previousBlockWatermark: 5,
+    previousInputWatermark: 20,
+    stalledAt: null,
+  });
+  t.true(readyForBackfill({ caughtUp: true, last: idle, settled: true }));
+  // a stalled partition (mempool child before its parent) does not hold the backfill back
+  t.true(readyForBackfill({ caughtUp: false, last: stalled, settled: true }));
+  // a partition that ran out of time with work left does
+  t.false(readyForBackfill({ caughtUp: false, last: stalled, settled: false }));
+  t.false(readyForBackfill({ caughtUp: false, last: idle, settled: true }));
+  t.false(
+    readyForBackfill({ caughtUp: false, last: undefined, settled: false })
+  );
 });

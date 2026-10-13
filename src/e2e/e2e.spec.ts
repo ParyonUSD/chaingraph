@@ -3040,7 +3040,7 @@ const concurrencyTransaction = (
 const e2eDefaultStallMaxMs = '2000';
 /*
  * The job modules imported by the tests read it from the environment; the
- * production default (10 minutes) would make every stall in the scenario
+ * production default (1 minute) would make every stall in the scenario
  * below sleep for 10 minutes.
  */
 process.env.CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS ??= e2eDefaultStallMaxMs;
@@ -3185,6 +3185,8 @@ const drainDeferred = async (
   const first = await db.drainUnspentNodeIdsJob(120_000);
   const stalled = first.stalled;
   if (stalled) {
+    // a stall (child saved before its parent) does not hold the backfill back
+    t.true(first.backfillReady, `${label}: backfill not gated by the stall`);
     await compareDeferredQueryRoot(t, `${label} (job stalled)`, filter);
     await deferredSleep(deferredStallMaxMs + 100);
     const second = await db.drainUnspentNodeIdsJob(120_000);

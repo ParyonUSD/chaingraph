@@ -36,6 +36,7 @@ import {
   parseWatchPassResult,
   progressSql,
   readSequencesSql,
+  readyForBackfill,
   rebuildRequiredSql,
   repartitionSql,
   runBatchSql,
@@ -1678,6 +1679,11 @@ let passInFlight: Promise<UnspentNodeIdsPassSummary> | undefined;
 export interface UnspentNodeIdsPassSummary {
   backfillBatches: number;
   backfillChanged: number;
+  /**
+   * Every partition is caught up, or only waits for missing parent outputs
+   * (stalled): the backfill may run (see `readyForBackfill`).
+   */
+  backfillReady: boolean;
   batches: number;
   busy: boolean;
   caughtUp: boolean;
@@ -1931,7 +1937,8 @@ const ensureInitialized = async (
  * One pass of the tracking job: settle new limits, then run every partition
  * on its own connection, in parallel, until it reaches the settled limits
  * (and nothing else is pending) or `maxMs` elapsed; then delete the events
- * every partition has consumed and, if enabled and caught up, backfill.
+ * every partition has consumed and, if enabled and every partition is caught
+ * up or only stalled on missing parents (`readyForBackfill`), backfill.
  * Concurrent callers share the pass in flight.
  */
 export const runUnspentNodeIdsJobPass = async (
@@ -1947,6 +1954,7 @@ export const runUnspentNodeIdsJobPass = async (
     const summary: UnspentNodeIdsPassSummary = {
       backfillBatches: 0,
       backfillChanged: 0,
+      backfillReady: false,
       batches: 0,
       busy: false,
       caughtUp: false,
@@ -1983,6 +1991,8 @@ export const runUnspentNodeIdsJobPass = async (
             changed: 0,
             inputs: 0,
             last: undefined as BatchResult | undefined,
+            /* the loop ended with nothing left to do now (not on maxMs) */
+            settled: false,
             stopped: false,
           };
           // eslint-disable-next-line functional/no-try-statement
@@ -2025,6 +2035,7 @@ export const runUnspentNodeIdsJobPass = async (
               const reached = batchReachedLimits(result, limits);
               if (!worked || (reached && result.events === 0)) {
                 state.caughtUp = reached;
+                state.settled = true;
                 return undefined;
               }
               if (Date.now() - start >= maxMs) {
@@ -2045,6 +2056,7 @@ export const runUnspentNodeIdsJobPass = async (
       summary.lastBatches = partitionResults.map((p) => p.last);
       summary.busy = partitionResults.some((p) => p.last?.busy === true);
       summary.caughtUp = partitionResults.every((p) => p.caughtUp);
+      summary.backfillReady = partitionResults.every(readyForBackfill);
       summary.stalled = partitionResults.some(
         (p) => p.last?.stalledAt !== null && p.last?.stalledAt !== undefined
       );
@@ -2063,7 +2075,7 @@ export const runUnspentNodeIdsJobPass = async (
       }
       if (
         (options.backfill ?? (unspentNodeIds.backfill || rebuildRequired)) &&
-        summary.caughtUp &&
+        summary.backfillReady &&
         Date.now() - start < maxMs
       ) {
         const backfillResults = await Promise.all(
