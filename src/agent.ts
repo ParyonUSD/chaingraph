@@ -136,6 +136,11 @@ const incompleteBlockRepairRetryDelayMs = 5_000;
  * Postgres connection (invalid indexes left behind are rebuilt on retry).
  */
 const unspentNodeIdsStartRetryDelayMs = 5_000;
+/**
+ * Block saves taking at least this long are logged with a per-step breakdown
+ * (a cold-cache mempool-cleaning trigger once held a save for 8 minutes).
+ */
+const slowBlockSaveMs = 10_000;
 const durationDecimalPlaces = 1;
 const transactionRateDecimalPlaces = 2;
 
@@ -1951,6 +1956,29 @@ export class Agent {
   }
 
   /**
+   * Warn with a per-step breakdown when a block save takes at least
+   * {@link slowBlockSaveMs}.
+   */
+  logSlowBlockSave(
+    block: ChaingraphBlock,
+    durationMs: number,
+    stepMs: {
+      block: number;
+      check: number;
+      commit: number;
+      transactions: number;
+    }
+  ) {
+    if (durationMs >= slowBlockSaveMs) {
+      this.logger.warn(
+        `Agent: slow block save – height ${block.height} (${
+          block.hash
+        }) took ${durationMs.toLocaleString()} ms: transactions ${stepMs.transactions.toLocaleString()} ms, block + node_block (incl. the mempool-cleaning trigger) ${stepMs.block.toLocaleString()} ms, check ${stepMs.check.toLocaleString()} ms, commit ${stepMs.commit.toLocaleString()} ms.`
+      );
+    }
+  }
+
+  /**
    * Save a block to the database including any previously-unseen transactions.
    *
    * This also marks the nodes by which the block has been accepted and removes
@@ -2001,7 +2029,7 @@ export class Agent {
     );
 
     const startTime = Date.now();
-    const { attemptedSavedTransactions, transactionCacheMisses } =
+    const { attemptedSavedTransactions, stepMs, transactionCacheMisses } =
       await saveBlock({
         block,
         nodeAcceptances,
@@ -2012,6 +2040,7 @@ export class Agent {
     const completionTime = Date.now();
 
     const durationMs = completionTime - startTime;
+    this.logSlowBlockSave(block, durationMs, stepMs);
     const transactions = attemptedSavedTransactions.length;
     const savedTransactionCount = transactions - transactionCacheMisses;
     const inputs = attemptedSavedTransactions.reduce(

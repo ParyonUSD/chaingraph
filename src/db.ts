@@ -1196,10 +1196,12 @@ SELECT
   const client = await pool.connect();
   // eslint-disable-next-line functional/no-try-statement
   try {
+    const stepStart = Date.now();
     await client.query('BEGIN;');
     const saveTransactionsResult = await client.query<{ count: string }>(
       addAllTransactions
     );
+    const transactionsSavedAt = Date.now();
     const attemptedSavedTransactions = blockTransactions.unknown;
     const savedTransactionCount = Number(saveTransactionsResult.rows[0]!.count);
     const transactionCacheMisses =
@@ -1209,6 +1211,7 @@ SELECT
       insertedNodeBlockCount: string;
       joinedTransactionCount: string;
     }>(addBlockQuery);
+    const blockSavedAt = Date.now();
     const joinedTransactionCount = Number(
       addBlockResult.rows[0]!.joinedTransactionCount
     );
@@ -1249,9 +1252,20 @@ SELECT
         `Failed to save all transactions for block ${block.height} (${block.hash}): joined ${joinedTransactionCount}/${block.transactions.length}, linked ${linkedBlockTransactionCount}/${block.transactions.length}.`
       );
     }
+    const checkedAt = Date.now();
     await client.query('COMMIT;');
     return {
       attemptedSavedTransactions,
+      /**
+       * Duration of each step (slow-save diagnostics): `block` includes the
+       * node_block mempool-cleaning trigger.
+       */
+      stepMs: {
+        block: blockSavedAt - transactionsSavedAt,
+        check: checkedAt - blockSavedAt,
+        commit: Date.now() - checkedAt,
+        transactions: transactionsSavedAt - stepStart,
+      },
       transactionCacheMisses,
     };
   } catch (err) {
