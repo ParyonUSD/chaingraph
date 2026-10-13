@@ -562,7 +562,7 @@ export const hashRangeParams = (range: HashRange): QueryParams => ({
  * hash range: the range's outputs and their creators' acceptance by key
  * range, the inputs spending outpoints of the range by `input.p_outpoint`'s
  * key range, and the acceptance of only those spenders. Memory follows the
- * range, not the chain (the whole-set form needs > 280 GiB on mainnet).
+ * range, not the chain (the whole-set form needs more than 280 GiB on mainnet).
  */
 export const unspentInHashRangeSql = (
   snapshot: Pick<VisibilitySnapshot, 'committedTail' | 'void'>,
@@ -832,7 +832,7 @@ const rowDigest = `cityHash64(toString(tuple(transaction_internal_id, value_sato
  * Whole set, memory bounded (fix-pass-7.md §5): the outpoints are compared
  * row for row per hash range of their transaction (`options.chunks`, by
  * default ~4 M outputs per range: a few GiB per statement on mainnet, where
- * the single-statement form needed > 280 GiB); the per-category totals of
+ * the single-statement form needed more than 280 GiB); the per-category totals of
  * the reference are summed over the ranges and compared with the stored
  * totals. A statement that fails (memory, time) fails the check: it throws,
  * nothing is reported as compared.

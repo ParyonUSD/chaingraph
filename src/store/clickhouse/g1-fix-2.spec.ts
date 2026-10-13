@@ -131,7 +131,7 @@ test('the DDL keys stop at the filter columns (planning-floor.md)', (t) => {
   t.deepEqual(keys.get('block_transaction.p_txid projection sort key'), [
     'transaction_internal_id',
   ]);
-  /* by node and height only: an id set on a third key column was analysed against every mark (fix-pass-7.md §2) */
+  /* by node and height only: an id set on a third key column was analyzed against every mark (fix-pass-7.md §2) */
   t.deepEqual(keys.get('tx_acceptance.p_node_height projection sort key'), [
     'node_internal_id',
     'height',
