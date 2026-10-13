@@ -809,6 +809,12 @@ export const TransactionEntity: Entity = {
        */
       defaultOrder: blockInclusionDefaultOrder,
       kind: 'relation',
+      /*
+       * The parents' internal ids bound the read too (one per hash):
+       * block_transaction.p_txid / tx_acceptance.p_node_tx probe one part
+       * per id where p_tx / the hash key probe every part (fix-pass-6.md §6).
+       */
+      linkColumns: ['hash', 'internal_id'],
       many: true,
       order: listOrder(blockInclusionOrder, blockInclusionDefaultOrder),
       parentKeys: ['hash'],
@@ -820,26 +826,33 @@ export const TransactionEntity: Entity = {
        */
       source: (c, link, args, needs) => {
         const node = acceptedByNode(c, args);
+        const hashes = `SELECT hash FROM (${link})`;
+        const ids = `SELECT internal_id FROM (${link})`;
+        const included = `transaction_hash IN (${hashes}) AND transaction_internal_id IN (${ids})`;
+        /* below the collapse: the alias any(transaction_internal_id) would shadow the column */
+        const accepted = `block_internal_id != 0 AND transaction_hash IN (${hashes}) AND tx_acceptance.transaction_internal_id IN (${ids})`;
         const inclusions =
           node === undefined
             ? `SELECT block_internal_id, transaction_hash, transaction_index FROM ${c.sql.view(
                 'block_transaction_at'
-              )} WHERE transaction_hash IN (${link})`
+              )} WHERE ${included}`
             : needs.has('transaction_index')
             ? `SELECT a.transaction_hash AS transaction_hash, a.block_internal_id AS block_internal_id,
           bt.transaction_index AS transaction_index
         FROM (SELECT transaction_hash, block_internal_id FROM ${c.sql.nodeView(
           'tx_acceptance_at',
-          node
-        )} WHERE block_internal_id != 0 AND transaction_hash IN (${link})) AS a
+          node,
+          accepted
+        )}) AS a
         LEFT JOIN (SELECT block_internal_id, transaction_hash, transaction_index FROM ${c.sql.view(
           'block_transaction_at'
-        )} WHERE transaction_hash IN (${link})) AS bt
+        )} WHERE ${included}) AS bt
           ON bt.block_internal_id = a.block_internal_id AND bt.transaction_hash = a.transaction_hash`
             : `SELECT transaction_hash, block_internal_id, toUInt32(0) AS transaction_index FROM ${c.sql.nodeView(
                 'tx_acceptance_at',
-                node
-              )} WHERE block_internal_id != 0 AND transaction_hash IN (${link})`;
+                node,
+                accepted
+              )}`;
         if (!needs.has('height') && !needs.has('block_hash')) {
           return `SELECT transaction_hash, block_internal_id, toUInt32(0) AS height,
           toFixedString('', 32) AS block_hash, transaction_index FROM (${inclusions})`;

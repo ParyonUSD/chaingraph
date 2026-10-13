@@ -124,6 +124,13 @@ test('the DDL keys stop at the filter columns (planning-floor.md)', (t) => {
     'outpoint_transaction_hash',
     'outpoint_index',
   ]);
+  /* inclusions by internal id (fix-pass-6.md §6) next to p_tx (by hash) */
+  t.deepEqual(keys.get('block_transaction.p_tx projection sort key'), [
+    'transaction_hash',
+  ]);
+  t.deepEqual(keys.get('block_transaction.p_txid projection sort key'), [
+    'transaction_internal_id',
+  ]);
 });
 
 e2e(

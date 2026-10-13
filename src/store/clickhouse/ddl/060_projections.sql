@@ -26,6 +26,16 @@ ALTER TABLE cg.block_transaction ADD PROJECTION IF NOT EXISTS p_tx
     SELECT * ORDER BY transaction_hash
 );
 
+-- p_txid: the inclusions of transactions by internal id (fix-pass-6.md §6). Rows are written in commit (time) order,
+-- so parts overlap in hash: a hash is probed in every part of p_tx, an id only in the part of its time (ids grow
+-- with time). Block inclusions of a page read both conditions; ClickHouse takes whichever projection selects fewer
+-- granules (time-ordered synthetic, 10,000 transactions: 84 M -> 10 M rows, 196 -> 34 ms). Parts without it (an
+-- existing database before MATERIALIZE) are read through p_tx as before.
+ALTER TABLE cg.block_transaction ADD PROJECTION IF NOT EXISTS p_txid
+(
+    SELECT * ORDER BY transaction_internal_id
+);
+
 ALTER TABLE cg.output ADD PROJECTION IF NOT EXISTS p_script
 (
     SELECT *, locking_bytecode_prefix, nonfungible_token_commitment_key
