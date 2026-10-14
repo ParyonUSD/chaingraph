@@ -1,4 +1,4 @@
-/* eslint-disable camelcase, @typescript-eslint/naming-convention, complexity, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, functional/no-mixed-type, max-params, functional/no-let, no-underscore-dangle, functional/no-loop-statement, functional/no-try-statement, @typescript-eslint/init-declarations, @typescript-eslint/parameter-properties, @typescript-eslint/strict-boolean-expressions */
+/* eslint-disable max-lines, camelcase, @typescript-eslint/naming-convention, complexity, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, functional/no-mixed-type, max-params, functional/no-let, no-underscore-dangle, functional/no-loop-statement, functional/no-try-statement, @typescript-eslint/init-declarations, @typescript-eslint/parameter-properties, @typescript-eslint/strict-boolean-expressions */
 // cspell:ignore clickhouse unhex subquery analysed
 /**
  * Selection-driven SQL for the v2 API: one root field = ONE ClickHouse
@@ -388,9 +388,14 @@ const keyOf = (values: readonly unknown[]) =>
 
 /** `keyOf` of `width` values of `tuple` from `start`, without copying them (one column: the value itself). */
 const keyAt = (tuple: readonly unknown[], start: number, width: number) => {
-  if (width === 1) {
-    const value = tuple[start];
-    return value === null || value === undefined ? undefined : String(value);
+  const value = tuple[start];
+  if (value === null || value === undefined) return undefined;
+  if (width === 1) return String(value);
+  const second = tuple[start + 1];
+  if (width === 2) {
+    return second === null || second === undefined
+      ? undefined
+      : `${String(value)}\u0000${String(second)}`;
   }
   return keyOf(tuple.slice(start, start + width));
 };
@@ -607,15 +612,25 @@ const planLevel = (
         `(SELECT ${array} FROM (${body})) AS ${child}`,
       ].join(',\n');
     }
-    const childData = (data: LevelData) => data.get(child);
+    /* the child level's groups, looked up once per statement result (not per parent row) */
+    let lastData: LevelData | undefined;
+    let groups: Map<string, unknown[][]> | undefined;
+    const keyWidth = parentKeyPositions.length;
+    const consecutive = parentKeyPositions.every(
+      (position, index) => position === parentKeyPositions[0]! + index
+    );
     decoders.push((values, base, _record, related, data, count) => {
+      if (data !== lastData) {
+        lastData = data;
+        groups = data.get(child);
+      }
       const key =
-        parentKeyPositions.length === 1
-          ? keyAt(values, base + parentKeyPositions[0]!, 1)
+        consecutive && keyWidth <= 2
+          ? keyAt(values, base + parentKeyPositions[0]!, keyWidth)
           : keyOf(
               parentKeyPositions.map((position) => values[base + position])
             );
-      const tuples = key === undefined ? undefined : childData(data)?.get(key);
+      const tuples = key === undefined ? undefined : groups?.get(key);
       if (tuples === undefined) {
         related[sel.key] = field.many ? [] : null;
         return;
@@ -735,7 +750,9 @@ const levelData = (
     const keyLength = keyWidths.get(name) ?? 0;
     const items = Array.isArray(value) ? (value as unknown[]) : [];
     for (const item of items) {
-      const tuple = tupleValues(item);
+      const tuple = Array.isArray(item)
+        ? (item as unknown[])
+        : tupleValues(item);
       const key = keyAt(tuple, 1, keyLength);
       const group = key === undefined ? undefined : groups.get(key);
       if (group !== undefined) group.push(tuple);
