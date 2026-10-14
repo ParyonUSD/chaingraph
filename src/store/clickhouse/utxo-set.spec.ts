@@ -38,7 +38,9 @@ import {
   hashRangeChunks,
   nodeCheckChunkCount,
   publishedUtxoMarks,
+  referenceTotalsChunked,
   spotCheckUtxoSet,
+  totalsAnswer,
   unspentAtQueryTimeSql,
   utxoSetMetricsText,
   utxoSetViewStatement,
@@ -734,6 +736,37 @@ e2e(
       t.deepEqual(spot!.failed, []);
       t.true(spot!.scopes.every((scope) => scope.equal));
       t.is(chunkStatements, expected, `node ${node}: totals chunks per node`);
+      /* fix-pass-10.md §2: the small-node form answers as the chain-range form, in any chunking */
+      const snapshot = snapshotForNode(
+        await readSnapshotMulti(client, [node], { utxo: true }),
+        node
+      );
+      const large = await referenceTotalsChunked(client, snapshot, {
+        chunks: 1,
+        form: 'large',
+      });
+      t.is(large.form, 'large');
+      for (const chunks of [1, 4]) {
+        const small = await referenceTotalsChunked(client, snapshot, {
+          chunks,
+          form: 'small',
+        });
+        t.is(small.form, 'small');
+        t.is(
+          totalsAnswer(small.totals),
+          totalsAnswer(large.totals),
+          `node ${node}: small-node form, ${chunks} chunks`
+        );
+      }
+      const auto = await referenceTotalsChunked(client, snapshot, {
+        utxos: BigInt(single!.count),
+      });
+      t.is(
+        auto.form,
+        'small',
+        `node ${node}: a small node gets the small form`
+      );
+      t.is(totalsAnswer(auto.totals), totalsAnswer(large.totals));
     }
     t.true(
       sizes.get(node2)! < sizes.get(node1)!,

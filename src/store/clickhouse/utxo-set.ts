@@ -1,5 +1,5 @@
 /* eslint-disable functional/no-let, functional/no-loop-statement, no-await-in-loop, functional/no-try-statement, @typescript-eslint/naming-convention, camelcase, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, complexity, max-params, no-continue, @typescript-eslint/member-ordering, max-lines, @typescript-eslint/no-loop-func, max-classes-per-file, functional/no-throw-statement */
-// cspell:ignore clickhouse unhex seqs dedup rebase rebased rebases analysed
+// cspell:ignore clickhouse unhex seqs dedup rebase rebased rebases analysed txid
 /**
  * The stored per-node UTXO set, maintained off the commit path
  * (`ddl/090_utxo_set.sql`, docs/clickhouse-port/utxo-async.md).
@@ -623,6 +623,68 @@ const totalsRowsSql = (rows: string) =>
            nonfungible_token_capability AS cap FROM (${rows}))
    GROUP BY token_category`;
 
+/**
+ * The query-time per-category totals of a SMALL node's unspent outputs in
+ * one hash range (fix-pass-10.md §2), as `totalsRowsSql` rows. The same
+ * definition as `unspentInHashRangeSql` (outputs of transactions the node
+ * accepts, minus outpoints spent by transactions it accepts; the stored
+ * set is not read), by access paths that follow the node, not the chain:
+ * - the node's acceptance by node (`p_node_tx` / `p_node_height`), its
+ *   transactions in the range kept as one array;
+ * - the spenders by the node's transaction ids (`input.p_txid`; bounded by
+ *   the ids' min and max so the projection is chosen at analysis), their
+ *   outpoints in the range kept as one array;
+ * - the outputs by their table's key (transaction hash), in a scalar
+ *   subquery with `optimize_use_projections = 0`: compared by marks,
+ *   ClickHouse otherwise picks `output.p_script` (granularity 1024) with no
+ *   key condition over the base table (granularity 128) and read ~0.9 B
+ *   rows for a 1 M-transaction node in a 150 M-transaction chain
+ *   (fix-pass-9.md §6).
+ * The range filters are aggregate conditions (`…If`), not WHERE terms: a
+ * hash range on tx_acceptance or input is a key range of their base table /
+ * `p_outpoint`, which would be chosen over the node's projections. Each
+ * array must stay under ClickHouse's 1 M elements per value: the caller
+ * sizes the chunks (`smallNodeChunkElements`).
+ */
+export const smallNodeTotalsInHashRangeSql = (
+  snapshot: Pick<VisibilitySnapshot, 'committedTail' | 'void'>,
+  range: HashRange
+) => {
+  const agnostic = pinnedGateTerms('agnostic', { snapshot }).join(' AND ');
+  const accepted = `SELECT transaction_hash, transaction_internal_id FROM ${inlinePinnedView(
+    'tx_acceptance_at',
+    snapshot
+  )}`;
+  const inRange = (column: string) => `(${hashRangeSql(column, range)})`;
+  const created = `(SELECT groupUniqArrayIf(transaction_hash, ${inRange(
+    'transaction_hash'
+  )}) FROM (${accepted})) AS __small_created`;
+  const ids = `(SELECT (min(transaction_internal_id), max(transaction_internal_id)) FROM (${accepted})) AS __small_ids`;
+  const spent = `(SELECT groupUniqArrayIf((outpoint_transaction_hash, outpoint_index), ${inRange(
+    'outpoint_transaction_hash'
+  )}) FROM input
+    WHERE ${agnostic}
+      AND transaction_internal_id BETWEEN tupleElement(__small_ids, 1) AND tupleElement(__small_ids, 2)
+      AND transaction_internal_id IN (SELECT transaction_internal_id FROM (${accepted}))) AS __small_spent`;
+  const unspent = `SELECT o.* FROM (
+      SELECT ${utxoSetReadColumns.join(', ')} FROM output
+      WHERE ${agnostic} AND ${hashRangeSql('transaction_hash', range)}
+        AND transaction_hash IN (SELECT arrayJoin(__small_created))
+      LIMIT 1 BY transaction_hash, output_index) AS o
+    WHERE (transaction_hash, output_index) NOT IN (
+      SELECT tupleElement(__s, 1), tupleElement(__s, 2) FROM (SELECT arrayJoin(__small_spent) AS __s))`;
+  const totals = `(SELECT groupArray(tuple(c, n, v, fn, fa, nn)) FROM (${totalsRowsSql(
+    unspent
+  )}) SETTINGS optimize_use_projections = 0) AS __small_totals`;
+  return `WITH ${created},
+  ${ids},
+  ${spent},
+  ${totals}
+SELECT tupleElement(__t, 1) AS c, tupleElement(__t, 2) AS n, tupleElement(__t, 3) AS v,
+  tupleElement(__t, 4) AS fn, tupleElement(__t, 5) AS fa, tupleElement(__t, 6) AS nn
+FROM (SELECT arrayJoin(__small_totals) AS __t)`;
+};
+
 const addTotals = (
   into: Map<string, UtxoCategoryTotals>,
   rows: readonly TotalsRow[]
@@ -702,6 +764,41 @@ const storedTotals = async (
     settings
   );
   return addTotals(new Map(), rows);
+};
+
+/**
+ * A node is small for the totals reference (`smallNodeTotalsInHashRangeSql`)
+ * up to this many accepted transactions: each chunk reads the node's whole
+ * acceptance and inputs again, so the form's cost grows with the square of
+ * the node's size (2 M: 32 chunks of ~7 M rows each).
+ */
+export const smallNodeMaxTransactions = 2_000_000;
+
+/** Elements per array of a small-node chunk (ClickHouse's limit per value is 1 M; hash ranges hold ± a few %). */
+export const smallNodeChunkElements = 250_000;
+
+/**
+ * A node's accepted transactions and its estimated inputs and created
+ * outputs (accepted transactions times the database's inputs / outputs per
+ * transaction, `system.parts` row counts).
+ */
+export const nodeSizeEstimate = async (
+  client: Pick<ClickHouseClient, 'query'>,
+  nodeId: number
+) => {
+  const [row] = await client.query<{ t: string; i: string; o: string }>(
+    `WITH (SELECT count() FROM tx_acceptance WHERE node_internal_id = {node:UInt32} AND sign > 0) AS accepted,
+       (SELECT greatest(1, sum(rows)) FROM system.parts WHERE database = currentDatabase() AND table = 'transaction' AND active) AS tx
+     SELECT toString(accepted) AS t,
+       toString(toUInt64(accepted * (SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = 'input' AND active) / tx)) AS i,
+       toString(toUInt64(accepted * (SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = 'output' AND active) / tx)) AS o`,
+    { node: nodeId }
+  );
+  return {
+    inputs: BigInt(row?.i ?? '0'),
+    outputs: BigInt(row?.o ?? '0'),
+    transactions: BigInt(row?.t ?? '0'),
+  };
 };
 
 /** Outputs per chunk a whole-set check aims at (memory per statement a few GiB, fix-pass-7.md §5). */
@@ -848,19 +945,39 @@ export const referenceTotalsChunked = async (
   options: WholeSetCheckOptions & {
     /** The node's stored UTXO count (chunk sizing; default: the database's output count). */
     utxos?: bigint;
+    /**
+     * `small`: `smallNodeTotalsInHashRangeSql`; `large`: `unspentInHashRangeSql`;
+     * `auto` (default): small up to `smallNodeMaxTransactions` accepted transactions.
+     */
+    form?: 'auto' | 'large' | 'small';
   } = {}
 ) => {
   const params = snapshotParams(snapshot);
+  const requested = options.form ?? 'auto';
+  const size =
+    requested === 'large'
+      ? undefined
+      : await nodeSizeEstimate(client, snapshot.nodeId);
+  const small =
+    size !== undefined &&
+    (requested === 'small' ||
+      size.transactions <= BigInt(smallNodeMaxTransactions));
+  const sized = async () =>
+    options.utxos === undefined
+      ? checkChunkCount(client)
+      : nodeCheckChunks(client, snapshot.nodeId, options.utxos, options);
+  /* small: also every array of a chunk under smallNodeChunkElements */
   const chunks = hashRangeChunks(
     options.chunks ??
-      (options.utxos === undefined
-        ? await checkChunkCount(client)
-        : await nodeCheckChunks(
-            client,
-            snapshot.nodeId,
-            options.utxos,
-            options
-          ))
+      (small
+        ? Math.max(
+            await sized(),
+            nodeCheckChunkCount(
+              size.transactions > size.inputs ? size.transactions : size.inputs,
+              smallNodeChunkElements
+            )
+          )
+        : await sized())
   );
   const settings =
     options.maxExecutionSeconds === undefined
@@ -872,7 +989,9 @@ export const referenceTotalsChunked = async (
   let done = 0;
   await forEachLimited(chunks, options.concurrency ?? 1, async (range) => {
     const rows = await client.query<TotalsRow>(
-      totalsRowsSql(unspentInHashRangeSql(snapshot, range)),
+      small
+        ? smallNodeTotalsInHashRangeSql(snapshot, range)
+        : totalsRowsSql(unspentInHashRangeSql(snapshot, range)),
       { ...params, ...hashRangeParams(range) },
       settings
     );
@@ -880,7 +999,11 @@ export const referenceTotalsChunked = async (
     done += 1;
     options.onChunk?.(done, chunks.length);
   });
-  return { chunks: chunks.length, totals };
+  return {
+    chunks: chunks.length,
+    form: small ? ('small' as const) : ('large' as const),
+    totals,
+  };
 };
 
 /** What `checkUtxoSet` found: empty lists and equal totals = exact. */
@@ -1133,6 +1256,8 @@ export interface UtxoSpotCheckOptions {
   totalsChunks?: number;
   /** Unspent outputs per totals chunk when `totalsChunks` is not given (default `checkUtxosPerChunk`). */
   totalsUtxosPerChunk?: number;
+  /** The totals reference's form (`referenceTotalsChunked`; default auto: by the node's size). */
+  totalsForm?: 'auto' | 'large' | 'small';
   /** Throw `UtxoSpotCheckFailedError` when a scope's statement failed (default true). */
   throwOnFailure?: boolean;
   /** These categories / prefixes (hex) instead of random ones (tests, tools). */
@@ -1321,6 +1446,9 @@ export const spotCheckUtxoSet = async (
             ...(options.totalsUtxosPerChunk === undefined
               ? {}
               : { utxosPerChunk: options.totalsUtxosPerChunk }),
+            ...(options.totalsForm === undefined
+              ? {}
+              : { form: options.totalsForm }),
             maxExecutionSeconds: options.maxExecutionSeconds ?? 120,
             utxos: totalOutputs(storedByCategory),
           })
