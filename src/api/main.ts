@@ -1,5 +1,5 @@
-/* eslint-disable complexity, no-process-exit, functional/no-let, @typescript-eslint/no-magic-numbers */
-// cspell:ignore clickhouse
+/* eslint-disable complexity, no-process-exit, functional/no-let, @typescript-eslint/no-magic-numbers, max-params */
+// cspell:ignore clickhouse serialisation serialised recognise
 /**
  * `yarn api:dev`: the Chaingraph v2 API on CHAINGRAPH_API_HOST:CHAINGRAPH_API_PORT
  * (default 127.0.0.1:4000), reading the ClickHouse store named by
@@ -39,6 +39,11 @@
  *   (node:cluster), each with its own event loop and its share of the
  *   ClickHouse budget: a single loop is the API's limit at mainnet scale
  *   (fix-pass-8.md §2);
+ * - CHAINGRAPH_API_HEAVY_THREADS (default 1; 0: none): per process, worker
+ *   threads that answer admitted heavy requests (heavy-lane.ts, front.ts),
+ *   so their decoding, execution and serialisation never block the loop
+ *   that serves light requests, refusals and cache hits (fix-pass-9.md §3).
+ *   Off with admission (the predicted class routes a request);
  * - a request whose client goes away has its unsent statements dropped and
  *   its running ones cancelled (KILL QUERY by query_id).
  */
@@ -65,34 +70,54 @@ import { createApi, listen } from './server.js';
 
 const defaultPort = 4000;
 
-/** CHAINGRAPH_API_WORKERS: worker processes (default 1: no cluster). */
-const workersFromEnv = (env: NodeJS.ProcessEnv) => {
-  const raw = env.CHAINGRAPH_API_WORKERS;
-  if (raw === undefined || raw === '') return 1;
+/** An integer variable of at least `min` (`fallback` when unset). */
+const integerFromEnv = (
+  env: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number,
+  min: number
+) => {
+  const raw = env[name];
+  if (raw === undefined || raw === '') return fallback;
   const value = Number(raw);
-  if (!Number.isInteger(value) || value < 1) {
+  if (!Number.isInteger(value) || value < min) {
     // eslint-disable-next-line functional/no-throw-statement
-    throw new Error('CHAINGRAPH_API_WORKERS must be an integer >= 1.');
+    throw new Error(`${name} must be an integer >= ${min}.`);
   }
   return value;
 };
+
+/** CHAINGRAPH_API_WORKERS: worker processes (default 1: no cluster). */
+const workersFromEnv = (env: NodeJS.ProcessEnv) =>
+  integerFromEnv(env, 'CHAINGRAPH_API_WORKERS', 1, 1);
+
+/** CHAINGRAPH_API_HEAVY_THREADS: heavy-lane worker threads per process (heavy-lane.ts). */
+export const defaultHeavyThreads = 1;
+
+const heavyThreadsFromEnv = (env: NodeJS.ProcessEnv) =>
+  integerFromEnv(env, 'CHAINGRAPH_API_HEAVY_THREADS', defaultHeavyThreads, 0);
 
 const main = async () => {
   const { env } = process;
   const workers = workersFromEnv(env);
   const statementTimeouts = statementTimeoutsFromEnv(env);
-  const client = new ClickHouseClient({
+  const clickhouse = {
     ...clickHouseConfigFromEnv(env),
     requestTimeoutMs:
       Math.max(statementTimeouts.data, statementTimeouts.aggregate) +
       requestTimeoutMarginMs,
-  });
+  };
+  const client = new ClickHouseClient(clickhouse);
   /* lane sizes follow the ClickHouse server's cores (fix-pass-4.md §8) */
   const serverLimits = await readClickHouseServerLimits(client);
+  const admissionOff = env.CHAINGRAPH_API_ADMISSION === 'off';
+  /* the lane needs admission: the predicted class routes a request */
+  const heavyThreads = admissionOff ? 0 : heavyThreadsFromEnv(env);
   const admission = admissionOptionsFromEnv(
     env,
     serverLimits.maxThreads,
-    workers
+    workers,
+    heavyThreads
   );
   if (cluster.isPrimary || cluster.worker?.id === 1) {
     // eslint-disable-next-line no-console
@@ -100,7 +125,7 @@ const main = async () => {
       `${admissionSummary(
         admission,
         serverLimits.maxConcurrentQueriesForUser
-      )} workers=${workers}`
+      )} workers=${workers} heavy_threads=${heavyThreads}`
     );
   }
   const trusted = env.CHAINGRAPH_API_TRUSTED_DOCUMENTS;
@@ -113,6 +138,18 @@ const main = async () => {
       : { maxResultRows: Number(env.CHAINGRAPH_API_MAX_RESULT_ROWS) }),
     admission,
     authchainMaxBranches: authchainMaxBranchesFromEnv(env),
+    ...(heavyThreads === 0
+      ? {}
+      : {
+          heavyLane: {
+            /* a lane thread's statements: at most the heavy requests in flight, plus snapshot reads */
+            clickhouse: {
+              ...clickhouse,
+              maxOpenConnections: Math.min(64, admission.heavyMaxInFlight + 4),
+            },
+            threads: heavyThreads,
+          },
+        }),
     responseCache: env.CHAINGRAPH_API_RESPONSE_CACHE === 'off' ? false : {},
     statementTimeouts,
     utxoSet: utxoSetPolicyFromEnv(env),

@@ -31,6 +31,9 @@ import type { AdmissionOptions, Ticket } from './admission.js';
 import { planKeys } from './admission.js';
 import type { RequestScope, StatementTimeouts } from './db.js';
 import { ApiDb, PinnedSnapshot, requestScope } from './db.js';
+import { handlePost } from './front.js';
+import type { HeavyLaneOptions } from './heavy-lane.js';
+import { HeavyLane } from './heavy-lane.js';
 import type { LiveHubOptions } from './live.js';
 import { LiveHub } from './live.js';
 import type {
@@ -182,6 +185,8 @@ const useAdmission = (db: ApiDb): Plugin<ApiContext> => ({
       | undefined;
     const operation = getOperationAST(document, operationName ?? undefined);
     if (operation?.operation !== 'query') return undefined;
+    /* admitted already (front.ts, or a heavy-lane worker's request) */
+    if (requestScope.getStore()?.ticket !== undefined) return undefined;
     let ticket: Ticket;
     try {
       ticket = admission.admit(
@@ -214,16 +219,16 @@ const useAdmission = (db: ApiDb): Plugin<ApiContext> => ({
 
 const useRequestSnapshot = (db: ApiDb): Plugin<ApiContext> => ({
   onExecute: ({ args, extendContext }) => {
-    extendContext({
-      snapshot: new PinnedSnapshot(
-        db,
-        operationNodeNames(
-          args.document as DocumentNode,
-          args.operationName as string | null | undefined,
-          args.variableValues as { [name: string]: unknown } | undefined
-        )
-      ),
-    });
+    const snapshot = new PinnedSnapshot(
+      db,
+      operationNodeNames(
+        args.document as DocumentNode,
+        args.operationName as string | null | undefined,
+        args.variableValues as { [name: string]: unknown } | undefined
+      )
+    );
+    requestScope.getStore()?.snapshots?.push(snapshot);
+    extendContext({ snapshot });
   },
 });
 
@@ -235,6 +240,8 @@ export interface Api {
   responseCache?: ResponseCache;
   /** Trusted documents (R34), when configured. */
   trustedDocuments?: TrustedDocuments;
+  /** Worker threads answering admitted heavy requests (heavy-lane.ts), when configured. */
+  heavyLane?: HeavyLane;
 }
 
 export interface ApiOptions {
@@ -261,6 +268,12 @@ export interface ApiOptions {
    * store has a set for the node; `main.ts` reads `utxoSetPolicyFromEnv`).
    */
   utxoSet?: Partial<UtxoSetPolicy>;
+  /**
+   * Heavy requests on worker threads (heavy-lane.ts, fix-pass-9.md §3):
+   * the ClickHouse connection and thread count; their API instances get
+   * this API's statement options. Needs admission (the class decides).
+   */
+  heavyLane?: Pick<HeavyLaneOptions, 'clickhouse' | 'threads'>;
 }
 
 export const createApi = (
@@ -312,10 +325,35 @@ export const createApi = (
     ],
     schema,
   });
+  const heavyLane =
+    options.heavyLane === undefined ||
+    options.heavyLane.threads < 1 ||
+    options.admission?.enabled !== true
+      ? undefined
+      : new HeavyLane({
+          ...options.heavyLane,
+          ...(options.maxResultRows === undefined
+            ? {}
+            : { maxResultRows: options.maxResultRows }),
+          ...(options.authchainMaxBranches === undefined
+            ? {}
+            : { authchainMaxBranches: options.authchainMaxBranches }),
+          ...(options.statementTimeouts === undefined
+            ? {}
+            : { statementTimeouts: options.statementTimeouts }),
+          ...(options.utxoSet === undefined
+            ? {}
+            : { utxoSet: options.utxoSet }),
+          ...(options.limits === undefined ? {} : { limits: options.limits }),
+          ...(options.trustedDocuments === undefined
+            ? {}
+            : { trustedDocuments: options.trustedDocuments }),
+        });
   return {
     db,
     hub,
     yoga,
+    ...(heavyLane === undefined ? {} : { heavyLane }),
     ...(responseCache === undefined ? {} : { responseCache }),
     ...(options.trustedDocuments === undefined
       ? {}
@@ -371,6 +409,23 @@ export const listen = async (
       if (scope.ticket !== undefined) api.db.admission.finish(scope.ticket);
     });
     requestScope.run(scope, () => {
+      if (request.method === 'POST') {
+        /* decided before Yoga: cache hit, refusal, light here, heavy on the lane (front.ts) */
+        handlePost(api, request, response, scope).catch((error: unknown) => {
+          if (response.headersSent || response.destroyed) {
+            response.destroy();
+            return;
+          }
+          // eslint-disable-next-line @typescript-eslint/no-magic-numbers, @typescript-eslint/naming-convention
+          response.writeHead(500, { 'content-type': 'application/json' });
+          response.end(
+            JSON.stringify({
+              errors: [{ message: `Internal error: ${String(error)}` }],
+            })
+          );
+        });
+        return;
+      }
       // eslint-disable-next-line @typescript-eslint/no-floating-promises
       api.yoga(request, response);
     });
@@ -461,6 +516,7 @@ export const listen = async (
   return {
     close: async () => {
       api.hub.close();
+      await api.heavyLane?.close();
       wsServer.clients.forEach((socket) => {
         socket.terminate();
       });

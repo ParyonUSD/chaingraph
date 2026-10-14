@@ -124,6 +124,8 @@ export interface AdmissionOptions {
     processes: number;
     cpuTarget: number;
     loopTarget: number;
+    /** Heavy-lane threads per process (heavy-lane.ts). */
+    heavyThreads?: number;
   };
 }
 
@@ -1200,7 +1202,8 @@ const classSettingsFromEnv = (env: NodeJS.ProcessEnv, prefix: string) => {
 export const admissionOptionsFromEnv = (
   env: NodeJS.ProcessEnv = process.env,
   serverCores?: number,
-  workers = 1
+  workers = 1,
+  heavyThreads = 0
 ): AdmissionOptions => {
   const flag = env.CHAINGRAPH_API_ADMISSION ?? 'on';
   if (flag !== 'on' && flag !== 'off' && flag !== '') {
@@ -1304,14 +1307,19 @@ export const admissionOptionsFromEnv = (
       'CHAINGRAPH_API_LIGHT_MAX_LOOP_MS',
       defaultAdmissionOptions.lightMaxLoopMs
     ),
+    /*
+     * With heavy-lane threads (heavy-lane.ts) heavy requests run on their
+     * loops: the light share is this thread's loop, the heavy share the
+     * lane's threads.
+     */
     loop: {
       burstSeconds: nonNegativeNumber(
         env,
         'CHAINGRAPH_API_LOOP_BURST_SECONDS',
         defaultAdmissionOptions.loop.burstSeconds
       ),
-      lightShare,
-      ratePerSecond: 1000 * loopTarget,
+      lightShare: heavyThreads > 0 ? 1 / (1 + heavyThreads) : lightShare,
+      ratePerSecond: 1000 * loopTarget * (1 + Math.max(0, heavyThreads)),
     },
     loopGuard: nonNegativeNumber(
       env,
@@ -1336,6 +1344,7 @@ export const admissionOptionsFromEnv = (
     sizing: {
       cores,
       cpuTarget,
+      heavyThreads: Math.max(0, heavyThreads),
       loopTarget,
       processes,
       source:
