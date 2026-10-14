@@ -1,5 +1,5 @@
 /* eslint-disable max-lines, camelcase, @typescript-eslint/naming-convention, complexity, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, functional/no-mixed-type, max-params, functional/no-let, no-underscore-dangle, functional/no-loop-statement, functional/no-try-statement, @typescript-eslint/init-declarations, @typescript-eslint/parameter-properties, @typescript-eslint/strict-boolean-expressions */
-// cspell:ignore clickhouse unhex subquery analysed
+// cspell:ignore clickhouse unhex subquery analysed inlinable
 /**
  * Selection-driven SQL for the v2 API: one root field = ONE ClickHouse
  * statement, at any depth.

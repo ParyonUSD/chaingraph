@@ -1,5 +1,5 @@
 /* eslint-disable camelcase, @typescript-eslint/naming-convention, complexity, functional/no-throw-statement, @typescript-eslint/no-magic-numbers, @typescript-eslint/parameter-properties, max-params, no-underscore-dangle, max-lines, @typescript-eslint/no-use-before-define, functional/no-let, functional/no-loop-statement, @typescript-eslint/member-ordering */
-// cspell:ignore clickhouse unhex seqs nfts unindexed analysed txid
+// cspell:ignore clickhouse unhex seqs nfts unindexed analysed txid PUSD
 /**
  * SQL building blocks of the v2 API (Phase 2): a parameter binder and the
  * filter compilers for the typed `where` inputs.
