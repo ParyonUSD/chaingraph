@@ -4418,6 +4418,148 @@ test.serial(
 );
 
 /**
+ * From PostgreSQL 17, a scan of a temporary table reads ahead through a read
+ * stream that may pin as many local buffers as temp_buffers holds (PG 18.3):
+ * with effective_io_concurrency = 200 (the chart's value) and the default 8MB
+ * temp_buffers, the backfill preparation failed on mainnet with "no empty
+ * local buffer available" (2026-10-13 lab). The functions that read their
+ * temporary tables cap the read-ahead (unspent_node_ids_limit_temp_read_ahead)
+ * and restore it. Here, in a session with the smallest temp_buffers (fixed
+ * by its first temporary table, as on a pooled connection) and
+ * effective_io_concurrency = 200: an uncapped copy between temporary tables
+ * larger than the local buffers fails (PG 18+), the capped copy succeeds, the
+ * settings are restored, and a backfill batch, a scope backfill and a job
+ * batch run there with every output NULL again (rolled back).
+ */
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): temporary-table reads fit the session's local buffers`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    // cspell:ignore temp_buffers xact
+    const session = new pg.Client({
+      connectionString: postgresE2eConnectionStringTestDb,
+      options: '-c temp_buffers=800kB -c effective_io_concurrency=200',
+    });
+    await session.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      const setting = async (name: string) =>
+        (
+          await session.query<{ value: string }>(
+            `SELECT current_setting($1) AS value;`,
+            [name]
+          )
+        ).rows[0]!.value;
+      const version = Number(await setting('server_version_num'));
+      t.is(await setting('effective_io_concurrency'), '200');
+      // 40,000 rows: about 180 pages, more than the 100 local buffers
+      await session.query(/* sql */ `
+        CREATE TEMP TABLE read_ahead_source (id bigint PRIMARY KEY, ids integer[] NOT NULL);
+        INSERT INTO read_ahead_source SELECT g, ARRAY[1, 2, 3] FROM generate_series(1, 40000) g;
+        CREATE TEMP TABLE read_ahead_target (id bigint PRIMARY KEY);`);
+      const copy = /* sql */ `
+        INSERT INTO read_ahead_target SELECT s.id FROM read_ahead_source s WHERE s.ids = ARRAY[1, 2, 3];`;
+      await session.query('BEGIN;');
+      const uncapped = await session.query(copy).then(
+        () => undefined,
+        (error: Error) => error.message
+      );
+      await session.query('ROLLBACK;');
+      t.log({ uncapped: uncapped ?? 'ok', version });
+      if (version >= 180000) {
+        t.is(uncapped, 'no empty local buffer available', 'the hazard');
+      }
+      await session.query('BEGIN;');
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        const previous = (
+          await session.query<{ previous: string[] | null }>(
+            `SELECT unspent_node_ids_limit_temp_read_ahead() AS previous;`
+          )
+        ).rows[0]!.previous;
+        t.log({ capped: await setting('effective_io_concurrency'), previous });
+        await session.query(copy);
+        t.is(
+          (
+            await session.query<{ n: string }>(
+              `SELECT count(*) AS n FROM read_ahead_target;`
+            )
+          ).rows[0]!.n,
+          '40000'
+        );
+        await session.query(
+          `SELECT unspent_node_ids_restore_read_ahead($1::text[]);`,
+          [previous]
+        );
+        t.is(await setting('effective_io_concurrency'), '200', 'restored');
+        /*
+         * the job's functions, in this session, with every output NULL again
+         * (their temporary tables then hold every output of the partition);
+         * the partition locks first, so none of them returns busy
+         */
+        await session.query(/* sql */ `
+          SELECT pg_advisory_xact_lock(1970172785, 0), pg_advisory_xact_lock(1970172786, 0);
+          UPDATE output SET unspent_node_ids = NULL;
+          UPDATE unspent_tracking_settings
+            SET tracking_start_transaction_internal_id = (SELECT max(internal_id) FROM transaction);
+          UPDATE unspent_tracking_progress
+            SET backfill_transaction_internal_id = 0, input_transaction_internal_id = 0, block_internal_id = 0
+            WHERE partition_index = 0;`);
+        const backfill = (
+          await session.query<{
+            result: { [key: string]: unknown };
+          }>(/* sql */ `
+            SELECT unspent_node_ids_backfill_batch(0, p.partition_count, 65536) AS result
+              FROM unspent_tracking_progress p WHERE p.partition_index = 0;`)
+        ).rows[0]!.result;
+        t.is(backfill.previousBackfillWatermark, 0, 'the backfill batch ran');
+        const scope = (
+          await session.query<{ changed: string }>(
+            `SELECT unspent_node_ids_backfill_scope(NULL, NULL) AS changed;`
+          )
+        ).rows[0]!.changed;
+        t.true(Number(scope) > 0, 'the scope backfill ran');
+        const batch = (
+          await session.query<{
+            result: { [key: string]: unknown };
+          }>(/* sql */ `
+            SELECT unspent_node_ids_run_batch(0, p.partition_count,
+              (SELECT max(internal_id) FROM transaction), (SELECT max(internal_id) FROM block),
+              (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq),
+              65536, 65536, 65536, 0) AS result
+              FROM unspent_tracking_progress p WHERE p.partition_index = 0;`)
+        ).rows[0]!.result;
+        t.log({ backfill, batch, scope });
+        t.is(batch.previousInputWatermark, 0, 'the job batch ran');
+        t.is(
+          (
+            await session.query<{ n: string }>(
+              `SELECT count(*) AS n FROM output WHERE unspent_node_ids IS NULL;`
+            )
+          ).rows[0]!.n,
+          '0',
+          'every output written'
+        );
+        t.is(
+          await setting('effective_io_concurrency'),
+          '200',
+          'restored after the batches'
+        );
+      } finally {
+        await session.query('ROLLBACK;');
+      }
+    } finally {
+      await session.end();
+    }
+  }
+);
+
+/**
  * Re-partitioning preserves progress: each new partition (a range of first
  * hash bytes) starts at the minimum watermarks of the old partitions whose
  * ranges overlap its own, not at the global minimum (the 2026-10-13 lab: a
