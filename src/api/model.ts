@@ -360,6 +360,20 @@ export const inputByIdColumns: ReadonlySet<string> = new Set([
   'commit_seq',
 ]);
 
+/** The columns of input's p_outpoint projection (060_projections.sql). */
+export const inputByOutpointColumns: ReadonlySet<string> = new Set([
+  'transaction_hash',
+  'input_index',
+  'transaction_internal_id',
+  'outpoint_transaction_hash',
+  'outpoint_index',
+  'commit_seq',
+]);
+
+/** True when a spenders level reading `needs` can be served by input.p_outpoint. */
+export const inputsByOutpointCovers = (needs: ReadonlySet<string>) =>
+  [...needs].every((column) => inputByOutpointColumns.has(column));
+
 /** True when an inputs level reading `needs` can be served by input.p_txid. */
 export const inputsByIdCovers = (needs: ReadonlySet<string>) =>
   [...needs].every((column) => inputByIdColumns.has(column));
@@ -1106,10 +1120,23 @@ export const OutputEntity: Entity = {
        * (conflicting spends included). `accepted_by: node` keeps the inputs
        * of transactions that node accepts.
        */
-      source: (c, link, args) => {
+      source: (c, link, args, needs) => {
+        /*
+         * A level that reads a column outside input.p_outpoint (slim: no
+         * unlocking_bytecode, no sequence_number) reads the table, whose key
+         * is the spender's hash: the spenders' hashes come first from
+         * p_outpoint, so the table read is a key read. By the outpoint alone
+         * it was a bloom-filter read of every part (golden X5: 2.6-7.4 M rows
+         * for one input, varying with the part layout; fix-pass-11.md §2).
+         */
+        const byHash = inputsByOutpointCovers(needs)
+          ? ''
+          : `transaction_hash IN (SELECT transaction_hash FROM ${c.sql.view(
+              'input_at'
+            )} WHERE (outpoint_transaction_hash, outpoint_index) IN (${link})) AND `;
         const rows = `SELECT * FROM ${c.sql.view(
           'input_at'
-        )} WHERE (outpoint_transaction_hash, outpoint_index) IN (${link})`;
+        )} WHERE ${byHash}(outpoint_transaction_hash, outpoint_index) IN (${link})`;
         const node = acceptedByNode(c, args);
         return node === undefined ? rows : c.sql.acceptedRows(rows, '*', node);
       },
