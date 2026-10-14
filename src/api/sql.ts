@@ -2294,9 +2294,19 @@ export const transactionCandidates = (
   const sets = outputSideCandidates(sql, filter, node);
   if (sets.length === 1) return sets[0];
   if (sets.length > 1) {
-    return `SELECT * FROM (${sets
-      .map((set) => `(${set})`)
-      .join(' INTERSECT ')})`;
+    /*
+     * Intersected as a chain: each set is read among the transactions of the
+     * sets before it (its read can take the table's key on their hashes),
+     * not in full (mainnet L1: an INTERSECT read every minting output of the
+     * PUSD category, 2.8 M rows, to keep 7 transactions; fix-pass-11.md §1).
+     */
+    return sets
+      .slice(1)
+      .reduce(
+        (chain, set) =>
+          `SELECT transaction_hash, transaction_internal_id FROM (${set}) WHERE transaction_hash IN (SELECT transaction_hash FROM (${chain}))`,
+        sets[0]!
+      );
   }
   if (given(filter.has_input) && requiresOutpoint(filter.has_input)) {
     return `SELECT transaction_hash, transaction_internal_id FROM ${spendRelationSql(
