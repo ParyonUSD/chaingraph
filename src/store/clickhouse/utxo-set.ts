@@ -655,28 +655,32 @@ export const smallNodeTotalsInHashRangeSql = (
     snapshot
   )}`;
   const inRange = (column: string) => `(${hashRangeSql(column, range)})`;
-  const created = `(SELECT groupUniqArrayIf(transaction_hash, ${inRange(
+  /*
+   * The node's acceptance is read once per chunk (fix-pass-11.md §4): its
+   * transactions in the range, the ids' min and max and every id (the
+   * spenders' IN set, built from the array instead of a second and third
+   * read of the acceptance).
+   */
+  const acceptance = `(SELECT (groupUniqArrayIf(transaction_hash, ${inRange(
     'transaction_hash'
-  )}) FROM (${accepted})) AS __small_created`;
-  const ids = `(SELECT (min(transaction_internal_id), max(transaction_internal_id)) FROM (${accepted})) AS __small_ids`;
+  )}), min(transaction_internal_id), max(transaction_internal_id), groupArray(transaction_internal_id)) FROM (${accepted})) AS __small_acc`;
   const spent = `(SELECT groupUniqArrayIf((outpoint_transaction_hash, outpoint_index), ${inRange(
     'outpoint_transaction_hash'
   )}) FROM input
     WHERE ${agnostic}
-      AND transaction_internal_id BETWEEN tupleElement(__small_ids, 1) AND tupleElement(__small_ids, 2)
-      AND transaction_internal_id IN (SELECT transaction_internal_id FROM (${accepted}))) AS __small_spent`;
+      AND transaction_internal_id BETWEEN tupleElement(__small_acc, 2) AND tupleElement(__small_acc, 3)
+      AND transaction_internal_id IN (SELECT arrayJoin(tupleElement(__small_acc, 4)))) AS __small_spent`;
   const unspent = `SELECT o.* FROM (
       SELECT ${utxoSetReadColumns.join(', ')} FROM output
       WHERE ${agnostic} AND ${hashRangeSql('transaction_hash', range)}
-        AND transaction_hash IN (SELECT arrayJoin(__small_created))
+        AND transaction_hash IN (SELECT arrayJoin(tupleElement(__small_acc, 1)))
       LIMIT 1 BY transaction_hash, output_index) AS o
     WHERE (transaction_hash, output_index) NOT IN (
       SELECT tupleElement(__s, 1), tupleElement(__s, 2) FROM (SELECT arrayJoin(__small_spent) AS __s))`;
   const totals = `(SELECT groupArray(tuple(c, n, v, fn, fa, nn)) FROM (${totalsRowsSql(
     unspent
   )}) SETTINGS optimize_use_projections = 0) AS __small_totals`;
-  return `WITH ${created},
-  ${ids},
+  return `WITH ${acceptance},
   ${spent},
   ${totals}
 SELECT tupleElement(__t, 1) AS c, tupleElement(__t, 2) AS n, tupleElement(__t, 3) AS v,
