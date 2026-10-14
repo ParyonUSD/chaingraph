@@ -401,6 +401,73 @@ test('admission: a heavy request admitted under contention gets the contended se
   );
 });
 
+test('admission: back-to-back heavy requests on an idle server keep the server threads; leftover debt never refuses or throttles (fix-pass-9.md §2)', async (t) => {
+  /* mainnet L15: ~61 CPU-s per request, 1.65 s each, query_log measurements ~2 s late, default budgets (48 cores) */
+  const measured = new Map<string, number>();
+  const admission = new Admission(
+    { ...defaultAdmissionOptions, cpuSource: 'query_log' },
+    quietMeter
+  );
+  admission.start(
+    async (ids) =>
+      new Map(
+        ids.flatMap((id) => (measured.has(id) ? [[id, measured.get(id)!]] : []))
+      )
+  );
+  t.teardown(() => {
+    admission.stop();
+  });
+  teach(admission, 'L15', { cpuSeconds: 61, loopMs: 5 });
+  let now = 0;
+  for (let run = 0; run < 20; run += 1) {
+    const ticket = admission.admit(keys('L15'), now);
+    t.deepEqual(ticket.settings, {}, `run ${run}: the server's threads`);
+    const statement: StatementRecord = {
+      queryId: `l15-${run}`,
+      rows: 100_000_000,
+      shape: 'L15',
+    };
+    ticket.statements.push(statement);
+    now += 1_650;
+    admission.statementFinished(ticket, statement, now);
+    admission.finish(ticket, now);
+    /* the measurement of the previous run arrives while this one is being answered */
+    measured.set(statement.queryId, 61_000_000);
+    if (run % 2 === 1) await admission.pollLedger(now);
+    now += 20;
+  }
+  t.is(admission.stats.contended, 0, 'never contended');
+  t.is(admission.stats.refused.clickhouse, 0);
+  await admission.pollLedger(now);
+  /* L17 (nothing known: heavy, 0.25 CPU-s) right after: admitted at full threads */
+  const l17 = admission.admit(keys('L17'), now);
+  t.deepEqual(l17.settings, {});
+  admission.finish(l17, now);
+  /* a debt left by a heavy request larger than the burst is forgiven on an idle server */
+  admission.budgets.clickhouse.level.heavy = -500;
+  admission.budgets.clickhouse.level.light = -50;
+  const after = admission.admit(keys('L15'), now);
+  t.deepEqual(after.settings, {}, 'idle: neither refused nor throttled');
+  t.is(admission.stats.refused.clickhouse, 0);
+  /* while it runs the server is not idle: the debt it left refuses the next heavy request */
+  t.throws(() => admission.admit(keys('L15'), now), { message: /overloaded/u });
+  admission.finish(after, now);
+});
+
+test('admission: a reconciled charge is one net adjustment (giving back first was capped at the capacity)', (t) => {
+  const admission = new Admission(options(), quietMeter);
+  teach(admission, 'heavy', 5);
+  const ticket = admission.admit(keys('heavy'), 0);
+  t.is(admission.budgets.clickhouse.level.heavy, 3);
+  /* 1 s later the share is full again; the request cost what it was charged */
+  ticket.statements.push({ queryId: 'h', rows: 5 / 0.3e-6, shape: 'h' });
+  admission.finish(ticket, 1_000);
+  t.true(
+    Math.abs(admission.budgets.clickhouse.level.heavy - 8) < 1e-6,
+    `not charged twice: ${admission.budgets.clickhouse.level.heavy}`
+  );
+});
+
 test('admission: a busy event loop refuses heavy requests whatever the budget says; light ones still run', (t) => {
   const admission = new Admission(options(), () => ({
     activeMs: 100,

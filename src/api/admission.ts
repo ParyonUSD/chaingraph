@@ -41,6 +41,9 @@
  *   heavy tokens.
  * - **Fast refusals.** A request whose budget is exhausted is refused at
  *   once: OVERLOADED, HTTP 503, Retry-After = the budget's time to repay.
+ * - **Idle never refuses.** With no request in flight (and the loop not
+ *   busy) a request is admitted whatever the levels, and any debt is
+ *   forgiven: debt only rations concurrent load (fix pass 9).
  * - **Backstops kept.** Heavy requests in flight per process are capped
  *   (`heavyMaxInFlight`), an event loop busier than `loopGuard` refuses heavy
  *   requests whatever the budget says (a misprediction must not stall the
@@ -104,10 +107,11 @@ export interface AdmissionOptions {
   /** ClickHouse settings of light and heavy requests' statements. */
   settings: { [cls in RequestClass]: { [name: string]: number | string } };
   /**
-   * Settings added to a heavy request admitted under contention (its
-   * budget share below `contendedFill` of its capacity, or half the
-   * heavy in-flight cap taken): about 2 cores' worth of threads per heavy
-   * slot, so light statements find cores. An uncontended heavy request
+   * Settings added to a heavy request admitted under contention (another
+   * heavy request in flight, and its budget share below `contendedFill`
+   * of its capacity or half the heavy in-flight cap taken): about 2 cores'
+   * worth of threads per heavy slot, so light statements find cores. An
+   * uncontended heavy request (one at a time, whatever the past debt)
    * runs with the server's threads.
    */
   contendedSettings: { [name: string]: number | string };
@@ -286,6 +290,21 @@ export class Budget {
       return 'heavy';
     }
     return undefined;
+  }
+
+  /**
+   * Charge `cost` to a share unconditionally (an idle process admits
+   * whatever its levels: `Admission.admit`).
+   */
+  charge(cls: RequestClass, cost: number): RequestClass {
+    this.level[cls] -= cost;
+    return cls;
+  }
+
+  /** Forgive debt: every share below zero back to zero (an idle process). */
+  forgive() {
+    this.level.heavy = Math.max(0, this.level.heavy);
+    this.level.light = Math.max(0, this.level.light);
   }
 
   /** Give back (a positive `amount`) or charge more (a negative one) to a share. */
@@ -700,6 +719,16 @@ export class Admission {
    */
   admit(keys: PlanKeys | undefined, now = performance.now()): Ticket {
     const { cls, cost, source } = this.predict(keys);
+    /*
+     * Idle: no request of this process in flight and the loop not busy
+     * (live re-runs run outside requests). Nothing competes for the
+     * budgets, so a request is never refused and a leftover debt (a heavy
+     * request larger than the burst, a late measurement) is forgiven
+     * (fix-pass-9.md §2: debt from two sequential L15s refused L17 on an
+     * idle server).
+     */
+    const idle =
+      this.active.size === 0 && this.loopUtilisation < this.options.loopGuard;
     const refuse = (reason: RefusalReason, detail: string, wait: number) => {
       this.stats.refused[reason] += 1;
       const retryAfter = Math.max(
@@ -709,6 +738,7 @@ export class Admission {
       return overloadedError(cls, reason, detail, retryAfter);
     };
     if (
+      !idle &&
       cls === 'heavy' &&
       this.stats.inFlight.heavy >= this.options.heavyMaxInFlight
     ) {
@@ -728,7 +758,13 @@ export class Admission {
     const { clickhouse, loop } = this.budgets;
     clickhouse.refill(now);
     loop.refill(now);
-    const chShare = clickhouse.take(cls, cost.cpuSeconds);
+    if (idle) {
+      clickhouse.forgive();
+      loop.forgive();
+    }
+    const chShare = idle
+      ? clickhouse.charge(cls, cost.cpuSeconds)
+      : clickhouse.take(cls, cost.cpuSeconds);
     if (chShare === undefined) {
       throw refuse(
         'clickhouse',
@@ -738,7 +774,9 @@ export class Admission {
         clickhouse.secondsToPositive(cls)
       );
     }
-    const loopShare = loop.take(cls, cost.loopMs);
+    const loopShare = idle
+      ? loop.charge(cls, cost.loopMs)
+      : loop.take(cls, cost.loopMs);
     if (loopShare === undefined) {
       clickhouse.adjust(chShare, cost.cpuSeconds);
       throw refuse(
@@ -756,8 +794,17 @@ export class Admission {
       { clickhouse: chShare, loop: loopShare },
       now
     );
+    /*
+     * Contended only under concurrent load: another heavy request of this
+     * process in flight, and the heavy share below `contendedFill` or half
+     * the in-flight cap taken. Past debt alone never throttles: a
+     * sequential run of one heavy document keeps the server's threads
+     * (fix-pass-9.md §2: back-to-back L15s were throttled to max_threads 4,
+     * 1.65 -> 13.6 s, on an otherwise idle server).
+     */
     const contended =
       cls === 'heavy' &&
+      this.stats.inFlight.heavy > 0 &&
       (clickhouse.fill().heavy < this.options.contendedFill ||
         2 * this.stats.inFlight.heavy >= this.options.heavyMaxInFlight);
     ticket.settings = contended
@@ -853,8 +900,17 @@ export class Admission {
         : actual > this.options.lightMaxLoopMs;
     const from = ticket.shares[budget];
     const to = heavyNow ? 'heavy' : from;
-    this.budgets[budget].adjust(from, charged);
-    this.budgets[budget].adjust(to, -actual);
+    if (from === to) {
+      /*
+       * One net adjustment: giving the charge back first was capped at the
+       * capacity on a refilled share, so the actual cost was charged a
+       * second time (fix-pass-9.md §2: the debt behind contended L15s).
+       */
+      this.budgets[budget].adjust(from, charged - actual);
+    } else {
+      this.budgets[budget].adjust(from, charged);
+      this.budgets[budget].adjust(to, -actual);
+    }
     ticket.shares[budget] = to;
     if (budget === 'clickhouse') ticket.chargedCpu = actual;
     else ticket.chargedLoop = actual;
