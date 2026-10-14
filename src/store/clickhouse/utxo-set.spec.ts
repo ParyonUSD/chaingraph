@@ -736,6 +736,7 @@ e2e(
       t.deepEqual(spot!.failed, []);
       t.true(spot!.scopes.every((scope) => scope.equal));
       t.is(chunkStatements, expected, `node ${node}: totals chunks per node`);
+      t.deepEqual(spot!.totalsReference, { chunks: expected, form: 'small' });
       /* fix-pass-10.md §2: the small-node form answers as the chain-range form, in any chunking */
       const snapshot = snapshotForNode(
         await readSnapshotMulti(client, [node], { utxo: true }),

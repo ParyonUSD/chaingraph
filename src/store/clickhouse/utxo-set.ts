@@ -1221,6 +1221,8 @@ export interface UtxoSetSpotCheck {
    * when any scope failed, unless `throwOnFailure` is false.
    */
   failed: { kind: UtxoSpotCheckScope['kind']; value: string; error: string }[];
+  /** How the totals scope's reference was computed (`referenceTotalsChunked`), when it ran. */
+  totalsReference?: { chunks: number; form: 'large' | 'small' };
 }
 
 /** A spot-check where some scope could not be compared (`check.failed`): the check failed, loudly. */
@@ -1426,6 +1428,7 @@ export const spotCheckUtxoSet = async (
       { spot: value }
     );
   }
+  const ran: Pick<UtxoSetSpotCheck, 'totalsReference'> = {};
   if (options.totals ?? false) {
     /* chunked: the single-statement reference needed > 280 GiB on mainnet (fix-pass-7.md §5) */
     try {
@@ -1437,23 +1440,21 @@ export const spotCheckUtxoSet = async (
         params,
         settings
       );
-      const reference = totalsAnswer(
-        (
-          await referenceTotalsChunked(client, snapshot, {
-            ...(options.totalsChunks === undefined
-              ? {}
-              : { chunks: options.totalsChunks }),
-            ...(options.totalsUtxosPerChunk === undefined
-              ? {}
-              : { utxosPerChunk: options.totalsUtxosPerChunk }),
-            ...(options.totalsForm === undefined
-              ? {}
-              : { form: options.totalsForm }),
-            maxExecutionSeconds: options.maxExecutionSeconds ?? 120,
-            utxos: totalOutputs(storedByCategory),
-          })
-        ).totals
-      );
+      const computed = await referenceTotalsChunked(client, snapshot, {
+        ...(options.totalsChunks === undefined
+          ? {}
+          : { chunks: options.totalsChunks }),
+        ...(options.totalsUtxosPerChunk === undefined
+          ? {}
+          : { utxosPerChunk: options.totalsUtxosPerChunk }),
+        ...(options.totalsForm === undefined
+          ? {}
+          : { form: options.totalsForm }),
+        maxExecutionSeconds: options.maxExecutionSeconds ?? 120,
+        utxos: totalOutputs(storedByCategory),
+      });
+      ran.totalsReference = { chunks: computed.chunks, form: computed.form };
+      const reference = totalsAnswer(computed.totals);
       const stored = totalsAnswer(storedByCategory);
       scopes.push({
         equal: stored === reference,
@@ -1471,6 +1472,7 @@ export const spotCheckUtxoSet = async (
     generation: mark.generation,
     node: nodeId,
     scopes,
+    ...ran,
     visible: snapshot.visible,
     watermark: mark.watermark,
   };
