@@ -172,6 +172,10 @@ export interface RequestScope {
   ticket?: Ticket;
   /** An HTTP request (server.ts `listen`): its ticket ends when the response closes. */
   http?: boolean;
+  /** The response cache was looked up already (front.ts): the cache plugin only stores. */
+  cacheChecked?: boolean;
+  /** The request snapshots of the request's executions (a heavy-lane worker reports their marks). */
+  snapshots?: PinnedSnapshot[];
 }
 
 /**

@@ -1,5 +1,5 @@
 /* eslint-disable functional/no-throw-statement, @typescript-eslint/no-magic-numbers, complexity, functional/no-loop-statement, max-params, @typescript-eslint/naming-convention, @typescript-eslint/parameter-properties, @typescript-eslint/no-unsafe-argument */
-// cspell:ignore clickhouse
+// cspell:ignore clickhouse serialisation serialised recognise
 /**
  * Operational parts of the v2 API (R34, R37):
  * - query limits (depth, aliases, root fields, total fields) as validation
@@ -29,6 +29,7 @@ import { getOperationAST, GraphQLError, Kind, print } from 'graphql';
 import type { Plugin } from 'graphql-yoga';
 
 import type { ApiDb } from './db.js';
+import { requestScope } from './db.js';
 import type { ApiContext } from './schema.js';
 
 /* ------------------------------------------------------------------ */
@@ -229,7 +230,10 @@ export interface ResponseCacheStats {
 interface CacheEntry {
   /** node id → watermark at which the response was computed (node 0: visible0). */
   marks: Map<number, bigint>;
-  result: ExecutionResult;
+  /** The result (computed on this thread), absent for a heavy-lane answer. */
+  result?: ExecutionResult;
+  /** The serialised response body (a heavy-lane answer, or a result once served by `lookupBody`). */
+  body?: Uint8Array | string;
 }
 
 /**
@@ -306,6 +310,9 @@ export class ResponseCache {
           args.operationName,
           args.variableValues
         );
+        /* looked up already by the HTTP front path (front.ts): only store */
+        const checked = requestScope.getStore()?.cacheChecked === true;
+        if (checked) return { onExecuteDone: this.storeOnDone(key, args) };
         const names = nodeNames(args as never);
         const ids = await Promise.all(
           names.map(async (name) => this.db.nodeId(name))
@@ -313,7 +320,7 @@ export class ResponseCache {
         const marks = await this.db.watermarks([0, ...ids]);
         const cached = this.entries.get(key);
         if (
-          cached !== undefined &&
+          cached?.result !== undefined &&
           [...cached.marks].every(
             ([node, mark]) => (marks.get(node) ?? 0n) === mark
           )
@@ -325,30 +332,91 @@ export class ResponseCache {
           return undefined;
         }
         this.stats.misses += 1;
-        return {
-          onExecuteDone: ({ result }) => {
-            const single = result as ExecutionResult;
-            if (
-              Symbol.asyncIterator in (result as object) ||
-              (single.errors !== undefined && single.errors.length > 0)
-            ) {
-              return;
-            }
-            const snapshot = (args.contextValue as ApiContext).snapshot
-              ?.resolved;
-            if (snapshot === undefined) return;
-            const computed = new Map<number, bigint>([
-              [0, snapshot.visible0],
-              ...[...snapshot.visibleByNode].filter(([node]) => node !== 0),
-            ]);
-            this.entries.delete(key);
-            this.entries.set(key, { marks: computed, result: single });
-            while (this.entries.size > this.maxEntries) {
-              this.entries.delete(this.entries.keys().next().value!);
-            }
-          },
-        };
+        return { onExecuteDone: this.storeOnDone(key, args) };
       },
     };
+  }
+
+  /** The cache key of a request, or undefined when it is not cacheable. */
+  // eslint-disable-next-line class-methods-use-this
+  keyOf(
+    document: DocumentNode,
+    operationName: string | null | undefined,
+    variables: unknown
+  ) {
+    const operation = getOperationAST(document, operationName ?? undefined);
+    if (
+      operation?.operation !== 'query' ||
+      uncachedFields.test(print(document))
+    ) {
+      return undefined;
+    }
+    return cacheKey(document, operationName, variables);
+  }
+
+  /**
+   * The HTTP front path's lookup (front.ts): the serialised body of a
+   * response computed at the watermarks the request reads now, or
+   * undefined (a miss).
+   */
+  async lookupBody(key: string, nodeNames: readonly string[]) {
+    const ids = await Promise.all(
+      nodeNames.map(async (name) => this.db.nodeId(name))
+    );
+    const marks = await this.db.watermarks([0, ...ids]);
+    const cached = this.entries.get(key);
+    if (
+      cached === undefined ||
+      ![...cached.marks].every(
+        ([node, mark]) => (marks.get(node) ?? 0n) === mark
+      )
+    ) {
+      this.stats.misses += 1;
+      return undefined;
+    }
+    this.stats.hits += 1;
+    this.entries.delete(key);
+    this.entries.set(key, cached);
+    cached.body ??= JSON.stringify(cached.result);
+    return cached.body;
+  }
+
+  /** Store a serialised response (a heavy-lane answer without errors). */
+  storeBody(
+    key: string,
+    marks: readonly [number, string][],
+    body: Uint8Array | string
+  ) {
+    this.store(key, {
+      body,
+      marks: new Map(marks.map(([node, mark]) => [node, BigInt(mark)])),
+    });
+  }
+
+  private storeOnDone(key: string, args: { contextValue: unknown }) {
+    return ({ result }: { result: unknown }) => {
+      const single = result as ExecutionResult;
+      if (
+        Symbol.asyncIterator in (result as object) ||
+        (single.errors !== undefined && single.errors.length > 0)
+      ) {
+        return;
+      }
+      const snapshot = (args.contextValue as ApiContext).snapshot?.resolved;
+      if (snapshot === undefined) return;
+      const computed = new Map<number, bigint>([
+        [0, snapshot.visible0],
+        ...[...snapshot.visibleByNode].filter(([node]) => node !== 0),
+      ]);
+      this.store(key, { marks: computed, result: single });
+    };
+  }
+
+  private store(key: string, entry: CacheEntry) {
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    while (this.entries.size > this.maxEntries) {
+      this.entries.delete(this.entries.keys().next().value!);
+    }
   }
 }
