@@ -34,6 +34,7 @@ import type {
   Sel,
   ValueKind,
 } from './compile.js';
+import { inlinePresent } from './compile.js';
 import type {
   BlockFilter,
   BlockInclusionFilter,
@@ -907,7 +908,9 @@ export const TransactionEntity: Entity = {
            */
           const blockColumnsRead = [
             ...new Set(['internal_id', 'height', 'hash', ...blockNeeds]),
-          ];
+          ].map((column) =>
+            column === inlinePresent ? `toUInt8(1) AS ${inlinePresent}` : column
+          );
           return `SELECT bt.transaction_hash AS transaction_hash, bt.block_internal_id AS block_internal_id,
           b.height AS height, b.hash AS block_hash, bt.transaction_index AS transaction_index${blockNeeds
             .map((column) => `, b.${column} AS ${inlineBlockPrefix}${column}`)
@@ -1416,11 +1419,7 @@ export const BlockInclusionEntity: Entity = {
     /* inlined: the inclusions level joins the block rows (fix-pass-11.md §1) */
     block: {
       ...blockById('block_internal_id'),
-      inline: {
-        columns: blockColumns,
-        key: 'internal_id',
-        prefix: inlineBlockPrefix,
-      },
+      inline: { columns: blockColumns, prefix: inlineBlockPrefix },
     },
     block_internal_id: scalar(str('block_internal_id')),
     transaction_index: scalar('transaction_index'),

@@ -263,9 +263,13 @@ export interface RelationField {
    * of the target over `columns` (no arguments), the parent's source
    * provides those target columns as `${prefix}${column}` (they are in its
    * `needs`) and the child row is decoded from the parent's tuple: no level
-   * of its own. NULL in `${prefix}${key}` (no matching row) is a null child.
+   * of its own. `${prefix}${inlinePresent}` is 1 when the parent row has a
+   * child row (a LEFT JOIN fills 0 otherwise: a null child). Joining in a
+   * level's source pays where the child level would read a table by a
+   * non-key column (block by id); the spent outputs of inputs (a key read)
+   * were 4-7 ms slower joined than as their own level (fix-pass-11.md §1).
    */
-  inline?: { prefix: string; columns: readonly string[]; key: string };
+  inline?: { prefix: string; columns: readonly string[] };
 }
 
 export type Field = ComputedField | RelationField | ScalarField;
@@ -530,6 +534,9 @@ const renameColumns = (
     expr
   );
 
+/** The marker column of an inlined row (`inline`): 1 when the parent row has one. */
+export const inlinePresent = '__present';
+
 /** A level's tuple elements, needed columns and client positions (shared by an inlined row). */
 interface LevelParts {
   elements: string[];
@@ -553,7 +560,9 @@ const planLevel = (
   c: Ctx,
   pipeline = false,
   /* an inlined row (`inline`): the parent's parts, its columns as `${rename}${column}` */
-  inlined?: { parts: LevelParts; rename: string }
+  inlined?: { parts: LevelParts; rename: string },
+  /* false for the root page: a root's source provides no inlined columns */
+  allowInline = true
 ): LevelPlan => {
   const { elements, needs, clientPositions } = inlined?.parts ?? {
     clientPositions: new Set<number>(),
@@ -595,11 +604,11 @@ const planLevel = (
     }
     if (field.kind !== 'relation') return;
     const target = field.target();
-    if (inlinable(field, target, sel, rename !== undefined)) {
+    if (allowInline && inlinable(field, target, sel, rename !== undefined)) {
       /* the child row from this level's tuple: no level of its own */
-      const { prefix: columnPrefix, key } = field.inline!;
-      const keyPosition = element(`${columnPrefix}${key}`);
-      needs.add(`${columnPrefix}${key}`);
+      const { prefix: columnPrefix } = field.inline!;
+      const keyPosition = element(`${columnPrefix}${inlinePresent}`);
+      needs.add(`${columnPrefix}${inlinePresent}`);
       clientPositions.add(keyPosition);
       const rowPlan = planLevel(
         st,
@@ -614,9 +623,9 @@ const planLevel = (
       decoders.push((values, base, _record, related, data, count) => {
         const present = values[base + keyPosition];
         related[sel.key] =
-          present === null || present === undefined
-            ? null
-            : rowPlan.decode(values, base, data, count);
+          present === 1 || present === '1'
+            ? rowPlan.decode(values, base, data, count)
+            : null;
       });
       return;
     }
@@ -1064,7 +1073,17 @@ export const compileRoot = (
   /* the page's WITH item: after the root's own (candidates …), before the levels' */
   const reserved = sql.withItems.length;
   sql.withItems.push('');
-  const plan = planLevel(st, root.entity, sels, '__page', 1, c);
+  const plan = planLevel(
+    st,
+    root.entity,
+    sels,
+    '__page',
+    1,
+    c,
+    false,
+    undefined,
+    false
+  );
   root.order.forEach((term) => {
     referencedColumns(term.expr, root.entity.columns).forEach((column) =>
       plan.needs.add(column)
