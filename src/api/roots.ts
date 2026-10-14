@@ -270,17 +270,25 @@ const candidateWindow = (
     'UInt64',
     idBounds
   );
+  /*
+   * One array of (hash, id) tuples, read by arrayJoin: `tupleElement` of a
+   * scalar is folded into a constant holding the whole column, and the
+   * analyzer hashes every constant of a subquery's tree each time it
+   * resolves it (a reference re-resolves the referenced level and its
+   * ancestors): a window of 60 k hashes was ~2 MB hashed per reference of
+   * the page (fix-pass-11.md §1).
+   */
   const first = sql.scalar(
     '__cand_window',
-    `SELECT (groupArray(transaction_hash), groupArray(transaction_internal_id)) FROM (SELECT transaction_hash, transaction_internal_id FROM (${candidates})${
+    `SELECT groupArray(tuple(transaction_hash, transaction_internal_id)) FROM (SELECT transaction_hash, transaction_internal_id FROM (${candidates})${
       onIds.length === 0 ? '' : ` WHERE ${onIds.join(' AND ')}`
     } ORDER BY transaction_internal_id ${dir} LIMIT 1 BY transaction_internal_id LIMIT ${k})`
   );
   return {
-    capped: `toUInt8(length(tupleElement(${first}, 2)) = ${k})`,
+    capped: `toUInt8(length(${first}) = ${k})`,
     where: checks(
-      `SELECT arrayJoin(tupleElement(${first}, 1))`,
-      `SELECT arrayJoin(tupleElement(${first}, 2))`
+      `SELECT tupleElement(__w, 1) FROM (SELECT arrayJoin(${first}) AS __w)`,
+      `SELECT tupleElement(__w, 2) FROM (SELECT arrayJoin(${first}) AS __w)`
     ),
   };
 };
