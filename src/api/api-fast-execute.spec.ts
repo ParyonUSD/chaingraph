@@ -131,3 +131,53 @@ e2e(
     t.true(fastExecutionStats.gaveUp > before.gaveUp, 'the error gave up');
   }
 );
+
+e2e(
+  '[e2e] group numbers (fix-pass-10.md §1): every document answers byte for byte as with key texts; the statements number groups only when on',
+  async (t) => {
+    t.timeout(120_000);
+    const env = await setup(t, 'group_numbers');
+    const grouped = createApi(env.client, {
+      admission: disabledAdmissionOptions,
+    });
+    const texts = createApi(env.client, {
+      admission: disabledAdmissionOptions,
+    });
+    texts.db.groupNumbers = false;
+    const statements = { grouped: [] as string[], texts: [] as string[] };
+    grouped.db.onQuery = (event) => {
+      if (event.kind === 'data') statements.grouped.push(event.sql);
+    };
+    texts.db.onQuery = (event) => {
+      if (event.kind === 'data') statements.texts.push(event.sql);
+    };
+    const servers = [await listen(grouped), await listen(texts)];
+    t.teardown(async () => Promise.all(servers.map((s) => s.close())));
+    /* shared parents (inclusions of one block), two-column keys (outpoints), coinbase (NULL-like zero outpoints) */
+    const extra: [string, string][] = [
+      [
+        'blocks with their transactions, inputs and outpoints',
+        `query { blocks(node: "${one}", limit: 3) { nodes { height transactions { transaction_index transaction { hash
+          inputs { input_index outpoint_transaction_hash outpoint { value_satoshis transaction { hash block_inclusions { block { height } } } } } } } } } }`,
+      ],
+    ];
+    for (const [label, query] of [...documents, ...extra]) {
+      if (label.startsWith('an error')) continue;
+      const [a, b] = await Promise.all(
+        servers.map(async (server) =>
+          (
+            await fetch(server.url, {
+              body: JSON.stringify({ query, variables: { n: one, yes: true } }),
+              headers: { 'content-type': 'application/json' },
+              method: 'POST',
+            })
+          ).text()
+        )
+      );
+      t.is(a, b, label);
+      t.false(a!.includes('"errors"'), `${label}: ${a!.slice(0, 300)}`);
+    }
+    t.true(statements.grouped.some((sql) => sql.includes('transform(')));
+    t.false(statements.texts.some((sql) => sql.includes('transform(')));
+  }
+);

@@ -201,6 +201,8 @@ export interface Ctx {
   nodeId: (name: string) => number;
   /** Rows one statement may return (all levels); default `maxRowsPerStatement`. */
   maxRows?: number;
+  /** Match relationship levels by group numbers (`GroupLink`); false: by key texts (default true). */
+  groupNumbers?: boolean;
 }
 
 export interface ScalarField {
@@ -546,16 +548,17 @@ const planLevel = (
       element(keyText(column))
     );
     /* group numbers for constant levels; key texts (read by the client) for pipeline levels */
-    const groupLink: GroupLink | undefined = childPipeline
-      ? undefined
-      : {
-          child,
-          childKeyWidth: field.childKeys.length,
-          groupAt: -1,
-          keyPositions: parentKeyPositions,
-          parent: level,
-          parentPrefix: prefix,
-        };
+    const groupLink: GroupLink | undefined =
+      childPipeline || c.groupNumbers === false
+        ? undefined
+        : {
+            child,
+            childKeyWidth: field.childKeys.length,
+            groupAt: -1,
+            keyPositions: parentKeyPositions,
+            parent: level,
+            parentPrefix: prefix,
+          };
     if (groupLink === undefined) {
       parentKeyPositions.forEach((position) => clientPositions.add(position));
     } else {

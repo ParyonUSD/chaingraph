@@ -2083,16 +2083,17 @@ const liveEnv = (
   db: ApiDb,
   snapshot: VisibilitySnapshot,
   nodeName: string
-): RootEnv => ({
-  ...singleNodeEnv(
+): RootEnv => {
+  const env = singleNodeEnv(
     snapshot,
     nodeName,
     db.maxResultRows,
     db.utxoSetPolicy,
     db.authchainMaxBranches
-  ),
-  db,
-});
+  );
+  env.ctx.groupNumbers = db.groupNumbers;
+  return { ...env, db };
+};
 
 builder.subscriptionType({
   description:

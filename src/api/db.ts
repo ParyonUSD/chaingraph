@@ -243,6 +243,13 @@ export class ApiDb {
   /** Rows (all levels) one root statement may return (R33): more is an error. */
   maxResultRows = 500_000;
 
+  /**
+   * Relationship levels matched by group numbers (fix-pass-10.md §1);
+   * CHAINGRAPH_API_GROUP_NUMBERS=off matches them by key texts (fix pass 9's
+   * statements: the A/B switch of the next GKE session).
+   */
+  groupNumbers = process.env.CHAINGRAPH_API_GROUP_NUMBERS !== 'off';
+
   /** Test hook: every query the API sends (after it is sent). */
   onQuery: ((event: QueryEvent) => void) | undefined;
 
@@ -663,6 +670,7 @@ export class PinnedSnapshot {
         this.db.authchainMaxBranches
       );
       env.sql.readsById = readsByIdFrom(await this.db.storeFeatures());
+      env.ctx.groupNumbers = this.db.groupNumbers;
       return env;
     }
     const snapshot = await this.get(node);
@@ -681,6 +689,7 @@ export class PinnedSnapshot {
     sql.readsById = readsByIdFrom(await this.db.storeFeatures());
     return {
       ctx: {
+        groupNumbers: this.db.groupNumbers,
         maxRows: this.db.maxResultRows,
         node: snapshot.nodeId === nodeAgnosticId ? undefined : snapshot.nodeId,
         nodeId,
