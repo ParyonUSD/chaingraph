@@ -770,6 +770,7 @@ e2e(
     // concurrent commits: every response is internally consistent (watermark >= page ids)
     const ids = await internalIds(env);
     const snapshotsBefore = env.api.db.stats.snapshots;
+    const retriesBefore = env.api.db.stats.speculativeRetries;
     const requests = 30;
     const responses = await Promise.all([
       ...Array.from({ length: requests }, async () =>
@@ -804,10 +805,11 @@ e2e(
         ])
         .then(() => undefined),
     ]);
+    /* a request run on a cached snapshot a concurrent commit made stale runs again on a checked one */
     t.is(
       env.api.db.stats.snapshots - snapshotsBefore,
-      requests,
-      'one readSnapshot per request'
+      requests + env.api.db.stats.speculativeRetries - retriesBefore,
+      'one readSnapshot per request (and per speculative retry)'
     );
     responses.forEach((response) => {
       if (response === undefined) return;
@@ -1266,6 +1268,8 @@ e2e(
   '[e2e] fix pass 3: request snapshots are reused while the watermarks stand still and never trail the watermark at request start',
   async (t) => {
     const env = await setup(t, 'cache');
+    /* the checked path (the speculative one has its own test below) */
+    env.api.db.speculativeSnapshots = false;
     const variables = { limit: 5000, node: one, paryon };
     const first = await env.gql(allHolders, variables);
     const hits = env.api.db.stats.snapshotCacheHits;
@@ -1293,6 +1297,49 @@ e2e(
       BigInt(String(data.params.visible)) >= published,
       'not staler than the watermark published before the request'
     );
+  }
+);
+
+e2e(
+  '[e2e] fix pass 11: a request on a cached snapshot is answered while the watermark check runs beside it; a commit in between makes it run again on a checked snapshot',
+  async (t) => {
+    const env = await setup(t, 'speculative');
+    const variables = { limit: 5000, node: one, paryon };
+    const first = await env.gql(allHolders, variables);
+    const retries = env.api.db.stats.speculativeRetries;
+    const hits = env.api.db.stats.snapshotCacheHits;
+    const recorder = recordQueries(env.api);
+    const second = await env.gql(allHolders, variables);
+    recorder.stop();
+    t.deepEqual(second, first);
+    t.is(env.api.db.stats.snapshotCacheHits, hits + 1, 'confirmed');
+    t.is(env.api.db.stats.speculativeRetries, retries, 'no retry');
+    t.deepEqual(
+      recorder.events
+        .filter((event) => event.kind === 'snapshot')
+        .map((event) => event.sql.includes('void_seqs')),
+      [false],
+      'one cheap watermark query, no full snapshot read'
+    );
+    /* a commit lands after the snapshot was cached: the speculative run is discarded */
+    await env.extendNodeOne([]);
+    const published = await readWatermark(env.client, env.nodes.node1);
+    const after = recordQueries(env.api);
+    const third = await env.gql(allHolders, variables);
+    after.stop();
+    t.deepEqual(third, first, 'an empty block changes no holder');
+    t.is(env.api.db.stats.speculativeRetries, retries + 1, 'one retry');
+    const data = after.events.filter((event) => event.kind === 'data');
+    t.true(
+      BigInt(String(data[data.length - 1]!.params.visible)) >= published,
+      'the answer is not staler than the watermark published before the request'
+    );
+    /* once the marks stand still (the UTXO set caught up too), requests are confirmed again */
+    await env.store.catchUpUtxoSet();
+    await env.gql(allHolders, variables);
+    const settled = env.api.db.stats.speculativeRetries;
+    await env.gql(allHolders, variables);
+    t.is(env.api.db.stats.speculativeRetries, settled, 'no further retry');
   }
 );
 

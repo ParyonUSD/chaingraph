@@ -505,60 +505,98 @@ export class SnapshotCache {
     private readonly maxEntries = defaultSnapshotCacheEntries
   ) {}
 
+  /** The cache key of a node set (and whether it reads the UTXO marks). */
+  private static key(nodeIds: readonly number[], options: SnapshotReadOptions) {
+    const nodes = [...new Set(nodeIds)].sort((a, b) => a - b);
+    return {
+      key: `${options.utxo === true ? 'u' : ''}${nodes.join(',')}`,
+      nodes,
+    };
+  }
+
+  /** The cached snapshot of a node set, unverified (`verify`), or undefined. */
+  peek(nodeIds: readonly number[], options: SnapshotReadOptions = {}) {
+    return this.entries.get(SnapshotCache.key(nodeIds, options).key);
+  }
+
+  /**
+   * Drop a node set's cached snapshot if it is still `stale` (a watermark
+   * check found newer marks): until a checked read caches the new one, no
+   * request runs on it speculatively again.
+   */
+  forget(
+    nodeIds: readonly number[],
+    options: SnapshotReadOptions,
+    stale: MultiNodeSnapshot
+  ) {
+    const { key } = SnapshotCache.key(nodeIds, options);
+    if (this.entries.get(key) === stale) this.entries.delete(key);
+  }
+
+  /**
+   * Whether `cached` is still the snapshot of the node set: one watermark
+   * query (read now) whose marks equal the cached snapshot's.
+   */
+  async verify(
+    nodeIds: readonly number[],
+    options: SnapshotReadOptions,
+    cached: MultiNodeSnapshot
+  ) {
+    const { nodes } = SnapshotCache.key(nodeIds, options);
+    const withUtxo = options.utxo === true;
+    const rows = await this.client.query<{
+      node: number;
+      visible: string;
+      utxo?: string;
+    }>(withUtxo ? watermarksWithUtxoSql : watermarksSql, {
+      nodes: [nodeAgnosticId, ...nodes],
+    });
+    const marks = new Map(
+      rows
+        .filter((row) => row.visible !== '')
+        .map((row) => [Number(row.node), BigInt(row.visible)])
+    );
+    const utxoMarks = new Map(
+      rows
+        .filter((row) => row.utxo !== undefined && row.utxo !== '')
+        .map((row) => [Number(row.node), row.utxo!])
+    );
+    /*
+     * The spend watermark is not compared: a cached (lower) one is still
+     * exact, the tail join just covers more (spend-index.md, read rule).
+     * The UTXO set mark is: a cached lower one would still be exact, but
+     * every request would pay the correction until the next commit, and
+     * an older generation's rows are dropped some time after a rebase
+     * (utxo-async.md). While visible(n) stands still, the newest mark is
+     * at most visible(n), so it is the mark a fresh snapshot would take.
+     */
+    return (
+      (marks.get(nodeAgnosticId) ?? 0n) === cached.visible0 &&
+      nodes.every(
+        (node) => (marks.get(node) ?? 0n) === cached.visibleByNode.get(node)
+      ) &&
+      (!withUtxo ||
+        nodes.every((node) => {
+          const mark = cached.utxoByNode?.get(node);
+          return (
+            utxoMarks.get(node) ===
+            (mark === undefined
+              ? undefined
+              : `${mark.watermark}:${mark.generation}`)
+          );
+        }))
+    );
+  }
+
   async read(
     nodeIds: readonly number[],
     options: SnapshotReadOptions = {}
   ): Promise<MultiNodeSnapshot> {
-    const nodes = [...new Set(nodeIds)].sort((a, b) => a - b);
-    const withUtxo = options.utxo === true;
-    const key = `${withUtxo ? 'u' : ''}${nodes.join(',')}`;
+    const { key, nodes } = SnapshotCache.key(nodeIds, options);
     const cached = this.entries.get(key);
-    if (cached !== undefined) {
-      const rows = await this.client.query<{
-        node: number;
-        visible: string;
-        utxo?: string;
-      }>(withUtxo ? watermarksWithUtxoSql : watermarksSql, {
-        nodes: [nodeAgnosticId, ...nodes],
-      });
-      const marks = new Map(
-        rows
-          .filter((row) => row.visible !== '')
-          .map((row) => [Number(row.node), BigInt(row.visible)])
-      );
-      const utxoMarks = new Map(
-        rows
-          .filter((row) => row.utxo !== undefined && row.utxo !== '')
-          .map((row) => [Number(row.node), row.utxo!])
-      );
-      /*
-       * The spend watermark is not compared: a cached (lower) one is still
-       * exact, the tail join just covers more (spend-index.md, read rule).
-       * The UTXO set mark is: a cached lower one would still be exact, but
-       * every request would pay the correction until the next commit, and
-       * an older generation's rows are dropped some time after a rebase
-       * (utxo-async.md). While visible(n) stands still, the newest mark is
-       * at most visible(n), so it is the mark a fresh snapshot would take.
-       */
-      const same =
-        (marks.get(nodeAgnosticId) ?? 0n) === cached.visible0 &&
-        nodes.every(
-          (node) => (marks.get(node) ?? 0n) === cached.visibleByNode.get(node)
-        ) &&
-        (!withUtxo ||
-          nodes.every((node) => {
-            const mark = cached.utxoByNode?.get(node);
-            return (
-              utxoMarks.get(node) ===
-              (mark === undefined
-                ? undefined
-                : `${mark.watermark}:${mark.generation}`)
-            );
-          }));
-      if (same) {
-        this.hits += 1;
-        return cached;
-      }
+    if (cached !== undefined && (await this.verify(nodes, options, cached))) {
+      this.hits += 1;
+      return cached;
     }
     this.misses += 1;
     const fresh = await readSnapshotMulti(this.client, nodes, options);

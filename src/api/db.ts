@@ -206,6 +206,8 @@ export interface ApiStats {
   nodeLookups: number;
   /** Watermark polls of the live-query hub. */
   watermarkPolls: number;
+  /** Requests run on a cached snapshot the watermark check then found stale, run again (`speculativeSnapshot`). */
+  speculativeRetries: number;
 }
 
 /** Optional store objects the compiler adapts to (DDL items, the stored UTXO set). */
@@ -237,8 +239,17 @@ export class ApiDb {
     nodeLookups: 0,
     snapshotCacheHits: 0,
     snapshots: 0,
+    speculativeRetries: 0,
     watermarkPolls: 0,
   };
+
+  /**
+   * Run a request on its cached snapshot while the watermark check runs
+   * beside it (`speculativeSnapshot`); CHAINGRAPH_API_SPECULATIVE_SNAPSHOT
+   * = off checks first (one round trip more per request).
+   */
+  speculativeSnapshots =
+    process.env.CHAINGRAPH_API_SPECULATIVE_SNAPSHOT !== 'off';
 
   /** Rows (all levels) one root statement may return (R33): more is an error. */
   maxResultRows = 500_000;
@@ -420,6 +431,40 @@ export class ApiDb {
     } finally {
       if (ticket !== undefined) this.admission.waiting(ticket, -1);
     }
+  }
+
+  /**
+   * The cached snapshot of a request's nodes, used at once, with its
+   * watermark check running concurrently (fix-pass-11.md §1): `confirmed`
+   * resolves true when the watermarks read (after the request started)
+   * equal the snapshot's, the same condition `pinnedSnapshot` checks before
+   * using it, so a confirmed result is what the checked path would have
+   * answered. Undefined when nothing is cached (the request reads one).
+   */
+  async speculativeSnapshot(
+    nodeIds: readonly number[]
+  ): Promise<
+    { snapshot: MultiNodeSnapshot; confirmed: Promise<boolean> } | undefined
+  > {
+    if (!this.speculativeSnapshots) return undefined;
+    const options = await this.snapshotOptions();
+    const snapshot = this.snapshotCache.peek(nodeIds, options);
+    if (snapshot === undefined) return undefined;
+    this.stats.snapshots += 1;
+    const confirmed = this.snapshotCache
+      .verify(nodeIds, options, snapshot)
+      .then((same) => {
+        if (same) {
+          this.snapshotCache.hits += 1;
+          this.stats.snapshotCacheHits += 1;
+        } else {
+          /* the next requests read a checked snapshot (one retry burst per commit) */
+          this.snapshotCache.forget(nodeIds, options, snapshot);
+        }
+        return same;
+      })
+      .catch(() => false);
+    return { confirmed, snapshot };
   }
 
   /**
@@ -699,6 +744,28 @@ export class PinnedSnapshot {
     };
   }
 
+  /** The concurrent watermark check of a speculative snapshot (`ApiDb.speculativeSnapshot`). */
+  private confirmation: Promise<boolean> | undefined;
+
+  private speculate = true;
+
+  /**
+   * Whether the request's result stands: true unless it ran on a cached
+   * snapshot whose watermark check found newer marks (then `refresh` and
+   * run it again).
+   */
+  async confirmed() {
+    return this.confirmation === undefined ? true : this.confirmation;
+  }
+
+  /** Read the snapshot again, checked first (after a failed speculation). */
+  refresh() {
+    this.speculate = false;
+    this.pending = undefined;
+    this.resolved = undefined;
+    this.confirmation = undefined;
+  }
+
   private async read() {
     const ids = await Promise.all(
       this.nodeNames.map(async (name) => {
@@ -707,9 +774,16 @@ export class PinnedSnapshot {
         return id;
       })
     );
-    this.resolved = await this.db.pinnedSnapshot(
-      ids.length === 0 ? [nodeAgnosticId] : ids
-    );
+    const nodes = ids.length === 0 ? [nodeAgnosticId] : ids;
+    const speculative = this.speculate
+      ? await this.db.speculativeSnapshot(nodes)
+      : undefined;
+    if (speculative !== undefined) {
+      this.confirmation = speculative.confirmed;
+      this.resolved = speculative.snapshot;
+      return this.resolved;
+    }
+    this.resolved = await this.db.pinnedSnapshot(nodes);
     return this.resolved;
   }
 }

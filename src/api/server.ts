@@ -240,7 +240,7 @@ const useFastExecution = (mode: FastExecutionMode): Plugin<ApiContext> => ({
 });
 
 const useRequestSnapshot = (db: ApiDb): Plugin<ApiContext> => ({
-  onExecute: ({ args, extendContext }) => {
+  onExecute: ({ args, executeFn, extendContext, setExecuteFn }) => {
     const snapshot = new PinnedSnapshot(
       db,
       operationNodeNames(
@@ -251,6 +251,25 @@ const useRequestSnapshot = (db: ApiDb): Plugin<ApiContext> => ({
     );
     requestScope.getStore()?.snapshots?.push(snapshot);
     extendContext({ snapshot });
+    const operation = getOperationAST(
+      args.document as DocumentNode,
+      (args.operationName as string | null | undefined) ?? undefined
+    );
+    if (operation?.operation !== 'query') return;
+    /*
+     * A query may run on a cached snapshot while its watermark check runs
+     * (db.ts `speculativeSnapshot`): its result stands once the check
+     * confirms the snapshot; otherwise the request runs again on a checked
+     * one (a commit landed since the snapshot was cached).
+     */
+    const execute = executeFn as (a: ExecutionArgs) => Promise<unknown>;
+    setExecuteFn(async (executeArgs: ExecutionArgs) => {
+      const result = await execute(executeArgs);
+      if (await snapshot.confirmed()) return result;
+      db.stats.speculativeRetries += 1;
+      snapshot.refresh();
+      return execute(executeArgs);
+    });
   },
 });
 

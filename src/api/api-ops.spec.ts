@@ -326,7 +326,11 @@ e2e(
     /* snapshots since: the hub's one for the advance, plus one per request made here (marks, query twins) */
     t.is(
       env.api.db.stats.snapshots - statsBefore.snapshots,
-      1 + 1 + documents.length,
+      1 +
+        1 +
+        documents.length +
+        env.api.db.stats.speculativeRetries -
+        statsBefore.speculativeRetries,
       'one snapshot for the advance'
     );
   }

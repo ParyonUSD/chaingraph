@@ -444,6 +444,8 @@ e2e(
   async (t) => {
     t.timeout(600_000);
     const env = await setup(t, 'g2_utxoset');
+    /* the statements of each path are inspected: no speculative run beside them */
+    env.api.db.speculativeSnapshots = false;
     const c0 = env.data.c0.hash;
     const expectedUnspent = (oracle: Oracle, filter: OutputFilter) => {
       const spent = new Set(
