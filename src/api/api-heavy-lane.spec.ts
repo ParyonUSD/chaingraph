@@ -68,17 +68,17 @@ e2e(
       ...defaultAdmissionOptions,
       cpuSource: 'rows' as const,
     };
-    const laned: Api = createApi(env.client, {
+    const withLane: Api = createApi(env.client, {
       admission,
       heavyLane: { clickhouse: connectionFor(database), threads: 1 },
       responseCache: {},
     });
     t.teardown(() => {
-      laned.db.admission.stop();
+      withLane.db.admission.stop();
     });
-    const server = await listen(laned);
+    const server = await listen(withLane);
     t.teardown(async () => server.close());
-    const lane = laned.heavyLane!;
+    const lane = withLane.heavyLane!;
     t.is(lane.threads, 1);
 
     /* nothing known: heavy, on the lane; the same bytes as the main thread's answer */
@@ -89,13 +89,13 @@ e2e(
     t.is(first.body, reference.body, 'byte-identical');
     t.is(first.contentType, 'application/json; charset=utf-8');
     t.is(lane.stats.served, 1);
-    t.is(laned.db.admission.stats.admitted.heavy, 1);
+    t.is(withLane.db.admission.stats.admitted.heavy, 1);
     t.true(
-      laned.db.admission.pendingStatements === 0 &&
-        laned.db.admission.stats.admitted.heavy === 1,
+      withLane.db.admission.pendingStatements === 0 &&
+        withLane.db.admission.stats.admitted.heavy === 1,
       'the ticket ended'
     );
-    const documents = laned.db.admission.model.documents();
+    const documents = withLane.db.admission.model.documents();
     const [learned] = Object.values(documents);
     t.truthy(learned, 'the model learned the lane request');
     t.true(
@@ -106,18 +106,22 @@ e2e(
     /* the lane answer was stored: the second request is a cache hit, not admitted */
     const second = await post(server.url, document);
     t.is(second.body, reference.body);
-    t.is(laned.responseCache!.stats.hits, 1);
-    t.is(laned.db.admission.stats.admitted.heavy, 1, 'a hit is not admitted');
+    t.is(withLane.responseCache!.stats.hits, 1);
+    t.is(
+      withLane.db.admission.stats.admitted.heavy,
+      1,
+      'a hit is not admitted'
+    );
     t.is(lane.stats.served, 1);
 
     /* a light request runs on the main thread */
-    laned.db.admission.model.observe(keysOf(light), {
+    withLane.db.admission.model.observe(keysOf(light), {
       cpuSeconds: 0.01,
       loopMs: 1,
     });
     const tip = await post(server.url, light);
     t.is(tip.status, 200);
-    t.is(laned.db.admission.stats.admitted.light, 1);
+    t.is(withLane.db.admission.stats.admitted.light, 1);
     t.is(lane.stats.served, 1, 'not on the lane');
 
     /* the graphql-response+json media type, as Yoga answers it */
@@ -127,10 +131,10 @@ e2e(
     t.is(typed.contentType, 'application/graphql-response+json; charset=utf-8');
 
     /* refused before Yoga: a request in flight, the budgets spent */
-    const blocker = laned.db.admission.admit(undefined);
-    laned.db.admission.budgets.clickhouse.level.heavy = -100;
-    laned.db.admission.budgets.clickhouse.level.light = -100;
-    const statementsBefore = laned.db.stats.dataQueries;
+    const blocker = withLane.db.admission.admit(undefined);
+    withLane.db.admission.budgets.clickhouse.level.heavy = -100;
+    withLane.db.admission.budgets.clickhouse.level.light = -100;
+    const statementsBefore = withLane.db.stats.dataQueries;
     const started = performance.now();
     const refused = await post(
       server.url,
@@ -148,8 +152,8 @@ e2e(
     t.is(body.errors[0]!.extensions.reason, 'clickhouse');
     t.is(body.errors[0]!.extensions.http, undefined, 'no internals');
     t.true(elapsed < 250, `refused in ${Math.round(elapsed)} ms`);
-    t.is(laned.db.stats.dataQueries, statementsBefore, 'nothing sent');
-    laned.db.admission.finish(blocker);
+    t.is(withLane.db.stats.dataQueries, statementsBefore, 'nothing sent');
+    withLane.db.admission.finish(blocker);
 
     /* an invalid document: Yoga's own validation errors, as without the front path */
     const invalid = await post(server.url, 'query { nope }');

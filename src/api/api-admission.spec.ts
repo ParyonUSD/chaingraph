@@ -488,10 +488,14 @@ test('admission: options from the environment and the startup line', (t) => {
   const fromServer = admissionOptionsFromEnv({}, 48);
   t.is(fromServer.clickhouse.ratePerSecond, 48 * 0.9, '48 cores × 0.9');
   /* two heavy-lane threads: the light share is this loop, the heavy share the lane's two */
-  const laned = admissionOptionsFromEnv({}, 48, 1, 2);
-  t.is(laned.loop.ratePerSecond, 850 * 3);
-  t.is(laned.loop.lightShare, 1 / 3);
-  t.is(laned.clickhouse.lightShare, 0.25, 'the ClickHouse budget is unchanged');
+  const withLane = admissionOptionsFromEnv({}, 48, 1, 2);
+  t.is(withLane.loop.ratePerSecond, 850 * 3);
+  t.is(withLane.loop.lightShare, 1 / 3);
+  t.is(
+    withLane.clickhouse.lightShare,
+    0.25,
+    'the ClickHouse budget is unchanged'
+  );
   t.is(fromServer.clickhouse.burstSeconds, 4);
   t.is(fromServer.loop.burstSeconds, 1);
   t.is(fromServer.loop.ratePerSecond, 850);
