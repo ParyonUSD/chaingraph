@@ -642,9 +642,8 @@ const totalsRowsSql = (rows: string) =>
  *   (fix-pass-9.md §6).
  * The range filters are aggregate conditions (`…If`), not WHERE terms: a
  * hash range on tx_acceptance or input is a key range of their base table /
- * `p_outpoint`, which would be chosen over the node's projections. Each
- * array must stay under ClickHouse's 1 M elements per value: the caller
- * sizes the chunks (`smallNodeChunkElements`).
+ * `p_outpoint`, which would be chosen over the node's projections. The
+ * caller bounds each array (`smallNodeChunkElements`).
  */
 export const smallNodeTotalsInHashRangeSql = (
   snapshot: Pick<VisibilitySnapshot, 'committedTail' | 'void'>,
@@ -769,13 +768,19 @@ const storedTotals = async (
 /**
  * A node is small for the totals reference (`smallNodeTotalsInHashRangeSql`)
  * up to this many accepted transactions: each chunk reads the node's whole
- * acceptance and inputs again, so the form's cost grows with the square of
- * the node's size (2 M: 32 chunks of ~7 M rows each).
+ * acceptance and inputs again, so that part of the form's cost grows with
+ * the square of the node's size (4 M: ~8 chunks of ~14 M rows each). Golden
+ * node 39 (the chipnet chain, ~2.8 M transactions) is small; node 1 is not.
  */
-export const smallNodeMaxTransactions = 2_000_000;
+export const smallNodeMaxTransactions = 4_000_000;
 
-/** Elements per array of a small-node chunk (ClickHouse's limit per value is 1 M; hash ranges hold ± a few %). */
-export const smallNodeChunkElements = 250_000;
+/**
+ * Elements per array of a small-node chunk (the node's transactions or
+ * spent outpoints in the range). A 2.8 M-transaction chipnet node's arrays
+ * in one chunk (2.8 M and 7 M elements) ran and answered exactly
+ * (fix-pass-10.md §2); 2 M bounds a chunk's sets at ~100-150 MB.
+ */
+export const smallNodeChunkElements = 2_000_000;
 
 /**
  * A node's accepted transactions and its estimated inputs and created
