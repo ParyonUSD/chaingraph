@@ -8,10 +8,11 @@
  * `yoga.fetch`, as an HTTP request without the socket).
  *
  *   node scripts/measure/api-side.mjs --db <database> --doc <catalogue id | file.graphql>
- *     [--vars '{"limit":10000}'] [--runs 9] [--build <worktree>] [--cpu-prof <dir>]
+ *     [--vars '{"limit":10000}'] [--runs 9] [--build <worktree>] [--cpu-prof <dir>] [--out <file>]
  *
  * Prints JSON: median / min total ms, response bytes, ClickHouse result bytes.
- * --cpu-prof writes a V8 CPU profile of the timed runs (open in DevTools).
+ * --cpu-prof writes a V8 CPU profile of the timed runs (open in DevTools);
+ * --out writes the response body (byte-identity checks between builds).
  */
 import { readFileSync } from 'node:fs';
 import { Session } from 'node:inspector/promises';
@@ -31,6 +32,7 @@ const doc = opt('--doc');
 const runs = Number(opt('--runs', '9'));
 const over = JSON.parse(opt('--vars', '{}'));
 const profDir = opt('--cpu-prof');
+const outFile = opt('--out');
 const imp = async (path) => import(pathToFileURL(join(root, path)).href);
 const { ClickHouseClient } = await imp('build/store/clickhouse/client.js');
 const { createApi } = await imp('build/api/server.js');
@@ -96,8 +98,10 @@ const once = async () => {
     headers: { accept: 'application/json', 'content-type': 'application/json' },
     method: 'POST',
   });
-  const bytes = (await response.arrayBuffer()).byteLength;
-  return { bytes, ms: performance.now() - started, status: response.status };
+  const buffer = await response.arrayBuffer();
+  const ms = performance.now() - started;
+  if (outFile !== undefined) writeFileSync(outFile, Buffer.from(buffer));
+  return { bytes: buffer.byteLength, ms, status: response.status };
 };
 const first = await once();
 if (first.status !== 200) {
