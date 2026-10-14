@@ -418,7 +418,8 @@ test('admission: back-to-back heavy requests on an idle server keep the server t
     admission.stop();
   });
   teach(admission, 'L15', { cpuSeconds: 61, loopMs: 5 });
-  let now = 0;
+  /* the budgets' clock started at construction */
+  let now = performance.now();
   for (let run = 0; run < 20; run += 1) {
     const ticket = admission.admit(keys('L15'), now);
     t.deepEqual(ticket.settings, {}, `run ${run}: the server's threads`);
@@ -457,11 +458,12 @@ test('admission: back-to-back heavy requests on an idle server keep the server t
 test('admission: a reconciled charge is one net adjustment (giving back first was capped at the capacity)', (t) => {
   const admission = new Admission(options(), quietMeter);
   teach(admission, 'heavy', 5);
-  const ticket = admission.admit(keys('heavy'), 0);
-  t.is(admission.budgets.clickhouse.level.heavy, 3);
+  const start = performance.now();
+  const ticket = admission.admit(keys('heavy'), start);
+  t.true(Math.abs(admission.budgets.clickhouse.level.heavy - 3) < 1e-6);
   /* 1 s later the share is full again; the request cost what it was charged */
   ticket.statements.push({ queryId: 'h', rows: 5 / 0.3e-6, shape: 'h' });
-  admission.finish(ticket, 1_000);
+  admission.finish(ticket, start + 1_000);
   t.true(
     Math.abs(admission.budgets.clickhouse.level.heavy - 8) < 1e-6,
     `not charged twice: ${admission.budgets.clickhouse.level.heavy}`
@@ -485,6 +487,11 @@ test('admission: a busy event loop refuses heavy requests whatever the budget sa
 test('admission: options from the environment and the startup line', (t) => {
   const fromServer = admissionOptionsFromEnv({}, 48);
   t.is(fromServer.clickhouse.ratePerSecond, 48 * 0.9, '48 cores × 0.9');
+  /* two heavy-lane threads: the light share is this loop, the heavy share the lane's two */
+  const laned = admissionOptionsFromEnv({}, 48, 1, 2);
+  t.is(laned.loop.ratePerSecond, 850 * 3);
+  t.is(laned.loop.lightShare, 1 / 3);
+  t.is(laned.clickhouse.lightShare, 0.25, 'the ClickHouse budget is unchanged');
   t.is(fromServer.clickhouse.burstSeconds, 4);
   t.is(fromServer.loop.burstSeconds, 1);
   t.is(fromServer.loop.ratePerSecond, 850);
@@ -494,6 +501,7 @@ test('admission: options from the environment and the startup line', (t) => {
   t.deepEqual(fromServer.sizing, {
     cores: 48,
     cpuTarget: 0.9,
+    heavyThreads: 0,
     loopTarget: 0.85,
     processes: 1,
     source: 'clickhouse',
