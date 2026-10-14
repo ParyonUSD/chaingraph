@@ -4866,7 +4866,7 @@ const planNodes = (node: PlanNode): PlanNode[] => [
 test.serial(
   `[e2e] unspent_node_ids (${String(
     unspentNodeIdsEnabled
-  )}): backfill preparation probes stay keyed under mainnet-scale statistics`,
+  )}): backfill preparation and batch probes stay keyed under mainnet-scale statistics`,
   async (t) => {
     if (!unspentNodeIdsEnabled) {
       t.pass();
@@ -4893,6 +4893,11 @@ test.serial(
      * pending, and the preparation runs with auto_explain reporting the plan
      * of each statement it runs. Every access to a big table in those two
      * statements must be a keyed index probe, driven from the small side.
+     * Then one batch of partition 0 over its whole range: its affected-set
+     * statement read the inputs of the dynamic transactions through the
+     * prefix range of spent_by_index (2.3 M inputs per batch in the
+     * 2026-10-13 lab, 24 kept); every big-table access in it must be keyed
+     * too.
      */
     const plans: { query: string; plan: PlanNode }[] = [];
     const onNotice = (notice: { message?: string }) => {
@@ -4949,9 +4954,16 @@ test.serial(
             (SELECT max(internal_id) FROM block),
             (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq)) AS result;`)
       ).rows[0]!.result;
-      client.removeListener('notice', onNotice);
       t.log({ prepared });
       t.true(Number(prepared.transactions) > 0, 'M is not empty');
+      const batch = (
+        await client.query<{ result: { [key: string]: unknown } }>(/* sql */ `
+          SELECT unspent_node_ids_backfill_batch(0, p.partition_count, 65536) AS result
+            FROM unspent_tracking_progress p WHERE p.partition_index = 0;`)
+      ).rows[0]!.result;
+      client.removeListener('notice', onNotice);
+      t.log({ batch });
+      t.is(batch.previousPrefix, 0, 'the batch ran from the first prefix');
     } finally {
       client.removeListener('notice', onNotice);
       await client.query('ROLLBACK;');
@@ -4987,6 +4999,28 @@ test.serial(
     t.not(spends, undefined, 'plan of the spends statement');
     keyed('other blocks', otherBlocks!.plan, 'unspent_node_ids_other_blocks');
     keyed('spends', spends!.plan, 'unspent_tracking_backfill_transactions');
+    const exact = statement('INSERT INTO unspent_node_ids_affected');
+    t.not(exact, undefined, 'plan of the batch affected-set statement');
+    const exactScans = planNodes(exact!.plan).filter((node) =>
+      bigTables.includes(node['Relation Name'] ?? '')
+    );
+    exactScans.forEach((node) => {
+      t.true(
+        ['Index Scan', 'Index Only Scan'].includes(node['Node Type']) &&
+          node['Index Cond'] !== undefined,
+        `batch affected set: ${node['Node Type']} on ${node[
+          'Relation Name'
+        ]!} must be a keyed probe\n${JSON.stringify(exact!.plan, undefined, 1)}`
+      );
+    });
+    t.true(
+      exactScans.some(
+        (node) =>
+          node['Relation Name'] === 'input' &&
+          (node['Index Cond'] ?? '').includes('transaction_internal_id')
+      ),
+      'batch affected set: dynamic inputs probed by transaction (input_pkey)'
+    );
   }
 );
 

@@ -865,9 +865,13 @@ BEGIN
       SELECT s.outpoint_transaction_hash, s.outpoint_index FROM unspent_tracking_backfill_spends s
         WHERE s.outpoint_transaction_hash >= lo AND s.outpoint_transaction_hash < hi
       UNION ALL
+      -- per dynamic transaction, its input_pkey range (not the prefix range
+      -- of spent_by_index: millions of inputs per batch on mainnet)
       SELECT i.outpoint_transaction_hash, i.outpoint_index FROM pg_temp.unspent_node_ids_dynamic d
-        JOIN input i ON i.transaction_internal_id = d.id
-        WHERE i.outpoint_transaction_hash >= lo AND i.outpoint_transaction_hash < hi;
+        CROSS JOIN LATERAL (SELECT input.outpoint_transaction_hash, input.outpoint_index FROM input
+                              WHERE input.transaction_internal_id = d.id
+                                AND input.outpoint_transaction_hash >= lo AND input.outpoint_transaction_hash < hi
+                              OFFSET 0) i;
     GET DIAGNOSTICS n_exact = ROW_COUNT;
     -- no spending input at all (both index ranges, merged)
     INSERT INTO unspent_node_ids_no_spender (h, i)
