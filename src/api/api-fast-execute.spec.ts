@@ -152,7 +152,17 @@ e2e(
       if (event.kind === 'data') statements.texts.push(event.sql);
     };
     const servers = [await listen(grouped), await listen(texts)];
-    t.teardown(async () => Promise.all(servers.map((s) => s.close())));
+    t.teardown(async () => {
+      await Promise.all(servers.map(async (s) => s.close()));
+    });
+    const answer = async (url: string, query: string) =>
+      (
+        await fetch(url, {
+          body: JSON.stringify({ query, variables: { n: one, yes: true } }),
+          headers: { 'content-type': 'application/json' },
+          method: 'POST',
+        })
+      ).text();
     /* shared parents (inclusions of one block), two-column keys (outpoints), coinbase (NULL-like zero outpoints) */
     const extra: [string, string][] = [
       [
@@ -164,15 +174,7 @@ e2e(
     for (const [label, query] of [...documents, ...extra]) {
       if (label.startsWith('an error')) continue;
       const [a, b] = await Promise.all(
-        servers.map(async (server) =>
-          (
-            await fetch(server.url, {
-              body: JSON.stringify({ query, variables: { n: one, yes: true } }),
-              headers: { 'content-type': 'application/json' },
-              method: 'POST',
-            })
-          ).text()
-        )
+        servers.map(async (server) => answer(server.url, query))
       );
       t.is(a, b, label);
       t.false(a!.includes('"errors"'), `${label}: ${a!.slice(0, 300)}`);
