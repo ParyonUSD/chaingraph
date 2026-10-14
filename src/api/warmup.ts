@@ -15,12 +15,13 @@
  * - V8's code for the compile, decode and write paths compiled.
  *
  * CHAINGRAPH_API_WARMUP names a JSON file: an array of
- * `{ "query" | "documentId", "variables"?, "operationName"? }`. A failing
- * entry is logged and skipped; the warm-up never stops the start. The
+ * `{ "query" | "documentId", "variables"?, "operationName"? }` (other fields
+ * ignored: a catalogue soak-mix file serves). A missing file is no warm-up. A
+ * failing entry is logged and skipped; the warm-up never stops the start. The
  * whole warm-up is bounded by CHAINGRAPH_API_WARMUP_TIMEOUT_MS (default
  * 120 s): entries after the deadline are skipped.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 export interface WarmupEntry {
   query?: string;
@@ -40,8 +41,12 @@ export interface WarmupResult {
 /** Default bound of the whole warm-up, ms. */
 export const defaultWarmupTimeoutMs = 120_000;
 
-/** Warm-up entries from a JSON file (an array of entries). */
+/**
+ * Warm-up entries from a JSON file (an array of entries); none when the file
+ * does not exist (an optional mount not created yet).
+ */
 export const loadWarmupEntries = (path: string): WarmupEntry[] => {
+  if (!existsSync(path)) return [];
   const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
   if (!Array.isArray(parsed)) {
     throw new Error(`${path}: a warm-up file is a JSON array of requests.`);
@@ -94,8 +99,10 @@ export const runWarmup = async (
         continue;
       }
       try {
+        /* only the request's own fields (a soak-mix file also carries `id` and a v1 twin) */
+        const { documentId, operationName, query, variables } = entry;
         const response = await fetch('http://localhost/graphql', {
-          body: JSON.stringify(entry),
+          body: JSON.stringify({ documentId, operationName, query, variables }),
           headers: { 'content-type': 'application/json' },
           method: 'POST',
         });
