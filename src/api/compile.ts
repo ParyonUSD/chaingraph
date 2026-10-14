@@ -228,6 +228,8 @@ export interface RelationField {
   childKeys: readonly string[];
   /** Parent raw columns the source reads (default `parentKeys`). */
   linkColumns?: readonly string[];
+  /** Raw columns a `where` may read (default: all), in `source`'s `needs` when filtered. */
+  filterColumns?: readonly string[];
   /**
    * The child rows (raw columns of the target entity), restricted to the
    * parent level: `link` is a subquery returning the parent's `linkColumns`.
@@ -533,8 +535,10 @@ const planLevel = (
       childCtx,
       link,
       sel.args,
-      /* a filter may read any column */
-      filtered ? new Set(target.columns) : plan.needs
+      /* a filter may read any column it names (default: any) */
+      filtered
+        ? new Set([...plan.needs, ...(field.filterColumns ?? target.columns)])
+        : plan.needs
     );
     const where = filtered
       ? field.where!(childCtx, sel.args.where, source)

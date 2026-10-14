@@ -349,6 +349,21 @@ const inputColumns = [
   'unlocking_bytecode',
 ] as const;
 
+/** The columns of input's p_txid projection (060_projections.sql): no unlocking_bytecode. */
+export const inputByIdColumns: ReadonlySet<string> = new Set([
+  'transaction_hash',
+  'input_index',
+  'transaction_internal_id',
+  'outpoint_transaction_hash',
+  'outpoint_index',
+  'sequence_number',
+  'commit_seq',
+]);
+
+/** True when an inputs level reading `needs` can be served by input.p_txid. */
+export const inputsByIdCovers = (needs: ReadonlySet<string>) =>
+  [...needs].every((column) => inputByIdColumns.has(column));
+
 const blockColumns = [
   'hash',
   'internal_id',
@@ -951,6 +966,8 @@ export const TransactionEntity: Entity = {
     inputs: {
       childKeys: ['transaction_hash'],
       defaultOrder: [term('input_index')],
+      /* an InputFilter reads the input's own key columns and sub-filters (sql.ts inputOwnColumns), never unlocking_bytecode */
+      filterColumns: [...inputByIdColumns],
       kind: 'relation',
       /*
        * The parents' internal ids bound the read too (one per hash):
@@ -962,10 +979,17 @@ export const TransactionEntity: Entity = {
       many: true,
       order: indexOrder(inputOrder, 'input_index', [term('input_index')]),
       parentKeys: ['hash'],
-      source: (c, link) =>
+      source: (c, link, _args, needs) =>
         `SELECT * FROM ${c.sql.view('input_at')} WHERE ${
-          /* by id alone when every part has p_txid (Sql.readsById): one id per hash */
-          c.sql.readsById.inputs
+          /*
+           * By id alone only when every part has p_txid (Sql.readsById) AND
+           * the level reads no column outside it: p_txid is slim (no
+           * unlocking_bytecode), and an id-only read the projection cannot
+           * serve scans the whole table, whose key is the hash (golden X6:
+           * 1.04 B rows; fix-pass-9.md §1). With the hash set the table's
+           * own key bounds the read.
+           */
+          c.sql.readsById.inputs && inputsByIdCovers(needs)
             ? ''
             : `transaction_hash IN (SELECT hash FROM (${link})) AND `
         }transaction_internal_id IN (SELECT internal_id FROM (${link}))`,
