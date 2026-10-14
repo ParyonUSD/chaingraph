@@ -18,15 +18,18 @@ partitions=${1:-$(${PSQL:-psql} "$PGURL" -qtAX -c 'SELECT count(*) FROM unspent_
 prefixes=${2:-64}
 log=${LOG:-/dev/stderr}
 sql() { ${PSQL:-psql} "$PGURL" -qtAX -v ON_ERROR_STOP=1 "$@"; }
+# milliseconds (the server's clock: no bc or GNU date needed), and as seconds
+now_ms() { sql -c 'SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint'; }
+seconds() { printf '%d.%03d' $(($1 / 1000)) $(($1 % 1000)); }
 
 wal_start=$(sql -c 'SELECT pg_current_wal_lsn()')
-start=$(date +%s.%N)
+start=$(now_ms)
 sql -c 'BEGIN ISOLATION LEVEL REPEATABLE READ' -c "
   SELECT unspent_node_ids_backfill_prepare(
     (SELECT max(internal_id) FROM transaction),
     (SELECT COALESCE(max(internal_id), 0) FROM block),
     (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq))" -c 'COMMIT' >>"$log"
-prepared=$(date +%s.%N)
+prepared=$(now_ms)
 
 run_partition() {
   local partition=$1 result
@@ -48,8 +51,8 @@ for partition in $(seq 0 $((partitions - 1))); do
 done
 status=0
 for pid in "${pids[@]}"; do wait "$pid" || status=1; done
-end=$(date +%s.%N)
+end=$(now_ms)
 sql -c 'SELECT unspent_node_ids_delete_consumed_events()' >/dev/null
 wal=$(sql -c "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '$wal_start')")
-echo "prepare_s=$(echo "$prepared - $start" | bc) batches_s=$(echo "$end - $prepared" | bc) total_s=$(echo "$end - $start" | bc) wal_bytes=$wal pending=$(sql -c 'SELECT unspent_node_ids_backfill_pending()')"
+echo "prepare_s=$(seconds $((prepared - start))) batches_s=$(seconds $((end - prepared))) total_s=$(seconds $((end - start))) wal_bytes=$wal pending=$(sql -c 'SELECT unspent_node_ids_backfill_pending()')"
 exit $status
