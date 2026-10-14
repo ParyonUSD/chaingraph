@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 const [wt, db, runs = '5', label = '', docsFile, onlyArg] = process.argv.slice(2);
 const { ClickHouseClient } = await import(`${wt}/build/store/clickhouse/client.js`);
 const { createApi } = await import(`${wt}/build/api/server.js`);
+const { disabledAdmissionOptions } = await import(`${wt}/build/api/admission.js`);
 const docs = JSON.parse(readFileSync(docsFile, 'utf8'));
 const only = onlyArg?.split(',');
 const admin = new ClickHouseClient({ url: 'http://localhost:18123', database: db, username: 'default', password: '', requestTimeoutMs: 900000 });
@@ -12,7 +13,7 @@ for (const [name, d] of Object.entries(docs)) {
   if (only && !only.includes(name)) continue;
   const tag = `fix6:${label}:${name}:${Date.now()}`;
   const client = new ClickHouseClient({ url: 'http://localhost:18123', database: db, username: 'default', password: '', requestTimeoutMs: 900000 });
-  const api = createApi(client, { admission: { enabled: false }, ...(d.options ?? {}) });
+  const api = createApi(client, { admission: disabledAdmissionOptions, ...(d.options ?? {}) });
   const query = readFileSync(`${wt}/docs/clickhouse-port/v2-documents/${d.file}`, 'utf8').replace(/^subscription /mu, 'query ');
   const run = async () => {
     const t0 = performance.now();
