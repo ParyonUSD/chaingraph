@@ -242,7 +242,6 @@ export interface RelationField {
     args: { [name: string]: unknown },
     needs: ReadonlySet<string>
   ) => string;
-  /** The `where` argument as a predicate on child rows. */
   /** The `where` argument as a predicate on child rows (`source`: the level's restricted rows). */
   where?: (c: Ctx, where: unknown, source: string) => string;
   /**
@@ -378,8 +377,8 @@ interface LevelPlan {
   ) => Row;
 }
 
-/** A key column as text, for matching parent and child rows in TypeScript (lossless for bytes). */
-const keyText = (column: string) => `hex(toString(${column}))`;
+/** A key column as text for parent/child matching: lossless, equal across unsigned widths (fix-pass-9.md §4). */
+const keyText = (column: string) => `lower(hex(${column}))`;
 
 /** Values of a tuple → the matching key (null: matches nothing, like SQL). */
 const keyOf = (values: readonly unknown[]) =>
