@@ -107,9 +107,10 @@ const main = async () => {
       Math.max(statementTimeouts.data, statementTimeouts.aggregate) +
       requestTimeoutMarginMs,
   };
-  const client = new ClickHouseClient(clickhouse);
   /* lane sizes follow the ClickHouse server's cores (fix-pass-4.md §8) */
-  const serverLimits = await readClickHouseServerLimits(client);
+  const probe = new ClickHouseClient(clickhouse);
+  const serverLimits = await readClickHouseServerLimits(probe);
+  await probe.close();
   const admissionOff = env.CHAINGRAPH_API_ADMISSION === 'off';
   /* the lane needs admission: the predicted class routes a request */
   const heavyThreads = admissionOff ? 0 : heavyThreadsFromEnv(env);
@@ -119,6 +120,17 @@ const main = async () => {
     workers,
     heavyThreads
   );
+  /*
+   * A process's statements stay within its 64 sockets (the backstop counts
+   * 72 per process, api-user.ts): the heavy lane's threads get the heavy
+   * requests in flight plus snapshot reads, the main thread the rest.
+   */
+  const laneSockets =
+    heavyThreads === 0 ? 0 : Math.min(48, admission.heavyMaxInFlight + 4);
+  const client = new ClickHouseClient({
+    ...clickhouse,
+    maxOpenConnections: 64 - laneSockets,
+  });
   if (cluster.isPrimary || cluster.worker?.id === 1) {
     // eslint-disable-next-line no-console
     console.log(
@@ -142,10 +154,12 @@ const main = async () => {
       ? {}
       : {
           heavyLane: {
-            /* a lane thread's statements: at most the heavy requests in flight, plus snapshot reads */
             clickhouse: {
               ...clickhouse,
-              maxOpenConnections: Math.min(64, admission.heavyMaxInFlight + 4),
+              maxOpenConnections: Math.max(
+                2,
+                Math.ceil(laneSockets / heavyThreads)
+              ),
             },
             threads: heavyThreads,
           },
