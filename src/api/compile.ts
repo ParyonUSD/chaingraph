@@ -483,42 +483,59 @@ const expandComputed = (entity: Entity, sels: readonly Sel[]): Sel[] => {
 };
 
 /**
- * The scalar fields of an inline relationship's selection (`inline`), their
- * SQL over the parent's prefixed columns; undefined when the selection
- * cannot be inlined (arguments, a relationship or computed field under it,
- * a column the parent does not provide).
+ * True when an inline relationship's selection (`inline`) can be decoded
+ * from the parent's tuple: no arguments, and every column it reads (its
+ * scalars', its relationships' link and key columns) among the columns the
+ * parent provides. Not inside another inlined row (one prefix per level).
  */
-const inlineScalars = (field: RelationField, target: Entity, sel: Sel) => {
+const inlinable = (
+  field: RelationField,
+  target: Entity,
+  sel: Sel,
+  renamed: boolean
+) => {
   const { inline } = field;
-  if (inline === undefined || field.many) return undefined;
+  if (inline === undefined || field.many || renamed) return false;
   if (Object.values(sel.args).some((value) => value !== undefined)) {
-    return undefined;
+    return false;
   }
-  const out: { name: string; sql: string; columns: string[] }[] = [];
-  for (const child of sel.sels ?? []) {
-    const childField = target.fields[child.name];
-    if (childField?.kind !== 'scalar' || child.sels !== undefined) {
-      return undefined;
+  const provided = new Set(inline.columns);
+  return expandComputed(target, sel.sels ?? []).every((child) => {
+    const childField = target.fields[child.name]!;
+    if (childField.kind === 'scalar') {
+      return referencedColumns(childField.sql, target.columns).every((column) =>
+        provided.has(column)
+      );
     }
-    const columns = referencedColumns(childField.sql, target.columns);
-    if (!columns.every((column) => inline.columns.includes(column))) {
-      return undefined;
-    }
-    out.push({
-      columns,
-      name: child.name,
-      sql: columns.reduce(
-        (text, column) =>
-          text.replace(
-            new RegExp(`(?<![\\w.])${column}(?![\\w])`, 'gu'),
-            `${inline.prefix}${column}`
-          ),
-        childField.sql
-      ),
-    });
-  }
-  return out;
+    if (childField.kind !== 'relation') return false;
+    return [
+      ...(childField.linkColumns ?? childField.parentKeys),
+      ...childField.parentKeys,
+    ].every((column) => provided.has(column));
+  });
 };
+
+/** `expr` with an entity's columns renamed to `${prefix}${column}`. */
+const renameColumns = (
+  expr: string,
+  columns: readonly string[],
+  prefix: string
+) =>
+  referencedColumns(expr, columns).reduce(
+    (text, column) =>
+      text.replace(
+        new RegExp(`(?<![\\w.])${column}(?![\\w])`, 'gu'),
+        `${prefix}${column}`
+      ),
+    expr
+  );
+
+/** A level's tuple elements, needed columns and client positions (shared by an inlined row). */
+interface LevelParts {
+  elements: string[];
+  needs: Set<string>;
+  clientPositions: Set<number>;
+}
 
 const resolveNode = (c: Ctx, args: { [name: string]: unknown }) =>
   typeof args.node === 'string' ? c.nodeId(args.node) : c.node;
@@ -534,11 +551,20 @@ const planLevel = (
   level: string,
   prefix: number,
   c: Ctx,
-  pipeline = false
+  pipeline = false,
+  /* an inlined row (`inline`): the parent's parts, its columns as `${rename}${column}` */
+  inlined?: { parts: LevelParts; rename: string }
 ): LevelPlan => {
-  const elements: string[] = [];
-  const needs = new Set<string>();
-  const clientPositions = new Set<number>();
+  const { elements, needs, clientPositions } = inlined?.parts ?? {
+    clientPositions: new Set<number>(),
+    elements: [],
+    needs: new Set<string>(),
+  };
+  const rename = inlined?.rename;
+  const col = (column: string) =>
+    rename === undefined ? column : `${rename}${column}`;
+  const sqlOf = (expr: string) =>
+    rename === undefined ? expr : renameColumns(expr, entity.columns, rename);
   const element = (sql: string) => {
     const existing = elements.indexOf(sql);
     if (existing !== -1) return existing;
@@ -557,10 +583,10 @@ const planLevel = (
   expandComputed(entity, sels).forEach((sel) => {
     const field = entity.fields[sel.name]!;
     if (field.kind === 'scalar') {
-      const position = element(field.sql);
+      const position = element(sqlOf(field.sql));
       clientPositions.add(position);
       referencedColumns(field.sql, entity.columns).forEach((column) =>
-        needs.add(column)
+        needs.add(col(column))
       );
       decoders.push((values, base, record) => {
         record[sel.name] = values[base + position] ?? null;
@@ -569,31 +595,28 @@ const planLevel = (
     }
     if (field.kind !== 'relation') return;
     const target = field.target();
-    const inlined = inlineScalars(field, target, sel);
-    if (inlined !== undefined) {
+    if (inlinable(field, target, sel, rename !== undefined)) {
+      /* the child row from this level's tuple: no level of its own */
       const { prefix: columnPrefix, key } = field.inline!;
       const keyPosition = element(`${columnPrefix}${key}`);
       needs.add(`${columnPrefix}${key}`);
       clientPositions.add(keyPosition);
-      const positions = inlined.map((scalarField) => {
-        scalarField.columns.forEach((column) =>
-          needs.add(`${columnPrefix}${column}`)
-        );
-        const position = element(scalarField.sql);
-        clientPositions.add(position);
-        return { name: scalarField.name, position };
-      });
-      decoders.push((values, base, _record, related) => {
+      const rowPlan = planLevel(
+        st,
+        target,
+        sel.sels ?? [],
+        level,
+        prefix,
+        c,
+        pipeline,
+        { parts: { clientPositions, elements, needs }, rename: columnPrefix }
+      );
+      decoders.push((values, base, _record, related, data, count) => {
         const present = values[base + keyPosition];
-        if (present === null || present === undefined) {
-          related[sel.key] = null;
-          return;
-        }
-        const childRecord: { [key: string]: unknown } = {};
-        for (const { name, position } of positions) {
-          childRecord[name] = values[base + position] ?? null;
-        }
-        related[sel.key] = withRelations(childRecord, {});
+        related[sel.key] =
+          present === null || present === undefined
+            ? null
+            : rowPlan.decode(values, base, data, count);
       });
       return;
     }
@@ -616,11 +639,11 @@ const planLevel = (
     );
     const linkColumns = field.linkColumns ?? field.parentKeys;
     [...linkColumns, ...field.parentKeys].forEach((column) =>
-      needs.add(column)
+      needs.add(col(column))
     );
-    const linkPositions = linkColumns.map(element);
+    const linkPositions = linkColumns.map((column) => element(col(column)));
     const parentKeyPositions = field.parentKeys.map((column) =>
-      element(keyText(column))
+      element(keyText(col(column)))
     );
     /* group numbers for constant levels; key texts (read by the client) for pipeline levels */
     const groupLink: GroupLink | undefined =
@@ -640,7 +663,11 @@ const planLevel = (
       st.groupLinks.push(groupLink);
     }
     const link = pipeline
-      ? `SELECT ${linkColumns.join(', ')} FROM ${level}_rows`
+      ? `SELECT ${linkColumns
+          .map((column) =>
+            col(column) === column ? column : `${col(column)} AS ${column}`
+          )
+          .join(', ')} FROM ${level}_rows`
       : `SELECT ${linkColumns
           .map(
             (column, index) =>
