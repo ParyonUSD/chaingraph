@@ -143,6 +143,8 @@ e2e(
     const texts = createApi(env.client, {
       admission: disabledAdmissionOptions,
     });
+    /* explicit: the suite also runs with CHAINGRAPH_API_GROUP_NUMBERS=off */
+    grouped.db.groupNumbers = true;
     texts.db.groupNumbers = false;
     const statements = { grouped: [] as string[], texts: [] as string[] };
     grouped.db.onQuery = (event) => {
