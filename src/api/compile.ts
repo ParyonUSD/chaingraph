@@ -349,6 +349,9 @@ class Statement {
     { width: number; client: ReadonlySet<number> }
   >();
 
+  /** Relationships matched by group number (`GroupLink`), in planning order. */
+  readonly groupLinks: GroupLink[] = [];
+
   constructor(readonly sql: Sql) {}
 
   levelName(keyWidth: number) {
@@ -358,8 +361,37 @@ class Statement {
   }
 }
 
+/**
+ * A relationship whose child rows are matched to parent rows by a group
+ * number instead of key texts (fix-pass-10.md §1). The statement's final
+ * SELECT numbers the parent level's keys (the 1-based position of the
+ * first parent row with that key, `transform` over the parent's key
+ * array); each parent row carries its key's number as an extra tuple
+ * element and each child row the number of its key in place of the key
+ * text. A child row whose key no parent has gets 0 (matches nothing), and
+ * a NULL key on either side matches nothing, as before. The 64-character
+ * hash texts of every child row (~28 % of L33's result bytes) become small
+ * integers, and the client groups by array index instead of hashing texts.
+ * Not for pipeline levels (`recursive`): their arrays are not constants of
+ * the final SELECT.
+ */
+interface GroupLink {
+  parent: string;
+  /** Tuple elements before the parent level's `elements` (`__pos` or `__rn` + key texts). */
+  parentPrefix: number;
+  /** Positions (0-based, in the parent's `elements`) of the parent's key texts. */
+  keyPositions: readonly number[];
+  child: string;
+  childKeyWidth: number;
+  /** Absolute tuple index of the parent's group number (set when the statement is assembled). */
+  groupAt: number;
+}
+
+/** A level's child tuples by group: key text (`Map`) or group number (array index). */
+type Groups = (unknown[][] | undefined)[] | Map<string, unknown[][]>;
+
 /** Rows of every level by name: child rows grouped by their parent key, sorted. */
-type LevelData = Map<string, Map<string, unknown[][]>>;
+type LevelData = Map<string, Groups>;
 
 interface LevelPlan {
   /** Tuple elements (SQL over the level row's raw columns), after the level's prefix. */
@@ -513,7 +545,22 @@ const planLevel = (
     const parentKeyPositions = field.parentKeys.map((column) =>
       element(keyText(column))
     );
-    parentKeyPositions.forEach((position) => clientPositions.add(position));
+    /* group numbers for constant levels; key texts (read by the client) for pipeline levels */
+    const groupLink: GroupLink | undefined = childPipeline
+      ? undefined
+      : {
+          child,
+          childKeyWidth: field.childKeys.length,
+          groupAt: -1,
+          keyPositions: parentKeyPositions,
+          parent: level,
+          parentPrefix: prefix,
+        };
+    if (groupLink === undefined) {
+      parentKeyPositions.forEach((position) => clientPositions.add(position));
+    } else {
+      st.groupLinks.push(groupLink);
+    }
     const link = pipeline
       ? `SELECT ${linkColumns.join(', ')} FROM ${level}_rows`
       : `SELECT ${linkColumns
@@ -614,7 +661,7 @@ const planLevel = (
     }
     /* the child level's groups, looked up once per statement result (not per parent row) */
     let lastData: LevelData | undefined;
-    let groups: Map<string, unknown[][]> | undefined;
+    let groups: Groups | undefined;
     const keyWidth = parentKeyPositions.length;
     const consecutive = parentKeyPositions.every(
       (position, index) => position === parentKeyPositions[0]! + index
@@ -624,13 +671,25 @@ const planLevel = (
         lastData = data;
         groups = data.get(child);
       }
-      const key =
-        consecutive && keyWidth <= 2
-          ? keyAt(values, base + parentKeyPositions[0]!, keyWidth)
-          : keyOf(
-              parentKeyPositions.map((position) => values[base + position])
-            );
-      const tuples = key === undefined ? undefined : groups?.get(key);
+      let tuples: unknown[][] | undefined;
+      if (groupLink === undefined) {
+        const key =
+          consecutive && keyWidth <= 2
+            ? keyAt(values, base + parentKeyPositions[0]!, keyWidth)
+            : keyOf(
+                parentKeyPositions.map((position) => values[base + position])
+              );
+        tuples =
+          key === undefined
+            ? undefined
+            : (groups as Map<string, unknown[][]> | undefined)?.get(key);
+      } else {
+        const group = values[groupLink.groupAt];
+        tuples =
+          typeof group === 'number' && group > 0
+            ? (groups as (unknown[][] | undefined)[] | undefined)?.[group]
+            : undefined;
+      }
       if (tuples === undefined) {
         related[sel.key] = field.many ? [] : null;
         return;
@@ -725,30 +784,138 @@ const levelOf = (column: string) =>
  */
 const outputColumn = (
   name: string,
-  output: { width: number; client: ReadonlySet<number> } | undefined
+  output: { width: number; client: ReadonlySet<number> } | undefined,
+  groups: {
+    /** The level's group number (SQL over `__t`), in place of its key texts (elements 2 …). */
+    own?: { sql: string; keyWidth: number };
+    /** Its key numbers as parent, appended. */
+    extras?: readonly string[];
+  } = {}
 ) => {
-  if (output === undefined || output.client.size >= output.width) return name;
+  const { own, extras = [] } = groups;
+  if (
+    output === undefined ||
+    (output.client.size >= output.width &&
+      own === undefined &&
+      extras.length === 0)
+  ) {
+    return name;
+  }
   const items = Array.from({ length: output.width }, (_, index) =>
-    output.client.has(index + 1) ? `tupleElement(__t, ${index + 1})` : 'NULL'
+    own !== undefined && index >= 1 && index <= own.keyWidth
+      ? index === 1
+        ? own.sql
+        : 'NULL'
+      : output.client.has(index + 1)
+      ? `tupleElement(__t, ${index + 1})`
+      : 'NULL'
   );
-  return `arrayMap(__t -> tuple(${items.join(
+  return `arrayMap(__t -> tuple(${[...items, ...extras].join(
     ', '
   )}), ${name}) AS ${name}${outputSuffix}`;
+};
+
+/** A key (texts at `elements`, SQL over `__t`) as one non-null String; `none` for a NULL key (matches nothing). */
+const groupKey = (elements: readonly string[], none: string) =>
+  `ifNull(${
+    elements.length === 1 ? elements[0]! : `concat(${elements.join(`, ',', `)})`
+  }, ${none})`;
+
+/**
+ * The group numbers of the statement's `GroupLink`s: per parent key (level
+ * and key positions) one key array (a `WITH` alias), the parent's number
+ * appended to its tuples, the child's in place of its key texts. Sets each
+ * link's `groupAt`.
+ */
+const groupNumbers = (st: Statement, widths: ReadonlyMap<string, number>) => {
+  const keys = new Map<string, { alias: string; at: number }>();
+  const extras = new Map<string, string[]>();
+  const own = new Map<string, { sql: string; keyWidth: number }>();
+  const withItems: string[] = [];
+  st.groupLinks.forEach((link) => {
+    const signature = `${link.parent}:${link.keyPositions.join(',')}`;
+    let key = keys.get(signature);
+    if (key === undefined) {
+      const alias = `__k${keys.size + 1}`;
+      /* 'p' / 'c': never a hex text, and never equal to each other */
+      const parentKey = groupKey(
+        link.keyPositions.map(
+          (position) => `tupleElement(__t, ${link.parentPrefix + position + 1})`
+        ),
+        `'p'`
+      );
+      withItems.push(
+        `arrayMap(__t -> ${parentKey}, ${link.parent}) AS ${alias}`
+      );
+      const list = extras.get(link.parent) ?? [];
+      list.push(
+        `transform(${parentKey}, ${alias}, arrayEnumerate(${alias}), toUInt32(0))`
+      );
+      extras.set(link.parent, list);
+      key = { alias, at: (widths.get(link.parent) ?? 0) + list.length - 1 };
+      keys.set(signature, key);
+    }
+    link.groupAt = key.at;
+    const childKey = groupKey(
+      Array.from(
+        { length: link.childKeyWidth },
+        (_, index) => `tupleElement(__t, ${index + 2})`
+      ),
+      `'c'`
+    );
+    own.set(link.child, {
+      keyWidth: link.childKeyWidth,
+      sql: `transform(${childKey}, ${key.alias}, arrayEnumerate(${key.alias}), toUInt32(0))`,
+    });
+  });
+  return { extras, own, withItems };
 };
 
 /** `__lN` arrays of a result row → child tuples grouped by parent key, in row-number order. */
 const levelData = (
   row: { [column: string]: unknown },
-  keyWidths: ReadonlyMap<string, number>
+  keyWidths: ReadonlyMap<string, number>,
+  grouped: ReadonlySet<string>
 ): LevelData => {
   const data: LevelData = new Map();
   Object.entries(row).forEach(([column, value]) => {
     if (!column.startsWith('__l')) return;
     const name = levelOf(column);
+    const items = Array.isArray(value) ? (value as unknown[]) : [];
+    if (grouped.has(name)) {
+      /* [__rn, group number, NULL…, elements…] */
+      const tuples = items.map((item) =>
+        Array.isArray(item) ? (item as unknown[]) : tupleValues(item)
+      );
+      let groupCount = 0;
+      for (const [, group] of tuples) {
+        if (typeof group === 'number' && group > groupCount) groupCount = group;
+      }
+      /* dense (filled by push): an out-of-order index store into an empty array makes it a dictionary */
+      const byGroup: (unknown[][] | undefined)[] = [];
+      for (let index = 0; index <= groupCount; index += 1) {
+        byGroup.push(undefined);
+      }
+      for (const tuple of tuples) {
+        const [, group] = tuple;
+        /* 0: no parent has the key */
+        if (typeof group === 'number' && group > 0) {
+          const members = byGroup[group];
+          if (members === undefined) byGroup[group] = [tuple];
+          else members.push(tuple);
+        }
+      }
+      for (const members of byGroup) {
+        if (members !== undefined && members.length > 1) {
+          members.sort((a, b) => Number(a[0]) - Number(b[0]));
+        }
+      }
+      data.set(name, byGroup);
+      return;
+    }
     const groups = new Map<string, unknown[][]>();
     /* [__rn, key texts…, elements…] */
     const keyLength = keyWidths.get(name) ?? 0;
-    const items = Array.isArray(value) ? (value as unknown[]) : [];
     for (const item of items) {
       const tuple = Array.isArray(item)
         ? (item as unknown[])
@@ -862,6 +1029,17 @@ export const compileRoot = (
     ]),
     width: 1 + elements.length,
   };
+  const groups = groupNumbers(
+    st,
+    new Map([
+      ['__page', pageOutput.width],
+      ...[...st.levelOutputs].map(
+        ([name, output]) => [name, output.width] as [string, number]
+      ),
+    ])
+  );
+  sql.withItems.push(...groups.withItems);
+  const grouped = new Set(groups.own.keys());
   return {
     decode: (rows) => {
       const [row] = rows;
@@ -869,7 +1047,7 @@ export const compileRoot = (
       const tuples = (Array.isArray(pageColumn) ? pageColumn : [])
         .map(tupleValues)
         .sort((a, b) => Number(a[0]) - Number(b[0]));
-      const data = levelData(row ?? {}, st.keyWidths);
+      const data = levelData(row ?? {}, st.keyWidths, grouped);
       const count = { rows: tuples.length };
       const decoded = tuples.map((tuple) => plan.decode(tuple, 1, data, count));
       checkCap(count.rows);
@@ -882,9 +1060,14 @@ export const compileRoot = (
       };
     },
     sql: `${sql.withClause()}SELECT ${[
-      outputColumn('__page', pageOutput),
+      outputColumn('__page', pageOutput, {
+        extras: groups.extras.get('__page') ?? [],
+      }),
       ...[...st.keyWidths.keys()].map((name) =>
-        outputColumn(name, st.levelOutputs.get(name))
+        outputColumn(name, st.levelOutputs.get(name), {
+          extras: groups.extras.get(name) ?? [],
+          own: groups.own.get(name),
+        })
       ),
       ...extraColumns,
     ].join(', ')}${
