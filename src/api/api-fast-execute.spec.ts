@@ -165,12 +165,13 @@ e2e(
           method: 'POST',
         })
       ).text();
-    /* shared parents (inclusions of one block), two-column keys (outpoints), coinbase (NULL-like zero outpoints) */
+    /* shared parents (inclusions of one block), two-column keys (outpoints), coinbase outpoints (no parent), nesting */
     const extra: [string, string][] = [
       [
-        'blocks with their transactions, inputs and outpoints',
-        `query { blocks(node: "${one}", limit: 3) { nodes { height transactions { transaction_index transaction { hash
-          inputs { input_index outpoint_transaction_hash outpoint { value_satoshis transaction { hash block_inclusions { block { height } } } } } } } } } }`,
+        'a large page: transactions with inclusions, outputs, inputs and outpoints',
+        `query { transactions(node: "${one}", limit: 2000) { nodes { hash block_inclusions { block { height hash } }
+          outputs { output_index value_satoshis spent_by { input_index transaction { hash } } }
+          inputs { input_index outpoint_transaction_hash outpoint { value_satoshis token_category transaction { hash block_inclusions { block { height } } } } } } } }`,
       ],
     ];
     for (const [label, query] of [...documents, ...extra]) {

@@ -793,7 +793,9 @@ const outputColumn = (
     own?: { sql: string; keyWidth: number };
     /** Its key numbers as parent, appended. */
     extras?: readonly string[];
-  } = {}
+  } = {},
+  /** How the final SELECT names the level's array (`groupNumbers`: a column of the wrapped scalars). */
+  ref: (name: string) => string = (array) => array
 ) => {
   const { own, extras = [] } = groups;
   if (
@@ -802,7 +804,7 @@ const outputColumn = (
       own === undefined &&
       extras.length === 0)
   ) {
-    return name;
+    return ref(name) === name ? name : `${ref(name)} AS ${name}`;
   }
   const items = Array.from({ length: output.width }, (_, index) =>
     own !== undefined && index >= 1 && index <= own.keyWidth
@@ -813,9 +815,9 @@ const outputColumn = (
       ? `tupleElement(__t, ${index + 1})`
       : 'NULL'
   );
-  return `arrayMap(__t -> tuple(${[...items, ...extras].join(
-    ', '
-  )}), ${name}) AS ${name}${outputSuffix}`;
+  return `arrayMap(__t -> tuple(${[...items, ...extras].join(', ')}), ${ref(
+    name
+  )}) AS ${name}${outputSuffix}`;
 };
 
 /** A key (texts at `elements`, SQL over `__t`) as one non-null String; `none` for a NULL key (matches nothing). */
@@ -830,7 +832,11 @@ const groupKey = (elements: readonly string[], none: string) =>
  * appended to its tuples, the child's in place of its key texts. Sets each
  * link's `groupAt`.
  */
-const groupNumbers = (st: Statement, widths: ReadonlyMap<string, number>) => {
+const groupNumbers = (
+  st: Statement,
+  widths: ReadonlyMap<string, number>,
+  ref: (name: string) => string
+) => {
   const keys = new Map<string, { alias: string; at: number }>();
   const extras = new Map<string, string[]>();
   const own = new Map<string, { sql: string; keyWidth: number }>();
@@ -852,7 +858,9 @@ const groupNumbers = (st: Statement, widths: ReadonlyMap<string, number>) => {
       );
       const list = extras.get(link.parent) ?? [];
       list.push(
-        `transform(${parentKey}, ${alias}, arrayEnumerate(${alias}), toUInt32(0))`
+        `transform(${parentKey}, ${ref(alias)}, arrayEnumerate(${ref(
+          alias
+        )}), toUInt32(0))`
       );
       extras.set(link.parent, list);
       key = { alias, at: (widths.get(link.parent) ?? 0) + list.length - 1 };
@@ -868,10 +876,17 @@ const groupNumbers = (st: Statement, widths: ReadonlyMap<string, number>) => {
     );
     own.set(link.child, {
       keyWidth: link.childKeyWidth,
-      sql: `transform(${childKey}, ${key.alias}, arrayEnumerate(${key.alias}), toUInt32(0))`,
+      sql: `transform(${childKey}, ${ref(key.alias)}, arrayEnumerate(${ref(
+        key.alias
+      )}), toUInt32(0))`,
     });
   });
-  return { extras, own, withItems };
+  return {
+    aliases: [...keys.values()].map((key) => key.alias),
+    extras,
+    own,
+    withItems,
+  };
 };
 
 /** `__lN` arrays of a result row → child tuples grouped by parent key, in row-number order. */
@@ -1032,6 +1047,17 @@ export const compileRoot = (
     ]),
     width: 1 + elements.length,
   };
+  /*
+   * With group numbers, the final SELECT reads the levels and key arrays as
+   * columns of a one-row subquery: referenced directly, each `transform`
+   * re-resolved its key array's alias and the scalar subquery behind it
+   * (tree hash of the level's whole subquery) during analysis, a few ms per
+   * relationship whatever the page's size (chipnet X5: 70 -> 119 ms;
+   * wrapped: 70 ms; fix-pass-10.md §1). Not with pipeline levels (their
+   * arrays come from the FROM clause).
+   */
+  const wrapped = st.groupLinks.length > 0 && st.pipelineOutputs.length === 0;
+  const ref = wrapped ? (name: string) => `${name}_v` : (name: string) => name;
   const groups = groupNumbers(
     st,
     new Map([
@@ -1039,9 +1065,15 @@ export const compileRoot = (
       ...[...st.levelOutputs].map(
         ([name, output]) => [name, output.width] as [string, number]
       ),
-    ])
+    ]),
+    ref
   );
   sql.withItems.push(...groups.withItems);
+  const wrappedColumns = [
+    '__page',
+    ...st.keyWidths.keys(),
+    ...groups.aliases,
+  ].map((name) => `${name} AS ${ref(name)}`);
   const grouped = new Set(groups.own.keys());
   return {
     decode: (rows) => {
@@ -1063,18 +1095,28 @@ export const compileRoot = (
       };
     },
     sql: `${sql.withClause()}SELECT ${[
-      outputColumn('__page', pageOutput, {
-        extras: groups.extras.get('__page') ?? [],
-      }),
+      outputColumn(
+        '__page',
+        pageOutput,
+        { extras: groups.extras.get('__page') ?? [] },
+        ref
+      ),
       ...[...st.keyWidths.keys()].map((name) =>
-        outputColumn(name, st.levelOutputs.get(name), {
-          extras: groups.extras.get(name) ?? [],
-          own: groups.own.get(name),
-        })
+        outputColumn(
+          name,
+          st.levelOutputs.get(name),
+          {
+            extras: groups.extras.get(name) ?? [],
+            own: groups.own.get(name),
+          },
+          ref
+        )
       ),
       ...extraColumns,
     ].join(', ')}${
-      st.pipelineOutputs.length === 0
+      wrapped
+        ? ` FROM (SELECT ${wrappedColumns.join(', ')})`
+        : st.pipelineOutputs.length === 0
         ? ''
         : ` FROM ${st.pipelineOutputs
             .map((output, index) => `${output} AS __o${index}`)
