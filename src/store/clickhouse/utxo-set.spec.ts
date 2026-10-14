@@ -33,6 +33,7 @@ import {
 import { e2eClickHouseUrl } from './test-support.js';
 import type { UtxoSetSpotCheckMismatch } from './utxo-set.js';
 import {
+  checkOutputsPerChunk,
   checkUtxoSet,
   hashRangeChunks,
   nodeCheckChunkCount,
@@ -658,6 +659,8 @@ test('whole-set check chunks follow the UTXO count of the node, not the outputs 
   t.is(nodeCheckChunkCount(1_000_000), 1);
   t.is(nodeCheckChunkCount(5, 1), 8);
   t.is(nodeCheckChunkCount(10n ** 12n), 65_536);
+  /* fix-pass-9.md §6: and ~8 M created outputs per chunk (node 1's ~1.16 B: 256 chunks, 2.6 GiB, as fix 7) */
+  t.is(nodeCheckChunkCount(1_160_000_000n, checkOutputsPerChunk), 256);
 });
 
 e2e(

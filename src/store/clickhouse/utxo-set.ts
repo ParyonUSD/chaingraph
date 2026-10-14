@@ -733,6 +733,47 @@ export const nodeCheckChunkCount = (
   return chunks;
 };
 
+/**
+ * The outputs a node's transactions created, estimated: its accepted
+ * transactions times the database's outputs per transaction (`system.parts`
+ * row counts). Memory per check statement follows the outputs a chunk
+ * reads, not the UTXOs it keeps (fix-pass-9.md §6: mainnet node 1 at 1 M
+ * UTXOs per chunk ran 128 chunks of ~9 M outputs, 5.2 GiB per statement).
+ */
+export const nodeOutputEstimate = async (
+  client: Pick<ClickHouseClient, 'query'>,
+  nodeId: number
+) => {
+  const [row] = await client.query<{ n: string }>(
+    `SELECT toString(toUInt64(
+       (SELECT count() FROM tx_acceptance WHERE node_internal_id = {node:UInt32} AND sign > 0)
+       * (SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = 'output' AND active)
+       / greatest(1, (SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = 'transaction' AND active))
+     )) AS n`,
+    { node: nodeId }
+  );
+  return BigInt(row?.n ?? '0');
+};
+
+/**
+ * Chunks for a whole-set check or totals reference of one node: enough for
+ * at most `utxosPerChunk` of its unspent outputs and about
+ * `outputsPerChunk` of the outputs it created per hash range.
+ */
+export const nodeCheckChunks = async (
+  client: Pick<ClickHouseClient, 'query'>,
+  nodeId: number,
+  utxos: bigint,
+  options: { utxosPerChunk?: number; outputsPerChunk?: number } = {}
+) =>
+  Math.max(
+    nodeCheckChunkCount(utxos, options.utxosPerChunk),
+    nodeCheckChunkCount(
+      await nodeOutputEstimate(client, nodeId),
+      options.outputsPerChunk ?? checkOutputsPerChunk
+    )
+  );
+
 /** Unspent outputs of a set of per-category totals. */
 const totalOutputs = (totals: ReadonlyMap<string, UtxoCategoryTotals>) =>
   [...totals.values()].reduce((sum, t) => sum + t.outputs, 0n);
@@ -765,6 +806,8 @@ export interface WholeSetCheckOptions {
   chunks?: number;
   /** Unspent outputs per chunk when `chunks` is not given (default `checkUtxosPerChunk`). */
   utxosPerChunk?: number;
+  /** Created outputs per chunk when `chunks` is not given (default `checkOutputsPerChunk`). */
+  outputsPerChunk?: number;
   /** Chunks checked at once (default 1). */
   concurrency?: number;
   /** Server-side budget of each statement, s (default: the server's). */
@@ -812,7 +855,12 @@ export const referenceTotalsChunked = async (
     options.chunks ??
       (options.utxos === undefined
         ? await checkChunkCount(client)
-        : nodeCheckChunkCount(options.utxos, options.utxosPerChunk))
+        : await nodeCheckChunks(
+            client,
+            snapshot.nodeId,
+            options.utxos,
+            options
+          ))
   );
   const settings =
     options.maxExecutionSeconds === undefined
@@ -922,7 +970,12 @@ export const checkUtxoSet = async (
   );
   const chunks = hashRangeChunks(
     options.chunks ??
-      nodeCheckChunkCount(totalOutputs(storedByCategory), options.utxosPerChunk)
+      (await nodeCheckChunks(
+        client,
+        pinned.nodeId,
+        totalOutputs(storedByCategory),
+        options
+      ))
   );
   const found = { extra: [], mismatched: [], missing: [] } as {
     [kind in 'extra' | 'mismatched' | 'missing']: string[];
