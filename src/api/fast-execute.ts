@@ -140,6 +140,9 @@ const writtenResult = (text: string): ExecutionResult => {
 /** How a field's resolver is called. */
 type CallMode = 'generic' | 'key' | 'parent';
 
+/** Write one completed value of a known type (graphql-js `completeValue`), compiled once per type and selection. */
+type Complete = (path: Path | undefined, result: unknown) => void;
+
 interface FieldPlan {
   responseName: string;
   /** `"name":` (the first field) and `,"name":`. */
@@ -150,6 +153,8 @@ interface FieldPlan {
   mode: CallMode;
   /** The resolve info a `key` resolver reads (the same for every row). */
   keyInfo: { path: { key: string } };
+  /** The field's value writer (built on first use: types may be recursive). */
+  complete?: Complete;
 }
 
 interface ObjectPlan {
@@ -159,11 +164,15 @@ interface ObjectPlan {
 }
 
 /** A string JSON writes as itself between quotes. */
-const plainString = /^[^"\\\u0000-\u001f\u007f-\uffff]*$/u;
+const plainString = /^[^"\\\u0000-\u001f\u007f-￿]*$/u;
 
 class Writer {
-  /** The response's JSON, in pieces (joined once). */
-  readonly out: string[] = [];
+  /**
+   * The response's JSON so far. Appended to (V8 keeps a rope and flattens
+   * it once): an array of ~3 M pieces joined at the end cost more (the
+   * array's growth and its garbage; fix-pass-10.md §1).
+   */
+  text = '';
 
   private readonly plans = new WeakMap<
     readonly FieldNode[],
@@ -219,60 +228,83 @@ class Writer {
     return plan;
   }
 
-  /** Write a completed value (graphql-js `completeValue`). `path`: undefined when nothing below reads it. */
-  value(
+  /**
+   * The writer of a value of `type` (graphql-js `completeValue`): the type
+   * is inspected once per field and selection, not per value (graphql-js's
+   * `isNonNullType` / `isListType` / `isLeafType` per value were ~15 % of a
+   * 10,000-row page).
+   */
+  completer(
     type: GraphQLOutputType,
     nodes: readonly FieldNode[],
-    path: Path | undefined,
-    result: unknown
-  ): void {
-    if (result instanceof Error) throw new GiveUp('error');
+    nonNull = false
+  ): Complete {
     if (isNonNullType(type)) {
-      if (result === null || result === undefined) throw new GiveUp('null');
-      const mark = this.out.length;
-      this.value(type.ofType, nodes, path, result);
-      if (this.out.length === mark + 1 && this.out[mark] === 'null') {
-        throw new GiveUp('null');
-      }
-      return;
-    }
-    if (result === null || result === undefined) {
-      this.out.push('null');
-      return;
+      const inner = this.completer(type.ofType, nodes, true);
+      return (path, result) => {
+        if (result === null || result === undefined) {
+          throw new GiveUp('null');
+        }
+        inner(path, result);
+      };
     }
     if (isListType(type)) {
-      if (!Array.isArray(result)) throw new GiveUp('list');
-      const { out } = this;
-      out.push('[');
-      for (let index = 0; index < result.length; index += 1) {
-        const item: unknown = result[index];
-        if (isPromiseLike(item)) throw new GiveUp('promise');
-        if (index > 0) out.push(',');
-        this.value(
-          type.ofType,
-          nodes,
-          path === undefined ? undefined : addPath(path, index, undefined),
-          item
-        );
-      }
-      out.push(']');
-      return;
+      const item = this.completer(type.ofType, nodes);
+      return (path, result) => {
+        if (result instanceof Error) throw new GiveUp('error');
+        if (result === null || result === undefined) {
+          this.text += 'null';
+          return;
+        }
+        if (!Array.isArray(result)) throw new GiveUp('list');
+        this.text += '[';
+        for (let index = 0; index < result.length; index += 1) {
+          const value: unknown = result[index];
+          if (isPromiseLike(value)) throw new GiveUp('promise');
+          if (index > 0) this.text += ',';
+          item(
+            path === undefined ? undefined : addPath(path, index, undefined),
+            value
+          );
+        }
+        this.text += ']';
+      };
     }
     if (isLeafType(type)) {
-      const serialized: unknown = type.serialize(result);
-      if (serialized === undefined) throw new GiveUp('serialize');
-      if (typeof serialized === 'string' && plainString.test(serialized)) {
-        this.out.push('"', serialized, '"');
-      } else {
-        this.out.push(JSON.stringify(serialized));
-      }
-      return;
+      return (_path, result) => {
+        if (result instanceof Error) throw new GiveUp('error');
+        if (result === null || result === undefined) {
+          this.text += 'null';
+          return;
+        }
+        const serialized: unknown = type.serialize(result);
+        if (serialized === undefined) throw new GiveUp('serialize');
+        /* a non-null field serialised to null: graphql-js reports it */
+        if (serialized === null && nonNull) throw new GiveUp('null');
+        this.text +=
+          typeof serialized === 'string' && plainString.test(serialized)
+            ? `"${serialized}"`
+            : JSON.stringify(serialized);
+      };
     }
     if (isAbstractType(type) || !isObjectType(type)) {
-      throw new GiveUp('abstract');
+      return () => {
+        throw new GiveUp('abstract');
+      };
     }
-    if (type.isTypeOf !== undefined) throw new GiveUp('isTypeOf');
-    this.object(type, nodes, path, result);
+    if (type.isTypeOf !== undefined) {
+      return () => {
+        throw new GiveUp('isTypeOf');
+      };
+    }
+    return (path, result) => {
+      if (result instanceof Error) throw new GiveUp('error');
+      if (result === null || result === undefined) {
+        this.text += 'null';
+        return;
+      }
+      this.object(type, nodes, path, result);
+    };
   }
 
   object(
@@ -281,10 +313,8 @@ class Writer {
     path: Path | undefined,
     source: unknown
   ): void {
-    const plan = this.planOf(type, nodes);
-    const { out } = this;
-    out.push('{');
-    const { fields } = plan;
+    const { fields } = this.planOf(type, nodes);
+    this.text += '{';
     for (let index = 0; index < fields.length; index += 1) {
       const field = fields[index]!;
       const fieldPath =
@@ -293,10 +323,11 @@ class Writer {
           : addPath(path, field.responseName, type.name);
       const value = this.resolve(field, type, fieldPath, source);
       if (isPromiseLike(value)) throw new GiveUp('promise');
-      out.push(index === 0 ? field.first : field.next);
-      this.value(field.fieldDef.type, field.nodes, fieldPath, value);
+      this.text += index === 0 ? field.first : field.next;
+      field.complete ??= this.completer(field.fieldDef.type, field.nodes);
+      field.complete(fieldPath, value);
     }
-    out.push('}');
+    this.text += '}';
   }
 
   private resolve(
@@ -426,17 +457,15 @@ export const fastExecute = async (
       })
     );
     /* written in field order once every root resolved (graphql-js completes them as they resolve: same JSON) */
-    writer.out.push('{"data":{');
+    writer.text += '{"data":{';
     let first = true;
     for (const part of parts) {
       if (part !== undefined) {
-        writer.out.push(
-          `${first ? '' : ','}${JSON.stringify(part.responseName)}:`
-        );
+        writer.text += `${first ? '' : ','}${JSON.stringify(
+          part.responseName
+        )}:`;
         first = false;
-        writer.value(
-          part.fieldDef.type,
-          part.fieldNodes,
+        writer.completer(part.fieldDef.type, part.fieldNodes)(
           writer.needsPath(part.fieldDef.type, part.fieldNodes)
             ? part.path
             : undefined,
@@ -444,9 +473,9 @@ export const fastExecute = async (
         );
       }
     }
-    writer.out.push('}}');
+    writer.text += '}}';
     fastExecutionStats.fast += 1;
-    return writtenResult(writer.out.join(''));
+    return writtenResult(writer.text);
   } catch {
     /* gave up (GiveUp), or a root field failed: graphql-js reports it */
     fastExecutionStats.gaveUp += 1;
