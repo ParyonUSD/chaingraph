@@ -1822,7 +1822,16 @@ export const transactionPredicate = (
   sql: Sql,
   filter: TransactionFilter | null | undefined,
   node?: number,
-  among?: string
+  among?: string,
+  /*
+   * `implied`: `among` is the intersection of this filter's output-side
+   * conjuncts (`transactionCandidates` from `outputSideCandidates`): a
+   * selective `hash` list and selective `has_output` conjuncts, here and in
+   * `_and` parts, hold for every row among them (the same predicates over the
+   * same pinned views) and are not checked again: each was a read of output
+   * or transaction plus its subqueries in the page level (fix-pass-11.md §1).
+   */
+  implied = false
 ): string => {
   /*
    * `among`: a subquery of transaction hashes every result row is among (the
@@ -1839,7 +1848,10 @@ export const transactionPredicate = (
       ...numericComparison(sql, 'internal_id', 'UInt64', filter.internal_id)
     );
   }
-  if (given(filter.hash)) {
+  if (
+    given(filter.hash) &&
+    !(implied && hasSelectiveHex(filter.hash) && !given(filter.hash._prefix))
+  ) {
     parts.push(...hexComparison(sql, 'hash', 'hash', filter.hash, 'hash'));
   }
   const numeric: [keyof TransactionFilter, string][] = [
@@ -1859,7 +1871,10 @@ export const transactionPredicate = (
   if (given(filter.is_coinbase)) {
     parts.push(...booleanComparison(sql, 'is_coinbase', filter.is_coinbase));
   }
-  if (given(filter.has_output)) {
+  if (
+    given(filter.has_output) &&
+    !(implied && outputFilterIsSelective(filter.has_output))
+  ) {
     /* a selective output filter is read through its projection: the candidates only filter */
     parts.push(
       `hash IN (SELECT transaction_hash FROM ${sql.view(
@@ -1972,7 +1987,9 @@ export const transactionPredicate = (
   }
   if (given(filter._and)) {
     parts.push(
-      ...filter._and.map((f) => transactionPredicate(sql, f, node, among))
+      ...filter._and.map((f) =>
+        transactionPredicate(sql, f, node, among, implied)
+      )
     );
   }
   if (given(filter._or)) {
@@ -2283,6 +2300,17 @@ export const transactionCandidates = (
   }
   return undefined;
 };
+
+/**
+ * True when `transactionCandidates` of `filter` are its output-side
+ * conjuncts (`outputSideCandidates`): `transactionPredicate(…, implied)`
+ * may then leave them out.
+ */
+export const candidatesAreOutputSide = (
+  sql: Sql,
+  filter: TransactionFilter | null | undefined,
+  node?: number
+) => given(filter) && outputSideCandidates(sql, filter, node).length > 0;
 
 /**
  * True when every transaction matching `filter` is accepted by the filter's

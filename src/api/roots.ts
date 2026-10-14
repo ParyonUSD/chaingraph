@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/naming-convention, functional/no-throw-statement, complexity, max-params */
+/* eslint-disable @typescript-eslint/naming-convention, functional/no-throw-statement, complexity, max-params, max-lines */
 // cspell:ignore clickhouse unhex unindexed cand
 /**
  * The v2 root fields: their row sources, acceptance rules, ordering,
@@ -43,6 +43,7 @@ import type {
 import {
   blockCandidates,
   blockPredicate,
+  candidatesAreOutputSide,
   hexComparison,
   impliesAcceptance,
   inputPredicate,
@@ -325,7 +326,14 @@ const fullTransactionsPage = async (
               : `hash IN (${sql.accepted(ctx.node, among)})`,
           ]),
       ...bounds,
-      transactionPredicate(sql, args.where, ctx.node, among),
+      transactionPredicate(
+        sql,
+        args.where,
+        ctx.node,
+        among,
+        among !== undefined &&
+          candidatesAreOutputSide(sql.fresh(), args.where, ctx.node)
+      ),
     ],
     order,
     { ...args, after: args.cursor },
@@ -393,7 +401,13 @@ export const runTransactions = async (
             )})`,
           ]),
       ...bounds,
-      transactionPredicate(sql, args.where, ctx.node, among),
+      transactionPredicate(
+        sql,
+        args.where,
+        ctx.node,
+        among,
+        candidatesAreOutputSide(sql.fresh(), args.where, ctx.node)
+      ),
     ];
     const window = candidateWindow(
       sql,
