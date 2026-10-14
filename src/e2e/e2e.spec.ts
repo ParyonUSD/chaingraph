@@ -5035,7 +5035,8 @@ test.serial(
  * by its first temporary table, as on a pooled connection) and
  * effective_io_concurrency = 200: an uncapped copy between temporary tables
  * larger than the local buffers fails (PG 18+), the capped copy succeeds, the
- * settings are restored, and a preparation plus a batch run (rolled back).
+ * settings are restored, and a preparation, a backfill batch, a scope
+ * backfill and a job batch run there (rolled back).
  */
 test.serial(
   `[e2e] unspent_node_ids (${String(
@@ -5046,7 +5047,7 @@ test.serial(
       t.pass();
       return;
     }
-    // cspell:ignore temp_buffers
+    // cspell:ignore temp_buffers xact
     const session = new pg.Client({
       connectionString: postgresE2eConnectionStringTestDb,
       options: '-c temp_buffers=800kB -c effective_io_concurrency=200',
@@ -5126,10 +5127,36 @@ test.serial(
         ).rows[0]!.result;
         t.log({ batch, prepared });
         t.is(batch.previousPrefix, 0, 'the batch ran');
+        /*
+         * a scope backfill and a job batch (partition 0 from the start), with
+         * the partition lock first, so the job batch does not return busy
+         */
+        await session.query(/* sql */ `
+          SELECT pg_advisory_xact_lock(1970172785, 0);
+          UPDATE unspent_tracking_progress SET input_transaction_internal_id = 0, block_internal_id = 0
+            WHERE partition_index = 0;`);
+        const scope = (
+          await session.query<{ changed: string }>(
+            `SELECT unspent_node_ids_backfill_scope(NULL, NULL) AS changed;`
+          )
+        ).rows[0]!.changed;
+        t.true(Number(scope) >= 0, 'the scope backfill ran');
+        const jobBatch = (
+          await session.query<{
+            result: { [key: string]: unknown };
+          }>(/* sql */ `
+            SELECT unspent_node_ids_run_batch(0, p.partition_count,
+              (SELECT max(internal_id) FROM transaction), (SELECT max(internal_id) FROM block),
+              (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq),
+              65536, 65536, 65536, 0) AS result
+              FROM unspent_tracking_progress p WHERE p.partition_index = 0;`)
+        ).rows[0]!.result;
+        t.log({ jobBatch, scope });
+        t.is(jobBatch.previousInputWatermark, 0, 'the job batch ran');
         t.is(
           await setting('effective_io_concurrency'),
           '200',
-          'restored after the preparation and the batch'
+          'restored after the preparation and the batches'
         );
       } finally {
         await session.query('ROLLBACK;');
