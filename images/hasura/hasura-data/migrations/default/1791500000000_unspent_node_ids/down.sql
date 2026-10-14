@@ -25,6 +25,8 @@ DROP FUNCTION IF EXISTS unspent_node_ids_run_batch (integer, integer, bigint, bi
 -- signatures of earlier drafts of this migration (lab databases)
 DROP FUNCTION IF EXISTS unspent_node_ids_run_batch (integer, integer, bigint, bigint, integer, integer, integer, bigint, boolean);
 DROP FUNCTION IF EXISTS unspent_node_ids_temp_tables ();
+DROP FUNCTION IF EXISTS unspent_node_ids_restore_read_ahead (text[]);
+DROP FUNCTION IF EXISTS unspent_node_ids_limit_temp_read_ahead ();
 DROP FUNCTION IF EXISTS unspent_node_ids_recompute ();
 DROP FUNCTION IF EXISTS unspent_node_ids_recompute (boolean);
 DROP FUNCTION IF EXISTS unspent_node_ids_accepting (bigint);
