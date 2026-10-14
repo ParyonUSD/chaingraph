@@ -86,9 +86,10 @@ raw.query = async (params) => {
 };
 const { disabledAdmissionOptions } = await imp('build/api/admission.js');
 const api = createApi(client, { admission: disabledAdmissionOptions });
-const sub = /^\s*subscription\b/u.test(query);
+/* a subscription document (after its header comments) runs as a query */
+const subscription = /^((?:\s*#[^\n]*\n)*\s*)subscription\b/u;
 const body = JSON.stringify({
-  query: sub ? query.replace(/^\s*subscription\b/u, 'query') : query,
+  query: query.replace(subscription, '$1query'),
   variables,
 });
 const once = async () => {
