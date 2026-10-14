@@ -257,6 +257,15 @@ export interface RelationField {
   /** Order terms from the arguments (undefined: `defaultOrder`). */
   order?: (args: { [name: string]: unknown }) => OrderTerm[] | undefined;
   defaultOrder: readonly OrderTerm[];
+  /**
+   * A to-one relationship the parent's source can also join in
+   * (fix-pass-11.md §1): when the selection under it is only scalar fields
+   * of the target over `columns` (no arguments), the parent's source
+   * provides those target columns as `${prefix}${column}` (they are in its
+   * `needs`) and the child row is decoded from the parent's tuple: no level
+   * of its own. NULL in `${prefix}${key}` (no matching row) is a null child.
+   */
+  inline?: { prefix: string; columns: readonly string[]; key: string };
 }
 
 export type Field = ComputedField | RelationField | ScalarField;
@@ -473,6 +482,44 @@ const expandComputed = (entity: Entity, sels: readonly Sel[]): Sel[] => {
   return out;
 };
 
+/**
+ * The scalar fields of an inline relationship's selection (`inline`), their
+ * SQL over the parent's prefixed columns; undefined when the selection
+ * cannot be inlined (arguments, a relationship or computed field under it,
+ * a column the parent does not provide).
+ */
+const inlineScalars = (field: RelationField, target: Entity, sel: Sel) => {
+  const { inline } = field;
+  if (inline === undefined || field.many) return undefined;
+  if (Object.values(sel.args).some((value) => value !== undefined)) {
+    return undefined;
+  }
+  const out: { name: string; sql: string; columns: string[] }[] = [];
+  for (const child of sel.sels ?? []) {
+    const childField = target.fields[child.name];
+    if (childField?.kind !== 'scalar' || child.sels !== undefined) {
+      return undefined;
+    }
+    const columns = referencedColumns(childField.sql, target.columns);
+    if (!columns.every((column) => inline.columns.includes(column))) {
+      return undefined;
+    }
+    out.push({
+      columns,
+      name: child.name,
+      sql: columns.reduce(
+        (text, column) =>
+          text.replace(
+            new RegExp(`(?<![\\w.])${column}(?![\\w])`, 'gu'),
+            `${inline.prefix}${column}`
+          ),
+        childField.sql
+      ),
+    });
+  }
+  return out;
+};
+
 const resolveNode = (c: Ctx, args: { [name: string]: unknown }) =>
   typeof args.node === 'string' ? c.nodeId(args.node) : c.node;
 
@@ -522,6 +569,34 @@ const planLevel = (
     }
     if (field.kind !== 'relation') return;
     const target = field.target();
+    const inlined = inlineScalars(field, target, sel);
+    if (inlined !== undefined) {
+      const { prefix: columnPrefix, key } = field.inline!;
+      const keyPosition = element(`${columnPrefix}${key}`);
+      needs.add(`${columnPrefix}${key}`);
+      clientPositions.add(keyPosition);
+      const positions = inlined.map((scalarField) => {
+        scalarField.columns.forEach((column) =>
+          needs.add(`${columnPrefix}${column}`)
+        );
+        const position = element(scalarField.sql);
+        clientPositions.add(position);
+        return { name: scalarField.name, position };
+      });
+      decoders.push((values, base, _record, related) => {
+        const present = values[base + keyPosition];
+        if (present === null || present === undefined) {
+          related[sel.key] = null;
+          return;
+        }
+        const childRecord: { [key: string]: unknown } = {};
+        for (const { name, position } of positions) {
+          childRecord[name] = values[base + position] ?? null;
+        }
+        related[sel.key] = withRelations(childRecord, {});
+      });
+      return;
+    }
     const childNode = field.perNode ? resolveNode(c, sel.args) : c.node;
     const childCtx: Ctx = { ...c, node: childNode };
     const child = st.levelName(field.childKeys.length);

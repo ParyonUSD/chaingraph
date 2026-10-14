@@ -389,6 +389,9 @@ const outputsOf = (c: Ctx, condition: string) =>
 const transactionsByHash = (c: Ctx, link: string) =>
   `SELECT * FROM ${c.sql.view('transaction_at')} WHERE hash IN (${link})`;
 
+/** Columns of the block joined into the inclusions level (`BlockInclusion.block` inline). */
+const inlineBlockPrefix = '__b_';
+
 const blocksById = (c: Ctx, link: string) =>
   `SELECT * FROM ${c.sql.view('block_at')} WHERE internal_id IN (${link})`;
 
@@ -875,6 +878,34 @@ export const TransactionEntity: Entity = {
           return `SELECT transaction_hash, block_internal_id, toUInt32(0) AS height,
           toFixedString('', 32) AS block_hash, transaction_index FROM (${inclusions})`;
         }
+        const filtered = args.where !== undefined && args.where !== null;
+        /* the inlined block's columns (BlockInclusion.block `inline`) */
+        const blockNeeds = [...needs]
+          .filter((column) => column.startsWith(inlineBlockPrefix))
+          .map((column) => column.slice(inlineBlockPrefix.length));
+        if (filtered || blockNeeds.length > 0) {
+          /*
+           * Every inclusion's block, joined in this level (fix-pass-11.md
+           * §1): the inclusions are read twice (both sides, by key), and
+           * the selected block fields come with them, so the `block` level
+           * and the inclusions' scalar array are not needed (L1 on the
+           * synthetic copy: three levels -> one, 94 -> 62 ms).
+           */
+          const blockColumnsRead = [
+            ...new Set(['internal_id', 'height', 'hash', ...blockNeeds]),
+          ];
+          return `SELECT bt.transaction_hash AS transaction_hash, bt.block_internal_id AS block_internal_id,
+          b.height AS height, b.hash AS block_hash, bt.transaction_index AS transaction_index${blockNeeds
+            .map((column) => `, b.${column} AS ${inlineBlockPrefix}${column}`)
+            .join('')}
+        FROM (${inclusions}) AS bt
+        ${filtered ? 'INNER' : 'LEFT'} JOIN (SELECT ${blockColumnsRead.join(
+            ', '
+          )} FROM ${c.sql.view(
+            'block_at'
+          )} WHERE internal_id IN (SELECT block_internal_id FROM (${inclusions}))) AS b
+          ON b.internal_id = bt.block_internal_id`;
+        }
         /*
          * The inclusions once (a statement-level scalar array: a MATERIALIZED
          * CTE read by both sides of the join below is evaluated twice on
@@ -895,19 +926,12 @@ export const TransactionEntity: Entity = {
          * keeps height 0 and an empty hash, which order nothing
          * (fix-pass-8b.md §2).
          */
-        const filtered = args.where !== undefined && args.where !== null;
         return `SELECT bt.transaction_hash AS transaction_hash, bt.block_internal_id AS block_internal_id,
           b.height AS height, b.hash AS block_hash, bt.transaction_index AS transaction_index
         FROM ${rows} AS bt
-        ${
-          filtered ? 'INNER' : 'LEFT'
-        } JOIN (SELECT internal_id, height, hash FROM ${c.sql.view(
+        LEFT JOIN (SELECT internal_id, height, hash FROM ${c.sql.view(
           'block_at'
-        )} WHERE internal_id IN (SELECT block_internal_id FROM ${rows}${
-          filtered
-            ? ''
-            : ` WHERE transaction_hash IN (SELECT transaction_hash FROM ${rows} GROUP BY transaction_hash HAVING count() > 1)`
-        })) AS b
+        )} WHERE internal_id IN (SELECT block_internal_id FROM ${rows} WHERE transaction_hash IN (SELECT transaction_hash FROM ${rows} GROUP BY transaction_hash HAVING count() > 1))) AS b
           ON b.internal_id = bt.block_internal_id`;
       },
       target: () => BlockInclusionEntity,
@@ -1362,7 +1386,15 @@ export const BlockInclusionEntity: Entity = {
         )}`,
       target: () => AcceptanceMarkEntity,
     },
-    block: blockById('block_internal_id'),
+    /* inlined: the inclusions level joins the block rows (fix-pass-11.md §1) */
+    block: {
+      ...blockById('block_internal_id'),
+      inline: {
+        columns: blockColumns,
+        key: 'internal_id',
+        prefix: inlineBlockPrefix,
+      },
+    },
     block_internal_id: scalar(str('block_internal_id')),
     transaction_index: scalar('transaction_index'),
   },
