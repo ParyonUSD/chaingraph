@@ -67,6 +67,11 @@ import {
 } from './db.js';
 import { loadTrustedDocuments } from './plugins.js';
 import { createApi, listen } from './server.js';
+import {
+  defaultWarmupTimeoutMs,
+  loadWarmupEntries,
+  runWarmup,
+} from './warmup.js';
 
 const defaultPort = 4000;
 
@@ -184,6 +189,33 @@ const main = async () => {
       },
     },
   });
+  /* before listening: the first client requests find costs, caches and code warm (warmup.ts) */
+  const warmup = env.CHAINGRAPH_API_WARMUP;
+  if (warmup !== undefined && warmup !== '') {
+    const result = await runWarmup(
+      async (url, init) => api.yoga.fetch(url, init),
+      loadWarmupEntries(warmup),
+      {
+        log: (line) => {
+          // eslint-disable-next-line no-console
+          console.error(line);
+        },
+        rounds: integerFromEnv(env, 'CHAINGRAPH_API_WARMUP_ROUNDS', 1, 1),
+        timeoutMs: integerFromEnv(
+          env,
+          'CHAINGRAPH_API_WARMUP_TIMEOUT_MS',
+          defaultWarmupTimeoutMs,
+          0
+        ),
+      }
+    );
+    if (cluster.isPrimary || cluster.worker?.id === 1) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `warm-up: ${result.ok} ok, ${result.failed} failed, ${result.skipped} skipped of ${result.entries} entries in ${result.ms} ms`
+      );
+    }
+  }
   const port = Number(process.env.CHAINGRAPH_API_PORT ?? defaultPort);
   const server = await listen(
     api,
