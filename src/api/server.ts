@@ -19,7 +19,7 @@ import type {
   OperationDefinitionNode,
   ValueNode,
 } from 'graphql';
-import { getOperationAST, Kind } from 'graphql';
+import { getOperationAST, Kind, print } from 'graphql';
 import { useServer } from 'graphql-ws/use/ws';
 import type { Plugin, YogaServerInstance } from 'graphql-yoga';
 import { createYoga } from 'graphql-yoga';
@@ -31,6 +31,12 @@ import type { AdmissionOptions, Ticket } from './admission.js';
 import { planKeys } from './admission.js';
 import type { RequestScope, StatementTimeouts } from './db.js';
 import { ApiDb, PinnedSnapshot, requestScope } from './db.js';
+import type { FastExecutionMode } from './fast-execute.js';
+import {
+  fastExecute,
+  fastExecutionModeFromEnv,
+  verifiedExecute,
+} from './fast-execute.js';
 import { handlePost } from './front.js';
 import type { HeavyLaneOptions } from './heavy-lane.js';
 import { HeavyLane } from './heavy-lane.js';
@@ -217,6 +223,22 @@ const useAdmission = (db: ApiDb): Plugin<ApiContext> => ({
   },
 });
 
+/**
+ * Query operations answered by the fast executor (fast-execute.ts): the
+ * response JSON written directly, graphql-js when it gives up. Before
+ * `useAdmission`, which wraps it in the request scope.
+ */
+const useFastExecution = (mode: FastExecutionMode): Plugin<ApiContext> => ({
+  onExecute: ({ executeFn, setExecuteFn }) => {
+    if (mode === 'off') return;
+    const execute = executeFn as (a: ExecutionArgs) => unknown;
+    setExecuteFn((async (args: ExecutionArgs) =>
+      mode === 'verify'
+        ? verifiedExecute(args, execute, print)
+        : fastExecute(args, execute)) as never);
+  },
+});
+
 const useRequestSnapshot = (db: ApiDb): Plugin<ApiContext> => ({
   onExecute: ({ args, extendContext }) => {
     const snapshot = new PinnedSnapshot(
@@ -261,6 +283,8 @@ export interface ApiOptions {
   authchainMaxBranches?: number;
   /** Admission control of ClickHouse statements (admission.ts; default on). */
   admission?: AdmissionOptions;
+  /** The fast executor (fast-execute.ts; default CHAINGRAPH_API_FAST_EXECUTION, on). */
+  fastExecution?: FastExecutionMode;
   /** Server-side time budget per statement class (db.ts `defaultStatementTimeouts`). */
   statementTimeouts?: Partial<StatementTimeouts>;
   /**
@@ -320,6 +344,7 @@ export const createApi = (
               )
             ),
           ]),
+      useFastExecution(options.fastExecution ?? fastExecutionModeFromEnv()),
       useAdmission(db),
       useRequestSnapshot(db),
     ],

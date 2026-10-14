@@ -42,6 +42,7 @@ import type { Page, Row, Sel } from './compile.js';
 import { pageNodeSels, prefetched, rootSels } from './compile.js';
 import type { ApiDb, PinnedSnapshot } from './db.js';
 import { singleNodeEnv } from './db.js';
+import { keyResolvers } from './fast-execute.js';
 import type { LiveHub } from './live.js';
 import { resultKey } from './live.js';
 import type {
@@ -637,6 +638,32 @@ const many = (parent: Row, info: GraphQLResolveInfo) =>
   prefetched(parent, String(info.path.key)) as Row[];
 const one = (parent: Row, info: GraphQLResolveInfo) =>
   (prefetched(parent, String(info.path.key)) ?? null) as Row | null;
+/*
+ * The relationship resolvers read only their parent and `info.path.key`
+ * (the prefetched rows): registered, the fast executor calls them without
+ * building a resolve info (fast-execute.ts).
+ */
+const manyResolve = (
+  p: Row,
+  _a: unknown,
+  _c: unknown,
+  info: Pick<GraphQLResolveInfo, 'path'>
+) => many(p, info as GraphQLResolveInfo);
+const optionalResolve = (
+  p: Row,
+  _a: unknown,
+  _c: unknown,
+  info: Pick<GraphQLResolveInfo, 'path'>
+) => one(p, info as GraphQLResolveInfo);
+const oneResolve = (
+  p: Row,
+  _a: unknown,
+  _c: unknown,
+  info: Pick<GraphQLResolveInfo, 'path'>
+) => one(p, info as GraphQLResolveInfo)!;
+[manyResolve, optionalResolve, oneResolve].forEach((resolve) =>
+  keyResolvers.add(resolve)
+);
 const hidden = (parent: Row, key: string) =>
   (prefetched(parent, key) ?? null) as Row | null;
 
@@ -743,14 +770,14 @@ TransactionRef.implement({
       args: { limit: t.arg.int(), offset: t.arg.int() },
       description:
         'Node-agnostic: every branch of the identity-output tree from this transaction, over all stored spends of output 0 (conflicting spends and stale blocks included): one Authchain per path to an output 0 no stored transaction spends (`unspent_authhead`) or to the depth limit. For fork analysis; the chain one node accepts is `authchains(node:)`. Longest first.',
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [AuthchainRef],
     }),
     authchains: t.field({
       args: { node: nodeArg(t) },
       description:
         "Per node: the authchain from this transaction (v1 `collect_authchains` at the node's view: output 0 followed through spends the node accepts, to the unspent authhead). At most one element.",
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [AuthchainRef],
     }),
     block_inclusions: t.field({
@@ -763,14 +790,14 @@ TransactionRef.implement({
       },
       description:
         'Every stored block that includes the transaction (node-agnostic: blocks of stale forks included), by block height, then block hash (`order_by: { block_internal_id: ASC }` for storage order). `accepted_by: node` keeps the blocks that node accepts; `accepted(node:)` on each inclusion tells them apart.',
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [BlockInclusionRef],
     }),
     data_carrier_outputs: t.field({
       args: outputListArgs(t),
       description:
         'Outputs with value 0 or a locking bytecode beginning with OP_RETURN.',
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [OutputRef],
     }),
     encoded_hex: t.field({
@@ -792,7 +819,7 @@ TransactionRef.implement({
       args: { where: t.arg({ type: OutputFilterInput }) },
       description: 'Output 0.',
       nullable: true,
-      resolve: (p, _a, _c, info) => one(p, info),
+      resolve: optionalResolve,
       type: OutputRef,
     }),
     input_count: intField(t, 'input_count'),
@@ -810,7 +837,7 @@ TransactionRef.implement({
         order_by: t.arg({ type: [InputOrderBy] }),
         where: t.arg({ type: InputFilterInput }),
       },
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [InputRef],
     }),
     internal_id: bigIntField(t, 'internal_id'),
@@ -827,7 +854,7 @@ TransactionRef.implement({
       },
       description:
         "The node's past validations of the transaction (mempool history: replaced or confirmed).",
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [TimelineRef],
     }),
     node_validations: t.field({
@@ -838,21 +865,21 @@ TransactionRef.implement({
       },
       description:
         "The node's current validation (the transaction is in its mempool).",
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [NodeTransactionRef],
     }),
     output_count: intField(t, 'output_count'),
     output_value_satoshis: bigIntField(t, 'output_value_satoshis'),
     outputs: t.field({
       args: outputListArgs(t),
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [OutputRef],
     }),
     signing_output: t.field({
       args: { where: t.arg({ type: OutputFilterInput }) },
       description: 'Output 1 (null if there is none).',
       nullable: true,
-      resolve: (p, _a, _c, info) => one(p, info),
+      resolve: optionalResolve,
       type: OutputRef,
     }),
     size_bytes: intField(t, 'size_bytes'),
@@ -895,13 +922,13 @@ OutputRef.implement({
       },
       description:
         'Every stored input spending this output (node-agnostic: conflicting spends included). `accepted_by: node` keeps the inputs of transactions that node accepts (at most one unless its mempool view holds a double spend); `accepted(node:)` on each input tells them apart.',
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [InputRef],
     }),
     token_category: nullableHex(t, 'token_category'),
     transaction: t.field({
       description: 'The creating transaction.',
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: TransactionRef,
     }),
     transaction_hash: hexField(t, 'transaction_hash'),
@@ -921,7 +948,7 @@ InputRef.implement({
       description:
         'The output this input spends (null when it is not stored, e.g. for a coinbase input).',
       nullable: true,
-      resolve: (p, _a, _c, info) => one(p, info),
+      resolve: optionalResolve,
       type: OutputRef,
     }),
     outpoint_index: bigIntField(
@@ -940,7 +967,7 @@ InputRef.implement({
     sequence_number: bigIntField(t, 'sequence_number'),
     transaction: t.field({
       description: 'The spending transaction.',
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: TransactionRef,
     }),
     transaction_hash: hexField(t, 'transaction_hash'),
@@ -984,7 +1011,7 @@ BlockRef.implement({
       args: { node: nodeArg(t), where: t.arg({ type: NodeBlockFilterInput }) },
       description:
         "The node's acceptance of this block (per node; empty if it does not accept it).",
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [NodeBlockRef],
     }),
     bits: bigIntField(t, 'bits'),
@@ -1048,7 +1075,7 @@ BlockRef.implement({
         where: t.arg({ type: BlockTransactionFilterInput }),
       },
       description: 'The transactions of the block, by transaction_index.',
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [BlockTransactionRef],
     }),
     version: intField(t, 'version'),
@@ -1061,7 +1088,7 @@ BlockInclusionRef.implement({
   fields: (t) => ({
     accepted: acceptedField(t, 'Whether the node accepts the block.'),
     block: t.field({
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: BlockRef,
     }),
     block_internal_id: bigIntField(t, 'block_internal_id'),
@@ -1075,11 +1102,11 @@ BlockInclusionRef.implement({
 BlockTransactionRef.implement({
   fields: (t) => ({
     block: t.field({
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: BlockRef,
     }),
     transaction: t.field({
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: TransactionRef,
     }),
     transaction_hash: hexField(t, 'transaction_hash'),
@@ -1095,12 +1122,12 @@ NodeTransactionRef.implement({
     "A node's validation of a transaction (the transaction is in its mempool).",
   fields: (t) => ({
     node: t.field({
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: NodeRef,
     }),
     node_internal_id: intField(t, 'node_internal_id'),
     transaction: t.field({
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: TransactionRef,
     }),
     transaction_hash: hexField(t, 'transaction_hash'),
@@ -1114,7 +1141,7 @@ TimelineRef.implement({
     "A past validation of a transaction by a node: replaced_at is when it left the node's mempool (null: confirmed).",
   fields: (t) => ({
     node: t.field({
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: NodeRef,
     }),
     replaced_at: timestampField(t, 'replaced_at'),
@@ -1132,14 +1159,14 @@ NodeBlockRef.implement({
       'Null if the block is known only from a historical sync.'
     ),
     block: t.field({
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: BlockRef,
     }),
     block_hash: hexField(t, 'block_hash'),
     block_internal_id: bigIntField(t, 'block_internal_id'),
     height: intField(t, 'height'),
     node: t.field({
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: NodeRef,
     }),
     node_internal_id: intField(t, 'node_internal_id'),
@@ -1157,7 +1184,7 @@ NodeRef.implement({
         order_by: t.arg({ type: [NodeBlockOrderBy] }),
         where: t.arg({ type: NodeBlockFilterInput }),
       },
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [NodeBlockRef],
     }),
     first_connected_at: timestampField(t, 'first_connected_at'),
@@ -1175,7 +1202,7 @@ NodeRef.implement({
         order_by: t.arg({ type: [NodeTransactionOrderBy] }),
         where: t.arg({ type: NodeTransactionFilterInput }),
       },
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [NodeTransactionRef],
     }),
     user_agent: t.string({ resolve: (p) => String(p.user_agent) }),
@@ -1192,7 +1219,7 @@ AuthchainRef.implement({
       'Transactions in the chain, the base included.'
     ),
     authhead: t.field({
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: TransactionRef,
     }),
     authhead_transaction_hash: hexField(t, 'authhead_transaction_hash'),
@@ -1203,7 +1230,7 @@ AuthchainRef.implement({
         order_by: t.arg({ type: [MigrationOrderBy] }),
       },
       description: 'The chain, base first (migration_index 0).',
-      resolve: (p, _a, _c, info) => many(p, info),
+      resolve: manyResolve,
       type: [MigrationRef],
     }),
     unspent_authhead: t.boolean({
@@ -1218,7 +1245,7 @@ MigrationRef.implement({
   fields: (t) => ({
     migration_index: intField(t, 'migration_index'),
     transaction: t.field({
-      resolve: (p, _a, _c, info) => one(p, info)!,
+      resolve: oneResolve,
       type: TransactionRef,
     }),
     transaction_hash: hexField(t, 'transaction_hash'),

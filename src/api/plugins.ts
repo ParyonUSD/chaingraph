@@ -30,6 +30,7 @@ import type { Plugin } from 'graphql-yoga';
 
 import type { ApiDb } from './db.js';
 import { requestScope } from './db.js';
+import { resultText } from './fast-execute.js';
 import type { ApiContext } from './schema.js';
 
 /* ------------------------------------------------------------------ */
@@ -377,7 +378,7 @@ export class ResponseCache {
     this.stats.hits += 1;
     this.entries.delete(key);
     this.entries.set(key, cached);
-    cached.body ??= JSON.stringify(cached.result);
+    cached.body ??= resultText(cached.result);
     return cached.body;
   }
 
