@@ -43,7 +43,7 @@ import type {
 import {
   blockCandidates,
   blockPredicate,
-  candidatesAreOutputSide,
+  candidatesImplied,
   hexComparison,
   impliesAcceptance,
   inputPredicate,
@@ -331,8 +331,9 @@ const fullTransactionsPage = async (
         args.where,
         ctx.node,
         among,
-        among !== undefined &&
-          candidatesAreOutputSide(sql.fresh(), args.where, ctx.node)
+        among === undefined
+          ? undefined
+          : candidatesImplied(sql.fresh(), args.where, ctx.node)
       ),
     ],
     order,
@@ -406,7 +407,7 @@ export const runTransactions = async (
         args.where,
         ctx.node,
         among,
-        candidatesAreOutputSide(sql.fresh(), args.where, ctx.node)
+        candidatesImplied(sql.fresh(), args.where, ctx.node)
       ),
     ];
     const window = candidateWindow(

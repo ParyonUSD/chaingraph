@@ -1824,14 +1824,15 @@ export const transactionPredicate = (
   node?: number,
   among?: string,
   /*
-   * `implied`: `among` is the intersection of this filter's output-side
-   * conjuncts (`transactionCandidates` from `outputSideCandidates`): a
-   * selective `hash` list and selective `has_output` conjuncts, here and in
-   * `_and` parts, hold for every row among them (the same predicates over the
-   * same pinned views) and are not checked again: each was a read of output
-   * or transaction plus its subqueries in the page level (fix-pass-11.md §1).
+   * `implied`: which conjuncts produced `among` (`candidatesImplied`). They
+   * hold for every row among the candidates (the same predicates over the
+   * same pinned views) and are not checked again: each was a read of output,
+   * spend or transaction plus its subqueries in the page level
+   * (fix-pass-11.md §1). `output`: a selective `hash` list and selective
+   * `has_output` conjuncts, here and in `_and` parts; `input`: this filter's
+   * `has_input` (the spend relation); `{ and, inner }`: part `and` of `_and`.
    */
-  implied = false
+  implied?: Implied
 ): string => {
   /*
    * `among`: a subquery of transaction hashes every result row is among (the
@@ -1850,7 +1851,11 @@ export const transactionPredicate = (
   }
   if (
     given(filter.hash) &&
-    !(implied && hasSelectiveHex(filter.hash) && !given(filter.hash._prefix))
+    !(
+      implied === 'output' &&
+      hasSelectiveHex(filter.hash) &&
+      !given(filter.hash._prefix)
+    )
   ) {
     parts.push(...hexComparison(sql, 'hash', 'hash', filter.hash, 'hash'));
   }
@@ -1873,7 +1878,7 @@ export const transactionPredicate = (
   }
   if (
     given(filter.has_output) &&
-    !(implied && outputFilterIsSelective(filter.has_output))
+    !(implied === 'output' && outputFilterIsSelective(filter.has_output))
   ) {
     /* a selective output filter is read through its projection: the candidates only filter */
     parts.push(
@@ -1886,7 +1891,10 @@ export const transactionPredicate = (
       )}${outputPredicate(sql, filter.has_output, outputRowColumns, node)})`
     );
   }
-  if (given(filter.has_input)) {
+  if (
+    given(filter.has_input) &&
+    !(implied === 'input' && requiresOutpoint(filter.has_input))
+  ) {
     /*
      * A filter requiring a spent output reads the spend relation alone (no
      * `input` rows): an address's or a category's spending transactions.
@@ -1987,8 +1995,18 @@ export const transactionPredicate = (
   }
   if (given(filter._and)) {
     parts.push(
-      ...filter._and.map((f) =>
-        transactionPredicate(sql, f, node, among, implied)
+      ...filter._and.map((f, index) =>
+        transactionPredicate(
+          sql,
+          f,
+          node,
+          among,
+          implied === 'output'
+            ? 'output'
+            : typeof implied === 'object' && implied.and === index
+            ? implied.inner
+            : undefined
+        )
       )
     );
   }
@@ -2301,16 +2319,36 @@ export const transactionCandidates = (
   return undefined;
 };
 
+/** Which conjuncts of a filter its candidates come from (`transactionPredicate`'s `implied`). */
+export type Implied =
+  | 'input'
+  | 'output'
+  | { and: number; inner: Implied | undefined };
+
 /**
- * True when `transactionCandidates` of `filter` are its output-side
- * conjuncts (`outputSideCandidates`): `transactionPredicate(…, implied)`
- * may then leave them out.
+ * The conjuncts `transactionCandidates` of `filter` come from, mirroring
+ * its choice: the output-side conjuncts, else the spend relation of
+ * `has_input`, else the first `_and` part with candidates; undefined when
+ * there are none or they come from `_or` branches.
  */
-export const candidatesAreOutputSide = (
+export const candidatesImplied = (
   sql: Sql,
   filter: TransactionFilter | null | undefined,
   node?: number
-) => given(filter) && outputSideCandidates(sql, filter, node).length > 0;
+): Implied | undefined => {
+  if (!given(filter)) return undefined;
+  if (outputSideCandidates(sql, filter, node).length > 0) return 'output';
+  if (given(filter.has_input) && requiresOutpoint(filter.has_input)) {
+    return 'input';
+  }
+  const parts = filter._and ?? [];
+  for (let index = 0; index < parts.length; index += 1) {
+    if (transactionCandidates(sql, parts[index], node) !== undefined) {
+      return { and: index, inner: candidatesImplied(sql, parts[index], node) };
+    }
+  }
+  return undefined;
+};
 
 /**
  * True when every transaction matching `filter` is accepted by the filter's
