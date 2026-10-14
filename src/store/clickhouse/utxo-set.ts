@@ -655,32 +655,36 @@ export const smallNodeTotalsInHashRangeSql = (
     snapshot
   )}`;
   const inRange = (column: string) => `(${hashRangeSql(column, range)})`;
-  /*
-   * The node's acceptance is read once per chunk (fix-pass-11.md §4): its
-   * transactions in the range, the ids' min and max and every id (the
-   * spenders' IN set, built from the array instead of a second and third
-   * read of the acceptance).
-   */
-  const acceptance = `(SELECT (groupUniqArrayIf(transaction_hash, ${inRange(
+  const created = `(SELECT groupUniqArrayIf(transaction_hash, ${inRange(
     'transaction_hash'
-  )}), min(transaction_internal_id), max(transaction_internal_id), groupArray(transaction_internal_id)) FROM (${accepted})) AS __small_acc`;
+  )}) FROM (${accepted})) AS __small_created`;
+  /*
+   * The node's transaction ids once (a scalar array read by arrayJoin; its
+   * min and max fold to two numbers), for the spenders' bounds and IN set:
+   * the acceptance is read twice per chunk, not three times
+   * (fix-pass-11.md §4). Not as tupleElement of one tuple scalar: that folds
+   * into a constant holding the whole column, hashed at every resolution
+   * (a 2.8 M-transaction node: 14.5 -> 23.5 s).
+   */
+  const ids = `(SELECT groupArray(transaction_internal_id) FROM (${accepted})) AS __small_ids`;
   const spent = `(SELECT groupUniqArrayIf((outpoint_transaction_hash, outpoint_index), ${inRange(
     'outpoint_transaction_hash'
   )}) FROM input
     WHERE ${agnostic}
-      AND transaction_internal_id BETWEEN tupleElement(__small_acc, 2) AND tupleElement(__small_acc, 3)
-      AND transaction_internal_id IN (SELECT arrayJoin(tupleElement(__small_acc, 4)))) AS __small_spent`;
+      AND transaction_internal_id BETWEEN arrayMin(__small_ids) AND arrayMax(__small_ids)
+      AND transaction_internal_id IN (SELECT arrayJoin(__small_ids))) AS __small_spent`;
   const unspent = `SELECT o.* FROM (
       SELECT ${utxoSetReadColumns.join(', ')} FROM output
       WHERE ${agnostic} AND ${hashRangeSql('transaction_hash', range)}
-        AND transaction_hash IN (SELECT arrayJoin(tupleElement(__small_acc, 1)))
+        AND transaction_hash IN (SELECT arrayJoin(__small_created))
       LIMIT 1 BY transaction_hash, output_index) AS o
     WHERE (transaction_hash, output_index) NOT IN (
       SELECT tupleElement(__s, 1), tupleElement(__s, 2) FROM (SELECT arrayJoin(__small_spent) AS __s))`;
   const totals = `(SELECT groupArray(tuple(c, n, v, fn, fa, nn)) FROM (${totalsRowsSql(
     unspent
   )}) SETTINGS optimize_use_projections = 0) AS __small_totals`;
-  return `WITH ${acceptance},
+  return `WITH ${created},
+  ${ids},
   ${spent},
   ${totals}
 SELECT tupleElement(__t, 1) AS c, tupleElement(__t, 2) AS n, tupleElement(__t, 3) AS v,
@@ -785,6 +789,15 @@ export const smallNodeMaxTransactions = 4_000_000;
  * (fix-pass-10.md §2); 2 M bounds a chunk's sets at ~100-150 MB.
  */
 export const smallNodeChunkElements = 2_000_000;
+
+/**
+ * Small-form chunks run at once (fix-pass-11.md §4). A chunk's cost is
+ * mostly its outputs read by key, a granule per transaction (synthetic
+ * 2.8 M-transaction node: 8 chunks of ~1.8 s, 43 M rows, ~13 CPU-s each,
+ * ~0.5 GiB peak); two at a time roughly halve the wall time of the hourly
+ * check for twice the momentary memory and CPU.
+ */
+export const smallNodeConcurrency = 2;
 
 /**
  * A node's accepted transactions and its estimated inputs and created
@@ -996,18 +1009,22 @@ export const referenceTotalsChunked = async (
         } as unknown as ClickHouseSettings);
   const totals = new Map<string, UtxoCategoryTotals>();
   let done = 0;
-  await forEachLimited(chunks, options.concurrency ?? 1, async (range) => {
-    const rows = await client.query<TotalsRow>(
-      small
-        ? smallNodeTotalsInHashRangeSql(snapshot, range)
-        : totalsRowsSql(unspentInHashRangeSql(snapshot, range)),
-      { ...params, ...hashRangeParams(range) },
-      settings
-    );
-    addTotals(totals, rows);
-    done += 1;
-    options.onChunk?.(done, chunks.length);
-  });
+  await forEachLimited(
+    chunks,
+    options.concurrency ?? (small ? smallNodeConcurrency : 1),
+    async (range) => {
+      const rows = await client.query<TotalsRow>(
+        small
+          ? smallNodeTotalsInHashRangeSql(snapshot, range)
+          : totalsRowsSql(unspentInHashRangeSql(snapshot, range)),
+        { ...params, ...hashRangeParams(range) },
+        settings
+      );
+      addTotals(totals, rows);
+      done += 1;
+      options.onChunk?.(done, chunks.length);
+    }
+  );
   return {
     chunks: chunks.length,
     form: small ? ('small' as const) : ('large' as const),
@@ -1269,6 +1286,8 @@ export interface UtxoSpotCheckOptions {
   totalsUtxosPerChunk?: number;
   /** The totals reference's form (`referenceTotalsChunked`; default auto: by the node's size). */
   totalsForm?: 'auto' | 'large' | 'small';
+  /** Totals chunks run at once (default: `smallNodeConcurrency` for the small form, 1 for the large one). */
+  totalsConcurrency?: number;
   /** Throw `UtxoSpotCheckFailedError` when a scope's statement failed (default true). */
   throwOnFailure?: boolean;
   /** These categories / prefixes (hex) instead of random ones (tests, tools). */
@@ -1459,6 +1478,9 @@ export const spotCheckUtxoSet = async (
         ...(options.totalsForm === undefined
           ? {}
           : { form: options.totalsForm }),
+        ...(options.totalsConcurrency === undefined
+          ? {}
+          : { concurrency: options.totalsConcurrency }),
         maxExecutionSeconds: options.maxExecutionSeconds ?? 120,
         utxos: totalOutputs(storedByCategory),
       });
