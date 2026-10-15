@@ -1152,9 +1152,13 @@ export const OutputEntity: Entity = {
           `SELECT outpoint_transaction_hash, outpoint_index FROM (${source})`
         ),
     },
-    token_category: scalar(
-      `if(token_category = ${zeroCategory}, NULL, ${hex('token_category')})`
-    ),
+    token_category: {
+      ...scalar(
+        `if(token_category = ${zeroCategory}, NULL, ${hex('token_category')})`
+      ),
+      /* a few distinct categories over many outputs: sent once (compile.ts sharedValues) */
+      shared: true,
+    },
     transaction: transactionByHash('transaction_hash'),
     transaction_hash: scalar(hex('transaction_hash')),
     transaction_internal_id: scalar(str('transaction_internal_id')),

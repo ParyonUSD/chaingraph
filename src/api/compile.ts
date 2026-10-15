@@ -209,6 +209,12 @@ export interface ScalarField {
   kind: 'scalar';
   /** SQL over the level row's raw columns; the decoded value is stored under the field name. */
   sql: string;
+  /**
+   * Values that repeat across rows (token categories): sent once per
+   * statement in `__dict`, each row carrying its value's number
+   * (`sharedValues`; fix-pass-12.md §3).
+   */
+  shared?: boolean;
 }
 
 /** A field computed by its resolver from other (hidden) selections. */
@@ -361,7 +367,7 @@ class Statement {
    */
   readonly levelOutputs = new Map<
     string,
-    { width: number; client: ReadonlySet<number> }
+    { width: number; client: ReadonlySet<number>; shared: ReadonlySet<number> }
   >();
 
   /** Relationships matched by group number (`GroupLink`), in planning order. */
@@ -405,8 +411,12 @@ interface GroupLink {
 /** A level's child tuples by group: key text (`Map`) or group number (array index). */
 type Groups = (unknown[][] | undefined)[] | Map<string, unknown[][]>;
 
-/** Rows of every level by name: child rows grouped by their parent key, sorted. */
-type LevelData = Map<string, Groups>;
+/**
+ * Rows of every level by name: child rows grouped by their parent key,
+ * sorted; `dict`: the statement's shared values (`[null, …__dict]`), when
+ * it sent them.
+ */
+type LevelData = Map<string, Groups> & { dict?: readonly unknown[] };
 
 interface LevelPlan {
   /** Tuple elements (SQL over the level row's raw columns), after the level's prefix. */
@@ -415,6 +425,8 @@ interface LevelPlan {
   needs: Set<string>;
   /** Positions (0-based, in `elements`) the decoder reads. */
   clientPositions: Set<number>;
+  /** Positions (0-based, in `elements`) of shared values (`ScalarField.shared`). */
+  sharedPositions: Set<number>;
   /** Tuple elements (from `offset`, after the prefix) → decoded row. */
   decode: (
     values: readonly unknown[],
@@ -519,6 +531,56 @@ const inlinable = (
   });
 };
 
+type RecordMaker = (
+  values: readonly unknown[],
+  base: number,
+  dict: readonly unknown[] | undefined
+) => { [key: string]: unknown };
+
+const recordMakers = new Map<string, RecordMaker>();
+const recordMakersMax = 2_000;
+
+/**
+ * A level's scalar fields as one object literal (fix-pass-12.md §3): the
+ * record gets its shape at once instead of one property store (and closure
+ * call) per field and row, ~10 % of a 10,000-row page's API side. Same keys
+ * in the same order as the stores did (a later duplicate name keeps its
+ * first place, as a second store to the same key did). The code is built
+ * from JSON-quoted field names and integer positions only, once per
+ * selection shape.
+ */
+const recordMaker = (
+  scalars: readonly [string, number][],
+  shared: ReadonlySet<number>
+): RecordMaker => {
+  const signature = JSON.stringify([scalars, [...shared]]);
+  let maker = recordMakers.get(signature);
+  if (maker !== undefined) return maker;
+  const last = new Map<string, number>();
+  scalars.forEach(([name, position]) => last.set(name, position));
+  const body = [...last]
+    .map(([name, position]) => {
+      const value = `values[base + ${String(Math.trunc(position))}]`;
+      /* a shared value's number (0: NULL) when the statement sent `__dict` */
+      return `${JSON.stringify(name)}: ${
+        shared.has(position)
+          ? `(dict === undefined ? ${value} : dict[${value}]) ?? null`
+          : `${value} ?? null`
+      }`;
+    })
+    .join(', ');
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+  maker = new Function(
+    'values',
+    'base',
+    'dict',
+    `return { ${body} };`
+  ) as RecordMaker;
+  if (recordMakers.size >= recordMakersMax) recordMakers.clear();
+  recordMakers.set(signature, maker);
+  return maker;
+};
+
 /** `expr` with an entity's columns renamed to `${prefix}${column}`. */
 const renameColumns = (
   expr: string,
@@ -542,6 +604,7 @@ interface LevelParts {
   elements: string[];
   needs: Set<string>;
   clientPositions: Set<number>;
+  sharedPositions: Set<number>;
 }
 
 const resolveNode = (c: Ctx, args: { [name: string]: unknown }) =>
@@ -564,11 +627,13 @@ const planLevel = (
   /* false for the root page: a root's source provides no inlined columns */
   allowInline = true
 ): LevelPlan => {
-  const { elements, needs, clientPositions } = inlined?.parts ?? {
-    clientPositions: new Set<number>(),
-    elements: [],
-    needs: new Set<string>(),
-  };
+  const { elements, needs, clientPositions, sharedPositions } =
+    inlined?.parts ?? {
+      clientPositions: new Set<number>(),
+      elements: [],
+      needs: new Set<string>(),
+      sharedPositions: new Set<number>(),
+    };
   const rename = inlined?.rename;
   const col = (column: string) =>
     rename === undefined ? column : `${rename}${column}`;
@@ -588,6 +653,8 @@ const planLevel = (
     data: LevelData,
     count: { rows: number }
   ) => void)[] = [];
+  /* the scalar fields: [name, position], built by one generated function per level (`recordMaker`) */
+  const scalars: [string, number][] = [];
   const { sql } = st;
   expandComputed(entity, sels).forEach((sel) => {
     const field = entity.fields[sel.name]!;
@@ -597,9 +664,8 @@ const planLevel = (
       referencedColumns(field.sql, entity.columns).forEach((column) =>
         needs.add(col(column))
       );
-      decoders.push((values, base, record) => {
-        record[sel.name] = values[base + position] ?? null;
-      });
+      if (field.shared === true) sharedPositions.add(position);
+      scalars.push([sel.name, position]);
       return;
     }
     if (field.kind !== 'relation') return;
@@ -618,7 +684,10 @@ const planLevel = (
         prefix,
         c,
         pipeline,
-        { parts: { clientPositions, elements, needs }, rename: columnPrefix }
+        {
+          parts: { clientPositions, elements, needs, sharedPositions },
+          rename: columnPrefix,
+        }
       );
       decoders.push((values, base, _record, related, data, count) => {
         const present = values[base + keyPosition];
@@ -757,6 +826,9 @@ const planLevel = (
           (position) => childPrefix + position + 1
         ),
       ]),
+      shared: new Set(
+        [...plan.sharedPositions].map((position) => childPrefix + position + 1)
+      ),
       width: childTuple.length,
     });
     if (childPipeline) {
@@ -820,10 +892,11 @@ const planLevel = (
       related[sel.key] = items;
     });
   });
+  const makeRecord = recordMaker(scalars, sharedPositions);
   return {
     clientPositions,
     decode: (values, base, data, count) => {
-      const record: { [key: string]: unknown } = {};
+      const record = makeRecord(values, base, data.dict);
       const related: { [key: string]: unknown } = {};
       for (const decode of decoders) {
         decode(values, base, record, related, data, count);
@@ -832,6 +905,7 @@ const planLevel = (
     },
     elements,
     needs,
+    sharedPositions,
   };
 };
 
@@ -890,6 +964,10 @@ const levelOf = (column: string) =>
     ? column.slice(0, -outputSuffix.length)
     : column;
 
+/** A shared value's number in `dict` (1-based; 0: NULL). */
+const sharedNumber = (value: string, dict: string) =>
+  `if(isNull(${value}), toUInt32(0), transform(assumeNotNull(${value}), ${dict}, arrayEnumerate(${dict}), toUInt32(0)))`;
+
 /**
  * A level's array as a result column: elements no decoder reads (link
  * columns of the levels below: raw hashes, internal ids) replaced by NULL.
@@ -898,37 +976,78 @@ const levelOf = (column: string) =>
  */
 const outputColumn = (
   name: string,
-  output: { width: number; client: ReadonlySet<number> } | undefined,
+  output:
+    | {
+        width: number;
+        client: ReadonlySet<number>;
+        shared?: ReadonlySet<number>;
+      }
+    | undefined,
   groups: {
     /** The level's group number (SQL over `__t`), in place of its key texts (elements 2 …). */
     own?: { sql: string; keyWidth: number };
     /** Its key numbers as parent, appended. */
     extras?: readonly string[];
+    /** The statement's shared-values array (`sharedValues`): shared positions become their numbers. */
+    dict?: string;
   } = {},
   /** How the final SELECT names the level's array (`groupNumbers`: a column of the wrapped scalars). */
   ref: (name: string) => string = (array) => array
 ) => {
-  const { own, extras = [] } = groups;
+  const { own, extras = [], dict } = groups;
+  const shared = dict === undefined ? undefined : output?.shared;
   if (
     output === undefined ||
     (output.client.size >= output.width &&
       own === undefined &&
-      extras.length === 0)
+      extras.length === 0 &&
+      (shared === undefined || shared.size === 0))
   ) {
     return ref(name) === name ? name : `${ref(name)} AS ${name}`;
   }
+  /*
+   * Elements the client does not read are sent as 0 (positions stay put):
+   * one byte instead of `null`'s four (L35: ~155 k of them, ~7 % of the
+   * result; fix-pass-12.md §3).
+   */
   const items = Array.from({ length: output.width }, (_, index) =>
     own !== undefined && index >= 1 && index <= own.keyWidth
       ? index === 1
         ? own.sql
-        : 'NULL'
+        : '0'
       : output.client.has(index + 1)
-      ? `tupleElement(__t, ${index + 1})`
-      : 'NULL'
+      ? shared?.has(index + 1) === true
+        ? sharedNumber(`tupleElement(__t, ${index + 1})`, dict!)
+        : `tupleElement(__t, ${index + 1})`
+      : '0'
   );
   return `arrayMap(__t -> tuple(${[...items, ...extras].join(', ')}), ${ref(
     name
   )}) AS ${name}${outputSuffix}`;
+};
+
+/**
+ * The statement's shared values (`ScalarField.shared`): every distinct
+ * non-NULL value at the shared positions of every output, as one array
+ * (fix-pass-12.md §3). L35's token categories were ~22 % of its result
+ * bytes, a 64-character string per output and outpoint for a few hundred
+ * distinct values; each row now carries a small number.
+ */
+const sharedValues = (
+  outputs: readonly [string, ReadonlySet<number>][],
+  ref: (name: string) => string
+) => {
+  const parts = outputs.flatMap(([name, positions]) =>
+    [...positions].map(
+      (position) =>
+        `arrayMap(__x -> assumeNotNull(__x), arrayFilter(__x -> isNotNull(__x), arrayMap(__t -> tupleElement(__t, ${position}), ${ref(
+          name
+        )})))`
+    )
+  );
+  return parts.length === 0
+    ? undefined
+    : `arrayDistinct(arrayConcat(${parts.join(', ')}))`;
 };
 
 /** A key (texts at `elements`, SQL over `__t`) as one non-null String; `none` for a NULL key (matches nothing). */
@@ -1000,6 +1119,16 @@ const groupNumbers = (
   };
 };
 
+/** Tuples in order of their first element (a row number); ClickHouse usually sends them in order already: checked first. */
+const sortByFirst = (tuples: unknown[][]) => {
+  for (let index = 1; index < tuples.length; index += 1) {
+    if (Number(tuples[index - 1]![0]) > Number(tuples[index]![0])) {
+      tuples.sort((a, b) => Number(a[0]) - Number(b[0]));
+      return;
+    }
+  }
+};
+
 /** `__lN` arrays of a result row → child tuples grouped by parent key, in row-number order. */
 const levelData = (
   row: { [column: string]: unknown },
@@ -1013,9 +1142,10 @@ const levelData = (
     const items = Array.isArray(value) ? (value as unknown[]) : [];
     if (grouped.has(name)) {
       /* [__rn, group number, NULL…, elements…] */
-      const tuples = items.map((item) =>
-        Array.isArray(item) ? (item as unknown[]) : tupleValues(item)
-      );
+      /* positional tuples (JSONEachRow arrays) as they are: no copy of the level */
+      const tuples = items.every(Array.isArray)
+        ? (items as unknown[][])
+        : items.map(tupleValues);
       let groupCount = 0;
       for (const [, group] of tuples) {
         if (typeof group === 'number' && group > groupCount) groupCount = group;
@@ -1036,7 +1166,7 @@ const levelData = (
       }
       for (const members of byGroup) {
         if (members !== undefined && members.length > 1) {
-          members.sort((a, b) => Number(a[0]) - Number(b[0]));
+          sortByFirst(members);
         }
       }
       data.set(name, byGroup);
@@ -1055,7 +1185,7 @@ const levelData = (
       else if (key !== undefined) groups.set(key, [tuple]);
     }
     groups.forEach((group) => {
-      if (group.length > 1) group.sort((a, b) => Number(a[0]) - Number(b[0]));
+      if (group.length > 1) sortByFirst(group);
     });
     data.set(name, groups);
   });
@@ -1166,6 +1296,7 @@ export const compileRoot = (
       ...[...plan.clientPositions].map((position) => position + 2),
       ...root.order.map((_, index) => cursorStart + index + 2),
     ]),
+    shared: new Set([...plan.sharedPositions].map((position) => position + 2)),
     width: 1 + elements.length,
   };
   /*
@@ -1196,14 +1327,31 @@ export const compileRoot = (
     ...groups.aliases,
   ].map((name) => `${name} AS ${ref(name)}`);
   const grouped = new Set(groups.own.keys());
+  /* shared values with the wrapped (group-number) form only: its outputs are rewritten anyway */
+  const dictSql = wrapped
+    ? sharedValues(
+        [
+          ['__page', pageOutput.shared],
+          ...[...st.levelOutputs].map(
+            ([name, output]) =>
+              [name, output.shared] as [string, ReadonlySet<number>]
+          ),
+        ],
+        ref
+      )
+    : undefined;
+  const dict = dictSql === undefined ? undefined : '__dict';
   return {
     decode: (rows) => {
       const [row] = rows;
       const pageColumn = row?.__page_c ?? row?.__page;
-      const tuples = (Array.isArray(pageColumn) ? pageColumn : [])
-        .map(tupleValues)
-        .sort((a, b) => Number(a[0]) - Number(b[0]));
+      const tuples = (Array.isArray(pageColumn) ? pageColumn : []).map(
+        tupleValues
+      );
+      sortByFirst(tuples);
       const data = levelData(row ?? {}, st.keyWidths, grouped);
+      const sent = row?.__dict;
+      if (Array.isArray(sent)) data.dict = [null, ...(sent as unknown[])];
       const count = { rows: tuples.length };
       const decoded = tuples.map((tuple) => plan.decode(tuple, 1, data, count));
       checkCap(count.rows);
@@ -1216,10 +1364,14 @@ export const compileRoot = (
       };
     },
     sql: `${sql.withClause()}SELECT ${[
+      ...(dictSql === undefined ? [] : [`${dictSql} AS __dict`]),
       outputColumn(
         '__page',
         pageOutput,
-        { extras: groups.extras.get('__page') ?? [] },
+        {
+          ...(dict === undefined ? {} : { dict }),
+          extras: groups.extras.get('__page') ?? [],
+        },
         ref
       ),
       ...[...st.keyWidths.keys()].map((name) =>
@@ -1227,6 +1379,7 @@ export const compileRoot = (
           name,
           st.levelOutputs.get(name),
           {
+            ...(dict === undefined ? {} : { dict }),
             extras: groups.extras.get(name) ?? [],
             own: groups.own.get(name),
           },
