@@ -89,7 +89,7 @@ const keys = (name: string): PlanKeys => ({
 const teach = (
   admission: Admission,
   name: string,
-  cost: number | { cpuSeconds: number; loopMs: number }
+  cost: number | { cpuSeconds: number; loopMs: number; rows?: number }
 ) => {
   admission.model.observe(
     keys(name),
@@ -289,6 +289,7 @@ test('admission: charges are reconciled with measured costs; a mispredicted ligh
   const learned = admission.predict(keys('q'));
   t.is(learned.cls, 'heavy');
   t.is(learned.cost.loopMs, 5 * 0.7 + 300 * 0.3);
+  t.is(learned.cost.rows, 10_000_000, 'the rows read are learned at once');
   t.is(admission.stats.inFlight.light, 0);
 });
 
@@ -371,7 +372,7 @@ test('admission: a heavy request admitted under contention gets the contended se
     quietMeter
   );
   teach(admission, 'heavy', 3);
-  teach(admission, 'light', 0.01);
+  teach(admission, 'light', { cpuSeconds: 0.01, loopMs: 1, rows: 50_000 });
   t.deepEqual(admission.admit(keys('heavy'), 0).settings, {}, 'share full');
   t.deepEqual(
     admission.admit(keys('heavy'), 0).settings,
@@ -381,13 +382,26 @@ test('admission: a heavy request admitted under contention gets the contended se
   t.deepEqual(
     admission.admit(keys('light'), 0).settings,
     { max_threads: 8, priority: 1 },
-    'small (predicted <= smallMaxCpuMs): the small settings under the light ones (fix-pass-12.md §2)'
+    'small (predicted to read <= smallMaxRows): the small settings under the light ones (fix-pass-13.md §5)'
   );
-  teach(admission, 'mid', 0.3);
+  teach(admission, 'mid', { cpuSeconds: 0.05, loopMs: 1, rows: 5_000_000 });
   t.deepEqual(
     admission.admit(keys('mid'), 0).settings,
     { priority: 1 },
-    'light, not small: the light settings alone'
+    'light, reads more than smallMaxRows: the light settings alone'
+  );
+  teach(admission, 'unread', 0.01);
+  t.deepEqual(
+    admission.admit(keys('unread'), 0).settings,
+    { priority: 1 },
+    'light, rows not known yet: not small'
+  );
+  /* the class does not follow the CPU (thread-dependent), only the rows */
+  teach(admission, 'mid', { cpuSeconds: 0.01, loopMs: 1 });
+  t.deepEqual(
+    admission.admit(keys('mid'), 0).settings,
+    { priority: 1 },
+    'a later CPU-only sample keeps the rows'
   );
   t.is(admission.stats.contended, 1);
   /* half the in-flight cap taken: contended whatever the budget */
@@ -513,7 +527,7 @@ test('admission: options from the environment and the startup line', (t) => {
   t.is(fromServer.heavyMaxInFlight, 24);
   t.deepEqual(fromServer.settings, { heavy: {}, light: {} });
   t.deepEqual(fromServer.smallSettings, defaultSmallSettings);
-  t.is(fromServer.smallMaxCpuMs, 150);
+  t.is(fromServer.smallMaxRows, 3_000_000);
   t.deepEqual(
     admissionOptionsFromEnv({ CHAINGRAPH_API_SMALL_MAX_THREADS: '0' }, 48, 1)
       .smallSettings,
@@ -564,7 +578,7 @@ test('admission: options from the environment and the startup line', (t) => {
   );
   t.regex(
     admissionSummary(fromServer, 154),
-    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=43\.2 CPU-s\/s burst 4 s loop_budget=850 ms\/s burst 1 s light_share=0\.25 light<=500 CPU-ms,25 loop-ms heavy_in_flight=24 heavy_contended=0\.5:max_threads 4 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=server default small<=150 CPU-ms:max_threads 8 heavy_settings=server default max_concurrent_queries_for_user=154$/u
+    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=43\.2 CPU-s\/s burst 4 s loop_budget=850 ms\/s burst 1 s light_share=0\.25 light<=500 CPU-ms,25 loop-ms heavy_in_flight=24 heavy_contended=0\.5:max_threads 4 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=server default small<=3000000 rows:max_threads 8 heavy_settings=server default max_concurrent_queries_for_user=154$/u
   );
 });
 

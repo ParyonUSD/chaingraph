@@ -68,6 +68,11 @@ export interface RequestCost {
   cpuSeconds: number;
   /** This process's event loop, milliseconds. */
   loopMs: number;
+  /**
+   * Rows the statements read (ClickHouse's summary): known when they end
+   * and the same at any thread count, unlike the CPU (`smallMaxRows`).
+   */
+  rows?: number;
 }
 
 export interface BudgetOptions {
@@ -106,10 +111,10 @@ export interface AdmissionOptions {
   maxKeys: number;
   /** ClickHouse settings of light and heavy requests' statements. */
   settings: { [cls in RequestClass]: { [name: string]: number | string } };
-  /** Settings of a small request (light, predicted at most `smallMaxCpuMs`), under `settings.light`. */
+  /** Settings of a small request (light, predicted to read at most `smallMaxRows`), under `settings.light`. */
   smallSettings: { [name: string]: number | string };
-  /** Predicted CPU (ms) up to which a light request is small. */
-  smallMaxCpuMs: number;
+  /** Predicted rows read up to which a light request is small. */
+  smallMaxRows: number;
   /**
    * Settings added to a heavy request admitted under contention (another
    * heavy request in flight, and its budget share below `contendedFill`
@@ -143,16 +148,23 @@ export const defaultLoopTarget = 0.85;
 export const defaultCores = 48;
 
 /**
- * Settings of a small request: light and predicted at most `smallMaxCpuMs`
- * (fix-pass-12.md §2). Such a document is a handful of small reads, each
- * split over the server's default thread count (48 on golden); on the
- * golden-sized local copy 8 threads made every median-band node-39 document
- * 2-8 ms faster for less CPU. Light documents that read millions of rows
- * (more predicted CPU) were up to 30 % slower with 8 threads, so they keep
- * the server's default.
+ * Settings of a small request: light and predicted to read at most
+ * `smallMaxRows` rows (fix-pass-12.md §2, fix-pass-13.md §5). Such a
+ * document is a handful of small reads, each split over the server's
+ * default thread count (48 on golden); 8 threads made them faster for less
+ * CPU (golden #107, v2-only A/B: X7 -26, X13 -72, L21 -13, L22 -14 ms; all
+ * read at most 2.8 M rows), while light documents reading more were slower
+ * (L6 +22 ms at 3.5 M rows, L7 +26 at 7.2 M).
+ *
+ * By rows, not CPU (fix 12 used a bound of 150 predicted CPU-ms): a request's CPU
+ * depends on the threads it ran with and arrives late (`query_log`), so the
+ * class depended on the model's history (X7: 0.21 CPU-s at the server's
+ * threads, below 0.15 at 8, so it stayed in whichever class it entered;
+ * 131 vs 104 ms in the same session). Rows are known when the statements
+ * end and do not depend on the threads.
  */
 export const defaultSmallSettings = { max_threads: 8 };
-export const defaultSmallMaxCpuMs = 150;
+export const defaultSmallMaxRows = 3_000_000;
 
 /**
  * Defaults (one process, 48 cores): ClickHouse 43.2 CPU-s/s (90 % of the
@@ -188,7 +200,7 @@ export const defaultAdmissionOptions: AdmissionOptions = {
   maxKeys: 10_000,
   minRetryAfterSeconds: 1,
   settings: { heavy: {}, light: {} },
-  smallMaxCpuMs: defaultSmallMaxCpuMs,
+  smallMaxRows: defaultSmallMaxRows,
   smallSettings: defaultSmallSettings,
   unknownCost: { cpuSeconds: 0.25, loopMs: 20 },
 };
@@ -433,6 +445,7 @@ export const planKeys = (
 interface Estimate {
   cpuSeconds: number;
   loopMs: number;
+  rows?: number;
   samples: number;
 }
 
@@ -457,7 +470,11 @@ export class CostModel {
       const estimate = this.estimates.get(keys[source]);
       if (estimate !== undefined) {
         return {
-          cost: { cpuSeconds: estimate.cpuSeconds, loopMs: estimate.loopMs },
+          cost: {
+            cpuSeconds: estimate.cpuSeconds,
+            loopMs: estimate.loopMs,
+            ...(estimate.rows === undefined ? {} : { rows: estimate.rows }),
+          },
           source,
         };
       }
@@ -482,6 +499,11 @@ export class CostModel {
             ? before.cpuSeconds
             : blend(before?.cpuSeconds, cost.cpuSeconds),
         loopMs: blend(before?.loopMs, cost.loopMs),
+        ...(cost.rows === undefined
+          ? before?.rows === undefined
+            ? {}
+            : { rows: before.rows }
+          : { rows: blend(before?.rows, cost.rows) }),
         samples: (before?.samples ?? 0) + 1,
       });
     }
@@ -828,7 +850,9 @@ export class Admission {
       (clickhouse.fill().heavy < this.options.contendedFill ||
         2 * this.stats.inFlight.heavy >= this.options.heavyMaxInFlight);
     const small =
-      cls === 'light' && cost.cpuSeconds * 1000 <= this.options.smallMaxCpuMs;
+      cls === 'light' &&
+      cost.rows !== undefined &&
+      cost.rows <= this.options.smallMaxRows;
     ticket.settings = contended
       ? { ...this.options.settings[cls], ...this.options.contendedSettings }
       : small
@@ -898,7 +922,14 @@ export class Admission {
       /* the CPU is learned when every statement is measured (an estimate only seeds a new key) */
       this.model.observe(
         ticket.keys,
-        { cpuSeconds: cpu, loopMs: ticket.loopMs },
+        {
+          cpuSeconds: cpu,
+          loopMs: ticket.loopMs,
+          rows: ticket.statements.reduce(
+            (sum, statement) => sum + statement.rows,
+            0
+          ),
+        },
         !this.allMeasured(ticket)
       );
     }
@@ -1385,10 +1416,10 @@ export const admissionOptionsFromEnv = (
           ? 'default'
           : 'clickhouse',
     },
-    smallMaxCpuMs: nonNegativeNumber(
+    smallMaxRows: nonNegativeNumber(
       env,
-      'CHAINGRAPH_API_SMALL_MAX_CPU_MS',
-      defaultSmallMaxCpuMs
+      'CHAINGRAPH_API_SMALL_MAX_ROWS',
+      defaultSmallMaxRows
     ),
     smallSettings: classSettingsFromEnv(
       env,
@@ -1477,8 +1508,8 @@ export const admissionSummary = (
   )} CPU-ms,${options.unknownCost.loopMs} loop-ms cpu_source=${
     cpuSource ?? options.cpuSource
   } light_settings=${settingsText(options.settings.light)} small<=${
-    options.smallMaxCpuMs
-  } CPU-ms:${settingsText(options.smallSettings)} heavy_settings=${settingsText(
+    options.smallMaxRows
+  } rows:${settingsText(options.smallSettings)} heavy_settings=${settingsText(
     options.settings.heavy
   )} max_concurrent_queries_for_user=${
     backstop === undefined ? 'unknown' : backstop === 0 ? '0 (none)' : backstop
