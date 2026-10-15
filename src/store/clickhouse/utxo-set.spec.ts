@@ -553,6 +553,25 @@ e2e(
       );
       t.true(check.scopes.some((scope) => scope.kind === 'totals'));
     }
+    /* a random prefix with more outputs than prefixMaxOutputs is not drawn (fix-pass-13.md §3) */
+    const drawn = await spotCheckUtxoSet(client, node1, {
+      categories: 0,
+      prefixes: 3,
+    });
+    t.true(
+      drawn!.scopes.some((scope) => scope.kind === 'prefix'),
+      'random prefixes drawn'
+    );
+    const bounded = await spotCheckUtxoSet(client, node1, {
+      categories: 0,
+      prefixMaxOutputs: 0,
+      prefixes: 3,
+    });
+    t.deepEqual(
+      bounded!.scopes.filter((scope) => scope.kind === 'prefix'),
+      [],
+      'no prefix has at most 0 outputs'
+    );
     const before = await spotCheckUtxoSet(client, node1, scoped);
     t.true(before!.scopes.every((scope) => scope.equal));
     t.regex(

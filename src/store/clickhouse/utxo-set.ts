@@ -1274,6 +1274,14 @@ export interface UtxoSpotCheckOptions {
   /** Random locking-bytecode prefixes (default 3; from outputs at a random transaction hash). */
   prefixes?: number;
   /**
+   * A random prefix is used only when at most this many outputs (spent or
+   * not, every node) have it (default `spotPrefixMaxOutputs`): the scope's
+   * query-time reference reads all of them, so a popular prefix drawn at
+   * random (a busy address, a token protocol's OP_RETURN) made the scope
+   * cost seconds (fix-pass-13.md §3).
+   */
+  prefixMaxOutputs?: number;
+  /**
    * Compare the node's whole-set totals (default false: on mainnet the
    * query-time totals read the whole chain, ~15 min of a 48-core server;
    * decision rule U6 of 2026-10-13). When on, the reference is summed over
@@ -1318,6 +1326,17 @@ const referenceTotals = (reference: string) =>
            nonfungible_token_capability AS c FROM (${reference}))
    GROUP BY token_category`;
 
+/**
+ * Outputs a random spot-check prefix may have (`prefixMaxOutputs`). Golden
+ * mainnet: three random prefixes took 0.3 s in one session and 20.7 s in
+ * the next (#106 / #107); at most 100,000 outputs each, a prefix scope reads
+ * at most that many outputs and their spends (well under a second there).
+ */
+export const spotPrefixMaxOutputs = 100_000;
+
+/** Windows of outputs drawn for candidate prefixes before giving up on more. */
+const spotPrefixWindows = 8;
+
 const randomHash = (random: () => number) =>
   Array.from({ length: 32 }, () =>
     Math.floor(random() * 256)
@@ -1326,12 +1345,62 @@ const randomHash = (random: () => number) =>
   ).join('');
 
 /**
+ * `count` random locking-bytecode prefixes, each of at most `maxOutputs`
+ * outputs: the distinct prefixes of the outputs at a random transaction
+ * hash (output key), each counted up to `maxOutputs + 1` (p_script key
+ * range, the read stops at the limit), until enough pass or
+ * `spotPrefixWindows` windows were drawn. Fewer when the windows hold too
+ * few small prefixes; the cost of a prefix scope is then bounded whichever
+ * prefix is drawn.
+ */
+const randomPrefixes = async (
+  client: Pick<ClickHouseClient, 'query'>,
+  count: number,
+  maxOutputs: number,
+  random: () => number,
+  settings: ClickHouseSettings
+) => {
+  const chosen: string[] = [];
+  const seen = new Set<string>();
+  for (
+    let window = 0;
+    window < spotPrefixWindows && chosen.length < count;
+    window += 1
+  ) {
+    const candidates = (
+      await client.query<{ p: string }>(
+        `SELECT DISTINCT lower(hex(locking_bytecode_prefix)) AS p FROM (
+           SELECT locking_bytecode_prefix FROM output WHERE transaction_hash >= unhex({from:String})
+           ORDER BY transaction_hash LIMIT 64)`,
+        { from: randomHash(random) },
+        settings
+      )
+    )
+      .map((row) => row.p)
+      .filter((prefix) => !seen.has(prefix));
+    for (const prefix of candidates) {
+      if (chosen.length >= count) break;
+      seen.add(prefix);
+      const [row] = await client.query<{ n: string }>(
+        `SELECT toString(count()) AS n FROM (SELECT 1 FROM output
+           WHERE locking_bytecode_prefix = unhex({p:String}) LIMIT {limit:UInt64})`,
+        { limit: maxOutputs + 1, p: prefix },
+        settings
+      );
+      if (Number(row?.n ?? 0) <= maxOutputs) chosen.push(prefix);
+    }
+  }
+  return chosen;
+};
+
+/**
  * Compare a few random scopes of a node's stored set with the query-time
  * definition, all at ONE snapshot (the stored read at the snapshot's own
  * mark plus its correction): token categories (rows and per-category
  * totals), locking-bytecode prefixes (rows) and the node's whole-set totals.
  * Cheap scopes: categories come from `utxo_total` (small), prefixes from the
- * outputs at a random transaction hash (output key), and each scope reads
+ * outputs at a random transaction hash (output key) with at most
+ * `prefixMaxOutputs` outputs each (`randomPrefixes`), and each scope reads
  * its outputs by key or projection. Undefined when the node has no stored
  * set.
  */
@@ -1370,21 +1439,15 @@ export const spotCheckUtxoSet = async (
         settings
       )
     ).map((row) => row.c);
-  const prefixCount = options.prefixes ?? 3;
   const prefixes =
     options.prefixValues ??
-    (prefixCount <= 0
-      ? []
-      : (
-          await client.query<{ p: string }>(
-            `SELECT DISTINCT lower(hex(locking_bytecode_prefix)) AS p FROM (
-               SELECT locking_bytecode_prefix FROM output WHERE transaction_hash >= unhex({from:String})
-               ORDER BY transaction_hash LIMIT 64)
-             LIMIT {n:UInt32}`,
-            { from: randomHash(random), n: prefixCount },
-            settings
-          )
-        ).map((row) => row.p));
+    (await randomPrefixes(
+      client,
+      options.prefixes ?? 3,
+      options.prefixMaxOutputs ?? spotPrefixMaxOutputs,
+      random,
+      settings
+    ));
   const scopes: UtxoSpotCheckScope[] = [];
   const failed: UtxoSetSpotCheck['failed'] = [];
   const compare = async (
