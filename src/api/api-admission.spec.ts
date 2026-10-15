@@ -39,7 +39,7 @@ import {
   admissionSummary,
   Budget,
   defaultAdmissionOptions,
-  defaultLightMaxThreads,
+  defaultSmallSettings,
   overloadedCode,
   planKeys,
   requestAbortedCode,
@@ -378,7 +378,17 @@ test('admission: a heavy request admitted under contention gets the contended se
     { max_threads: 4 },
     'share 2 of 8: under half'
   );
-  t.deepEqual(admission.admit(keys('light'), 0).settings, { priority: 1 });
+  t.deepEqual(
+    admission.admit(keys('light'), 0).settings,
+    { max_threads: 8, priority: 1 },
+    'small (predicted <= smallMaxCpuMs): the small settings under the light ones (fix-pass-12.md §2)'
+  );
+  teach(admission, 'mid', 0.3);
+  t.deepEqual(
+    admission.admit(keys('mid'), 0).settings,
+    { priority: 1 },
+    'light, not small: the light settings alone'
+  );
   t.is(admission.stats.contended, 1);
   /* half the in-flight cap taken: contended whatever the budget */
   const busy = new Admission(
@@ -501,14 +511,13 @@ test('admission: options from the environment and the startup line', (t) => {
   t.is(fromServer.loop.burstSeconds, 1);
   t.is(fromServer.loop.ratePerSecond, 850);
   t.is(fromServer.heavyMaxInFlight, 24);
-  t.deepEqual(fromServer.settings, {
-    heavy: {},
-    light: { max_threads: defaultLightMaxThreads },
-  });
+  t.deepEqual(fromServer.settings, { heavy: {}, light: {} });
+  t.deepEqual(fromServer.smallSettings, defaultSmallSettings);
+  t.is(fromServer.smallMaxCpuMs, 150);
   t.deepEqual(
-    admissionOptionsFromEnv({ CHAINGRAPH_API_LIGHT_MAX_THREADS: '0' }, 48, 1)
-      .settings,
-    { heavy: {}, light: {} },
+    admissionOptionsFromEnv({ CHAINGRAPH_API_SMALL_MAX_THREADS: '0' }, 48, 1)
+      .smallSettings,
+    {},
     '0: the server default'
   );
   t.is(fromServer.cpuSource, 'query_log');
@@ -555,7 +564,7 @@ test('admission: options from the environment and the startup line', (t) => {
   );
   t.regex(
     admissionSummary(fromServer, 154),
-    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=43\.2 CPU-s\/s burst 4 s loop_budget=850 ms\/s burst 1 s light_share=0\.25 light<=500 CPU-ms,25 loop-ms heavy_in_flight=24 heavy_contended=0\.5:max_threads 4 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=max_threads 8 heavy_settings=server default max_concurrent_queries_for_user=154$/u
+    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=43\.2 CPU-s\/s burst 4 s loop_budget=850 ms\/s burst 1 s light_share=0\.25 light<=500 CPU-ms,25 loop-ms heavy_in_flight=24 heavy_contended=0\.5:max_threads 4 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=server default small<=150 CPU-ms:max_threads 8 heavy_settings=server default max_concurrent_queries_for_user=154$/u
   );
 });
 

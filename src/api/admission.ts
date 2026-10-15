@@ -106,6 +106,10 @@ export interface AdmissionOptions {
   maxKeys: number;
   /** ClickHouse settings of light and heavy requests' statements. */
   settings: { [cls in RequestClass]: { [name: string]: number | string } };
+  /** Settings of a small request (light, predicted at most `smallMaxCpuMs`), under `settings.light`. */
+  smallSettings: { [name: string]: number | string };
+  /** Predicted CPU (ms) up to which a light request is small. */
+  smallMaxCpuMs: number;
   /**
    * Settings added to a heavy request admitted under contention (another
    * heavy request in flight, and its budget share below `contendedFill`
@@ -139,15 +143,16 @@ export const defaultLoopTarget = 0.85;
 export const defaultCores = 48;
 
 /**
- * `max_threads` of light statements unless CHAINGRAPH_API_LIGHT_MAX_THREADS
- * says otherwise (0: the server's default) (fix-pass-12.md §2). A light
- * document is a handful of small reads, each split over the server's
- * default thread count (48 on golden); on the golden-sized local copy 8
- * threads made every median-band node-39 document 2-8 ms faster for less
- * CPU, and no light document slower (4: data-reading ones up to 28 ms
- * slower; heavy documents keep the default).
+ * Settings of a small request: light and predicted at most `smallMaxCpuMs`
+ * (fix-pass-12.md §2). Such a document is a handful of small reads, each
+ * split over the server's default thread count (48 on golden); on the
+ * golden-sized local copy 8 threads made every median-band node-39 document
+ * 2-8 ms faster for less CPU. Light documents that read millions of rows
+ * (more predicted CPU) were up to 30 % slower with 8 threads, so they keep
+ * the server's default.
  */
-export const defaultLightMaxThreads = 8;
+export const defaultSmallSettings = { max_threads: 8 };
+export const defaultSmallMaxCpuMs = 150;
 
 /**
  * Defaults (one process, 48 cores): ClickHouse 43.2 CPU-s/s (90 % of the
@@ -182,7 +187,9 @@ export const defaultAdmissionOptions: AdmissionOptions = {
   loopGuard: 0.95,
   maxKeys: 10_000,
   minRetryAfterSeconds: 1,
-  settings: { heavy: {}, light: { max_threads: defaultLightMaxThreads } },
+  settings: { heavy: {}, light: {} },
+  smallMaxCpuMs: defaultSmallMaxCpuMs,
+  smallSettings: defaultSmallSettings,
   unknownCost: { cpuSeconds: 0.25, loopMs: 20 },
 };
 
@@ -820,8 +827,12 @@ export class Admission {
       this.stats.inFlight.heavy > 0 &&
       (clickhouse.fill().heavy < this.options.contendedFill ||
         2 * this.stats.inFlight.heavy >= this.options.heavyMaxInFlight);
+    const small =
+      cls === 'light' && cost.cpuSeconds * 1000 <= this.options.smallMaxCpuMs;
     ticket.settings = contended
       ? { ...this.options.settings[cls], ...this.options.contendedSettings }
+      : small
+      ? { ...this.options.smallSettings, ...this.options.settings.light }
       : this.options.settings[cls];
     if (contended) this.stats.contended += 1;
     this.stats.admitted[cls] += 1;
@@ -1359,12 +1370,18 @@ export const admissionOptionsFromEnv = (
     ),
     settings: {
       heavy: classSettingsFromEnv(env, 'CHAINGRAPH_API_HEAVY'),
-      light: classSettingsFromEnv(
-        env,
-        'CHAINGRAPH_API_LIGHT',
-        defaultLightMaxThreads
-      ),
+      light: classSettingsFromEnv(env, 'CHAINGRAPH_API_LIGHT'),
     },
+    smallMaxCpuMs: nonNegativeNumber(
+      env,
+      'CHAINGRAPH_API_SMALL_MAX_CPU_MS',
+      defaultSmallMaxCpuMs
+    ),
+    smallSettings: classSettingsFromEnv(
+      env,
+      'CHAINGRAPH_API_SMALL',
+      defaultSmallSettings.max_threads
+    ),
     sizing: {
       cores,
       cpuTarget,
@@ -1459,9 +1476,9 @@ export const admissionSummary = (
     options.unknownCost.cpuSeconds * 1000
   )} CPU-ms,${options.unknownCost.loopMs} loop-ms cpu_source=${
     cpuSource ?? options.cpuSource
-  } light_settings=${settingsText(
-    options.settings.light
-  )} heavy_settings=${settingsText(
+  } light_settings=${settingsText(options.settings.light)} small<=${
+    options.smallMaxCpuMs
+  } CPU-ms:${settingsText(options.smallSettings)} heavy_settings=${settingsText(
     options.settings.heavy
   )} max_concurrent_queries_for_user=${
     backstop === undefined ? 'unknown' : backstop === 0 ? '0 (none)' : backstop
