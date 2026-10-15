@@ -2267,6 +2267,52 @@ const outputSideCandidates = (
 ];
 
 /**
+ * The largest set of earlier candidates a chained read takes the table's key
+ * on (fix-pass-12.md §1). Key analysis of a hash set against output's key
+ * (granularity 128, ~9 M marks on golden) costs ~20 µs per element there:
+ * golden node 39's L27 spent 174 ms of key analysis on 8,627 hashes to choose
+ * p_category's 122 marks anyway; node 39's L1 / L29 24 / 33 ms CPU for
+ * 714. Above the limit the set filters the rows only and the read takes its
+ * own projection, as fix 10's INTERSECT did; below it the key read pays
+ * (mainnet L1: a user's loan keys, a few transactions, kept 7 of 2.8 M
+ * minting outputs). 256 bounds the analysis at ~6 ms CPU on golden.
+ */
+export const chainKeySetMax = 256;
+
+/** Whether a client list bound so far is longer than `chainKeySetMax`. */
+const hasLongClientList = (sql: Sql) =>
+  Object.entries(sql.params).some(
+    ([name, value]) =>
+      isClientParamName(name) &&
+      Array.isArray(value) &&
+      value.length > chainKeySetMax
+  );
+
+/**
+ * One link of the candidate chain: `set` read among the transactions of
+ * `chain`, the hash set taking the key only while it has at most
+ * `chainKeySetMax` elements.
+ * - Normally by `use_index_for_in_with_subqueries_max_values` on the link:
+ *   ClickHouse leaves a larger set out of key analysis; no extra read.
+ * - The setting reaches every subquery set below the link, so when a client
+ *   list could be longer than the limit (it would lose its key read) a
+ *   counted gate instead: a scalar count of `chain` (stops reading at
+ *   `chainKeySetMax + 1`) folds `if` to one branch before key analysis;
+ *   `identity` hides the set in the other. One more read of `chain`
+ *   (~5 ms on chipnet).
+ */
+const chainStep = (sql: Sql, set: string, chain: string) => {
+  const among = `IN (SELECT transaction_hash FROM (${chain}))`;
+  const head = `SELECT transaction_hash, transaction_internal_id FROM (${set}) WHERE`;
+  if (!hasLongClientList(sql)) {
+    return `${head} transaction_hash ${among} SETTINGS use_index_for_in_with_subqueries_max_values = ${chainKeySetMax}`;
+  }
+  return `${head} if((SELECT count() FROM (SELECT 1 FROM (${chain}) LIMIT ${
+    chainKeySetMax + 1
+  })) <= ${chainKeySetMax}, transaction_hash ${among}, identity(transaction_hash) ${among})`;
+};
+
+/**
  * A subquery of candidate transactions (`transaction_hash`,
  * `transaction_internal_id`) that every transaction matching `filter` is
  * among (a positive, selective conjunct), or undefined when the filter has
@@ -2296,17 +2342,14 @@ export const transactionCandidates = (
   if (sets.length > 1) {
     /*
      * Intersected as a chain: each set is read among the transactions of the
-     * sets before it (its read can take the table's key on their hashes),
-     * not in full (mainnet L1: an INTERSECT read every minting output of the
-     * PUSD category, 2.8 M rows, to keep 7 transactions; fix-pass-11.md §1).
+     * sets before it (its read can take the table's key on their hashes
+     * while they are few, `chainStep`), not in full (mainnet L1: an
+     * INTERSECT read every minting output of the PUSD category, 2.8 M rows,
+     * to keep 7 transactions; fix-pass-11.md §1).
      */
     return sets
       .slice(1)
-      .reduce(
-        (chain, set) =>
-          `SELECT transaction_hash, transaction_internal_id FROM (${set}) WHERE transaction_hash IN (SELECT transaction_hash FROM (${chain}))`,
-        sets[0]!
-      );
+      .reduce((chain, set) => chainStep(sql, set, chain), sets[0]!);
   }
   if (given(filter.has_input) && requiresOutpoint(filter.has_input)) {
     return `SELECT transaction_hash, transaction_internal_id FROM ${spendRelationSql(

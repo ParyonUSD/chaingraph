@@ -26,7 +26,13 @@ import {
 } from './catalogue.js';
 import { dataQuerySettings } from './db.js';
 import { createApi } from './server.js';
-import { spendRelationSql, spendRowPredicate, Sql } from './sql.js';
+import {
+  chainKeySetMax,
+  spendRelationSql,
+  spendRowPredicate,
+  Sql,
+  transactionCandidates,
+} from './sql.js';
 
 const database = process.env.CHAINGRAPH_API_CHIPNET_DATABASE;
 const v1Url = process.env.CHAINGRAPH_API_V1_URL;
@@ -286,6 +292,85 @@ run(
         t.is(sha256d(block.header), block.hash);
         t.true(block.encoded_hex.startsWith(block.header));
       });
+    } finally {
+      await client.close();
+    }
+  }
+);
+
+run(
+  '[e2e] [chipnet] candidate chain: a large set of earlier candidates stays out of key analysis (L27, fix-pass-12.md §1)',
+  async (t) => {
+    const client = ClickHouseClient.fromEnv({
+      CHAINGRAPH_CLICKHOUSE_DATABASE: database,
+      CHAINGRAPH_CLICKHOUSE_URL: e2eClickHouseUrl,
+    });
+    const api = createApi(client);
+    try {
+      const snapshot = await api.db.readSnapshot(
+        await api.db.nodeId('chipnet-local')
+      );
+      const sql = new Sql(snapshot);
+      /* L27 on chipnet: the user's script has ~7,000 transactions, the minting category a few hundred outputs */
+      const candidates = transactionCandidates(sql, {
+        _and: [
+          {
+            has_output: {
+              nonfungible_token_capability: { _eq: 'minting' },
+              token_category: {
+                _eq: 'dfe50223c8d5cba8dcef8dff6d92b61deb88a8ba44947367f2b746487b56039b',
+              },
+            },
+          },
+        ],
+        has_output: {
+          locking_bytecode: {
+            _in: ['76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac'],
+          },
+        },
+      })!;
+      const limit = `SETTINGS use_index_for_in_with_subqueries_max_values = ${chainKeySetMax}`;
+      t.true(candidates.includes(limit), 'the chain link carries the limit');
+      const [earlier] = await client.query<{ n: string }>(
+        `SELECT toString(count(DISTINCT transaction_hash)) AS n FROM output WHERE locking_bytecode = unhex('76a9148ee26d6c9f58369f94864dc3630cdeb17fae2f2d88ac')`
+      );
+      t.true(
+        Number(earlier!.n) > chainKeySetMax,
+        `the earlier set (${earlier!.n}) exceeds the limit`
+      );
+      const tag = `fix12-chain-${Date.now()}`;
+      const measure = async (label: string, text: string) => {
+        const rows = await client.query<{ n: string }>(
+          `SELECT toString(count()) AS n FROM (${text})`,
+          sql.params,
+          { ...dataQuerySettings, log_comment: `${tag}-${label}` }
+        );
+        return rows[0]!.n;
+      };
+      /* warm, then measure each form once more */
+      const keyed = candidates.replace(limit, '');
+      t.is(await measure('w1', candidates), await measure('w2', keyed));
+      const limited = await measure('limited', candidates);
+      const unlimited = await measure('unlimited', keyed);
+      t.is(limited, unlimited, 'same candidates');
+      await client.command('SYSTEM FLUSH LOGS');
+      const stats = await client.query<{ label: string; key_us: string }>(
+        `SELECT replaceOne(log_comment, {tag:String}, '') AS label,
+                toString(ProfileEvents['FilteringMarksWithPrimaryKeyMicroseconds']) AS key_us
+           FROM system.query_log WHERE type = 'QueryFinish' AND log_comment IN ({a:String}, {b:String})`,
+        { a: `${tag}-limited`, b: `${tag}-unlimited`, tag: `${tag}-` }
+      );
+      const keyUs = (label: string) =>
+        Number(stats.find((row) => row.label === label)?.key_us);
+      t.log(
+        `key analysis: ${keyUs('limited')} µs with the limit, ${keyUs(
+          'unlimited'
+        )} µs without (earlier set ${earlier!.n})`
+      );
+      t.true(
+        keyUs('limited') * 4 < keyUs('unlimited'),
+        'the hash set does not drive key analysis'
+      );
     } finally {
       await client.close();
     }

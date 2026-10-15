@@ -8,10 +8,12 @@ import type { VisibilitySnapshot } from '../store/clickhouse/visibility.js';
 import { operationNodeNames } from './server.js';
 import {
   candidateWindowRows,
+  chainKeySetMax,
   isClientParamName,
   outputPredicate,
   snapshotParameterNames,
   Sql,
+  transactionCandidates,
   transactionConjuncts,
   transactionPredicate,
   unspentOutputRows,
@@ -202,4 +204,55 @@ test('candidate window: wider when the filter has conjuncts beyond its candidate
   );
   t.is(transactionConjuncts({ has_input: null }), 0);
   t.is(transactionConjuncts(undefined), 0);
+});
+
+test('candidate chain: a later set takes the key on earlier candidates only up to chainKeySetMax (fix-pass-12.md §1)', (t) => {
+  const category = 'aa'.repeat(32);
+  const l27 = (scripts: string[]) => ({
+    _and: [
+      {
+        has_output: {
+          nonfungible_token_capability: { _eq: 'minting' as const },
+          token_category: { _eq: category },
+        },
+      },
+    ],
+    has_output: { locking_bytecode: { _in: scripts } },
+  });
+  const short = transactionCandidates(new Sql(snapshot), l27(['76a914']))!;
+  t.is(
+    short.match(/use_index_for_in_with_subqueries_max_values = (\d+)/gu)
+      ?.length,
+    1,
+    'one link, one limit'
+  );
+  t.true(short.includes(`max_values = ${chainKeySetMax}`));
+  t.false(short.includes('identity('));
+  /* a client list longer than the limit would lose its own key read under the setting: the counted gate */
+  const long = transactionCandidates(
+    new Sql(snapshot),
+    l27(
+      Array.from({ length: chainKeySetMax + 1 }, (_, index) =>
+        index.toString(16).padStart(4, '0')
+      )
+    )
+  )!;
+  t.false(long.includes('use_index_for_in_with_subqueries_max_values'));
+  t.regex(
+    long,
+    new RegExp(
+      `if\\(\\(SELECT count\\(\\) FROM \\(SELECT 1 FROM \\([^]*LIMIT ${
+        chainKeySetMax + 1
+      }\\)\\) <= ${chainKeySetMax}, transaction_hash IN `,
+      'u'
+    )
+  );
+  t.true(
+    long.includes('identity(transaction_hash) IN (SELECT transaction_hash')
+  );
+  /* one set: no chain */
+  const single = transactionCandidates(new Sql(snapshot), {
+    has_output: { locking_bytecode: { _in: ['76a914'] } },
+  })!;
+  t.false(single.includes('max_values'));
 });
