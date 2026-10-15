@@ -917,8 +917,12 @@ export interface RootQuery {
   entity: Entity;
   /** Root rows: a FROM item providing the entity's raw columns. */
   source: string;
-  /** Predicate over the source's raw columns. */
-  where: string;
+  /**
+   * Predicate over the source's raw columns; a function gets the columns the
+   * page reads (its selections and order), so a root can bound the read by a
+   * slim projection only it covers (`runInputs`: input.p_txid).
+   */
+  where: string | ((needs: ReadonlySet<string>) => string);
   order: readonly OrderTerm[];
   /** Rows to fetch (page size + 1 for `has_more`); undefined: all. */
   limit?: number;
@@ -1221,13 +1225,15 @@ export const compileRoot = (
   });
   const needs = [...plan.needs];
   const order = orderSql(root.order);
+  const where =
+    typeof root.where === 'string' ? root.where : root.where(plan.needs);
   const page = `SELECT ${
     needs.length === 0 ? '1 AS __one' : needs.join(', ')
   } FROM (${
     /^\s*(?:SELECT|WITH)\b/iu.test(root.source)
       ? root.source
       : `SELECT * FROM ${root.source}`
-  }) WHERE ${root.where}${order === '' ? '' : ` ORDER BY ${order}`}${
+  }) WHERE ${where}${order === '' ? '' : ` ORDER BY ${order}`}${
     root.limit === undefined
       ? ''
       : ` LIMIT ${sql.bind(root.limit, 'UInt64')}${

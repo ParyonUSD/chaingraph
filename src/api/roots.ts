@@ -22,6 +22,7 @@ import {
   blockOrder,
   InputEntity,
   inputOrder,
+  inputsByIdCovers,
   NodeEntity,
   NodeTransactionEntity,
   nodeTransactionOrder,
@@ -133,7 +134,10 @@ const pageOf = async (
   label: string,
   entity: Entity,
   source: string,
-  where: readonly string[],
+  /** Conjuncts; a function gets the columns the page reads (`RootQuery.where`). */
+  where:
+    | readonly string[]
+    | ((needs: ReadonlySet<string>) => readonly string[]),
   order: readonly OrderTerm[],
   args: PageArgs,
   sels: readonly Sel[],
@@ -146,6 +150,7 @@ const pageOf = async (
 ): Promise<Page> => {
   checkLimit(args.limit, max);
   const offset = checkOffset(args.offset);
+  const bound = keysetBound(env.sql, order, args.after);
   const compiled = compileRoot(
     env.sql,
     env.ctx,
@@ -156,9 +161,10 @@ const pageOf = async (
       offset,
       order,
       source,
-      where: [...where, ...keysetBound(env.sql, order, args.after)]
-        .map((part) => `(${part})`)
-        .join(' AND '),
+      where: (needs) =>
+        [...(typeof where === 'function' ? where(needs) : where), ...bound]
+          .map((part) => `(${part})`)
+          .join(' AND '),
     },
     sels
   );
@@ -568,24 +574,60 @@ export const runInputs = async (
   sels: readonly Sel[]
 ) => {
   const { sql, ctx } = env;
-  const candidates =
-    args.where !== undefined &&
-    args.where !== null &&
-    requiresOutpoint(args.where)
-      ? `SELECT transaction_hash FROM ${spendRelationSql(
-          sql,
-          spendRowPredicate(sql, args.where, ctx.node)
-        )}`
-      : undefined;
+  const { where } = args;
+  const spends =
+    where !== undefined && where !== null && requiresOutpoint(where);
+  /* the spend relation's rows matching `where` (`columns`), as a subquery */
+  const spent = (columns: string) =>
+    `SELECT ${columns} FROM ${spendRelationSql(
+      sql,
+      spendRowPredicate(sql, where, ctx.node)
+    )}`;
+  const byHash = () => [
+    `transaction_hash IN (${sql.accepted(
+      ctx.node,
+      spends ? spent('transaction_hash') : undefined
+    )})`,
+    inputPredicate(sql, where, ctx.node),
+  ];
+  const { acceptanceByIdProjection } =
+    spends && sql.readsById.inputs
+      ? await env.db.storeFeatures()
+      : { acceptanceByIdProjection: false };
+  /*
+   * Inputs matched through the spend relation (`outpoint` filters) are read
+   * by the spends' internal ids when every part has input.p_txid and the
+   * page reads no column outside it (fix-pass-13.md §2): the hash sets stay
+   * out of key analysis (`identity`), so ClickHouse does not search input's
+   * hash key with a set of every matching spend (mainnet L17: ~1,500 hashes,
+   * every part spanning every hash, 0.35-0.7 s of key CPU) only to read
+   * p_txid's few granules anyway; with p_node_tx the acceptance check reads
+   * the ids alone. Exact: one id per hash, and the hash conditions stay.
+   */
+  const byId = () => {
+    const ids = spent('transaction_internal_id');
+    return [
+      `transaction_internal_id IN (${ids})`,
+      `identity(transaction_hash) IN (${sql.accepted(
+        ctx.node,
+        /* `among` is not read with idsOnly (no second spend read) */
+        acceptanceByIdProjection ? ids : spent('transaction_hash'),
+        ids,
+        acceptanceByIdProjection
+      )})`,
+      `identity((transaction_hash, input_index)) IN (${spent(
+        'transaction_hash, input_index'
+      )})`,
+    ];
+  };
   return pageOf(
     env,
     label,
     InputEntity,
     sql.view('input_at'),
-    [
-      `transaction_hash IN (${sql.accepted(ctx.node, candidates)})`,
-      inputPredicate(sql, args.where, ctx.node),
-    ],
+    spends && sql.readsById.inputs
+      ? (needs) => (inputsByIdCovers(needs) ? byId() : byHash())
+      : byHash(),
     rootOrder(
       orderTerms(inputOrder, args.order_by),
       inputDefaultOrder,

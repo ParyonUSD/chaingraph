@@ -36,8 +36,18 @@ export const idOnlyInputsRead = (sql: string) =>
     sql
   );
 
-const documents: [string, string, boolean][] = [
-  /* [label, document, reads inputs by id alone] */
+/**
+ * An inputs root matched through the spend relation, read by the spends'
+ * internal ids with the hash sets out of key analysis (roots.ts `runInputs`,
+ * fix-pass-13.md §2).
+ */
+export const rootInputsBySpendIds = (sql: string) =>
+  sql.includes(
+    'WHERE (transaction_internal_id IN (SELECT transaction_internal_id FROM '
+  ) && sql.includes('identity((transaction_hash, input_index)) IN');
+
+const documents: [string, string, boolean, boolean?][] = [
+  /* [label, document, reads inputs by id alone, inputs root by spend ids] */
   [
     'inputs, key columns only',
     `query { transactions(node: "${one}", limit: 100) { nodes { hash inputs { input_index outpoint_transaction_hash outpoint_index sequence_number } } } }`,
@@ -62,6 +72,18 @@ const documents: [string, string, boolean][] = [
     'inputs root, nested transaction inputs (L17 shape)',
     `query { inputs(node: "${one}", limit: 100) { nodes { input_index transaction { hash inputs(where: { input_index: { _eq: 0 } }) { input_index outpoint { value_satoshis } } } } } }`,
     true,
+  ],
+  [
+    'inputs root filtered by outpoint (L17 page)',
+    `query { inputs(node: "${one}", limit: 100, where: { outpoint: { value_satoshis: { _gt: "0" } } }) { nodes { transaction_internal_id input_index transaction { hash } } } }`,
+    false,
+    true,
+  ],
+  [
+    'inputs root filtered by outpoint, unlocking_bytecode: by hash',
+    `query { inputs(node: "${one}", limit: 100, where: { outpoint: { value_satoshis: { _gt: "0" } } }) { nodes { input_index unlocking_bytecode } } }`,
+    false,
+    false,
   ],
   [
     'unlocking_bytecode (X6 shape): by hash and id',
@@ -132,7 +154,7 @@ e2e(
     const database = (
       await env.client.query<{ d: string }>('SELECT currentDatabase() AS d')
     )[0]!.d;
-    for (const [label, document, byIdAlone] of documents) {
+    for (const [label, document, byIdAlone, rootBySpendIds] of documents) {
       const { now } = (
         await env.client.query<{ now: string }>(
           "SELECT toString(now64(6, 'UTC')) AS now"
@@ -151,6 +173,13 @@ e2e(
         byIdAlone,
         `${label}: ${byIdAlone ? 'by id alone' : 'by hash and id'}`
       );
+      if (rootBySpendIds !== undefined) {
+        t.is(
+          recorded.some((event) => rootInputsBySpendIds(event.sql)),
+          rootBySpendIds,
+          `${label}: ${rootBySpendIds ? 'root by spend ids' : 'root by hash'}`
+        );
+      }
       const logged = (await statementsSince(env, now)).filter((row) =>
         row.query.includes('FROM input')
       );
@@ -160,7 +189,7 @@ e2e(
           Number(row.read_rows) < fillerRows / 4,
           `${label}: ${row.read_rows} rows read (input holds ${fillerRows} filler rows)`
         );
-        if (idOnlyInputsRead(row.query)) {
+        if (idOnlyInputsRead(row.query) || rootInputsBySpendIds(row.query)) {
           t.true(
             row.projections.includes(`${database}.input.p_txid`),
             `${label}: input.p_txid used (${row.projections.join(', ')})`
