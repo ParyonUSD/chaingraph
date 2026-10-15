@@ -39,6 +39,7 @@ import {
   admissionSummary,
   Budget,
   defaultAdmissionOptions,
+  defaultLightMaxThreads,
   overloadedCode,
   planKeys,
   requestAbortedCode,
@@ -500,7 +501,16 @@ test('admission: options from the environment and the startup line', (t) => {
   t.is(fromServer.loop.burstSeconds, 1);
   t.is(fromServer.loop.ratePerSecond, 850);
   t.is(fromServer.heavyMaxInFlight, 24);
-  t.deepEqual(fromServer.settings, { heavy: {}, light: {} });
+  t.deepEqual(fromServer.settings, {
+    heavy: {},
+    light: { max_threads: defaultLightMaxThreads },
+  });
+  t.deepEqual(
+    admissionOptionsFromEnv({ CHAINGRAPH_API_LIGHT_MAX_THREADS: '0' }, 48, 1)
+      .settings,
+    { heavy: {}, light: {} },
+    '0: the server default'
+  );
   t.is(fromServer.cpuSource, 'query_log');
   t.deepEqual(fromServer.sizing, {
     cores: 48,
@@ -545,7 +555,7 @@ test('admission: options from the environment and the startup line', (t) => {
   );
   t.regex(
     admissionSummary(fromServer, 154),
-    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=43\.2 CPU-s\/s burst 4 s loop_budget=850 ms\/s burst 1 s light_share=0\.25 light<=500 CPU-ms,25 loop-ms heavy_in_flight=24 heavy_contended=0\.5:max_threads 4 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=server default heavy_settings=server default max_concurrent_queries_for_user=154$/u
+    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=43\.2 CPU-s\/s burst 4 s loop_budget=850 ms\/s burst 1 s light_share=0\.25 light<=500 CPU-ms,25 loop-ms heavy_in_flight=24 heavy_contended=0\.5:max_threads 4 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=max_threads 8 heavy_settings=server default max_concurrent_queries_for_user=154$/u
   );
 });
 

@@ -139,6 +139,17 @@ export const defaultLoopTarget = 0.85;
 export const defaultCores = 48;
 
 /**
+ * `max_threads` of light statements unless CHAINGRAPH_API_LIGHT_MAX_THREADS
+ * says otherwise (0: the server's default) (fix-pass-12.md §2). A light
+ * document is a handful of small reads, each split over the server's
+ * default thread count (48 on golden); on the golden-sized local copy 8
+ * threads made every median-band node-39 document 2-8 ms faster for less
+ * CPU, and no light document slower (4: data-reading ones up to 28 ms
+ * slower; heavy documents keep the default).
+ */
+export const defaultLightMaxThreads = 8;
+
+/**
  * Defaults (one process, 48 cores): ClickHouse 43.2 CPU-s/s (90 % of the
  * cores) with a 4 s burst (a burst of ~173 CPU-s: mainnet's heaviest
  * catalogue request, L15, is 59 CPU-s; a 2 s burst and a 75 % target refused
@@ -171,7 +182,7 @@ export const defaultAdmissionOptions: AdmissionOptions = {
   loopGuard: 0.95,
   maxKeys: 10_000,
   minRetryAfterSeconds: 1,
-  settings: { heavy: {}, light: {} },
+  settings: { heavy: {}, light: { max_threads: defaultLightMaxThreads } },
   unknownCost: { cpuSeconds: 0.25, loopMs: 20 },
 };
 
@@ -1151,11 +1162,20 @@ const nonNegativeNumber = (
   return value;
 };
 
-const classSettingsFromEnv = (env: NodeJS.ProcessEnv, prefix: string) => {
+const classSettingsFromEnv = (
+  env: NodeJS.ProcessEnv,
+  prefix: string,
+  defaultThreads = 0
+) => {
   const settings: { [name: string]: number | string } = {};
-  const threads = nonNegativeNumber(env, `${prefix}_MAX_THREADS`, 0, {
-    integer: true,
-  });
+  const threads = nonNegativeNumber(
+    env,
+    `${prefix}_MAX_THREADS`,
+    defaultThreads,
+    {
+      integer: true,
+    }
+  );
   if (threads > 0) settings.max_threads = threads;
   const priority = nonNegativeNumber(env, `${prefix}_PRIORITY`, 0, {
     integer: true,
@@ -1339,7 +1359,11 @@ export const admissionOptionsFromEnv = (
     ),
     settings: {
       heavy: classSettingsFromEnv(env, 'CHAINGRAPH_API_HEAVY'),
-      light: classSettingsFromEnv(env, 'CHAINGRAPH_API_LIGHT'),
+      light: classSettingsFromEnv(
+        env,
+        'CHAINGRAPH_API_LIGHT',
+        defaultLightMaxThreads
+      ),
     },
     sizing: {
       cores,
