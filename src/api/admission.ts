@@ -1372,16 +1372,6 @@ export const admissionOptionsFromEnv = (
       heavy: classSettingsFromEnv(env, 'CHAINGRAPH_API_HEAVY'),
       light: classSettingsFromEnv(env, 'CHAINGRAPH_API_LIGHT'),
     },
-    smallMaxCpuMs: nonNegativeNumber(
-      env,
-      'CHAINGRAPH_API_SMALL_MAX_CPU_MS',
-      defaultSmallMaxCpuMs
-    ),
-    smallSettings: classSettingsFromEnv(
-      env,
-      'CHAINGRAPH_API_SMALL',
-      defaultSmallSettings.max_threads
-    ),
     sizing: {
       cores,
       cpuTarget,
@@ -1395,6 +1385,16 @@ export const admissionOptionsFromEnv = (
           ? 'default'
           : 'clickhouse',
     },
+    smallMaxCpuMs: nonNegativeNumber(
+      env,
+      'CHAINGRAPH_API_SMALL_MAX_CPU_MS',
+      defaultSmallMaxCpuMs
+    ),
+    smallSettings: classSettingsFromEnv(
+      env,
+      'CHAINGRAPH_API_SMALL',
+      defaultSmallSettings.max_threads
+    ),
     unknownCost: {
       cpuSeconds:
         nonNegativeNumber(
