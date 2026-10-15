@@ -39,6 +39,11 @@ export interface HeavyLaneWorkerData {
 export interface HeavyLaneOptions extends HeavyLaneWorkerData {
   /** Worker threads (at least 1). */
   threads: number;
+  /**
+   * Each worker's young generation, MiB (`resourceLimits`; undefined: V8's
+   * default). 3 × the semi-space size (`semiSpaceMbFromEnv`, main.ts).
+   */
+  youngGenerationMb?: number;
 }
 
 /** A request for a lane worker. */
@@ -117,9 +122,17 @@ export class HeavyLane {
 
   private spawn(): Slot {
     const data: HeavyLaneWorkerData = Object.fromEntries(
-      Object.entries(this.options).filter(([name]) => name !== 'threads')
+      Object.entries(this.options).filter(
+        ([name]) => name !== 'threads' && name !== 'youngGenerationMb'
+      )
     ) as unknown as HeavyLaneWorkerData;
-    const worker = new Worker(workerUrl, { workerData: data });
+    const { youngGenerationMb } = this.options;
+    const worker = new Worker(workerUrl, {
+      ...(youngGenerationMb === undefined
+        ? {}
+        : { resourceLimits: { maxYoungGenerationSizeMb: youngGenerationMb } }),
+      workerData: data,
+    });
     const slot: Slot = { inFlight: 0, worker };
     worker.on('message', (message: LaneMessage) => {
       if (message.type === 'ready') return;

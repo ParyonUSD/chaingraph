@@ -102,6 +102,21 @@ export const defaultHeavyThreads = 1;
 const heavyThreadsFromEnv = (env: NodeJS.ProcessEnv) =>
   integerFromEnv(env, 'CHAINGRAPH_API_HEAVY_THREADS', defaultHeavyThreads, 0);
 
+/**
+ * CHAINGRAPH_API_SEMI_SPACE_MB (default 128; 0: V8's default): V8's
+ * semi-space size for the API's isolates (fix-pass-12.md §3). A 10,000-row
+ * page allocates tens of MB of short-lived arrays and rows; with the default
+ * young generation most of them were promoted and collected again by the
+ * old-generation GC (~25 % of L35's API side). 128 MiB: L35's API side
+ * -19 % locally. Cluster workers get `--max-semi-space-size`, lane threads
+ * a 3 × larger young generation (`resourceLimits`); a single process takes
+ * it from NODE_OPTIONS only (an isolate's heap is sized when it starts).
+ */
+export const defaultSemiSpaceMb = 128;
+
+export const semiSpaceMbFromEnv = (env: NodeJS.ProcessEnv) =>
+  integerFromEnv(env, 'CHAINGRAPH_API_SEMI_SPACE_MB', defaultSemiSpaceMb, 0);
+
 const main = async () => {
   const { env } = process;
   const workers = workersFromEnv(env);
@@ -167,6 +182,9 @@ const main = async () => {
               ),
             },
             threads: heavyThreads,
+            ...(semiSpaceMbFromEnv(env) === 0
+              ? {}
+              : { youngGenerationMb: 3 * semiSpaceMbFromEnv(env) }),
           },
         }),
     responseCache: env.CHAINGRAPH_API_RESPONSE_CACHE === 'off' ? false : {},
@@ -245,6 +263,15 @@ const main = async () => {
 const workerCount = workersFromEnv(process.env);
 if (workerCount > 1 && cluster.isPrimary) {
   /* the primary only forks (and replaces a worker that exits); workers share the port */
+  const semiSpaceMb = semiSpaceMbFromEnv(process.env);
+  if (
+    semiSpaceMb > 0 &&
+    !process.execArgv.some((arg) => arg.startsWith('--max-semi-space-size'))
+  ) {
+    cluster.setupPrimary({
+      execArgv: [...process.execArgv, `--max-semi-space-size=${semiSpaceMb}`],
+    });
+  }
   Array.from({ length: workerCount }).forEach(() => cluster.fork());
   cluster.on('exit', (worker, code, signal) => {
     // eslint-disable-next-line no-console
