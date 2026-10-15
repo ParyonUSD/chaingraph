@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention, functional/no-throw-statement, complexity, max-params, max-lines */
-// cspell:ignore clickhouse unhex unindexed cand
+// cspell:ignore clickhouse unhex unindexed cand txid
 /**
  * The v2 root fields: their row sources, acceptance rules, ordering,
  * pagination (keyset, offset) and page caps. Each root is ONE statement
