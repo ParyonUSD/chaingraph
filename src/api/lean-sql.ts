@@ -53,6 +53,9 @@ const clauseEnds = [
   ' FORMAT ',
 ] as const;
 
+/** Set operations: a query with one at its own depth is more than one SELECT. */
+const setOperations = [' UNION ', ' INTERSECT ', ' EXCEPT '] as const;
+
 /** Words the inner query of rule 2 must not have at its own depth. */
 const innerForbidden = [
   ...clauseEnds,
@@ -309,6 +312,10 @@ const projectOnce = (scan: Scan): string | undefined => {
     if (from < 0) continue;
     const innerList = sql.slice(open + 8, from);
     if (!columnList.test(innerList)) continue;
+    /* a set operation: the outer list would apply to its first query only */
+    if (scan.find({ from, level: level + 1, to: close }, setOperations) >= 0) {
+      continue;
+    }
     /* the outer's ORDER BY / LIMIT … may follow the inner's WHERE, not its own ORDER BY / LIMIT … */
     if (
       clauses &&

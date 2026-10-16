@@ -1,4 +1,4 @@
-// cspell:ignore subquery
+// cspell:ignore subquery cand
 import test from 'ava';
 
 import { leanSql } from './lean-sql.js';
@@ -81,6 +81,9 @@ test("leanSql: a projection of plain columns reads the inner query's source dire
     /* a column the inner list does not have, or an expression */
     'SELECT a, b FROM (SELECT a, c FROM t)',
     'SELECT a FROM (SELECT a, b + 1 AS c FROM t)',
+    /* a set operation: the outer list would reach its first query only */
+    'SELECT a FROM (SELECT a, b FROM t UNION ALL SELECT a, b FROM u)',
+    'SELECT a FROM (SELECT a, b FROM t WHERE x = 1 UNION ALL SELECT a, b FROM u) ORDER BY a',
   ];
   kept.forEach((sql) => {
     t.is(leanSql(sql), sql, sql);
