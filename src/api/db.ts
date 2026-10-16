@@ -41,6 +41,7 @@ import {
   statementShape,
 } from './admission.js';
 import type { Ctx } from './compile.js';
+import { leanSql } from './lean-sql.js';
 import { maxAuthchainDepth } from './model.js';
 import type { UtxoSetPolicy } from './sql.js';
 import {
@@ -265,6 +266,12 @@ export class ApiDb {
    * statements: the A/B switch of the next GKE session).
    */
   groupNumbers = process.env.CHAINGRAPH_API_GROUP_NUMBERS !== 'off';
+
+  /**
+   * Data statements sent with fewer query nodes (`leanSql`,
+   * fix-pass-14.md §2); CHAINGRAPH_API_LEAN_SQL=off sends them as compiled.
+   */
+  leanStatements = process.env.CHAINGRAPH_API_LEAN_SQL !== 'off';
 
   /** Test hook: every query the API sends (after it is sent). */
   onQuery: ((event: QueryEvent) => void) | undefined;
@@ -492,10 +499,11 @@ export class ApiDb {
    */
   async query<T>(
     label: string,
-    sql: string,
+    compiled: string,
     params: QueryParams,
     statementClass: StatementClass = 'data'
   ) {
+    const sql = this.leanStatements ? leanSql(compiled) : compiled;
     const scope = requestScope.getStore();
     const signal = scope?.signal;
     const ticket = scope?.ticket;

@@ -133,6 +133,68 @@ e2e(
 );
 
 e2e(
+  '[e2e] lean statements (fix-pass-14.md §2): every document answers byte for byte as with the statements as compiled; the lean ones have fewer subqueries',
+  async (t) => {
+    t.timeout(120_000);
+    const env = await setup(t, 'lean_sql');
+    const lean = createApi(env.client, {
+      admission: disabledAdmissionOptions,
+    });
+    const compiled = createApi(env.client, {
+      admission: disabledAdmissionOptions,
+    });
+    /* explicit: the suite also runs with CHAINGRAPH_API_LEAN_SQL=off */
+    lean.db.leanStatements = true;
+    compiled.db.leanStatements = false;
+    const statements = { compiled: [] as string[], lean: [] as string[] };
+    lean.db.onQuery = (event) => {
+      if (event.kind === 'data') statements.lean.push(event.sql);
+    };
+    compiled.db.onQuery = (event) => {
+      if (event.kind === 'data') statements.compiled.push(event.sql);
+    };
+    const servers = [await listen(lean), await listen(compiled)];
+    t.teardown(async () => {
+      await Promise.all(servers.map(async (s) => s.close()));
+    });
+    const answer = async (url: string, query: string) =>
+      (
+        await fetch(url, {
+          body: JSON.stringify({ query, variables: { n: one, yes: true } }),
+          headers: { 'content-type': 'application/json' },
+          method: 'POST',
+        })
+      ).text();
+    const extra: [string, string][] = [
+      [
+        'a large page: transactions with inclusions, outputs, inputs and outpoints',
+        `query { transactions(node: "${one}", limit: 2000) { nodes { hash block_inclusions { block { height hash } }
+          outputs { output_index value_satoshis spent_by { input_index transaction { hash } } }
+          inputs { input_index outpoint_transaction_hash outpoint { value_satoshis token_category transaction { hash block_inclusions { block { height } } } } } } } }`,
+      ],
+    ];
+    for (const [label, query] of [...documents, ...extra]) {
+      if (label.startsWith('an error')) continue;
+      const [a, b] = await Promise.all(
+        servers.map(async (server) => answer(server.url, query))
+      );
+      t.is(a, b, label);
+      t.false(a!.includes('"errors"'), `${label}: ${a!.slice(0, 300)}`);
+    }
+    const subqueries = (list: readonly string[]) =>
+      list.reduce(
+        (sum, sql) => sum + (sql.match(/\(SELECT /gu)?.length ?? 0),
+        0
+      );
+    t.is(statements.lean.length, statements.compiled.length);
+    t.true(
+      subqueries(statements.lean) < subqueries(statements.compiled),
+      `${subqueries(statements.lean)} vs ${subqueries(statements.compiled)}`
+    );
+  }
+);
+
+e2e(
   '[e2e] group numbers (fix-pass-10.md §1): every document answers byte for byte as with key texts; the statements number groups only when on',
   async (t) => {
     t.timeout(120_000);
