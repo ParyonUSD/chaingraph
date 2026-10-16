@@ -784,9 +784,28 @@ const planLevel = (
       .map((key, index) => `${key} AS __pk${index}`)
       .join(', ');
     const childNeeds = [...plan.needs];
-    const rowNumber = `row_number() OVER (PARTITION BY ${field.childKeys.join(
+    const windowNumber = `row_number() OVER (PARTITION BY ${field.childKeys.join(
       ', '
     )}${order.length === 0 ? '' : ` ORDER BY ${orderSql(order)}`}) AS __rn`;
+    /*
+     * The row number only orders a parent's children (the client sorts by
+     * it, `sortByFirst`) unless a per-parent limit or offset bounds it. Then
+     * a window per level is analysed, planned and sorted for nothing: with
+     * no order any number serves (ties are as arbitrary as the window's),
+     * and one ascending integer order term is its own number (NULLs last,
+     * as ORDER BY puts them). fix-pass-14.md §2.
+     */
+    const single = order.length === 1 ? order[0] : undefined;
+    const bounded = limit !== undefined || offset !== undefined;
+    const rowNumber = bounded
+      ? windowNumber
+      : order.length === 0
+      ? 'toUInt8(1) AS __rn'
+      : single !== undefined &&
+        single.dir === 'ASC' &&
+        (single.kind === 'int' || single.kind === 'uint')
+      ? `ifNull(toInt64(${single.expr}), toInt64(9007199254740991)) AS __rn`
+      : windowNumber;
     /*
      * A per-parent limit is applied first with `LIMIT n BY` (a top-n per key,
      * cheaper than numbering every row: Node.accepted_blocks(limit: 1)
