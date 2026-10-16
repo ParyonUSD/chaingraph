@@ -44,17 +44,17 @@
 --   force_custom_plan (production setting): 33.6 s of lock on 1.3M rows on a
 --   production clone. If block internal_ids are too sparse for an array, the
 --   function is used with a generic plan.
--- - If block_height already exists and is NOT NULL (an earlier version of this
---   migration was applied), it is already complete and correct (backfilled,
---   then written by the agent and the trigger below), so it is not rebuilt.
+-- - If block_height already exists and is NOT NULL, it is complete and correct
+--   (backfilled, then written by the agent and the trigger below), so it is
+--   not rebuilt; re-applying the migration is a no-op.
 --
 -- Measured on 1,299,941 synthetic node_block rows (laptop, PG 18): about 2.0 s
 -- of ACCESS EXCLUSIVE (vs 6.0 s for UPDATE ... FROM block and 6.4 s for the
 -- per-row function under force_custom_plan); expect 2-3x that on a cloud vCPU.
 --
--- Optional afterwards, only on a database where an earlier UPDATE-based version
--- of this migration was applied (bloated heap and node_block_pkey), outside a
--- transaction and without blocking readers or the agent:
+-- Optional afterwards, only on a database where block_height was filled by an
+-- in-place UPDATE (bloated heap and node_block_pkey), outside a transaction
+-- and without blocking readers or the agent:
 --   VACUUM (ANALYZE) node_block;
 --   REINDEX INDEX CONCURRENTLY node_block_pkey;
 SET LOCAL lock_timeout = '3s';
