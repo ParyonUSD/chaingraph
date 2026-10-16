@@ -841,6 +841,36 @@ const gatedApi = async (
 };
 
 e2e(
+  '[e2e] a request admitted small matches its levels by key texts; the same document admitted otherwise by group numbers (fix-pass-14.md §2)',
+  async (t) => {
+    t.timeout(120_000);
+    const { api, post, state } = await gatedApi(t, 'small_texts', options());
+    state.held = false;
+    state.gate.resolve();
+    const statements: string[] = [];
+    api.db.onQuery = (event) => {
+      if (event.kind === 'data') statements.push(event.sql);
+    };
+    const query =
+      '{ blocks(node: "node-one", limit: 5) { nodes { height transactions { transaction_index transaction { hash } } } } }';
+    const bodies: string[] = [];
+    for (let run = 0; run < 2; run += 1) {
+      const response = await post(query);
+      t.is(response.status, 200);
+      bodies.push(await response.text());
+    }
+    t.is(bodies[0], bodies[1], 'the same answer');
+    t.false(bodies[0]!.includes('"errors"'), bodies[0]!.slice(0, 300));
+    t.is(statements.length, 2);
+    /* nothing known: heavy, group numbers; then small by its rows: key texts */
+    t.true(statements[0]!.includes('transform('));
+    t.false(statements[1]!.includes('transform('));
+    t.is(api.db.admission.stats.admitted.heavy, 1);
+    t.is(api.db.admission.stats.admitted.light, 1);
+  }
+);
+
+e2e(
   '[e2e] request-level admission over HTTP: refused at once with 503 + Retry-After before any statement is sent; an admitted request is never refused part-way',
   async (t) => {
     t.timeout(120_000);

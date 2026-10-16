@@ -741,7 +741,7 @@ export class PinnedSnapshot {
         this.db.authchainMaxBranches
       );
       env.sql.readsById = readsByIdFrom(await this.db.storeFeatures());
-      env.ctx.groupNumbers = this.db.groupNumbers;
+      env.ctx.groupNumbers = this.groupNumbers();
       return env;
     }
     const snapshot = await this.get(node);
@@ -760,7 +760,7 @@ export class PinnedSnapshot {
     sql.readsById = readsByIdFrom(await this.db.storeFeatures());
     return {
       ctx: {
-        groupNumbers: this.db.groupNumbers,
+        groupNumbers: this.groupNumbers(),
         maxRows: this.db.maxResultRows,
         node: snapshot.nodeId === nodeAgnosticId ? undefined : snapshot.nodeId,
         nodeId,
@@ -768,6 +768,19 @@ export class PinnedSnapshot {
       },
       sql,
     };
+  }
+
+  /**
+   * Group numbers for this request's statements: on (`ApiDb.groupNumbers`)
+   * unless the request was admitted small. Group numbers save the API time
+   * on large results (fix-pass-10.md §1) but cost ClickHouse ~1–3 ms of final
+   * SELECT per small document (golden-like node 2: L21 −2.4, X5 −3.1, median
+   * band −1.4 ms with key texts; fix-pass-14.md §2). Both answer byte for byte.
+   */
+  private groupNumbers() {
+    return (
+      this.db.groupNumbers && requestScope.getStore()?.ticket?.small !== true
+    );
   }
 
   /** The concurrent watermark check of a speculative snapshot (`ApiDb.speculativeSnapshot`). */

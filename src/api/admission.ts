@@ -622,6 +622,13 @@ export class Ticket {
   /** ClickHouse settings of the request's statements (its class's, plus the contended ones). */
   settings: { [name: string]: number | string } = {};
 
+  /**
+   * Admitted small (light, few rows read in small parts: `isSmall`): its
+   * statements also match relationship levels by key texts, not group
+   * numbers (db.ts `statement`; fix-pass-14.md §2).
+   */
+  small = false;
+
   /** CPU charged to the ClickHouse budget so far (prediction, then estimates). */
   chargedCpu: number;
 
@@ -914,6 +921,7 @@ export class Admission {
       : small
       ? { ...this.options.smallSettings, ...this.options.settings.light }
       : this.options.settings[cls];
+    ticket.small = small && !contended;
     if (contended) this.stats.contended += 1;
     this.stats.admitted[cls] += 1;
     this.stats.inFlight[cls] += 1;
