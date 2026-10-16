@@ -463,7 +463,7 @@ const nonNegativeIntegerSetting = (
 /* eslint-disable @typescript-eslint/no-magic-numbers */
 /**
  * Stored per-node unspent set (`output.unspent_node_ids`, query root
- * `unspent_output_stored`), maintained by a job inside the agent. Set via the
+ * `unspent_output`), maintained by a job inside the agent. Set via the
  * `CHAINGRAPH_UNSPENT_NODE_IDS*` environment variables (see `defaults.env`).
  */
 const unspentNodeIds = {

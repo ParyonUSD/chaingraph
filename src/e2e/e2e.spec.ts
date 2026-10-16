@@ -2758,8 +2758,8 @@ test.serial('[e2e] [api] /send-transaction: valid', async (t) => {
 /* eslint-disable max-params, require-atomic-updates, @typescript-eslint/no-shadow, prefer-destructuring */
 /**
  * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_NODE_IDS=true`): the
- * reference is the F1g predicate (the semantics of `unspent_output(node)`)
- * evaluated live for one node. Run the e2e suite with
+ * reference is the F1g predicate (the semantics of the `unspent_output(node_name)`
+ * query root) evaluated live for one node. Run the e2e suite with
  * `CHAINGRAPH_UNSPENT_NODE_IDS=true` (the tests below pass trivially
  * otherwise).
  */
@@ -2774,7 +2774,8 @@ const nodeAccepts = (
              WHERE bt.transaction_internal_id = ${transactionInternalId})
    OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = ${transactionInternalId} AND nt.node_internal_id = ${nodeId}))`;
 /**
- * F1g for one node (`unspent_output(node)` with the node resolved to its id).
+ * F1g for one node (the `unspent_output(node_name)` semantics with the node
+ * resolved to its id).
  */
 const nodeUnspentReferenceSql = (nodeId: number) => /* sql */ `
   SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
@@ -3100,7 +3101,7 @@ const compareDeferredQueryRoot = async (
               );
               const actual = await deferredRows(
                 /* sql */ `SELECT encode(u.transaction_hash, 'hex') || ':' || u.output_index AS outpoint
-                  FROM unspent_output_stored('${node.name}') u`,
+                  FROM unspent_output('${node.name}') u`,
                 filter
               );
               t.deepEqual(

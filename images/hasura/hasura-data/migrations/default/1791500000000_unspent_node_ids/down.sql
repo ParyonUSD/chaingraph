@@ -1,4 +1,4 @@
-DROP FUNCTION IF EXISTS unspent_output_stored (text);
+DROP FUNCTION IF EXISTS unspent_output (text);
 DROP FUNCTION IF EXISTS unspent_node_ids_build_root ();
 DROP FUNCTION IF EXISTS unspent_node_ids_gained_creators (bigint);
 DROP FUNCTION IF EXISTS unspent_node_ids_released_spends (bigint);
@@ -20,6 +20,7 @@ DROP FUNCTION IF EXISTS unspent_node_ids_backfill_scope (bytea, bytea);
 DROP FUNCTION IF EXISTS unspent_node_ids_backfill_batch (integer, integer, integer);
 DROP FUNCTION IF EXISTS unspent_node_ids_run_batch (integer, integer, bigint, bigint, bigint, integer, integer, integer, bigint);
 -- signatures of earlier drafts of this migration (lab databases)
+DROP FUNCTION IF EXISTS unspent_output_stored (text);
 DROP FUNCTION IF EXISTS unspent_node_ids_run_batch (integer, integer, bigint, bigint, integer, integer, integer, bigint, boolean);
 DROP FUNCTION IF EXISTS unspent_node_ids_temp_tables ();
 DROP FUNCTION IF EXISTS unspent_node_ids_restore_read_ahead (text[]);
