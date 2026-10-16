@@ -138,7 +138,7 @@ const incompleteBlockRepairRetryDelayMs = 5_000;
 const unspentNodeIdsStartRetryDelayMs = 5_000;
 /**
  * Block saves taking at least this long are logged with a per-step breakdown
- * (a cold-cache mempool-cleaning trigger once held a save for 8 minutes).
+ * (a cold-cache mempool-cleaning trigger can hold a save for minutes).
  */
 const slowBlockSaveMs = 10_000;
 const durationDecimalPlaces = 1;

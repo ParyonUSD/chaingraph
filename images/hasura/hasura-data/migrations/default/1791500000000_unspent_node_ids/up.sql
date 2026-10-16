@@ -7,8 +7,9 @@
 --   {1,3}  = unspent for nodes 1 and 3 (sorted node internal ids): created by
 --            a transaction the node accepts (in a block it accepts or in its
 --            mempool) and not spent by any transaction the node accepts.
--- Every fact is per node: the value is the F1g test (the semantics of the
--- unspent_output(node_name) query root), precomputed for every node at once.
+-- Every fact is per node: the value is the per-node unspent test (the
+-- semantics of the unspent_output(node_name) query root), precomputed for
+-- every node at once.
 --
 -- Ingestion stays append-only. Outputs are inserted with NULL; nothing is
 -- added to `input`. The only write-path triggers are two statement-level
@@ -43,9 +44,9 @@
 --
 -- Reads: unspent_output(node_name) (generated per node by
 -- unspent_node_ids_build_root(); tracked in Hasura). The stored set, plus a
--- live F1g correction for whatever the job has not processed, so the result
+-- live correction for whatever the job has not processed, so the result
 -- is always exact; above a backlog threshold (unspent_tracking_settings) it
--- falls back to F1g.
+-- falls back to the live per-node test.
 
 ALTER TABLE output ADD COLUMN unspent_node_ids integer[];
 COMMENT ON COLUMN output.unspent_node_ids IS 'Per-node unspent set (CHAINGRAPH_UNSPENT_NODE_IDS): NULL = not processed yet; otherwise the sorted internal ids of the nodes for which the output is unspent (created by a transaction the node accepts, no spender the node accepts). Maintained by the agent''s tracking job; read through unspent_output(node_name).';
@@ -85,7 +86,7 @@ CREATE TABLE unspent_tracking_settings (
   watch_consumed_event_id bigint NOT NULL DEFAULT 0
 );
 INSERT INTO unspent_tracking_settings DEFAULT VALUES;
-COMMENT ON TABLE unspent_tracking_settings IS 'Unspent tracking state and read thresholds (written by the agent from CHAINGRAPH_UNSPENT_NODE_IDS_* settings). tracking_start_*: outputs of earlier transactions are pre-tracking (NULL until backfilled); backfill_complete: every partition''s backfill cursor passed the tracking start, so no pre-tracking output is NULL (status only: reads derive it from the cursors, never from this flag); rebuild_required: tracking was stopped (stored values may be stale), so pre-tracking outputs are recomputed whatever their value, and reads use the live F1g predicate until that backfill is complete and the job has passed rebuild_through_transaction_internal_id (the highest transaction id when tracking restarted). Reads correct a backlog of up to hash_max_transactions unprocessed transactions with one hashed set, up to fallback_transactions with per-row probes, and fall back to the live F1g predicate above it (or above fallback_events unconsumed events). Not tracked by Hasura.';
+COMMENT ON TABLE unspent_tracking_settings IS 'Unspent tracking state and read thresholds (written by the agent from CHAINGRAPH_UNSPENT_NODE_IDS_* settings). tracking_start_*: outputs of earlier transactions are pre-tracking (NULL until backfilled); backfill_complete: every partition''s backfill cursor passed the tracking start, so no pre-tracking output is NULL (status only: reads derive it from the cursors, never from this flag); rebuild_required: tracking was stopped (stored values may be stale), so pre-tracking outputs are recomputed whatever their value, and reads use the live per-node test until that backfill is complete and the job has passed rebuild_through_transaction_internal_id (the highest transaction id when tracking restarted). Reads correct a backlog of up to hash_max_transactions unprocessed transactions with one hashed set, up to fallback_transactions with per-row probes, and fall back to the live per-node test above it (or above fallback_events unconsumed events). Not tracked by Hasura.';
 
 CREATE TABLE unspent_tracking_watch (
   transaction_internal_id bigint NOT NULL,
@@ -101,7 +102,7 @@ CREATE TABLE unspent_tracking_nodes (
   indexed_at timestamp NOT NULL DEFAULT now(),
   CONSTRAINT unspent_tracking_nodes_pkey PRIMARY KEY (node_internal_id)
 );
-COMMENT ON TABLE unspent_tracking_nodes IS 'Nodes the query root may serve from the stored set: a row is written by the agent once the node''s three per-node partial indexes are valid (and removed while they are rebuilt); the node is served from the stored set once every partition has consumed the events up to ready_after_event_id (the acceptance changes recorded before its indexes existed). Other nodes are answered by the live F1g predicate. Not tracked by Hasura.';
+COMMENT ON TABLE unspent_tracking_nodes IS 'Nodes the query root may serve from the stored set: a row is written by the agent once the node''s three per-node partial indexes are valid (and removed while they are rebuilt); the node is served from the stored set once every partition has consumed the events up to ready_after_event_id (the acceptance changes recorded before its indexes existed). Other nodes are answered by the live per-node test. Not tracked by Hasura.';
 
 CREATE TABLE unspent_tracking_skipped (
   outpoint_transaction_hash bytea NOT NULL,
@@ -206,11 +207,11 @@ $$;
 -- (temp_buffers). A scan of a temporary table larger than temp_buffers can
 -- then pin every local buffer, and the statement's next local buffer (a write
 -- to another temporary table, a second scan) fails with "no empty local buffer
--- available": PG 18.3 with effective_io_concurrency = 200 (the chart's value)
--- and the default 8MB temp_buffers fails the backfill preparation (2026-10-13
--- lab). temp_buffers cannot be raised once the session has used a temporary
--- table (the agent's pooled connections), so the functions that read their
--- temporary tables lower the read-ahead instead, for those statements only:
+-- available": on PG 18.3, effective_io_concurrency = 200 (the chart's value)
+-- and the default 8MB temp_buffers are enough to hit it. temp_buffers cannot
+-- be raised once the session has used a temporary table (the agent's pooled
+-- connections), so the functions that read their temporary tables lower the
+-- read-ahead instead, for those statements only:
 -- one stream then pins at most a quarter of the local buffers. Returns the
 -- settings to restore (unspent_node_ids_restore_read_ahead), or NULL when
 -- nothing changed (no read streams before 17, or already low enough). Set
@@ -272,7 +273,7 @@ $$;
 -- event id is allocated when its row is inserted, so a later id can commit
 -- first, and consuming past an uncommitted id would skip that event forever.
 -- `max_inputs` bounds the inputs of all partitions walked by one batch. `skip_stall_through`: inputs of transactions up to this id whose
--- output row is missing no longer stop the batch (0 = never skip).
+-- output row is missing are passed instead of stopping the batch (0 = never skip).
 CREATE FUNCTION unspent_node_ids_run_batch (part integer, part_count integer, tx_limit bigint, block_limit bigint,
   event_limit bigint, max_inputs integer, max_blocks integer, max_events integer, skip_stall_through bigint)
   RETURNS jsonb LANGUAGE plpgsql
@@ -453,7 +454,7 @@ BEGIN
   GET DIAGNOSTICS n_fresh = ROW_COUNT;
   n_affected := n_affected + n_fresh;
   n_changed := n_changed + n_fresh;
-  -- passed inputs whose output has now been processed are no longer needed
+  -- passed inputs whose output this batch processed are dropped
   DELETE FROM unspent_tracking_skipped s USING unspent_node_ids_fresh f
     WHERE s.outpoint_transaction_hash = f.h AND s.outpoint_index = f.i;
 
@@ -539,7 +540,7 @@ $$;
 
 -- Backfill of one scope (a token category and/or a 25-byte locking bytecode
 -- prefix): every NULL output of the scope, recomputed and written ('{}'
--- included). For targeted backfills (tests, lab); a full backfill uses
+-- included). For targeted backfills (tests, measurements); a full backfill uses
 -- unspent_node_ids_backfill_batch. It does not advance the backfill cursors:
 -- the query root keeps answering the remaining NULL outputs live (it never
 -- reads a NULL as spent), so a scoped backfill cannot hide an unspent output.
@@ -576,9 +577,9 @@ $$;
 -- other, so a later re-acceptance through a path that writes no event still
 -- reaches outputs processed after the start (e.g. the output of a parent saved
 -- after tracking started, spent by a released child saved before).
--- there is nothing to backfill. After a stop (rebuild_required), values
--- written before the stop may be stale: rebuild_through is set to the highest
--- transaction id now, and reads use F1g until the job has passed it and the
+-- After a stop (rebuild_required), values written before the stop may be
+-- stale: rebuild_through is set to the highest transaction id at the restart,
+-- and reads use the live per-node test until the job has passed it and the
 -- backfill (which then recomputes every pre-tracking output) is complete.
 CREATE FUNCTION unspent_node_ids_initialize (part_count integer, input_watermark bigint, block_watermark bigint,
   event_watermark bigint DEFAULT 0)
@@ -751,9 +752,9 @@ $$;
 
 -- Stop tracking (the agent runs with CHAINGRAPH_UNSPENT_NODE_IDS=false on a
 -- database where tracking had started; the release-event triggers are
--- disabled first, so acceptance changes are no longer recorded): drop the
+-- disabled first, so acceptance changes are not recorded): drop the
 -- watermarks, events, watch set and passed inputs, so the query root answers
--- with the live F1g predicate (read tier "fallback" without watermarks), and
+-- with the live per-node test (read tier "fallback" without watermarks), and
 -- mark the stored values as possibly stale (rebuild_required) for the next
 -- start. Returns whether tracking was running.
 CREATE FUNCTION unspent_node_ids_stop ()
@@ -810,8 +811,8 @@ $$;
 --   'probe'    backlog <= fallback_transactions: one spent_by_index probe per
 --              stored row;
 --   'fallback' larger backlog, too many events, tracking not started (or
---              stopped), or a rebuild after a stop in progress: the live F1g
---              predicate.
+--              stopped), or a rebuild after a stop in progress: the live per-node
+--              test.
 -- `SET chaingraph.unspent_read_tier = hash|probe|fallback` forces a tier
 -- (tests and measurements).
 CREATE FUNCTION unspent_node_ids_read_tier ()
@@ -878,7 +879,7 @@ $$;
 -- (unspent_tracking_nodes) and every partition has consumed the events
 -- recorded before they were. Otherwise (a node registered after tracking
 -- started, before its indexes exist; an unknown name) the root answers with
--- the live F1g predicate only.
+-- the live per-node test only.
 CREATE FUNCTION unspent_node_ids_stored_path (node_name text)
   RETURNS boolean LANGUAGE sql STABLE AS $$
   SELECT unspent_node_ids_read_tier() <> 'fallback'
@@ -1053,7 +1054,7 @@ $$;
 --        the per-node "rest" index, keyed on the category too, so a category
 --        filter is an index condition there (no token: NULL keys, deduplicated);
 --   both also reachable through the per-node 25-byte prefix index; each row
---   re-checked live (F1g) when spent above the watermark or by a dirty
+--   re-checked live when spent above the watermark or by a dirty
 --   transaction, or created by a dirty transaction. The two arm predicates
 --   are complementary and spelled exactly as the index predicates, so the
 --   planner matches them.
@@ -1063,8 +1064,8 @@ $$;
 --        caller's own index: token_category_index, output_search_index);
 --   (d1) outputs spent by released transactions the node no longer accepts;
 --   (d2) outputs of transactions the node started accepting;
---   (f)  F1g, instead of every other arm, when the read tier is "fallback" or
---        the node is not served from the stored set yet
+--   (f)  the live per-node test, instead of every other arm, when the read
+--        tier is "fallback" or the node is not served from the stored set yet
 --        (unspent_node_ids_stored_path: its per-node indexes are not valid,
 --        or the events recorded before they were are not consumed, or the
 --        name is unknown). Every arm is gated by that one per-query value,
@@ -1074,8 +1075,8 @@ CREATE FUNCTION unspent_node_ids_build_root ()
 DECLARE
   arms text := '';
   node record;
-  f1g_literal text;
-  f1g_shared constant text := $f$CASE
+  live_test_literal text;
+  live_test constant text := $f$CASE
       WHEN EXISTS (
         SELECT 1 FROM input i
         WHERE i.outpoint_transaction_hash = o.transaction_hash AND i.outpoint_index = o.output_index
@@ -1123,16 +1124,16 @@ BEGIN
   -- "tuple concurrently updated"; the lock is held until the caller commits
   PERFORM pg_advisory_xact_lock(1970172787);
   -- stored arms only for nodes whose per-node indexes are valid (the others
-  -- are answered by F1g; unspent_node_ids_stored_path gates every arm at run time)
+  -- are answered by the live per-node test; unspent_node_ids_stored_path gates every arm at run time)
   FOR node IN SELECT n.internal_id, n.name FROM node n
                 JOIN unspent_tracking_nodes r ON r.node_internal_id = n.internal_id
                 ORDER BY n.internal_id LOOP
-    f1g_literal := replace(f1g_shared, '(SELECT n.internal_id FROM node n WHERE n.name = node_name)', node.internal_id::text);
+    live_test_literal := replace(live_test, '(SELECT n.internal_id FROM node n WHERE n.name = node_name)', node.internal_id::text);
     arms := arms
       || format(stored_arm, node.name, node.internal_id,
-           'o.token_category IS NOT NULL AND octet_length(o.locking_bytecode) <= 1000', f1g_literal)
+           'o.token_category IS NOT NULL AND octet_length(o.locking_bytecode) <= 1000', live_test_literal)
       || format(stored_arm, node.name, node.internal_id,
-           '(o.token_category IS NULL OR octet_length(o.locking_bytecode) > 1000)', f1g_literal);
+           '(o.token_category IS NULL OR octet_length(o.locking_bytecode) > 1000)', live_test_literal);
   END LOOP;
   EXECUTE 'CREATE OR REPLACE FUNCTION unspent_output (node_name text) RETURNS SETOF output LANGUAGE sql STABLE AS $root$'
     || chr(10) || arms
@@ -1171,7 +1172,7 @@ BEGIN
   SELECT o.* FROM output o
   WHERE NOT (SELECT unspent_node_ids_stored_path(node_name))
     AND %1$s
-$shared$, f1g_shared) || '$root$';
+$shared$, live_test) || '$root$';
   EXECUTE $c$COMMENT ON FUNCTION unspent_output (text) IS 'The outputs unspent according to the named node: created by a transaction the node accepts (in a block it accepts or in its mempool) and not spent by any transaction the node accepts. Served from a per-node set (output.unspent_node_ids) with a live correction for anything the tracking job has not processed yet. Filter by token_category (and nonfungible_token_capability) or use a 25-byte locking bytecode prefix; a call filtered only by locking_bytecode scans every output.'$c$;
 END;
 $build$;

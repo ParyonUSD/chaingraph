@@ -518,10 +518,11 @@ const expiryAdvisoryLockKey = 1970172700;
  * of a parent and of its descendants lock the same rows in opposite orders
  * (each locks its own row, then the cascade waits for the other's) and
  * deadlock; a restarted agent's stale mempool, expiring all at once on every
- * pool connection, live-locked this way. Expiry therefore runs one batch at a
- * time (see {@link expireMempoolTransaction}), under a transaction-level
- * advisory lock (also across agents sharing the database), locks its rows in (node, transaction) order before deleting
- * them, and retries a deadlock or serialization failure against other writers
+ * pool connection, would live-lock this way. Expiry therefore runs one batch
+ * at a time (see {@link expireMempoolTransaction}), under a
+ * transaction-level advisory lock (also across agents sharing the database),
+ * locks its rows in (node, transaction) order before deleting them, and
+ * retries a deadlock or serialization failure against other writers
  * (block acceptance, double-spend replacement) with backoff.
  */
 export const archiveMempoolTransactions = async (
@@ -1520,7 +1521,7 @@ const runStatements = async (client: pg.PoolClient, statements: string[]) =>
  * thresholds and rebuild the query root for the registered nodes. When
  * tracking is off on a database where it had started, disable the triggers
  * and stop tracking (`unspent_node_ids_stop()`: the query root answers with
- * the live F1g predicate, and the next start rebuilds the stored values,
+ * the live per-node test, and the next start rebuilds the stored values,
  * which stop following acceptance changes once the triggers are off). One
  * transaction, serialized across agents by an advisory lock. Returns the
  * statements run (none if the migration is missing and tracking is off).
