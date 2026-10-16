@@ -1919,7 +1919,7 @@ const ensureInitialized = async (
     );
     if (!unspentNodeIds.startAtGenesis && !unspentNodeIds.backfill) {
       unspentTrackingLog.warn(
-        'Unspent tracking job: CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false, so outputs saved before tracking started stay NULL, and unspent_output answers them with the live predicate (exact, but as slow as unspent_output) until a backfill completes (unspent_tracking_settings.backfill_complete).'
+        'Unspent tracking job: CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false, so outputs saved before tracking started stay NULL, and unspent_output answers them with the live predicate (exact, but slow) until a backfill completes (unspent_tracking_settings.backfill_complete).'
       );
     }
     return;
