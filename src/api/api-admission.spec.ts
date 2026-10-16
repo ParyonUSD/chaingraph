@@ -39,7 +39,9 @@ import {
   admissionSummary,
   Budget,
   defaultAdmissionOptions,
+  defaultSmallMaxRowsPerPart,
   defaultSmallSettings,
+  isSmall,
   overloadedCode,
   planKeys,
   requestAbortedCode,
@@ -89,7 +91,9 @@ const keys = (name: string): PlanKeys => ({
 const teach = (
   admission: Admission,
   name: string,
-  cost: number | { cpuSeconds: number; loopMs: number; rows?: number }
+  cost:
+    | number
+    | { cpuSeconds: number; loopMs: number; rows?: number; parts?: number }
 ) => {
   admission.model.observe(
     keys(name),
@@ -297,7 +301,9 @@ test('admission: the CPU ledger replaces estimates with system.query_log measure
   const measured = new Map<string, number>();
   const reader: CpuReader = async (ids) =>
     new Map(
-      ids.flatMap((id) => (measured.has(id) ? [[id, measured.get(id)!]] : []))
+      ids.flatMap((id) =>
+        measured.has(id) ? [[id, { cpuMicros: measured.get(id)! }]] : []
+      )
     );
   const admission = new Admission(
     options({ cpuSource: 'query_log' }),
@@ -426,6 +432,109 @@ test('admission: a heavy request admitted under contention gets the contended se
   );
 });
 
+test('admission: a light request that scans few large parts is not small once its parts are measured; one of many small reads stays small; the class changes once and never flips back (fix-pass-14.md §1)', async (t) => {
+  const measured = new Map<string, { cpuMicros: number; parts?: number }>();
+  const admission = new Admission(
+    options({ cpuSource: 'query_log', settings: { heavy: {}, light: {} } }),
+    quietMeter
+  );
+  admission.start(async (ids) => {
+    const found = new Map<string, { cpuMicros: number; parts?: number }>();
+    ids.forEach((id) => {
+      const measurement = measured.get(id);
+      if (measurement !== undefined) found.set(id, measurement);
+    });
+    return found;
+  });
+  t.teardown(() => {
+    admission.stop();
+  });
+  /* golden #110 node 1: X2 1,221,824 rows in 4 parts (305 k per part), X13 1,461,109 rows in 167 parts (8.7 k) */
+  const run = async (
+    name: string,
+    { parts, rows }: { parts: number; rows: number },
+    serial: number
+  ) => {
+    const ticket = admission.admit(keys(name), 0);
+    const statement: StatementRecord = {
+      queryId: `${name}-${serial}`,
+      rows,
+      shape: name,
+    };
+    ticket.statements.push(statement);
+    admission.statementFinished(ticket, statement, 0);
+    admission.finish(ticket, 0);
+    measured.set(statement.queryId, { cpuMicros: 100_000, parts });
+    return ticket.settings;
+  };
+  const x2 = { parts: 4, rows: 1_221_824 };
+  const x13 = { parts: 167, rows: 1_461_109 };
+  t.deepEqual(await run('X2', x2, 0), {}, 'nothing known: the server threads');
+  t.deepEqual(
+    await run('X2', x2, 1),
+    { max_threads: 8 },
+    'rows known, parts not yet: small by rows'
+  );
+  t.deepEqual(await run('X13', x13, 0), {});
+  await admission.pollLedger(0);
+  t.is(admission.predict(keys('X2')).cost.parts, 4, 'parts learned');
+  for (let serial = 2; serial < 12; serial += 1) {
+    t.deepEqual(
+      await run('X2', x2, serial),
+      {},
+      `run ${serial}: 305 k rows per part: not small`
+    );
+    t.deepEqual(
+      await run('X13', x13, serial),
+      { max_threads: 8 },
+      `run ${serial}: 8.7 k rows per part: small`
+    );
+    await admission.pollLedger(0);
+  }
+  /* a statement without a part count (not reported) leaves the learned parts alone */
+  const ticket = admission.admit(keys('X2'), 0);
+  const unreported: StatementRecord = {
+    queryId: 'X2-unreported',
+    rows: 1_221_824,
+    shape: 'X2',
+  };
+  ticket.statements.push(unreported);
+  admission.statementFinished(ticket, unreported, 0);
+  admission.finish(ticket, 0);
+  measured.set(unreported.queryId, { cpuMicros: 100_000 });
+  await admission.pollLedger(0);
+  t.is(admission.predict(keys('X2')).cost.parts, 4);
+  /* the rule itself */
+  const bounds = { smallMaxRows: 3_000_000, smallMaxRowsPerPart: 100_000 };
+  t.true(isSmall({ cpuSeconds: 0, loopMs: 0, rows: 3_000_000 }, bounds));
+  t.false(isSmall({ cpuSeconds: 0, loopMs: 0, rows: 3_000_001 }, bounds));
+  t.false(isSmall({ cpuSeconds: 0, loopMs: 0 }, bounds), 'rows unknown');
+  t.true(
+    isSmall({ cpuSeconds: 0, loopMs: 0, parts: 10, rows: 1_000_000 }, bounds),
+    '100 k per part: at the bound'
+  );
+  t.false(
+    isSmall({ cpuSeconds: 0, loopMs: 0, parts: 10, rows: 1_000_001 }, bounds)
+  );
+  t.false(
+    isSmall({ cpuSeconds: 0, loopMs: 0, parts: 0, rows: 100_001 }, bounds),
+    'no part selected counts as one'
+  );
+  t.true(
+    isSmall(
+      { cpuSeconds: 0, loopMs: 0, parts: 4, rows: 1_221_824 },
+      { ...bounds, smallMaxRowsPerPart: 0 }
+    ),
+    '0: no per-part bound'
+  );
+  t.is(defaultSmallMaxRowsPerPart, 100_000);
+  t.is(
+    admissionOptionsFromEnv({ CHAINGRAPH_API_SMALL_MAX_ROWS_PER_PART: '0' }, 48)
+      .smallMaxRowsPerPart,
+    0
+  );
+});
+
 test('admission: back-to-back heavy requests on an idle server keep the server threads; leftover debt never refuses or throttles (fix-pass-9.md §2)', async (t) => {
   /* mainnet L15: ~61 CPU-s per request, 1.65 s each, query_log measurements ~2 s late, default budgets (48 cores) */
   const measured = new Map<string, number>();
@@ -436,7 +545,9 @@ test('admission: back-to-back heavy requests on an idle server keep the server t
   admission.start(
     async (ids) =>
       new Map(
-        ids.flatMap((id) => (measured.has(id) ? [[id, measured.get(id)!]] : []))
+        ids.flatMap((id) =>
+          measured.has(id) ? [[id, { cpuMicros: measured.get(id)! }]] : []
+        )
       )
   );
   t.teardown(() => {
@@ -528,6 +639,7 @@ test('admission: options from the environment and the startup line', (t) => {
   t.deepEqual(fromServer.settings, { heavy: {}, light: {} });
   t.deepEqual(fromServer.smallSettings, defaultSmallSettings);
   t.is(fromServer.smallMaxRows, 3_000_000);
+  t.is(fromServer.smallMaxRowsPerPart, 100_000);
   t.deepEqual(
     admissionOptionsFromEnv({ CHAINGRAPH_API_SMALL_MAX_THREADS: '0' }, 48, 1)
       .smallSettings,
@@ -578,7 +690,7 @@ test('admission: options from the environment and the startup line', (t) => {
   );
   t.regex(
     admissionSummary(fromServer, 154),
-    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=43\.2 CPU-s\/s burst 4 s loop_budget=850 ms\/s burst 1 s light_share=0\.25 light<=500 CPU-ms,25 loop-ms heavy_in_flight=24 heavy_contended=0\.5:max_threads 4 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=server default small<=3000000 rows:max_threads 8 heavy_settings=server default max_concurrent_queries_for_user=154$/u
+    /^admission: on \(request level\) cores=48 \(clickhouse\) processes=1 cpu_budget=43\.2 CPU-s\/s burst 4 s loop_budget=850 ms\/s burst 1 s light_share=0\.25 light<=500 CPU-ms,25 loop-ms heavy_in_flight=24 heavy_contended=0\.5:max_threads 4 loop_guard=0\.95 unknown=250 CPU-ms,20 loop-ms cpu_source=query_log light_settings=server default small<=3000000 rows,<=100000 rows\/part:max_threads 8 heavy_settings=server default max_concurrent_queries_for_user=154$/u
   );
 });
 
@@ -628,6 +740,44 @@ e2e(
       { id: queryId }
     );
     t.is(Number(logged?.code), 394, 'QUERY_WAS_CANCELLED');
+  }
+);
+
+e2e(
+  "[e2e] the CPU ledger reads a statement's CPU and selected parts from system.query_log (fix-pass-14.md §1)",
+  async (t) => {
+    t.timeout(60_000);
+    const { name: database, openStore } = await scratch(
+      t,
+      'ledger',
+      { utxo: 'off' },
+      'ch1_api'
+    );
+    const store = await openStore();
+    const { node1 } = await registerNodes(store);
+    const { block0 } = threeBlockChain();
+    await store.saveBlock({
+      block: block0,
+      isSavedTransaction: notSaved,
+      nodeAcceptances: [acceptance(node1)],
+    });
+    const client = new ClickHouseClient(connectionFor(database));
+    t.teardown(async () => client.close());
+    const db = new ApiDb(client);
+    const queryId = `${apiQueryIdPrefix}ledger-${Date.now()}`;
+    await client.query(
+      'SELECT sum(height) AS n FROM block',
+      {},
+      {},
+      { queryId }
+    );
+    await client.command('SYSTEM FLUSH LOGS');
+    const measured = await db.statementCpu([queryId, `${queryId}-missing`]);
+    const measurement = measured.get(queryId);
+    t.truthy(measurement);
+    t.true((measurement?.cpuMicros ?? -1) >= 0);
+    t.is(measurement?.parts, 1, 'one part of block selected');
+    t.false(measured.has(`${queryId}-missing`), 'not logged: missing');
   }
 );
 

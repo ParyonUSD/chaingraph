@@ -28,7 +28,12 @@ import {
   snapshotForNode,
 } from '../store/clickhouse/visibility.js';
 
-import type { AdmissionOptions, StatementRecord, Ticket } from './admission.js';
+import type {
+  AdmissionOptions,
+  StatementMeasurement,
+  StatementRecord,
+  Ticket,
+} from './admission.js';
 import {
   Admission,
   disabledAdmissionOptions,
@@ -367,19 +372,32 @@ export class ApiDb {
   }
 
   /**
-   * Measured ClickHouse CPU (user + system, µs) of finished API statements
-   * by query_id, from `system.query_log` (the API user needs SELECT on it;
-   * rows appear after the log's flush interval). Missing ids: not logged yet.
+   * Measured ClickHouse CPU (user + system, µs) and selected data parts of
+   * finished API statements by query_id, from `system.query_log` (the API
+   * user needs SELECT on it; rows appear after the log's flush interval).
+   * Missing ids: not logged yet.
    */
-  async statementCpu(queryIds: readonly string[]) {
-    const rows = await this.client.query<{ id: string; us: string }>(
-      `SELECT query_id AS id, toString(ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds']) AS us
+  async statementCpu(
+    queryIds: readonly string[]
+  ): Promise<Map<string, StatementMeasurement>> {
+    const rows = await this.client.query<{
+      id: string;
+      us: string;
+      parts: string;
+    }>(
+      `SELECT query_id AS id, toString(ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds']) AS us,
+              toString(ProfileEvents['SelectedParts']) AS parts
        FROM system.query_log
        WHERE event_date >= yesterday() AND event_time >= now() - INTERVAL 15 MINUTE
          AND type != 'QueryStart' AND query_id IN {ids:Array(String)}`,
       { ids: queryIds }
     );
-    return new Map(rows.map((row) => [row.id, Number(row.us)]));
+    return new Map(
+      rows.map((row) => [
+        row.id,
+        { cpuMicros: Number(row.us), parts: Number(row.parts) },
+      ])
+    );
   }
 
   /** Statements cancelled because their request went away (counter). */

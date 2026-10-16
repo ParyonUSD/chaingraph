@@ -73,6 +73,12 @@ export interface RequestCost {
    * and the same at any thread count, unlike the CPU (`smallMaxRows`).
    */
   rows?: number;
+  /**
+   * Data parts the statements selected (`query_log` SelectedParts, summed):
+   * known when the CPU is, and the same at any thread count. With `rows`,
+   * the rows per part (`smallMaxRowsPerPart`).
+   */
+  parts?: number;
 }
 
 export interface BudgetOptions {
@@ -115,6 +121,11 @@ export interface AdmissionOptions {
   smallSettings: { [name: string]: number | string };
   /** Predicted rows read up to which a light request is small. */
   smallMaxRows: number;
+  /**
+   * Predicted rows per selected part above which a light request is not
+   * small (once its parts are measured); 0: no such bound.
+   */
+  smallMaxRowsPerPart: number;
   /**
    * Settings added to a heavy request admitted under contention (another
    * heavy request in flight, and its budget share below `contendedFill`
@@ -167,6 +178,37 @@ export const defaultSmallSettings = { max_threads: 8 };
 export const defaultSmallMaxRows = 3_000_000;
 
 /**
+ * Rows per selected part above which a light request is not small
+ * (fix-pass-14.md §1). The 8 threads help a document of many small reads
+ * (each read a few granules from each of many parts: X13 8.7 k rows per
+ * part, L34 29.6 k); they slow one that scans a few large parts, where the
+ * server's threads split real work (golden #110: X2, the node tips, 1.22 M
+ * rows in 4 parts, 305 k per part, 67 ms at 8 threads vs 42 at the default;
+ * L41 / L43 / X14 / X15, the block tips and counts, 526–568 k per part, all
+ * faster at the default). Golden's light documents leave a gap from 37.5 k
+ * (L6) to 305 k rows per part; 100 k is near its geometric middle. Parts
+ * come from `query_log` with the CPU (a few seconds late) and, like rows,
+ * do not depend on the threads, so a document's class changes at most once
+ * (when its parts arrive) and never flips back.
+ */
+export const defaultSmallMaxRowsPerPart = 100_000;
+
+/**
+ * Whether a light request's predicted cost makes it small: rows known and
+ * at most `smallMaxRows`, and, once its parts are measured, at most
+ * `smallMaxRowsPerPart` rows per part (fix-pass-14.md §1).
+ */
+export const isSmall = (
+  cost: RequestCost,
+  options: Pick<AdmissionOptions, 'smallMaxRows' | 'smallMaxRowsPerPart'>
+) =>
+  cost.rows !== undefined &&
+  cost.rows <= options.smallMaxRows &&
+  (options.smallMaxRowsPerPart <= 0 ||
+    cost.parts === undefined ||
+    cost.rows <= options.smallMaxRowsPerPart * Math.max(1, cost.parts));
+
+/**
  * Defaults (one process, 48 cores): ClickHouse 43.2 CPU-s/s (90 % of the
  * cores) with a 4 s burst (a burst of ~173 CPU-s: mainnet's heaviest
  * catalogue request, L15, is 59 CPU-s; a 2 s burst and a 75 % target refused
@@ -201,6 +243,7 @@ export const defaultAdmissionOptions: AdmissionOptions = {
   minRetryAfterSeconds: 1,
   settings: { heavy: {}, light: {} },
   smallMaxRows: defaultSmallMaxRows,
+  smallMaxRowsPerPart: defaultSmallMaxRowsPerPart,
   smallSettings: defaultSmallSettings,
   unknownCost: { cpuSeconds: 0.25, loopMs: 20 },
 };
@@ -446,6 +489,7 @@ interface Estimate {
   cpuSeconds: number;
   loopMs: number;
   rows?: number;
+  parts?: number;
   samples: number;
 }
 
@@ -474,6 +518,7 @@ export class CostModel {
             cpuSeconds: estimate.cpuSeconds,
             loopMs: estimate.loopMs,
             ...(estimate.rows === undefined ? {} : { rows: estimate.rows }),
+            ...(estimate.parts === undefined ? {} : { parts: estimate.parts }),
           },
           source,
         };
@@ -504,6 +549,11 @@ export class CostModel {
             ? {}
             : { rows: before.rows }
           : { rows: blend(before?.rows, cost.rows) }),
+        ...(cost.parts === undefined
+          ? before?.parts === undefined
+            ? {}
+            : { parts: before.parts }
+          : { parts: blend(before?.parts, cost.parts) }),
         samples: (before?.samples ?? 0) + 1,
       });
     }
@@ -547,6 +597,8 @@ export interface StatementRecord {
   rows: number;
   /** Measured CPU, s (`query_log`); undefined until known. */
   cpuSeconds?: number;
+  /** Selected data parts (`query_log` SelectedParts); undefined until known. */
+  parts?: number;
   /** When the statement finished (performance.now()), for the ledger's patience. */
   finishedAt?: number;
   /** Outside a request: the CPU estimate it was charged when it finished. */
@@ -616,10 +668,17 @@ export interface AdmissionStats {
 /* the gate                                                             */
 /* ------------------------------------------------------------------ */
 
-/** Reads measured CPU (µs) of statements by query id; a missing id: not logged yet. */
+/** What `query_log` tells of a finished statement: CPU (user + system, µs) and the data parts it selected. */
+export interface StatementMeasurement {
+  cpuMicros: number;
+  /** SelectedParts; undefined: not reported. */
+  parts?: number;
+}
+
+/** Reads the measurements of statements by query id; a missing id: not logged yet. */
 export type CpuReader = (
   queryIds: readonly string[]
-) => Promise<Map<string, number>>;
+) => Promise<Map<string, StatementMeasurement>>;
 
 /** Loop busy time since the previous call, ms (default: `performance.eventLoopUtilization`). */
 export type LoopMeter = () => { activeMs: number; elapsedMs: number };
@@ -849,10 +908,7 @@ export class Admission {
       this.stats.inFlight.heavy > 0 &&
       (clickhouse.fill().heavy < this.options.contendedFill ||
         2 * this.stats.inFlight.heavy >= this.options.heavyMaxInFlight);
-    const small =
-      cls === 'light' &&
-      cost.rows !== undefined &&
-      cost.rows <= this.options.smallMaxRows;
+    const small = cls === 'light' && isSmall(cost, this.options);
     ticket.settings = contended
       ? { ...this.options.settings[cls], ...this.options.contendedSettings }
       : small
@@ -1056,12 +1112,12 @@ export class Admission {
       const touched = new Set<Ticket>();
       for (const id of ids) {
         const entry = this.pending.get(id);
-        const micros = measured.get(id);
-        if (entry !== undefined && micros === undefined) {
+        const measurement = measured.get(id);
+        if (entry !== undefined && measurement === undefined) {
           this.expireIfStale(id, entry, now, touched);
         }
-        if (entry !== undefined && micros !== undefined) {
-          this.resolve(id, entry, micros, touched);
+        if (entry !== undefined && measurement !== undefined) {
+          this.resolve(id, entry, measurement, touched);
         }
       }
       for (const ticket of touched) this.reconcileMeasured(ticket);
@@ -1077,17 +1133,18 @@ export class Admission {
     }
   }
 
-  /** A statement's measured CPU: the estimate replaced, the CPU per row learned. */
+  /** A statement's measured CPU (and parts): the estimate replaced, the CPU per row learned. */
   private resolve(
     id: string,
     entry: { statement: StatementRecord; ticket: Ticket | undefined },
-    micros: number,
+    measurement: StatementMeasurement,
     touched: Set<Ticket>
   ) {
     this.pending.delete(id);
     this.stats.ledgerResolved += 1;
     const { statement, ticket } = entry;
-    const cpu = micros / 1e6;
+    const cpu = measurement.cpuMicros / 1e6;
+    if (measurement.parts !== undefined) statement.parts = measurement.parts;
     const estimate =
       statement.chargedCpu ?? this.estimateCpu(statement.shape, statement.rows);
     statement.cpuSeconds = cpu;
@@ -1122,9 +1179,19 @@ export class Admission {
     const cpu = this.ticketCpu(ticket);
     this.recharge(ticket, 'clickhouse', cpu);
     if (ticket.keys !== undefined && this.allMeasured(ticket)) {
+      /* parts only when every statement reported them (a part count of some statements would overstate rows per part) */
+      const parts = ticket.statements.every(
+        (statement) => statement.parts !== undefined
+      )
+        ? ticket.statements.reduce(
+            (sum, statement) => sum + (statement.parts ?? 0),
+            0
+          )
+        : undefined;
       this.model.observe(ticket.keys, {
         cpuSeconds: cpu,
         loopMs: ticket.loopMs,
+        ...(parts === undefined ? {} : { parts }),
       });
     }
   }
@@ -1421,6 +1488,11 @@ export const admissionOptionsFromEnv = (
       'CHAINGRAPH_API_SMALL_MAX_ROWS',
       defaultSmallMaxRows
     ),
+    smallMaxRowsPerPart: nonNegativeNumber(
+      env,
+      'CHAINGRAPH_API_SMALL_MAX_ROWS_PER_PART',
+      defaultSmallMaxRowsPerPart
+    ),
     smallSettings: classSettingsFromEnv(
       env,
       'CHAINGRAPH_API_SMALL',
@@ -1509,7 +1581,11 @@ export const admissionSummary = (
     cpuSource ?? options.cpuSource
   } light_settings=${settingsText(options.settings.light)} small<=${
     options.smallMaxRows
-  } rows:${settingsText(options.smallSettings)} heavy_settings=${settingsText(
+  } rows,${
+    options.smallMaxRowsPerPart > 0
+      ? `<=${options.smallMaxRowsPerPart} rows/part`
+      : 'any rows/part'
+  }:${settingsText(options.smallSettings)} heavy_settings=${settingsText(
     options.settings.heavy
   )} max_concurrent_queries_for_user=${
     backstop === undefined ? 'unknown' : backstop === 0 ? '0 (none)' : backstop
