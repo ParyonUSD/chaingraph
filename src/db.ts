@@ -1568,7 +1568,7 @@ export const configureUnspentNodeIds = async () => {
       await client.query('COMMIT;');
       if (stopped) {
         unspentTrackingLog.warn(
-          'Unspent tracking stopped (CHAINGRAPH_UNSPENT_NODE_IDS=false on a database where it had started): unspent_output_stored now answers with the live predicate; enabling tracking again rebuilds the stored values (backfill) before the stored set is used.'
+          'Unspent tracking stopped (CHAINGRAPH_UNSPENT_NODE_IDS=false on a database where it had started): unspent_output now answers with the live predicate; enabling tracking again rebuilds the stored values (backfill) before the stored set is used.'
         );
       }
       return stopped ? [...statements, stopTrackingSql] : statements;
@@ -1979,7 +1979,7 @@ const ensureInitialized = async (
     );
     if (!unspentNodeIds.startAtGenesis && !unspentNodeIds.backfill) {
       unspentTrackingLog.warn(
-        'Unspent tracking job: CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false, so outputs saved before tracking started are not backfilled, and unspent_output_stored answers with the live predicate (exact, but as slow as unspent_output) until a backfill completes (unspent_tracking_settings.backfill_complete).'
+        'Unspent tracking job: CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false, so outputs saved before tracking started are not backfilled, and unspent_output answers with the live predicate (exact, but slow) until a backfill completes (unspent_tracking_settings.backfill_complete).'
       );
     }
     return;
@@ -2144,7 +2144,7 @@ export const runUnspentNodeIdsJobPass = async (
       if (rebuildRequired && !unspentNodeIds.backfill && !rebuildWarned) {
         rebuildWarned = true;
         unspentTrackingLog.warn(
-          'Unspent tracking job: a rebuild after a stop is pending; it runs although CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false (until it completes, unspent_output_stored answers with the live predicate).'
+          'Unspent tracking job: a rebuild after a stop is pending; it runs although CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false (until it completes, unspent_output answers with the live predicate).'
         );
       }
       if (

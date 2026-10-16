@@ -7,8 +7,8 @@
 --   {1,3}  = unspent for nodes 1 and 3 (sorted node internal ids): created by
 --            a transaction the node accepts (in a block it accepts or in its
 --            mempool) and not spent by any transaction the node accepts.
--- Every fact is per node: the value is the same F1g test that
--- unspent_output(node) evaluates live, stored for every node at once.
+-- Every fact is per node: the value is the F1g test (the semantics of the
+-- unspent_output(node_name) query root), precomputed for every node at once.
 -- Rows that exist when the column is added read '{}' (a constant default is
 -- kept in the catalog: no table rewrite, no WAL per row) and rows inserted
 -- later read NULL. A pre-tracking value (an output of a transaction at or below
@@ -49,7 +49,7 @@
 -- row created at or below it has been processed, and every spend above it is
 -- re-checked live.
 --
--- Reads: unspent_output_stored(node_name) (generated per node by
+-- Reads: unspent_output(node_name) (generated per node by
 -- unspent_node_ids_build_root(); tracked in Hasura). The stored set, plus a
 -- live F1g correction for whatever the job has not processed, so the result
 -- is always exact; above a backlog threshold (unspent_tracking_settings) it
@@ -60,7 +60,7 @@
 -- makes every later insert NULL (the agent's inserts name their columns).
 ALTER TABLE output ADD COLUMN unspent_node_ids integer[] DEFAULT '{}';
 ALTER TABLE output ALTER COLUMN unspent_node_ids DROP DEFAULT;
-COMMENT ON COLUMN output.unspent_node_ids IS 'Per-node unspent set (CHAINGRAPH_UNSPENT_NODE_IDS): NULL = not processed yet; otherwise the sorted internal ids of the nodes for which the output is unspent (created by a transaction the node accepts, no spender the node accepts). Rows that existed when the column was added read ''{}'' until the backfill has processed them: values of outputs created at or below the tracking start are used only once the backfill is complete. Maintained by the agent''s tracking job; read through unspent_output_stored(node_name).';
+COMMENT ON COLUMN output.unspent_node_ids IS 'Per-node unspent set (CHAINGRAPH_UNSPENT_NODE_IDS): NULL = not processed yet; otherwise the sorted internal ids of the nodes for which the output is unspent (created by a transaction the node accepts, no spender the node accepts). Rows that existed when the column was added read ''{}'' until the backfill has processed them: values of outputs created at or below the tracking start are used only once the backfill is complete. Maintained by the agent''s tracking job; read through unspent_output(node_name).';
 
 CREATE TABLE unspent_tracking_events (
   id bigserial PRIMARY KEY,
@@ -1476,7 +1476,7 @@ BEGIN
 END;
 $$;
 
--- (Re)create unspent_output_stored(node_name) for the registered nodes. The
+-- (Re)create unspent_output(node_name) for the registered nodes. The
 -- agent calls it whenever tracking is configured (once all nodes are
 -- registered) and when it creates the per-node indexes. Serialised by a
 -- transaction-scoped advisory lock (idempotent: the last build wins and every
@@ -1568,7 +1568,7 @@ BEGIN
       || format(stored_arm, node.name, node.internal_id,
            '(o.token_category IS NULL OR octet_length(o.locking_bytecode) > 1000)', f1g_literal);
   END LOOP;
-  EXECUTE 'CREATE OR REPLACE FUNCTION unspent_output_stored (node_name text) RETURNS SETOF output LANGUAGE sql STABLE AS $root$'
+  EXECUTE 'CREATE OR REPLACE FUNCTION unspent_output (node_name text) RETURNS SETOF output LANGUAGE sql STABLE AS $root$'
     || chr(10) || arms
     || format($shared$  SELECT o.* FROM unspent_node_ids_backlog_transactions() b
   CROSS JOIN LATERAL (
@@ -1599,7 +1599,7 @@ BEGIN
   WHERE NOT (SELECT unspent_node_ids_stored_path(node_name))
     AND %1$s
 $shared$, f1g_shared) || '$root$';
-  EXECUTE $c$COMMENT ON FUNCTION unspent_output_stored (text) IS 'The outputs unspent according to the named node: created by a transaction the node accepts (in a block it accepts or in its mempool) and not spent by any transaction the node accepts. Same rows as unspent_output(node_name); served from the stored per-node set (output.unspent_node_ids) with a live correction for anything the tracking job has not processed yet. Filter by token_category (and nonfungible_token_capability) or use a 25-byte locking bytecode prefix; a call filtered only by locking_bytecode scans every output.'$c$;
+  EXECUTE $c$COMMENT ON FUNCTION unspent_output (text) IS 'The outputs unspent according to the named node: created by a transaction the node accepts (in a block it accepts or in its mempool) and not spent by any transaction the node accepts. Served from a per-node set (output.unspent_node_ids) with a live correction for anything the tracking job has not processed yet. Filter by token_category (and nonfungible_token_capability) or use a 25-byte locking bytecode prefix; a call filtered only by locking_bytecode scans every output.'$c$;
 END;
 $build$;
 SELECT unspent_node_ids_build_root();
