@@ -16,7 +16,7 @@
  * same either way.
  *
  * `leanSql` rewrites a statement into the same query with fewer nodes, by
- * three rules applied until none applies:
+ * four rules applied until none applies:
  *
  * 1. A parenthesised `SELECT * FROM (X) WHERE 1` or `SELECT * FROM (X)`
  *    becomes `X`, for a SELECT `X`: the same columns, the same rows.
@@ -31,6 +31,9 @@
  * 3. An IN argument that reads tuple element n of an arrayJoin of a level's
  *    array through two subqueries becomes
  *    `SELECT tupleElement(arrayJoin(A), n)`: the same set.
+ *
+ * 4. A SELECT of plain columns from a subquery of plain columns (`projectOnce`)
+ *    reads the subquery's source itself.
  *
  * It sees the compiler's own SQL only (values are bound as parameters);
  * quoted text is skipped when matching parentheses. CHAINGRAPH_API_LEAN_SQL
@@ -273,6 +276,59 @@ const linkOf =
 
 const linkItem = /tupleElement\(__r, (?<at>\d+)\) AS (?<name>\w+)/gu;
 
+const columnList = /^(?:\w+, )*\w+$/u;
+
+/**
+ * Rule 4: a SELECT of plain columns from a subquery that selects plain
+ * columns (a superset) reads the subquery's source itself:
+ * `SELECT a FROM (SELECT a, b FROM X R)` becomes `SELECT a FROM X R`. The
+ * outer may add ORDER BY / LIMIT … only when the inner has none of its own,
+ * and no WHERE.
+ */
+const projectOnce = (scan: Scan): string | undefined => {
+  const { sql } = scan;
+  const head = ' FROM (SELECT ';
+  for (let at = sql.indexOf(head); at >= 0; at = sql.indexOf(head, at + 1)) {
+    const level = scan.depth[at]!;
+    if (level === -1) continue;
+    const open = at + 6;
+    const close = scan.closing(open);
+    if (close < 0) continue;
+    const after = close + 1;
+    const trailing =
+      after < sql.length &&
+      sql[after] !== ')' &&
+      (sql.startsWith(' WHERE ', after) ||
+        !clauseEnds.some((word) => sql.startsWith(word, after)));
+    if (trailing) continue;
+    const clauses = after < sql.length && sql[after] !== ')';
+    const inner = sql.slice(open + 1, close);
+    const from = scan.find({ from: open + 8, level: level + 1, to: close }, [
+      ' FROM ',
+    ]);
+    if (from < 0) continue;
+    const innerList = sql.slice(open + 8, from);
+    if (!columnList.test(innerList)) continue;
+    /* the outer's ORDER BY / LIMIT … may follow the inner's WHERE, not its own ORDER BY / LIMIT … */
+    if (
+      clauses &&
+      scan.find({ from, level: level + 1, to: close }, clauseEnds) >= 0
+    ) {
+      continue;
+    }
+    const select = scan.ownerSelect(at);
+    if (select < 0) continue;
+    const outerList = sql.slice(select + 7, at);
+    if (!columnList.test(outerList)) continue;
+    const available = new Set(innerList.split(', '));
+    if (!outerList.split(', ').every((name) => available.has(name))) continue;
+    return `${sql.slice(0, at)} ${inner.slice(from - open - 1 + 1)}${sql.slice(
+      close + 1
+    )}`;
+  }
+  return undefined;
+};
+
 /** Rule 3: a link's set read straight from its level's array. */
 const linkOnce = (scan: Scan): string | undefined => {
   const { sql } = scan;
@@ -320,7 +376,11 @@ export const leanSql = (sql: string): string => {
   let text = sql;
   for (let rounds = 0; rounds < 1_000; rounds += 1) {
     const scan = new Scan(text);
-    const next = unwrapOnce(scan) ?? inlineOnce(scan) ?? linkOnce(scan);
+    const next =
+      unwrapOnce(scan) ??
+      inlineOnce(scan) ??
+      projectOnce(scan) ??
+      linkOnce(scan);
     if (next === undefined) break;
     text = next;
   }

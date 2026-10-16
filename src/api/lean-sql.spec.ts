@@ -66,6 +66,27 @@ test('leanSql: a view is left alone when merging could change the query (rule 2)
   });
 });
 
+test("leanSql: a projection of plain columns reads the inner query's source directly (rule 4)", (t) => {
+  t.is(
+    leanSql(
+      'SELECT groupArray(tuple(a, b)) FROM (SELECT a, b FROM (SELECT a, b, c FROM t WHERE x = 1) ORDER BY a LIMIT 3)'
+    ),
+    'SELECT groupArray(tuple(a, b)) FROM (SELECT a, b FROM t WHERE x = 1 ORDER BY a LIMIT 3)'
+  );
+  const kept = [
+    /* the inner query orders or limits itself: the outer ORDER BY may not join it */
+    'SELECT a FROM (SELECT a, b FROM t ORDER BY b LIMIT 1) ORDER BY a',
+    /* an outer WHERE */
+    'SELECT a FROM (SELECT a, b FROM t) WHERE b = 1',
+    /* a column the inner list does not have, or an expression */
+    'SELECT a, b FROM (SELECT a, c FROM t)',
+    'SELECT a FROM (SELECT a, b + 1 AS c FROM t)',
+  ];
+  kept.forEach((sql) => {
+    t.is(leanSql(sql), sql, sql);
+  });
+});
+
 test('leanSql: a link set reads its level array directly, only as an IN argument (rule 3)', (t) => {
   t.is(
     leanSql(
