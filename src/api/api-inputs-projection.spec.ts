@@ -29,21 +29,26 @@ const fillerRows = fillerParts * fillerRowsPerPart;
 
 /**
  * An inputs read by id alone: `input_at`'s view, then the id set with no
- * hash set before it (model.ts, inputs `source`).
+ * hash set before it (model.ts, inputs `source`); as compiled, or as sent
+ * (lean-sql.ts: the view merged into the read, the link set read straight
+ * from the level array).
  */
 export const idOnlyInputsRead = (sql: string) =>
   /FROM input WHERE (?:(?!FROM )[^])*?\) WHERE transaction_internal_id IN \(SELECT internal_id FROM/u.test(
+    sql
+  ) ||
+  /FROM input WHERE \((?:(?!FROM |transaction_hash)[^])*?\) AND \(+transaction_internal_id IN \(SELECT tupleElement\(arrayJoin\(/u.test(
     sql
   );
 
 /**
  * An inputs root matched through the spend relation, read by the spends'
  * internal ids with the hash sets out of key analysis (roots.ts `runInputs`,
- * fix-pass-13.md §2).
+ * fix-pass-13.md §2); as compiled or as sent.
  */
 export const rootInputsBySpendIds = (sql: string) =>
-  sql.includes(
-    'WHERE (transaction_internal_id IN (SELECT transaction_internal_id FROM '
+  /(?:WHERE|AND) \(+transaction_internal_id IN \(SELECT transaction_internal_id FROM /u.test(
+    sql
   ) && sql.includes('identity((transaction_hash, input_index)) IN');
 
 const documents: [string, string, boolean, boolean?][] = [
