@@ -320,10 +320,9 @@ export const batchReachedLimits = (
  * outputs from the current state, which does not depend on how far tracking
  * has walked (later spends and acceptance changes are re-applied by tracking,
  * recomputing from scratch), and a mempool child-before-parent resolves only
- * when the parent arrives or the stall cap passes. Gating on it let one
- * stalled partition (of 64, after a restart reloaded the mempool) block the
- * whole backfill for the stall cap, again for every new stalled transaction
- * (2026-10-13 backfill lab: no backfill for 13 minutes).
+ * when the parent arrives or the stall cap passes. Gating on stalls would let
+ * one stalled partition (e.g. after a restart reloads the mempool) block the
+ * whole backfill for the stall cap, again for every new stalled transaction.
  */
 export const readyForBackfill = (partition: {
   caughtUp: boolean;

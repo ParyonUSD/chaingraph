@@ -2764,8 +2764,8 @@ test.serial('[e2e] [api] /send-transaction: valid', async (t) => {
 /* eslint-disable max-params, require-atomic-updates, @typescript-eslint/no-shadow, prefer-destructuring */
 /**
  * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_NODE_IDS=true`): the
- * reference is the F1g predicate (the semantics of the `unspent_output(node_name)`
- * query root) evaluated live for one node. Run the e2e suite with
+ * reference is the per-node unspent test (the semantics of the
+ * `unspent_output(node_name)` query root) evaluated live for one node. Run the e2e suite with
  * `CHAINGRAPH_UNSPENT_NODE_IDS=true` (the tests below pass trivially
  * otherwise).
  */
@@ -2780,8 +2780,8 @@ const nodeAccepts = (
              WHERE bt.transaction_internal_id = ${transactionInternalId})
    OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = ${transactionInternalId} AND nt.node_internal_id = ${nodeId}))`;
 /**
- * F1g for one node (the `unspent_output(node_name)` semantics with the node
- * resolved to its id).
+ * The per-node unspent test for one node (the `unspent_output(node_name)`
+ * semantics with the node resolved to its id).
  */
 const nodeUnspentReferenceSql = (nodeId: number) => /* sql */ `
   SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
@@ -3008,7 +3008,7 @@ const runUnspentTrackingScenario = async (
  * see the child's uncommitted inputs. The post-commit pass must close that
  * race. A chain of blocks (each spending the previous one) and mempool
  * parent/child pairs (child save issued first) are all saved at once, with at
- * least 16 saves in flight; the read model must then equal the F1g reference
+ * least 16 saves in flight; the read model must then equal the per-node reference
  * for every output they created.
  */
 const concurrencyHash = (kind: number, group: number, index: number) =>
@@ -3040,7 +3040,7 @@ const concurrencyTransaction = (
  * The tracking job is driven from the tests (run the e2e suite with
  * `CHAINGRAPH_UNSPENT_NODE_IDS_JOB=false`, so the spawned agents leave it
  * alone, and a short `CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS`). After each
- * step the query root is compared with the per-node F1g reference before the
+ * step the query root is compared with the per-node reference before the
  * job runs (backlog correction), while it is stalled, and after it caught up,
  * for every node and read tier; then the stored values are compared too.
  */
@@ -3206,7 +3206,7 @@ const drainDeferred = async (
 test.serial(
   `[e2e] unspent_node_ids (${String(
     unspentNodeIdsEnabled
-  )}): deferred job and query root equal the F1g reference`,
+  )}): deferred job and query root equal the per-node reference`,
   async (t) => {
     if (!unspentNodeIdsEnabled) {
       t.pass();
@@ -3642,7 +3642,11 @@ test.serial(
       const mismatches =
         stored.filter((row) => !reference.includes(row)).length +
         reference.filter((row) => !stored.includes(row)).length;
-      t.is(mismatches, 0, 'stored values vs F1g after the job caught up');
+      t.is(
+        mismatches,
+        0,
+        'stored values vs the per-node reference after the job caught up'
+      );
       t.log({
         maxInFlight,
         mismatches,
@@ -3666,7 +3670,7 @@ test.serial(
 test.serial(
   `[e2e] unspent_node_ids (${String(
     unspentNodeIdsEnabled
-  )}): query root equals the F1g reference with a backlog`,
+  )}): query root equals the per-node reference with a backlog`,
   async (t) => {
     if (!unspentNodeIdsEnabled) {
       t.pass();
@@ -3857,7 +3861,7 @@ test.serial(
         `pre-tracking outputs whose spenders are accepted by no node: ${unacceptedSpenderOutputs}`
       );
       /*
-       * The backfill_complete flag set by hand before the backfill (the lab
+       * The backfill_complete flag set by hand before the backfill (an operator
        * shortcut after a scoped backfill): the root must still compute every
        * NULL output live, never read it as spent.
        */
@@ -3908,7 +3912,7 @@ test.serial(
       /*
        * Tracking stopped (CHAINGRAPH_UNSPENT_NODE_IDS=false: triggers off,
        * then unspent_node_ids_stop()), an acceptance change while stopped
-       * (no event), then restarted at the tip: the root answers with F1g
+       * (no event), then restarted at the tip: the root answers live
        * while stopped and until the rebuild (a backfill of every
        * pre-tracking output) is complete; then the stored values are exact.
        */
@@ -3935,7 +3939,7 @@ test.serial(
           )
         ).rows[0]!.stopped
       );
-      t.is(await readTier(), 'fallback', 'stopped: F1g');
+      t.is(await readTier(), 'fallback', 'stopped: live');
       // while stopped: node A drops its mempool spender of f0:1 (no release event)
       await db.archiveMempoolTransaction({
         nodeInternalId: nodeA,
@@ -3957,7 +3961,7 @@ test.serial(
           )
         ).rows[0]!.rebuild
       );
-      t.is(await readTier(), 'fallback', 'rebuild pending: F1g');
+      t.is(await readTier(), 'fallback', 'rebuild pending: live');
       await compareDeferredQueryRoot(t, 'tracking restarted, rebuild pending');
       // the default pass runs the rebuild whatever CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL says
       const rebuildPass = async (remaining: number): Promise<void> => {
@@ -4645,7 +4649,7 @@ test.serial(
       await saveBlockFor(dropped, [nodeA, nodeB]);
       /*
        * Tracking starts at the tip: every pre-tracking value ('{}' from the
-       * default, NULL for the fixtures) is unprocessed, so reads use F1g.
+       * default, NULL for the fixtures) is unprocessed, so reads use the live per-node test.
        */
       await trackingTriggers(true);
       await db.runUnspentNodeIdsJobPass({
@@ -4654,7 +4658,7 @@ test.serial(
         settleWaitMs: 2_000,
       });
       t.true(await pending(), 'backfill pending');
-      t.is(await readTier(), 'fallback', 'backfill pending: F1g');
+      t.is(await readTier(), 'fallback', 'backfill pending: live');
       t.is(await stored('f0', 5), null, 'fixtures saved after the default');
       await client.query('ANALYZE;');
       await compareDeferredQueryRoot(t, 'fast backfill: pending');
@@ -4727,7 +4731,7 @@ test.serial(
         JSON.stringify(firstResults)
       );
       t.true(await pending(), 'still pending: other partitions');
-      t.is(await readTier(), 'fallback', 'partly backfilled: F1g');
+      t.is(await readTier(), 'fallback', 'partly backfilled: live');
       await compareDeferredQueryRoot(t, 'fast backfill: half done');
       /*
        * A node gains a block below the floor without an "accepted" event (a
@@ -4896,9 +4900,8 @@ test.serial(
      * statements must be a keyed index probe, driven from the small side.
      * Then one batch of partition 0 over its whole range: its affected-set
      * statement read the inputs of the dynamic transactions through the
-     * prefix range of spent_by_index (2.3 M inputs per batch in the
-     * 2026-10-13 lab, 24 kept); every big-table access in it must be keyed
-     * too.
+     * prefix range of spent_by_index (millions of inputs per batch on mainnet,
+     * few of them kept); every big-table access in it must be keyed too.
      */
     const plans: { query: string; plan: PlanNode }[] = [];
     const onNotice = (notice: { message?: string }) => {
@@ -5029,8 +5032,8 @@ test.serial(
  * From PostgreSQL 17, a scan of a temporary table reads ahead through a read
  * stream that may pin as many local buffers as temp_buffers holds (PG 18.3):
  * with effective_io_concurrency = 200 (the chart's value) and the default 8MB
- * temp_buffers, the backfill preparation failed on mainnet with "no empty
- * local buffer available" (2026-10-13 lab). The functions that read their
+ * temp_buffers, a large scan fails with "no empty local buffer available".
+ * The functions that read their
  * temporary tables cap the read-ahead (unspent_node_ids_limit_temp_read_ahead)
  * and restore it. Here, in a session with the smallest temp_buffers (fixed
  * by its first temporary table, as on a pooled connection) and
@@ -5171,8 +5174,8 @@ test.serial(
 /**
  * Re-partitioning preserves progress: each new partition (a range of first
  * hash bytes) starts at the minimum watermarks of the old partitions whose
- * ranges overlap its own, not at the global minimum (the 2026-10-13 lab: a
- * change from 32 to 64 partitions restarted every partition from the lowest
+ * ranges overlap its own, not at the global minimum (otherwise a change from
+ * 32 to 64 partitions would restart every partition from the lowest
  * watermark). The backfill's prefix cursor (backfill_prefix) is carried
  * over too: a new partition resumes at the lowest cursor of the overlapping old
  * partitions whose backfill is not complete, and never counts a prefix as

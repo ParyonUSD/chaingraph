@@ -243,13 +243,13 @@ test.serial('[e2e] cleanup accepts an empty mempool', async (t) => {
 });
 
 /*
- * Regression: the agent's mempool scan runs archiveMempoolTransactionsAcceptedByBlocks
- * and then getMempoolTransactionsExpiringBefore as two separate statements, and
+ * The agent's mempool scan runs archiveMempoolTransactionsAcceptedByBlocks and
+ * then getMempoolTransactionsExpiringBefore as two separate statements, and
  * expires the rows returned by the second via archiveMempoolTransaction. A row
  * inserted between the two (e.g. an announcement of an already-confirmed
- * transaction with an old validated_at) used to be archived as expired, with
- * replaced_at = expiry, although the node had accepted it in a block. Expiry
- * must leave such rows for the accepted-block archive.
+ * transaction with an old validated_at) must not be archived as expired (with
+ * replaced_at = expiry) when the node accepted it in a block: expiry leaves
+ * such rows for the accepted-block archive.
  */
 test.serial(
   '[e2e] expiry never archives a transaction accepted or replaced by a block for that node',

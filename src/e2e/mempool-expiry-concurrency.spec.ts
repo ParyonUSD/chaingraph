@@ -165,12 +165,11 @@ const staleExpiries = async (db: typeof database) => {
 };
 
 /*
- * Regression (2026-10-13 backfill lab): a restarted agent's 6-day-stale mempool
- * expired all at once, one archive statement per timer on every pool
- * connection. Archiving a transaction cascades to its descendants (history
- * trigger), so a parent's and a descendant's expiry locked the same rows in
- * opposite orders: >1,300 deadlocks and no net progress. Before the fix this
- * test failed with dozens of 40P01 errors (or timed out).
+ * A restarted agent's stale mempool expires all at once, one timer per
+ * transaction. Archiving a transaction cascades to its descendants (history
+ * trigger), so racing single-row expiries of a parent and a descendant would
+ * lock the same rows in opposite orders and deadlock (40P01) without net
+ * progress; every row must be archived without a deadlock.
  */
 test.serial(
   '[e2e] concurrent single-row expiries of a stale mempool archive every row without deadlocks',

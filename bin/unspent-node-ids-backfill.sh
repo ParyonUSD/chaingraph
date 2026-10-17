@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run (and time) the unspent_node_ids backfill without the agent: one
 # preparation, then every partition's batches in parallel, one psql session
-# per partition. For labs; the agent runs the same functions itself when
+# per partition. For measurements; the agent runs the same functions itself when
 # CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=true.
 #
 # Usage: PGURL=postgres://... [PSQL="docker exec <container> psql"] bin/unspent-node-ids-backfill.sh [partitions] [prefixes-per-batch]

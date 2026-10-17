@@ -15,22 +15,22 @@ DROP FUNCTION IF EXISTS unspent_node_ids_stop ();
 DROP FUNCTION IF EXISTS unspent_node_ids_watch_pass (bigint);
 DROP FUNCTION IF EXISTS unspent_node_ids_repartition (integer);
 DROP FUNCTION IF EXISTS unspent_node_ids_initialize (integer, bigint, bigint, bigint);
-DROP FUNCTION IF EXISTS unspent_node_ids_initialize (integer, bigint, bigint);
 DROP FUNCTION IF EXISTS unspent_node_ids_backfill_scope (bytea, bytea);
 DROP FUNCTION IF EXISTS unspent_node_ids_backfill_batch (integer, integer, integer);
 DROP FUNCTION IF EXISTS unspent_node_ids_backfill_reset ();
 DROP FUNCTION IF EXISTS unspent_node_ids_backfill_prepare (bigint, bigint, bigint);
 DROP FUNCTION IF EXISTS unspent_node_ids_backfill_node_blocks (bigint, bigint, bigint);
 DROP FUNCTION IF EXISTS unspent_node_ids_run_batch (integer, integer, bigint, bigint, bigint, integer, integer, integer, bigint);
--- signatures of earlier drafts of this migration (lab databases)
-DROP FUNCTION IF EXISTS unspent_output_stored (text);
-DROP FUNCTION IF EXISTS unspent_node_ids_run_batch (integer, integer, bigint, bigint, integer, integer, integer, bigint, boolean);
 DROP FUNCTION IF EXISTS unspent_node_ids_temp_tables ();
 DROP FUNCTION IF EXISTS unspent_node_ids_restore_read_ahead (text[]);
 DROP FUNCTION IF EXISTS unspent_node_ids_limit_temp_read_ahead ();
 DROP FUNCTION IF EXISTS unspent_node_ids_recompute ();
-DROP FUNCTION IF EXISTS unspent_node_ids_recompute (boolean);
 DROP FUNCTION IF EXISTS unspent_node_ids_accepting (bigint);
+-- signatures from development builds of this migration
+DROP FUNCTION IF EXISTS unspent_output_stored (text);
+DROP FUNCTION IF EXISTS unspent_node_ids_run_batch (integer, integer, bigint, bigint, integer, integer, integer, bigint, boolean);
+DROP FUNCTION IF EXISTS unspent_node_ids_initialize (integer, bigint, bigint);
+DROP FUNCTION IF EXISTS unspent_node_ids_recompute (boolean);
 DROP TRIGGER IF EXISTS trigger_unspent_tracking_node_block_delete ON node_block;
 DROP TRIGGER IF EXISTS trigger_unspent_tracking_node_transaction_delete ON node_transaction;
 DROP FUNCTION IF EXISTS trigger_unspent_tracking_node_block_delete ();
