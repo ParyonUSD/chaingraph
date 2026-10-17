@@ -4,9 +4,19 @@ on: [push, pull_request]
 jobs:
   e2e-tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 14: the oldest supported; 18.3: production. Read streams (17+)
+        # behave differently with temporary tables (see the
+        # unspent_node_ids migration), so both are tested.
+        postgres: ['14', '18.3']
+        unspent-node-ids: ['false', 'true']
+    env:
+      CHAINGRAPH_UNSPENT_NODE_IDS: ${{ matrix.unspent-node-ids }}
     services:
       postgres:
-        image: postgres:14
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_DB: chaingraph
           POSTGRES_USER: chaingraph
@@ -28,6 +38,16 @@ jobs:
         with:
           node-version: '18'
       - run: yarn install --immutable --immutable-cache
+      # production settings that change plans and read-ahead (the chart's
+      # init-db-config): effective_io_concurrency 200, random_page_cost 1.1
+      - name: Configure Postgres like production
+        env:
+          PGPASSWORD: very_insecure_postgres_password
+        run: |
+          psql -h localhost -U chaingraph -d chaingraph -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET effective_io_concurrency = '200'" \
+            -c "ALTER SYSTEM SET random_page_cost = '1.1'" \
+            -c "SELECT pg_reload_conf()"
       - run: yarn test
       - run: yarn cov:lcov
       - name: Upload test coverage
@@ -38,7 +58,7 @@ jobs:
         uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: e2e-test-log
+          name: e2e-test-log-pg${{ matrix.postgres }}-unspent-${{ matrix.unspent-node-ids }}
           path: data/chaingraph/log-e2e.ndjson
 
   check-yarn-cache:

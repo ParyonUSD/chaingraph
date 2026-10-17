@@ -241,3 +241,93 @@ test.serial('[e2e] cleanup accepts an empty mempool', async (t) => {
     []
   );
 });
+
+/*
+ * The agent's mempool scan runs archiveMempoolTransactionsAcceptedByBlocks and
+ * then getMempoolTransactionsExpiringBefore as two separate statements, and
+ * expires the rows returned by the second via archiveMempoolTransaction. A row
+ * inserted between the two (e.g. an announcement of an already-confirmed
+ * transaction with an old validated_at) must not be archived as expired (with
+ * replaced_at = expiry) when the node accepted it in a block: expiry leaves
+ * such rows for the accepted-block archive.
+ */
+test.serial(
+  '[e2e] expiry never archives a transaction accepted or replaced by a block for that node',
+  async (t) => {
+    const {
+      pool,
+      archiveMempoolTransaction,
+      archiveMempoolTransactionsAcceptedByBlocks: archive,
+      getMempoolTransactionsExpiringBefore,
+    } = t.context.db;
+    await pool.query(/* sql */ `
+INSERT INTO input
+  SELECT 4, 0, hash, 0 FROM transaction WHERE internal_id = 10
+  UNION ALL SELECT 5, 0, hash, 0 FROM transaction WHERE internal_id = 10;
+-- tx 1 is confirmed and tx 5 (conflicting with tx 4) is mined, for alpha only.
+INSERT INTO block_transaction VALUES (1, 1), (2, 5);
+INSERT INTO node_block VALUES (1, 1, '2026-01-02'), (1, 2, '2026-01-03');
+INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
+  VALUES (1, 3);
+`);
+    // Scan step 1: the accepted-block archive finds nothing to do yet.
+    t.deepEqual(await archive(), []);
+    // A concurrent insert lands between the two scan steps.
+    await pool.query(/* sql */ `
+INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
+  VALUES (1, 1), (1, 4), (2, 1), (2, 4);
+`);
+    // Scan step 2: every row is already past expiry, so all get timers.
+    const expiring = await getMempoolTransactionsExpiringBefore({
+      expirationMs: 3_600_000,
+      expiresBefore: new Date('2026-01-10T00:00:00.000Z'),
+    });
+    t.deepEqual(
+      expiring.map((row) => ({
+        node: row.nodeName,
+        tx: row.transactionInternalId,
+      })),
+      [
+        { node: 'alpha', tx: 1 },
+        { node: 'alpha', tx: 3 },
+        { node: 'alpha', tx: 4 },
+        { node: 'beta', tx: 1 },
+        { node: 'beta', tx: 4 },
+      ]
+    );
+    // Timers fire: only rows not resolved by a block accepted by that node expire.
+    const archivedCounts = await expiring.reduce<Promise<number[]>>(
+      async (previous, row) => [
+        ...(await previous),
+        await archiveMempoolTransaction({
+          nodeInternalId: row.nodeInternalId,
+          replacedAt: row.expiresAt,
+          transactionInternalId: row.transactionInternalId,
+        }),
+      ],
+      Promise.resolve([])
+    );
+    t.deepEqual(archivedCounts, [0, 1, 0, 1, 1]);
+    t.deepEqual((await pool.query(membershipQuery)).rows, [
+      { node: 1, tx: 1 },
+      { node: 1, tx: 4 },
+    ]);
+    // The next scan archives them with the block-derived replaced_at.
+    t.deepEqual(await archive(), [
+      { hash: hash('01'), nodeName: 'alpha', replacedAt: null },
+      {
+        hash: hash('04'),
+        nodeName: 'alpha',
+        replacedAt: new Date('2026-01-03T00:00:00.000Z'),
+      },
+    ]);
+    t.deepEqual((await pool.query(membershipQuery)).rows, []);
+    t.deepEqual((await pool.query(historyQuery)).rows, [
+      { node: 1, replaced: null, tx: 1 },
+      { node: 1, replaced: '2026-01-01 01:00:00', tx: 3 },
+      { node: 1, replaced: '2026-01-03 00:00:00', tx: 4 },
+      { node: 2, replaced: '2026-01-01 01:00:00', tx: 1 },
+      { node: 2, replaced: '2026-01-01 01:00:00', tx: 4 },
+    ]);
+  }
+);

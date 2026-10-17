@@ -100,6 +100,8 @@
     "statefulsets",
     "symlinks",
     "templating",
+    "tgisinternal",
+    "tgrelid",
     "txindex",
     "unintuitive",
     "unpruned",
@@ -107,6 +109,9 @@
     "UTXO",
     "UTXOs",
     "verack",
+    "xact",
+    "xmax",
+    "xmin",
     "xprivkey",
     "xpubkey"
   ],

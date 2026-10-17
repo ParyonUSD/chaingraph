@@ -21,6 +21,7 @@ import type {
 import bitcoreP2pCash, {
   BitcoreInventoryType,
 } from '@chaingraph/bitcore-p2p-cash';
+import type { ExecutionContext } from 'ava';
 import test from 'ava';
 import type { ExecaChildProcess } from 'execa';
 import { execa } from 'execa';
@@ -28,7 +29,12 @@ import got from 'got';
 import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
-import type { ChaingraphTransaction } from '../types/chaingraph.js';
+import { configureTrackingTriggersSql } from '../components/unspent-node-ids.js';
+import type * as DbModule from '../db.js';
+import type {
+  ChaingraphBlock,
+  ChaingraphTransaction,
+} from '../types/chaingraph.js';
 
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
 import {
@@ -87,6 +93,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
+  migration('default/1791500000000_unspent_node_ids/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -169,6 +176,11 @@ const e2eEnvVariables = {
   CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS: '100',
   CHAINGRAPH_POSTGRES_CONNECTION_STRING: postgresE2eConnectionStringTestDb,
   CHAINGRAPH_TRUSTED_NODES: e2eTrustedNodesSet1,
+  /*
+   * The unspent_node_ids tests drive the tracking job themselves; a job in the
+   * spawned agents would race them (and hold the partitions they drain).
+   */
+  CHAINGRAPH_UNSPENT_NODE_IDS_JOB: 'false',
   NODE_ENV: 'production',
   /* eslint-enable @typescript-eslint/naming-convention */
 };
@@ -801,7 +813,13 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     }>(/* sql */ `
   SELECT indexname FROM pg_indexes WHERE schemaname = 'public' ORDER BY indexname;
   `)
-  ).rows.map((row) => row.indexname);
+  ).rows
+    .map((row) => row.indexname)
+    /*
+     * CHAINGRAPH_UNSPENT_NODE_IDS=true adds three partial indexes per node
+     * when its job starts (checked by the unspent tracking tests).
+     */
+    .filter((name) => !/^output_unspent_node_\d+_/u.test(name));
   t.deepEqual(indexes, [
     'block_hash_key',
     'block_height_index',
@@ -823,6 +841,12 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'token_category_index',
     'transaction_hash_key',
     'transaction_pkey',
+    'unspent_tracking_events_pkey',
+    'unspent_tracking_nodes_pkey',
+    'unspent_tracking_progress_pkey',
+    'unspent_tracking_settings_pkey',
+    'unspent_tracking_skipped_pkey',
+    'unspent_tracking_watch_pkey',
   ]);
   // cspell:ignore tgenabled tgname
   const triggers = (
@@ -1976,6 +2000,37 @@ const newBlocks = (
 };
 
 test.serial(
+  '[e2e] survives Postgres terminating its connections (e.g. a restart)',
+  async (t) => {
+    const crashGracePeriodMs = 2_000;
+    const logStart = stdoutBuffer.length;
+    const terminated = await client.query<{ terminated: boolean }>(
+      /* sql */ `
+      SELECT pg_terminate_backend(pid) AS terminated FROM pg_stat_activity
+        -- cspell:disable-next-line
+        WHERE datname = $1
+          AND pid <> pg_backend_pid();
+    `,
+      [e2eTestDbName]
+    );
+    t.true(
+      terminated.rows.some((row) => row.terminated),
+      'Expected the agent to hold at least one Postgres connection.'
+    );
+    await waitForStdout('Postgres connection lost');
+    // give a crash (uncaught 'error' event → shutdown) time to happen
+    await sleep(crashGracePeriodMs);
+    const logsSinceTermination = stdoutBuffer.slice(logStart);
+    t.false(logsSinceTermination.includes('uncaughtException'));
+    t.false(logsSinceTermination.includes('Shutting down...'));
+    const healthCheckResponse = await got(
+      `http://localhost:${chaingraphInternalApiPort}/health-check`
+    );
+    t.deepEqual(healthCheckResponse.statusCode, StatusCode.success);
+  }
+);
+
+test.serial(
   '[e2e] syncs blocks as they arrive, handles multiple chain tips',
   async (t) => {
     const [, tx1] = tipA[0]!.transactions;
@@ -2023,15 +2078,13 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   t.pass();
 });
 
-test.serial(
-  '[e2e] new block saved after reorg',
-  async (t) => {
-    const acceptedBlocks = (
-      await client.query<{
-        hash: string;
-        nodeName: string;
-      }>(
-        /* sql */ `
+test.serial('[e2e] new block saved after reorg', async (t) => {
+  const acceptedBlocks = (
+    await client.query<{
+      hash: string;
+      nodeName: string;
+    }>(
+      /* sql */ `
       SELECT node.name AS "nodeName", encode(block.hash, 'hex') AS hash
         FROM node_block
         INNER JOIN node
@@ -2042,14 +2095,13 @@ test.serial(
           AND block.height = $1
         ORDER BY block.hash;
     `,
-        [splitHeight + 1]
-      )
-    ).rows;
-    t.deepEqual(acceptedBlocks, [
-      { hash: tipA[0]!.header.hash, nodeName: 'node3' },
-    ]);
-  }
-);
+      [splitHeight + 1]
+    )
+  ).rows;
+  t.deepEqual(acceptedBlocks, [
+    { hash: tipA[0]!.header.hash, nodeName: 'node3' },
+  ]);
+});
 
 test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
   const tipStartIndex = 2;
@@ -2703,6 +2755,1921 @@ test.serial('[e2e] [api] /send-transaction: valid', async (t) => {
 });
 /* eslint-enable @typescript-eslint/naming-convention, camelcase */
 
+/* eslint-disable max-params, require-atomic-updates, @typescript-eslint/no-shadow, prefer-destructuring */
+/**
+ * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_NODE_IDS=true`): the
+ * reference is the per-node unspent test (the semantics of the
+ * `unspent_output(node_name)` query root) evaluated live for one node. Run the e2e suite with
+ * `CHAINGRAPH_UNSPENT_NODE_IDS=true` (the tests below pass trivially
+ * otherwise).
+ */
+const unspentNodeIdsEnabled =
+  process.env.CHAINGRAPH_UNSPENT_NODE_IDS === 'true';
+const nodeAccepts = (
+  transactionInternalId: string,
+  nodeId: number
+) => /* sql */ `
+  (EXISTS (SELECT 1 FROM block_transaction bt
+             JOIN node_block nb ON nb.node_internal_id = ${nodeId} AND nb.block_internal_id = bt.block_internal_id
+             WHERE bt.transaction_internal_id = ${transactionInternalId})
+   OR EXISTS (SELECT 1 FROM node_transaction nt WHERE nt.transaction_internal_id = ${transactionInternalId} AND nt.node_internal_id = ${nodeId}))`;
+/**
+ * The per-node unspent test for one node (the `unspent_output(node_name)`
+ * semantics with the node resolved to its id).
+ */
+const nodeUnspentReferenceSql = (nodeId: number) => /* sql */ `
+  SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
+    WHERE CASE
+      WHEN EXISTS (SELECT 1 FROM input i WHERE i.outpoint_transaction_hash = o.transaction_hash
+                     AND i.outpoint_index = o.output_index AND ${nodeAccepts(
+                       'i.transaction_internal_id',
+                       nodeId
+                     )})
+      THEN false
+      ELSE EXISTS (SELECT 1 FROM transaction t WHERE t.hash = o.transaction_hash AND ${nodeAccepts(
+        't.internal_id',
+        nodeId
+      )})
+    END`;
+
+/* eslint-disable @typescript-eslint/no-magic-numbers */
+/**
+ * Hash for the explicit unspent-tracking scenario (`e7` + one distinct byte).
+ */
+const scenarioHash = (byte: string) => `e7${byte.repeat(31)}`;
+const scenarioTransaction = (
+  byte: string,
+  spends: (number | [string, number])[],
+  outputCount = 1
+): ChaingraphTransaction => ({
+  hash: scenarioHash(byte),
+  inputs: spends.map((spend) => ({
+    outpointIndex: typeof spend === 'number' ? spend : spend[1],
+    outpointTransactionHash: scenarioHash(
+      typeof spend === 'number' ? 'f0' : spend[0]
+    ),
+    sequenceNumber: 0,
+    unlockingBytecode: '51',
+  })),
+  isCoinbase: false,
+  locktime: 0,
+  outputs: Array.from({ length: outputCount }, () => ({
+    lockingBytecode: '51',
+    valueSatoshis: 1000n,
+  })),
+  sizeBytes: 60,
+  version: 2,
+});
+
+/**
+ * Drive the agent's own DB functions (as the agent calls them) through the
+ * cases the read model must follow, on top of the e2e chain state: a mined
+ * spend, a mempool spend, a dropped mempool spender, a block spender removed by a re-org
+ * and its re-acceptance via headers on another node, and a cross-node
+ * double-spend whose first spender is dropped. After each step, `check()`
+ * compares the read model with the reference.
+ */
+const runUnspentTrackingScenario = async (
+  check: (step: string, db: typeof DbModule) => Promise<void>
+) => {
+  const originalPostgresConnectionString =
+    process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+  process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+    postgresE2eConnectionStringTestDb;
+  /*
+   * A fresh module instance: an earlier test ends the shared module's pool.
+   */
+  const scenarioDbModule = '../db.js?unspent-tracking-scenario';
+  const db = (await import(scenarioDbModule)) as typeof DbModule;
+  const nodeId = async (name: string) =>
+    Number(
+      (
+        await client.query<{ id: string }>(
+          /* sql */ `SELECT internal_id AS id FROM node WHERE name = $1;`,
+          [name]
+        )
+      ).rows[0]!.id
+    );
+  const [nodeA, nodeB] = [await nodeId('node1'), await nodeId('node2')];
+  const block = (byte: string, transactions: ChaingraphTransaction[]) => ({
+    bits: 0,
+    hash: scenarioHash(byte),
+    height: 999_000,
+    merkleRoot: '00'.repeat(32),
+    nonce: 0,
+    previousBlockHash: '00'.repeat(32),
+    sizeBytes: 0,
+    timestamp: 0,
+    transactions,
+    version: 1,
+  });
+  const saveBlockFor = async (
+    blockToSave: ChaingraphBlock,
+    nodeInternalId: number
+  ) =>
+    db.saveBlock({
+      block: blockToSave,
+      nodeAcceptances: [
+        { acceptedAt: new Date(), nodeInternalId, nodeName: 'scenario' },
+      ],
+      transactionCache: new Map() as unknown as Parameters<
+        typeof db.saveBlock
+      >[0]['transactionCache'],
+    });
+  const saveMempoolTransaction = async (
+    transaction: ChaingraphTransaction,
+    nodeInternalId: number
+  ) =>
+    db.saveTransactionForNodes(transaction, [
+      { nodeInternalId, validatedAt: new Date() },
+    ]);
+  const transactionId = async (byte: string) =>
+    Number(
+      (
+        await client.query<{ id: string }>(
+          /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+          [hexToBin(scenarioHash(byte))]
+        )
+      ).rows[0]!.id
+    );
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    // fund:0 stays unspent; fund:1 is spent in the same block
+    await saveBlockFor(
+      block('b1', [
+        scenarioTransaction('f0', [], 10),
+        scenarioTransaction('a1', [1]),
+      ]),
+      nodeA
+    );
+    await check('mined spend', db);
+    /*
+     * node b also accepts block b1 (via headers); a transaction only node b
+     * accepts spends f0:9: unspent for node a only, its output for node b only
+     */
+    await db.acceptBlocksViaHeaders(
+      nodeB,
+      [{ hash: scenarioHash('b1'), height: 999_000 }],
+      new Date()
+    );
+    await check('block accepted by a second node via headers', db);
+    await saveMempoolTransaction(scenarioTransaction('e2', [9]), nodeB);
+    await check('transaction accepted by one node only', db);
+    await saveMempoolTransaction(scenarioTransaction('a2', [2]), nodeA);
+    await check('mempool spend', db);
+    await saveMempoolTransaction(scenarioTransaction('a3', [3]), nodeA);
+    await check('mempool spend before drop', db);
+    await db.archiveMempoolTransaction({
+      nodeInternalId: nodeA,
+      replacedAt: new Date(),
+      transactionInternalId: await transactionId('a3'),
+    });
+    await check('dropped mempool spender', db);
+    const staleBlock = block('b2', [scenarioTransaction('a4', [4])]);
+    await saveBlockFor(staleBlock, nodeA);
+    await check('block spend before re-org', db);
+    await db.removeStaleBlocksForNode(nodeA, [staleBlock.hash]);
+    await check('block spender removed by a re-org', db);
+    await db.acceptBlocksViaHeaders(
+      nodeB,
+      [{ hash: staleBlock.hash, height: staleBlock.height }],
+      new Date()
+    );
+    await check('stale block re-accepted via headers by another node', db);
+    await saveMempoolTransaction(scenarioTransaction('a5', [5]), nodeA);
+    await saveMempoolTransaction(scenarioTransaction('a6', [5]), nodeB);
+    await check('cross-node double-spend', db);
+    await db.archiveMempoolTransaction({
+      nodeInternalId: nodeA,
+      replacedAt: new Date(),
+      transactionInternalId: await transactionId('a5'),
+    });
+    await check('first of a cross-node double-spend dropped', db);
+    // child-before-parent across two saves: a mempool child, then its parent
+    await saveMempoolTransaction(scenarioTransaction('c1', [['b0', 0]]), nodeA);
+    await check('mempool child saved before its parent', db);
+    await saveBlockFor(
+      block('b6', [scenarioTransaction('b0', [['ff', 0]], 2)]),
+      nodeA
+    );
+    await check('parent saved after its mempool child', db);
+    // child-before-parent across two blocks
+    await saveBlockFor(
+      block('b7', [scenarioTransaction('c2', [['b1', 0]])]),
+      nodeA
+    );
+    await saveBlockFor(
+      block('b8', [scenarioTransaction('b1', [['ff', 1]], 1)]),
+      nodeA
+    );
+    await check('parent block saved after its child block', db);
+    // a later mempool-only spender must not replace a block-accepted one
+    await saveMempoolTransaction(scenarioTransaction('e1', [1]), nodeB);
+    await check('conflicting mempool spender of a mined output', db);
+    // a block-accepted spender replaces a mempool-only one
+    await saveMempoolTransaction(scenarioTransaction('a7', [6]), nodeA);
+    await saveBlockFor(block('b9', [scenarioTransaction('a8', [6])]), nodeA);
+    await check('block spender replaces a mempool spender', db);
+    // re-org replacing the spender: replacement block saved first
+    const replacedBlock = block('ba', [scenarioTransaction('91', [7])]);
+    await saveBlockFor(replacedBlock, nodeA);
+    await saveBlockFor(block('bb', [scenarioTransaction('92', [7])]), nodeA);
+    await check('competing block spender while the first is accepted', db);
+    await db.removeStaleBlocksForNode(nodeA, [replacedBlock.hash]);
+    await check('re-org replaced the spender (replacement saved first)', db);
+    // re-org replacing the spender: stale block removed first
+    const staleFirstBlock = block('bc', [scenarioTransaction('93', [8])]);
+    await saveBlockFor(staleFirstBlock, nodeA);
+    await db.removeStaleBlocksForNode(nodeA, [staleFirstBlock.hash]);
+    await saveBlockFor(block('bd', [scenarioTransaction('94', [8])]), nodeA);
+    await check('re-org replaced the spender (stale removed first)', db);
+  } finally {
+    await db.pool.end();
+    await db.unspentNodeIdsJobPool.end();
+    if (originalPostgresConnectionString === undefined) {
+      delete process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    } else {
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+        originalPostgresConnectionString;
+    }
+  }
+};
+
+/**
+ * `CHAINGRAPH_UNSPENT_TRACKING`: concurrent parent/child saves. The agent saves
+ * up to 16 blocks at once; under READ COMMITTED a child's spend statement
+ * cannot see its parent's uncommitted outputs, and the parent's resolve cannot
+ * see the child's uncommitted inputs. The post-commit pass must close that
+ * race. A chain of blocks (each spending the previous one) and mempool
+ * parent/child pairs (child save issued first) are all saved at once, with at
+ * least 16 saves in flight; the read model must then equal the per-node reference
+ * for every output they created.
+ */
+const concurrencyHash = (kind: number, group: number, index: number) =>
+  `e8${kind.toString(16).padStart(2, '0')}${group
+    .toString(16)
+    .padStart(4, '0')}${index.toString(16).padStart(4, '0')}${'00'.repeat(26)}`;
+const concurrencyTransaction = (
+  hash: string,
+  spends: [string, number][]
+): ChaingraphTransaction => ({
+  hash,
+  inputs: spends.map(([outpointTransactionHash, outpointIndex]) => ({
+    outpointIndex,
+    outpointTransactionHash,
+    sequenceNumber: 0,
+    unlockingBytecode: '51',
+  })),
+  isCoinbase: false,
+  locktime: 0,
+  outputs: [
+    { lockingBytecode: '51', valueSatoshis: 1000n },
+    { lockingBytecode: '52', valueSatoshis: 1000n },
+  ],
+  sizeBytes: 60,
+  version: 2,
+});
+
+/**
+ * The tracking job is driven from the tests (run the e2e suite with
+ * `CHAINGRAPH_UNSPENT_NODE_IDS_JOB=false`, so the spawned agents leave it
+ * alone, and a short `CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS`). After each
+ * step the query root is compared with the per-node reference before the
+ * job runs (backlog correction), while it is stalled, and after it caught up,
+ * for every node and read tier; then the stored values are compared too.
+ */
+const e2eDefaultStallMaxMs = '2000';
+/*
+ * The job modules imported by the tests read it from the environment; the
+ * production default (1 minute) would make every stall in the scenario
+ * below sleep for 10 minutes.
+ */
+process.env.CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS ??= e2eDefaultStallMaxMs;
+const deferredStallMaxMs = Number(
+  process.env.CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS
+);
+/**
+ * The unspent_node_ids tests compare every read tier for every node after
+ * every step; on the e2e chain (pre-tracking, answered live) one comparison
+ * takes about a second, so a test runs for minutes without finishing a test
+ * (AVA's --timeout).
+ */
+const unspentTestTimeoutMs = 45 * 60_000;
+const deferredReadTiers = ['auto', 'hash', 'probe', 'fallback'] as const;
+const deferredRows = async (sql: string, filter?: (row: string) => boolean) =>
+  (await client.query<{ outpoint: string }>(sql)).rows
+    .map((row) => row.outpoint)
+    .filter((outpoint) => filter === undefined || filter(outpoint))
+    .sort((a, b) => a.localeCompare(b));
+const deferredNodes = async () =>
+  (
+    await client.query<{ id: string; name: string }>(
+      /* sql */ `SELECT internal_id AS id, name FROM node ORDER BY internal_id;`
+    )
+  ).rows.map((row) => ({ id: Number(row.id), name: row.name }));
+const deferredSleep = async (ms: number) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+/**
+ * The query root equals the reference for every node and every read tier.
+ * Returns the number of comparisons.
+ */
+const compareDeferredQueryRoot = async (
+  t: ExecutionContext,
+  label: string,
+  filter?: (row: string) => boolean
+) => {
+  const nodes = await deferredNodes();
+  // eslint-disable-next-line functional/no-let
+  let comparisons = 0;
+  await nodes.reduce<Promise<unknown>>(
+    async (chain, node) =>
+      chain.then(async () => {
+        const expected = await deferredRows(
+          nodeUnspentReferenceSql(node.id),
+          filter
+        );
+        await deferredReadTiers.reduce<Promise<unknown>>(
+          async (tierChain, tier) =>
+            tierChain.then(async () => {
+              await client.query(
+                tier === 'auto'
+                  ? `RESET chaingraph.unspent_read_tier;`
+                  : `SET chaingraph.unspent_read_tier = '${tier}';`
+              );
+              const actual = await deferredRows(
+                /* sql */ `SELECT encode(u.transaction_hash, 'hex') || ':' || u.output_index AS outpoint
+                  FROM unspent_output('${node.name}') u`,
+                filter
+              );
+              t.deepEqual(
+                actual,
+                expected,
+                `${label}: node ${node.name}, tier ${tier}`
+              );
+              comparisons += 1;
+            }),
+          Promise.resolve()
+        );
+        await client.query(`RESET chaingraph.unspent_read_tier;`);
+      }),
+    Promise.resolve()
+  );
+  return comparisons;
+};
+
+/**
+ * Stored values (rows the job has processed) equal the reference; nothing
+ * created at or after `fromTransactionId` is left unprocessed.
+ */
+const compareDeferredStored = async (
+  t: ExecutionContext,
+  label: string,
+  fromTransactionId: number,
+  filter?: (row: string) => boolean
+) => {
+  t.is(
+    Number(
+      (
+        await client.query<{ n: string }>(/* sql */ `
+        SELECT count(*) AS n FROM output o JOIN transaction t ON t.hash = o.transaction_hash
+          WHERE t.internal_id >= ${fromTransactionId} AND o.unspent_node_ids IS NULL`)
+      ).rows[0]!.n
+    ),
+    0,
+    `${label}: no unprocessed output created since tracking started`
+  );
+  const processed = new Set(
+    await deferredRows(
+      /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o WHERE o.unspent_node_ids IS NOT NULL`,
+      filter
+    )
+  );
+  const inProcessed = (rows: string[]) =>
+    rows.filter((row) => processed.has(row));
+  const nodes = await deferredNodes();
+  await nodes.reduce<Promise<unknown>>(
+    async (chain, node) =>
+      chain.then(async () => {
+        t.deepEqual(
+          inProcessed(
+            await deferredRows(/* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o
+              WHERE ${node.id} = ANY (o.unspent_node_ids)`)
+          ),
+          inProcessed(await deferredRows(nodeUnspentReferenceSql(node.id))),
+          `${label}: stored node ids, node ${node.name}`
+        );
+      }),
+    Promise.resolve()
+  );
+};
+
+const deferredDbModule = async (name: string) => {
+  process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+    postgresE2eConnectionStringTestDb;
+  return (await import(`../db.js?${name}`)) as typeof DbModule;
+};
+
+/**
+ * Drain the job; while it is stalled on an input whose output is missing,
+ * check the query root, then wait for the stall limit and drain again.
+ * Returns whether it stalled.
+ */
+const drainDeferred = async (
+  t: ExecutionContext,
+  db: typeof DbModule,
+  label: string,
+  filter?: (row: string) => boolean
+) => {
+  const first = await db.drainUnspentNodeIdsJob(120_000);
+  const stalled = first.stalled;
+  if (stalled) {
+    // a stall (child saved before its parent) does not hold the backfill back
+    t.true(first.backfillReady, `${label}: backfill not gated by the stall`);
+    await compareDeferredQueryRoot(t, `${label} (job stalled)`, filter);
+    await deferredSleep(deferredStallMaxMs + 100);
+    const second = await db.drainUnspentNodeIdsJob(120_000);
+    // fixtures spend outputs that never exist: the stall limit lets the job pass them
+    t.true(!second.stalled, `${label}: stall resolved`);
+  }
+  return stalled;
+};
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): deferred job and query root equal the per-node reference`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    t.timeout(unspentTestTimeoutMs);
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const setup = await deferredDbModule('unspent-deferred-setup');
+    // eslint-disable-next-line functional/no-let
+    let trackingStart = 0;
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      // write path: only the two release-event triggers among the tracking triggers
+      const enabledTriggers = (
+        await client.query<{ tgname: string }>(/* sql */ `
+        SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgenabled <> 'D'
+          AND (tgname LIKE 'trigger_unspent_%') ORDER BY tgname;`)
+      ).rows.map((row) => row.tgname);
+      t.deepEqual(enabledTriggers, [
+        'trigger_unspent_tracking_node_block_delete',
+        'trigger_unspent_tracking_node_transaction_delete',
+      ]);
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(/* sql */ `
+            SELECT count(*) AS n FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid
+              WHERE NOT tg.tgisinternal AND c.relname IN ('output', 'input', 'transaction', 'block_transaction')`)
+          ).rows[0]!.n
+        ),
+        0,
+        'no triggers on output, input, transaction or block_transaction'
+      );
+      // the agent creates them when its job starts (disabled in the e2e agents)
+      await setup.ensureUnspentNodeIdsIndexes();
+      const indexes = (
+        await client.query<{ indexname: string }>(
+          /* sql */ `SELECT indexname FROM pg_indexes WHERE indexname LIKE 'output_unspent_%' ORDER BY indexname;`
+        )
+      ).rows.map((row) => row.indexname);
+      const nodeCount = (await deferredNodes()).length;
+      t.is(indexes.length, nodeCount * 3, indexes.join(', '));
+      t.true(
+        indexes.includes('output_unspent_node_1_category_index') &&
+          indexes.includes('output_unspent_node_1_category_rest_index') &&
+          indexes.includes('output_unspent_node_1_search_index'),
+        indexes.join(', ')
+      );
+      t.false(
+        indexes.some((name) => name.includes('null')),
+        'no NULL (unprocessed) partial index'
+      );
+      /*
+       * Before tracking starts: outputs whose only spenders end up accepted by
+       * no node (a dropped mempool spender, a spender in a block removed by a
+       * re-org). They stay NULL until the backfill (see the backlog test).
+       */
+      const preHash = (byte: string) => `eb${byte.repeat(31)}`;
+      const preTransaction = (
+        byte: string,
+        spends: [string, number][],
+        outputCount = 1
+      ): ChaingraphTransaction => ({
+        hash: preHash(byte),
+        inputs: spends.map(([outpointTransactionHash, outpointIndex]) => ({
+          outpointIndex,
+          outpointTransactionHash,
+          sequenceNumber: 0,
+          unlockingBytecode: '51',
+        })),
+        isCoinbase: false,
+        locktime: 0,
+        outputs: Array.from({ length: outputCount }, () => ({
+          lockingBytecode: '51',
+          valueSatoshis: 1000n,
+        })),
+        sizeBytes: 60,
+        version: 2,
+      });
+      const preBlock = (
+        byte: string,
+        transactions: ChaingraphTransaction[]
+      ) => ({
+        bits: 0,
+        hash: preHash(byte),
+        height: 998_000,
+        merkleRoot: '00'.repeat(32),
+        nonce: 0,
+        previousBlockHash: '00'.repeat(32),
+        sizeBytes: 0,
+        timestamp: 0,
+        transactions,
+        version: 1,
+      });
+      const preNode = (await deferredNodes())[0]!.id;
+      const preSaveBlock = async (blockToSave: ChaingraphBlock) =>
+        setup.saveBlock({
+          block: blockToSave,
+          nodeAcceptances: [
+            {
+              acceptedAt: new Date(),
+              nodeInternalId: preNode,
+              nodeName: 'pre',
+            },
+          ],
+          transactionCache: new Map() as unknown as Parameters<
+            typeof setup.saveBlock
+          >[0]['transactionCache'],
+        });
+      await preSaveBlock(
+        preBlock('b0', [preTransaction('f0', [[preHash('ff'), 0]], 3)])
+      );
+      await setup.saveTransactionForNodes(
+        preTransaction('01', [[preHash('f0'), 0]]),
+        [{ nodeInternalId: preNode, validatedAt: new Date() }]
+      );
+      await setup.archiveMempoolTransaction({
+        nodeInternalId: preNode,
+        replacedAt: new Date(),
+        transactionInternalId: Number(
+          (
+            await client.query<{ id: string }>(
+              /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+              [hexToBin(preHash('01'))]
+            )
+          ).rows[0]!.id
+        ),
+      });
+      const preStale = preBlock('b1', [
+        preTransaction('02', [[preHash('f0'), 1]]),
+      ]);
+      await preSaveBlock(preStale);
+      await setup.removeStaleBlocksForNode(preNode, [preStale.hash]);
+      /*
+       * A mempool child saved and dropped before tracking starts, spending an
+       * output of a parent saved after it started (see below).
+       */
+      await setup.saveTransactionForNodes(
+        preTransaction('c1', [[preHash('a0'), 0]]),
+        [{ nodeInternalId: preNode, validatedAt: new Date() }]
+      );
+      const preChildId = Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+            [hexToBin(preHash('c1'))]
+          )
+        ).rows[0]!.id
+      );
+      await setup.archiveMempoolTransaction({
+        nodeInternalId: preNode,
+        replacedAt: new Date(),
+        transactionInternalId: preChildId,
+      });
+      // the job starts tracking at the current tip: the e2e chain stays unprocessed (NULL)
+      await setup.drainUnspentNodeIdsJob(120_000);
+      trackingStart =
+        Number(
+          (
+            await client.query<{ w: string }>(
+              /* sql */ `SELECT min(input_transaction_internal_id) AS w FROM unspent_tracking_progress;`
+            )
+          ).rows[0]!.w
+        ) + 1;
+      await client.query('ANALYZE;');
+      await compareDeferredQueryRoot(t, 'e2e chain state');
+      /*
+       * Released before tracking started, re-accepted after: the dropped
+       * child is in the watch set (the watch pass reads pre-tracking release
+       * events), its parent is saved after tracking started, then the child is
+       * accepted again through a path that writes no event: the parent's
+       * output becomes spent for the node.
+       */
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(
+              /* sql */ `SELECT count(*) AS n FROM unspent_tracking_watch WHERE transaction_internal_id = $1;`,
+              [preChildId]
+            )
+          ).rows[0]!.n
+        ),
+        1,
+        'child released before tracking started is watched'
+      );
+      await preSaveBlock(
+        preBlock('b2', [preTransaction('a0', [[preHash('fd'), 0]], 1)])
+      );
+      await drainDeferred(t, setup, 'parent saved after tracking started');
+      await client.query(
+        /* sql */ `INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at) VALUES ($1, $2, now());`,
+        [preNode, preChildId]
+      );
+      await drainDeferred(t, setup, 'pre-tracking release re-accepted');
+      const parentId = Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+            [hexToBin(preHash('a0'))]
+          )
+        ).rows[0]!.id
+      );
+      await compareDeferredStored(
+        t,
+        'pre-tracking release re-accepted',
+        parentId,
+        (outpoint) => outpoint.startsWith(preHash('a0'))
+      );
+      t.deepEqual(
+        (
+          await client.query<{ ids: number[] }>(
+            /* sql */ `SELECT unspent_node_ids AS ids FROM output WHERE transaction_hash = $1;`,
+            [hexToBin(preHash('a0'))]
+          )
+        ).rows.map((row) => row.ids),
+        [[]],
+        'parent output spent by the re-accepted child'
+      );
+      await compareDeferredQueryRoot(t, 'pre-tracking release re-accepted');
+    } finally {
+      await setup.pool.end();
+      await setup.unspentNodeIdsJobPool.end();
+    }
+    const stalls: string[] = [];
+    // eslint-disable-next-line functional/no-let
+    let comparisons = 0;
+    await runUnspentTrackingScenario(async (step, db) => {
+      await client.query('ANALYZE;');
+      comparisons += await compareDeferredQueryRoot(t, `${step} (backlog)`);
+      if (await drainDeferred(t, db, step)) {
+        stalls.push(step);
+      }
+      comparisons += await compareDeferredQueryRoot(t, `${step} (caught up)`);
+      await compareDeferredStored(t, step, trackingStart);
+    });
+    t.log({ comparisons, stalls, trackingStart });
+    // child-before-parent: the mempool child (and the child block) stall the job until the parent is saved
+    t.true(
+      stalls.includes('mempool child saved before its parent'),
+      stalls.join('; ')
+    );
+    if (originalPostgresConnectionString !== undefined) {
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+        originalPostgresConnectionString;
+    }
+  }
+);
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): concurrent parent/child saves with the deferred job running`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    t.timeout(unspentTestTimeoutMs);
+    const blockCount = 24;
+    const transactionsPerBlock = 40;
+    const mempoolPairs = 24;
+    const minimumInFlight = 16;
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const db = await deferredDbModule('unspent-deferred-concurrency');
+    (db.pool as unknown as { options: { max: number } }).options.max = Math.max(
+      (db.pool as unknown as { options: { max: number } }).options.max,
+      minimumInFlight + 8
+    );
+    const nodeA = Number(
+      (
+        await client.query<{ id: string }>(
+          /* sql */ `SELECT internal_id AS id FROM node WHERE name = 'node1';`
+        )
+      ).rows[0]!.id
+    );
+    const kindByte = 0x10;
+    const blocks = Array.from({ length: blockCount }, (_, blockIndex) => ({
+      bits: 0,
+      hash: concurrencyHash(kindByte + 1, blockIndex, 0xffff),
+      height: 999_300 + blockIndex,
+      merkleRoot: '00'.repeat(32),
+      nonce: 0,
+      previousBlockHash: '00'.repeat(32),
+      sizeBytes: 0,
+      timestamp: 0,
+      transactions: Array.from(
+        { length: transactionsPerBlock },
+        (__, transactionIndex) =>
+          concurrencyTransaction(
+            concurrencyHash(kindByte + 2, blockIndex, transactionIndex),
+            blockIndex === 0
+              ? [[concurrencyHash(kindByte + 9, 0, transactionIndex), 0]]
+              : [
+                  [
+                    concurrencyHash(
+                      kindByte + 2,
+                      blockIndex - 1,
+                      transactionIndex
+                    ),
+                    0,
+                  ],
+                ]
+          )
+      ),
+      version: 1,
+    }));
+    const pairs = Array.from({ length: mempoolPairs }, (_, pairIndex) => {
+      const parent = concurrencyTransaction(
+        concurrencyHash(kindByte + 3, pairIndex, 0),
+        [[concurrencyHash(kindByte + 9, 1, pairIndex), 0]]
+      );
+      const child = concurrencyTransaction(
+        concurrencyHash(kindByte + 3, pairIndex, 1),
+        [[parent.hash, 0]]
+      );
+      return { child, parent };
+    });
+    // eslint-disable-next-line functional/no-let
+    let inFlight = 0;
+    // eslint-disable-next-line functional/no-let
+    let maxInFlight = 0;
+    // eslint-disable-next-line functional/no-let
+    let saving = true;
+    // eslint-disable-next-line functional/no-let
+    let passesDuringSaves = 0;
+    // eslint-disable-next-line functional/no-let
+    let passesWithBatches = 0;
+    const track = async <T>(work: () => Promise<T>) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        return await work();
+      } finally {
+        inFlight -= 1;
+      }
+    };
+    const jobLoop = async (): Promise<void> => {
+      if (!saving) {
+        return;
+      }
+      const pass = await db.runUnspentNodeIdsJobPass({
+        maxMs: 200,
+        settleWaitMs: 20,
+      });
+      if (pass.batches > 0) {
+        passesWithBatches += 1;
+      }
+      passesDuringSaves += 1;
+      await deferredSleep(5);
+      await jobLoop();
+    };
+    const created = new Set([
+      ...blocks.flatMap((block) =>
+        block.transactions.map((transaction) => transaction.hash)
+      ),
+      ...pairs.flatMap(({ child, parent }) => [child.hash, parent.hash]),
+    ]);
+    const createdHere = (outpoint: string) =>
+      created.has(outpoint.split(':')[0] ?? '');
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      const job = jobLoop();
+      await Promise.all([
+        ...blocks.map(async (block) =>
+          track(async () =>
+            db.saveBlock({
+              block,
+              nodeAcceptances: [
+                {
+                  acceptedAt: new Date(),
+                  nodeInternalId: nodeA,
+                  nodeName: 'concurrency',
+                },
+              ],
+              transactionCache: new Map() as unknown as Parameters<
+                typeof db.saveBlock
+              >[0]['transactionCache'],
+            })
+          )
+        ),
+        ...pairs.flatMap(({ child, parent }) => [
+          track(async () =>
+            db.saveTransactionForNodes(child, [
+              { nodeInternalId: nodeA, validatedAt: new Date() },
+            ])
+          ),
+          track(async () =>
+            db.saveTransactionForNodes(parent, [
+              { nodeInternalId: nodeA, validatedAt: new Date() },
+            ])
+          ),
+        ]),
+      ]);
+      saving = false;
+      await job;
+      t.true(maxInFlight >= minimumInFlight, `in flight: ${maxInFlight}`);
+      await client.query('ANALYZE;');
+      // before the job catches up: backlog correction
+      await compareDeferredQueryRoot(
+        t,
+        'concurrent saves (backlog)',
+        createdHere
+      );
+      const stalled = await drainDeferred(
+        t,
+        db,
+        'concurrent saves',
+        createdHere
+      );
+      await compareDeferredQueryRoot(
+        t,
+        'concurrent saves (caught up)',
+        createdHere
+      );
+      const expectedUnspent =
+        blockCount * transactionsPerBlock +
+        transactionsPerBlock +
+        3 * mempoolPairs;
+      const nodes = await deferredNodes();
+      const reference = await deferredRows(
+        nodeUnspentReferenceSql(nodeA),
+        createdHere
+      );
+      t.is(reference.length, expectedUnspent);
+      const column = `${nodeA} = ANY (o.unspent_node_ids)`;
+      const stored = await deferredRows(
+        /* sql */ `SELECT encode(o.transaction_hash, 'hex') || ':' || o.output_index AS outpoint FROM output o WHERE ${column}`,
+        createdHere
+      );
+      const mismatches =
+        stored.filter((row) => !reference.includes(row)).length +
+        reference.filter((row) => !stored.includes(row)).length;
+      t.is(
+        mismatches,
+        0,
+        'stored values vs the per-node reference after the job caught up'
+      );
+      t.log({
+        maxInFlight,
+        mismatches,
+        nodes: nodes.length,
+        passesDuringSaves,
+        passesWithBatches,
+        stalled,
+      });
+    } finally {
+      saving = false;
+      await db.pool.end();
+      await db.unspentNodeIdsJobPool.end();
+      if (originalPostgresConnectionString !== undefined) {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+  }
+);
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): query root equals the per-node reference with a backlog`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    t.timeout(unspentTestTimeoutMs);
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const db = await deferredDbModule('unspent-deferred-backlog');
+    const hash = (byte: string) => `e9${byte.repeat(31)}`;
+    const transaction = (
+      byte: string,
+      spends: [string, number][],
+      outputCount = 2
+    ): ChaingraphTransaction => ({
+      hash: hash(byte),
+      inputs: spends.map(([outpointTransactionHash, outpointIndex]) => ({
+        outpointIndex,
+        outpointTransactionHash,
+        sequenceNumber: 0,
+        unlockingBytecode: '51',
+      })),
+      isCoinbase: false,
+      locktime: 0,
+      outputs: Array.from({ length: outputCount }, () => ({
+        lockingBytecode: '51',
+        valueSatoshis: 1000n,
+      })),
+      sizeBytes: 60,
+      version: 2,
+    });
+    const block = (byte: string, transactions: ChaingraphTransaction[]) => ({
+      bits: 0,
+      hash: hash(byte),
+      height: 999_500,
+      merkleRoot: '00'.repeat(32),
+      nonce: 0,
+      previousBlockHash: '00'.repeat(32),
+      sizeBytes: 0,
+      timestamp: 0,
+      transactions,
+      version: 1,
+    });
+    const nodes = await deferredNodes();
+    const [nodeA, nodeB] = [nodes[0]!.id, nodes[1]!.id];
+    const saveBlockFor = async (
+      blockToSave: ChaingraphBlock,
+      nodeInternalId: number
+    ) =>
+      db.saveBlock({
+        block: blockToSave,
+        nodeAcceptances: [
+          { acceptedAt: new Date(), nodeInternalId, nodeName: 'backlog' },
+        ],
+        transactionCache: new Map() as unknown as Parameters<
+          typeof db.saveBlock
+        >[0]['transactionCache'],
+      });
+    const ours = (outpoint: string) => outpoint.startsWith('e9');
+    const transactionId = async (byte: string) =>
+      Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+            [hexToBin(hash(byte))]
+          )
+        ).rows[0]!.id
+      );
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      // a funding block, processed by the job (stored values exist)
+      await saveBlockFor(
+        block('a0', [transaction('f0', [[hash('ff'), 0]], 8)]),
+        nodeA
+      );
+      await db.acceptBlocksViaHeaders(
+        nodeB,
+        [{ hash: hash('a0'), height: 999_500 }],
+        new Date()
+      );
+      await drainDeferred(t, db, 'backlog funding');
+      await client.query('ANALYZE;');
+      await compareDeferredQueryRoot(t, 'backlog: funding processed', ours);
+      // job stopped: ingest a block spend, mempool spends, a drop, a re-org and a re-acceptance
+      await saveBlockFor(
+        block('a1', [
+          transaction('11', [[hash('f0'), 0]]),
+          transaction('12', [[hash('11'), 0]]),
+        ]),
+        nodeA
+      );
+      await db.saveTransactionForNodes(transaction('21', [[hash('f0'), 1]]), [
+        { nodeInternalId: nodeA, validatedAt: new Date() },
+      ]);
+      await db.saveTransactionForNodes(transaction('22', [[hash('f0'), 2]]), [
+        { nodeInternalId: nodeB, validatedAt: new Date() },
+      ]);
+      await db.archiveMempoolTransaction({
+        nodeInternalId: nodeB,
+        replacedAt: new Date(),
+        transactionInternalId: await transactionId('22'),
+      });
+      const stale = block('a2', [transaction('31', [[hash('f0'), 3]])]);
+      await saveBlockFor(stale, nodeA);
+      await db.removeStaleBlocksForNode(nodeA, [stale.hash]);
+      // the same spender re-accepted by node B via headers (a re-acceptance event)
+      await db.acceptBlocksViaHeaders(
+        nodeB,
+        [{ hash: stale.hash, height: 999_500 }],
+        new Date()
+      );
+      // a double-spend across nodes, then node A also accepts B's spender from its mempool (re-acceptance)
+      await db.saveTransactionForNodes(transaction('41', [[hash('f0'), 4]]), [
+        { nodeInternalId: nodeA, validatedAt: new Date() },
+      ]);
+      await db.saveTransactionForNodes(transaction('42', [[hash('f0'), 4]]), [
+        { nodeInternalId: nodeB, validatedAt: new Date() },
+      ]);
+      await db.archiveMempoolTransaction({
+        nodeInternalId: nodeA,
+        replacedAt: new Date(),
+        transactionInternalId: await transactionId('41'),
+      });
+      await db.saveTransactionForNodes(transaction('42', [[hash('f0'), 4]]), [
+        { nodeInternalId: nodeA, validatedAt: new Date() },
+      ]);
+      const events = Number(
+        (
+          await client.query<{ n: string }>(
+            `SELECT count(*) AS n FROM unspent_tracking_events;`
+          )
+        ).rows[0]!.n
+      );
+      t.true(events > 0, `unconsumed events: ${events}`);
+      await client.query('ANALYZE;');
+      await compareDeferredQueryRoot(t, 'backlog: job stopped', ours);
+      await compareDeferredQueryRoot(t, 'backlog: job stopped (whole table)');
+      await drainDeferred(t, db, 'backlog drained', ours);
+      await compareDeferredQueryRoot(t, 'backlog: job caught up', ours);
+      await compareDeferredStored(
+        t,
+        'backlog: job caught up',
+        await transactionId('f0'),
+        ours
+      );
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(
+              `SELECT count(*) AS n FROM unspent_tracking_events;`
+            )
+          ).rows[0]!.n
+        ),
+        0,
+        'events consumed'
+      );
+      /*
+       * Backfill of the pre-tracking outputs (the whole e2e chain). Every
+       * output gets its value ('{}' included): NULL only ever means "not
+       * processed yet", and the query root never reads a NULL as spent.
+       */
+      const backfillComplete = async () =>
+        (
+          await client.query<{ done: boolean }>(
+            `SELECT backfill_complete AS done FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.done;
+      t.false(await backfillComplete());
+      /*
+       * Pre-tracking outputs whose spenders exist but are accepted by no node
+       * (dropped mempool spenders, spenders in stale blocks): unspent for the
+       * nodes accepting their creator. A backfill that only takes outputs
+       * without any spending input leaves them NULL.
+       */
+      const unacceptedSpenderOutputs = Number(
+        (
+          await client.query<{ n: string }>(/* sql */ `
+          SELECT count(*) AS n FROM output o JOIN transaction ct ON ct.hash = o.transaction_hash
+            WHERE o.unspent_node_ids IS NULL
+              AND unspent_node_ids_accepting(ct.internal_id) <> '{}'
+              AND EXISTS (SELECT 1 FROM input i WHERE i.outpoint_transaction_hash = o.transaction_hash AND i.outpoint_index = o.output_index)
+              AND NOT EXISTS (SELECT 1 FROM input i WHERE i.outpoint_transaction_hash = o.transaction_hash AND i.outpoint_index = o.output_index
+                                AND unspent_node_ids_accepting(i.transaction_internal_id) <> '{}');`)
+        ).rows[0]!.n
+      );
+      t.true(
+        unacceptedSpenderOutputs > 0,
+        `pre-tracking outputs whose spenders are accepted by no node: ${unacceptedSpenderOutputs}`
+      );
+      /*
+       * The backfill_complete flag set by hand before the backfill (an operator
+       * shortcut after a scoped backfill): the root must still compute every
+       * NULL output live, never read it as spent.
+       */
+      await client.query(
+        `UPDATE unspent_tracking_settings SET backfill_complete = true;`
+      );
+      t.true(
+        (
+          await client.query<{ pending: boolean }>(
+            `SELECT unspent_node_ids_backfill_pending() AS pending;`
+          )
+        ).rows[0]!.pending,
+        'pending is derived from the backfill cursors, not the flag'
+      );
+      await compareDeferredQueryRoot(
+        t,
+        'backfill_complete set by hand before the backfill (whole table)'
+      );
+      await client.query(
+        `UPDATE unspent_tracking_settings SET backfill_complete = false;`
+      );
+      const backfillPass = async (remaining: number): Promise<void> => {
+        await db.runUnspentNodeIdsJobPass({
+          backfill: true,
+          maxMs: 60_000,
+          settleWaitMs: 2_000,
+        });
+        if (!(await backfillComplete()) && remaining > 0) {
+          await backfillPass(remaining - 1);
+        }
+      };
+      await backfillPass(50);
+      t.true(await backfillComplete(), 'backfill complete');
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(
+              `SELECT count(*) AS n FROM output WHERE unspent_node_ids IS NULL;`
+            )
+          ).rows[0]!.n
+        ),
+        0,
+        'no output left NULL after the backfill'
+      );
+      await client.query('ANALYZE;');
+      await compareDeferredStored(t, 'backfill complete (whole table)', 0);
+      await compareDeferredQueryRoot(t, 'backfill complete (whole table)');
+      /*
+       * Tracking stopped (CHAINGRAPH_UNSPENT_NODE_IDS=false: triggers off,
+       * then unspent_node_ids_stop()), an acceptance change while stopped
+       * (no event), then restarted at the tip: the root answers live
+       * while stopped and until the rebuild (a backfill of every
+       * pre-tracking output) is complete; then the stored values are exact.
+       */
+      const stopTriggers = async (enabled: boolean) =>
+        client.query(
+          configureTrackingTriggersSql(enabled, {
+            // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
+            trigger_unspent_tracking_node_block_delete: !enabled,
+            // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
+            trigger_unspent_tracking_node_transaction_delete: !enabled,
+          }).join(' ')
+        );
+      const readTier = async () =>
+        (
+          await client.query<{ tier: string }>(
+            `SELECT unspent_node_ids_read_tier() AS tier;`
+          )
+        ).rows[0]!.tier;
+      await stopTriggers(false);
+      t.true(
+        (
+          await client.query<{ stopped: boolean }>(
+            `SELECT unspent_node_ids_stop() AS stopped;`
+          )
+        ).rows[0]!.stopped
+      );
+      t.is(await readTier(), 'fallback', 'stopped: live');
+      // while stopped: node A drops its mempool spender of f0:1 (no release event)
+      await db.archiveMempoolTransaction({
+        nodeInternalId: nodeA,
+        replacedAt: new Date(),
+        transactionInternalId: await transactionId('21'),
+      });
+      await compareDeferredQueryRoot(t, 'tracking stopped', ours);
+      await stopTriggers(true);
+      // restart without the rebuild (an explicit no-backfill pass), to observe the pending state
+      await db.runUnspentNodeIdsJobPass({
+        backfill: false,
+        maxMs: 60_000,
+        settleWaitMs: 2_000,
+      });
+      t.true(
+        (
+          await client.query<{ rebuild: boolean }>(
+            `SELECT rebuild_required AS rebuild FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.rebuild
+      );
+      t.is(await readTier(), 'fallback', 'rebuild pending: live');
+      await compareDeferredQueryRoot(t, 'tracking restarted, rebuild pending');
+      // the default pass runs the rebuild whatever CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL says
+      const rebuildPass = async (remaining: number): Promise<void> => {
+        await db.runUnspentNodeIdsJobPass({
+          maxMs: 60_000,
+          settleWaitMs: 2_000,
+        });
+        const rebuilding = (
+          await client.query<{ rebuild: boolean }>(
+            `SELECT rebuild_required AS rebuild FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.rebuild;
+        if (rebuilding && remaining > 0) {
+          await rebuildPass(remaining - 1);
+        }
+      };
+      await rebuildPass(50);
+      t.false(
+        (
+          await client.query<{ rebuild: boolean }>(
+            `SELECT rebuild_required AS rebuild FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.rebuild,
+        'rebuild complete'
+      );
+      await client.query('ANALYZE;');
+      await compareDeferredStored(t, 'rebuild complete (whole table)', 0);
+      await compareDeferredQueryRoot(t, 'rebuild complete (whole table)');
+    } finally {
+      await db.pool.end();
+      await db.unspentNodeIdsJobPool.end();
+      if (originalPostgresConnectionString !== undefined) {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+  }
+);
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): events committed out of id order, watch-set re-acceptance, idle pass`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    t.timeout(unspentTestTimeoutMs);
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const db = await deferredDbModule('unspent-deferred-event-order');
+    const hash = (byte: string) => `ea${byte.repeat(31)}`;
+    const transaction = (
+      byte: string,
+      spends: [string, number][],
+      outputCount = 1
+    ): ChaingraphTransaction => ({
+      hash: hash(byte),
+      inputs: spends.map(([outpointTransactionHash, outpointIndex]) => ({
+        outpointIndex,
+        outpointTransactionHash,
+        sequenceNumber: 0,
+        unlockingBytecode: '51',
+      })),
+      isCoinbase: false,
+      locktime: 0,
+      outputs: Array.from({ length: outputCount }, () => ({
+        lockingBytecode: '51',
+        valueSatoshis: 1000n,
+      })),
+      sizeBytes: 60,
+      version: 2,
+    });
+    const nodeA = (await deferredNodes())[0]!.id;
+    const ours = (outpoint: string) => outpoint.startsWith('ea');
+    const transactionId = async (byte: string) =>
+      Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+            [hexToBin(hash(byte))]
+          )
+        ).rows[0]!.id
+      );
+    const holder = new pg.Client({
+      connectionString: postgresE2eConnectionStringTestDb,
+    });
+    await holder.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await db.saveBlock({
+        block: {
+          bits: 0,
+          hash: hash('b0'),
+          height: 999_600,
+          merkleRoot: '00'.repeat(32),
+          nonce: 0,
+          previousBlockHash: '00'.repeat(32),
+          sizeBytes: 0,
+          timestamp: 0,
+          transactions: [transaction('f0', [[hash('ff'), 0]], 2)],
+          version: 1,
+        },
+        nodeAcceptances: [
+          { acceptedAt: new Date(), nodeInternalId: nodeA, nodeName: 'order' },
+        ],
+        transactionCache: new Map() as unknown as Parameters<
+          typeof db.saveBlock
+        >[0]['transactionCache'],
+      });
+      await db.saveTransactionForNodes(transaction('01', [[hash('f0'), 0]]), [
+        { nodeInternalId: nodeA, validatedAt: new Date() },
+      ]);
+      await db.saveTransactionForNodes(transaction('02', [[hash('f0'), 1]]), [
+        { nodeInternalId: nodeA, validatedAt: new Date() },
+      ]);
+      await drainDeferred(t, db, 'event order: funding and spenders');
+      await compareDeferredStored(
+        t,
+        'event order: spenders processed',
+        await transactionId('f0'),
+        ours
+      );
+      /*
+       * A long transaction drops node A's spender of f0:0 (release event id
+       * N, not committed yet) while node A's spender of f0:1 is dropped and
+       * committed (event id N + 1); a pass runs in between.
+       */
+      await holder.query('BEGIN;');
+      await holder.query(
+        /* sql */ `DELETE FROM node_transaction WHERE transaction_internal_id = $1 AND node_internal_id = $2;`,
+        [await transactionId('01'), nodeA]
+      );
+      await db.archiveMempoolTransaction({
+        nodeInternalId: nodeA,
+        replacedAt: new Date(),
+        transactionInternalId: await transactionId('02'),
+      });
+      const ids = (
+        await client.query<{ id: string }>(
+          /* sql */ `SELECT id FROM unspent_tracking_events ORDER BY id;`
+        )
+      ).rows.map((row) => Number(row.id));
+      t.true(ids.length > 0, 'committed event visible');
+      await db.runUnspentNodeIdsJobPass({ maxMs: 5_000, settleWaitMs: 500 });
+      await holder.query('COMMIT;');
+      await drainDeferred(t, db, 'event order: drained');
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(
+              `SELECT count(*) AS n FROM unspent_tracking_events;`
+            )
+          ).rows[0]!.n
+        ),
+        0,
+        'events consumed'
+      );
+      await compareDeferredStored(
+        t,
+        'event order: both releases applied',
+        await transactionId('f0'),
+        ours
+      );
+      await compareDeferredQueryRoot(t, 'event order: drained', ours);
+      /*
+       * Watch set. A re-acceptance through a path that writes no event (a
+       * node_transaction row inserted directly) for a watched (released)
+       * transaction becomes an "accepted" event and is applied.
+       */
+      const watched = async (byte: string) =>
+        Number(
+          (
+            await client.query<{ n: string }>(
+              /* sql */ `SELECT count(*) AS n FROM unspent_tracking_watch WHERE transaction_internal_id = $1;`,
+              [await transactionId(byte)]
+            )
+          ).rows[0]!.n
+        );
+      t.is(await watched('02'), 1, 'dropped mempool spender watched');
+      await client.query(
+        /* sql */ `INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at) VALUES ($1, $2, now());`,
+        [nodeA, await transactionId('02')]
+      );
+      const reAcceptance = await db.runUnspentNodeIdsJobPass({
+        maxMs: 5_000,
+        settleWaitMs: 2_000,
+      });
+      t.is(reAcceptance.watch?.reaccepted, 1, 'one re-acceptance event');
+      await drainDeferred(t, db, 'watch: re-acceptance');
+      await compareDeferredStored(
+        t,
+        'watch: re-acceptance applied',
+        await transactionId('f0'),
+        ours
+      );
+      await compareDeferredQueryRoot(t, 'watch: re-acceptance applied', ours);
+      /*
+       * A mempool transaction confirmed by a block its node accepts: the
+       * mempool row is removed (a release event), but the node still accepts
+       * the transaction, so it is not watched; then an idle pass does no work.
+       */
+      const fundingBlock = (
+        byte: string,
+        transactions: ChaingraphTransaction[]
+      ) => ({
+        bits: 0,
+        hash: hash(byte),
+        height: 999_601,
+        merkleRoot: '00'.repeat(32),
+        nonce: 0,
+        previousBlockHash: '00'.repeat(32),
+        sizeBytes: 0,
+        timestamp: 0,
+        transactions,
+        version: 1,
+      });
+      const saveFor = async (blockToSave: ChaingraphBlock) =>
+        db.saveBlock({
+          block: blockToSave,
+          nodeAcceptances: [
+            {
+              acceptedAt: new Date(),
+              nodeInternalId: nodeA,
+              nodeName: 'order',
+            },
+          ],
+          transactionCache: new Map() as unknown as Parameters<
+            typeof db.saveBlock
+          >[0]['transactionCache'],
+        });
+      await saveFor(
+        fundingBlock('b1', [transaction('f1', [[hash('fe'), 0]], 2)])
+      );
+      await db.saveTransactionForNodes(transaction('03', [[hash('f1'), 0]]), [
+        { nodeInternalId: nodeA, validatedAt: new Date() },
+      ]);
+      await drainDeferred(t, db, 'watch: mempool spender');
+      await saveFor(fundingBlock('b2', [transaction('03', [[hash('f1'), 0]])]));
+      await db.archiveMempoolTransactionsAcceptedByBlocks();
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(
+              /* sql */ `SELECT count(*) AS n FROM node_transaction WHERE transaction_internal_id = $1;`,
+              [await transactionId('03')]
+            )
+          ).rows[0]!.n
+        ),
+        0,
+        'mempool row removed on confirmation'
+      );
+      await drainDeferred(t, db, 'watch: confirmed');
+      t.is(await watched('03'), 0, 'confirmed transaction not watched');
+      await compareDeferredStored(
+        t,
+        'watch: confirmed',
+        await transactionId('f0'),
+        ours
+      );
+      const idleStart = Date.now();
+      const idle = await db.runUnspentNodeIdsJobPass({
+        maxMs: 5_000,
+        settleWaitMs: 2_000,
+      });
+      const idleMs = Date.now() - idleStart;
+      const watchSize = Number(
+        (
+          await client.query<{ n: string }>(
+            `SELECT count(*) AS n FROM unspent_tracking_watch;`
+          )
+        ).rows[0]!.n
+      );
+      t.log({ idle: idle.watch, idleMs, watchSize });
+      t.is(idle.watch?.added, 0, 'idle pass: nothing added to the watch set');
+      t.is(idle.watch?.reaccepted, 0, 'idle pass: no re-acceptance');
+      t.is(idle.inputs, 0, 'idle pass: no inputs');
+      t.is(idle.changed, 0, 'idle pass: no output changed');
+      t.true(
+        idle.lastBatches.every(
+          (last) =>
+            last !== undefined && last.events === 0 && last.affected === 0
+        ),
+        'idle pass: no event, no output checked'
+      );
+      // cspell:ignore indisvalid indexrelid relname
+      /*
+       * A node registered after tracking started: answered by the live
+       * predicate until its three indexes are valid (built concurrently) and
+       * the events recorded before then are consumed. An index left INVALID
+       * by an interrupted build is dropped and rebuilt.
+       */
+      const lateNode = Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `INSERT INTO node (name, protocol_version, user_agent) VALUES ('unspent-late-node', 70012, '/late/') RETURNING internal_id AS id;`
+          )
+        ).rows[0]!.id
+      );
+      await client.query(`SELECT unspent_node_ids_build_root();`);
+      const storedPath = async (name: string) =>
+        (
+          await client.query<{ stored: boolean }>(
+            `SELECT unspent_node_ids_stored_path($1) AS stored;`,
+            [name]
+          )
+        ).rows[0]!.stored;
+      const nodeAName = (await deferredNodes())[0]!.name;
+      t.false(
+        await storedPath('unspent-late-node'),
+        'late node: live predicate'
+      );
+      t.true(await storedPath(nodeAName), 'node A: stored set');
+      await db.acceptBlocksViaHeaders(
+        lateNode,
+        [{ hash: hash('b0'), height: 999_600 }],
+        new Date()
+      );
+      await compareDeferredQueryRoot(t, 'late node, no indexes yet', ours);
+      await client.query(
+        `UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'output_unspent_node_${nodeA}_search_index'::regclass;`
+      );
+      const indexStatements = await db.ensureUnspentNodeIdsIndexes();
+      t.true(
+        indexStatements.includes(
+          `DROP INDEX CONCURRENTLY IF EXISTS output_unspent_node_${nodeA}_search_index;`
+        ),
+        indexStatements.join(' ')
+      );
+      t.is(
+        indexStatements.filter((statement) =>
+          statement.startsWith('CREATE INDEX CONCURRENTLY')
+        ).length,
+        4,
+        indexStatements.join(' ')
+      );
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(/* sql */ `
+            SELECT count(*) AS n FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+              WHERE c.relname LIKE 'output_unspent_node_%' AND i.indisvalid`)
+          ).rows[0]!.n
+        ),
+        (await deferredNodes()).length * 3,
+        'every per-node index valid'
+      );
+      await drainDeferred(t, db, 'late node indexed');
+      t.true(await storedPath('unspent-late-node'), 'late node: stored set');
+      await compareDeferredStored(
+        t,
+        'late node indexed',
+        await transactionId('f0'),
+        ours
+      );
+      await compareDeferredQueryRoot(t, 'late node indexed', ours);
+    } finally {
+      await holder.end();
+      await db.pool.end();
+      await db.unspentNodeIdsJobPool.end();
+      if (originalPostgresConnectionString !== undefined) {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+  }
+);
+
+/**
+ * Every pass calls unspent_node_ids_repartition. With the partition count
+ * unchanged it must not queue for the progress table lock behind a batch in
+ * flight (another job's, holding its progress row): the queued EXCLUSIVE
+ * request made every later batch wait behind it. A real re-partition gives up
+ * after lock_timeout (55P03) instead of waiting.
+ */
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): repartition does not queue behind a batch in flight`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    const partitionCount = Number(
+      (
+        await client.query<{ n: string }>(
+          /* sql */ `SELECT count(*) AS n FROM unspent_tracking_progress;`
+        )
+      ).rows[0]!.n
+    );
+    t.true(partitionCount > 1, `partitions: ${partitionCount}`);
+    const holder = new pg.Client({
+      connectionString: postgresE2eConnectionStringTestDb,
+    });
+    const other = new pg.Client({
+      connectionString: postgresE2eConnectionStringTestDb,
+    });
+    await holder.connect();
+    await other.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      // a batch of partition 0 in flight (another agent's job)
+      await holder.query('BEGIN;');
+      await holder.query(
+        /* sql */ `SELECT 1 FROM unspent_tracking_progress WHERE partition_index = 0 FOR UPDATE;`
+      );
+      const unchangedStart = Date.now();
+      t.false(
+        (
+          await client.query<{ repartitioned: boolean }>(
+            /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`,
+            [partitionCount]
+          )
+        ).rows[0]!.repartitioned,
+        'same partition count: nothing to do'
+      );
+      t.true(
+        Date.now() - unchangedStart < 1_000,
+        `same partition count returns at once (${
+          Date.now() - unchangedStart
+        } ms)`
+      );
+      // a batch of another partition still gets its row lock at once
+      await other.query(`SET lock_timeout = '1s';`);
+      await other.query('BEGIN;');
+      await t.notThrowsAsync(async () =>
+        other.query(
+          /* sql */ `SELECT 1 FROM unspent_tracking_progress WHERE partition_index = 1 FOR UPDATE;`
+        )
+      );
+      await other.query('ROLLBACK;');
+      // a real re-partition gives up (retried by the next pass)
+      const changeStart = Date.now();
+      const error = await t.throwsAsync(async () =>
+        client.query(
+          /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`,
+          [partitionCount + 1]
+        )
+      );
+      t.is((error as { code?: string } | undefined)?.code, '55P03');
+      t.true(
+        Date.now() - changeStart < 10_000,
+        `re-partition gave up after ${Date.now() - changeStart} ms`
+      );
+      t.is(
+        Number(
+          (
+            await client.query<{ n: string }>(
+              /* sql */ `SELECT count(*) AS n FROM unspent_tracking_progress WHERE partition_count = $1;`,
+              [partitionCount]
+            )
+          ).rows[0]!.n
+        ),
+        partitionCount,
+        'partitions unchanged'
+      );
+    } finally {
+      await holder.query('ROLLBACK;');
+      await holder.end();
+      await other.end();
+    }
+  }
+);
+
+/**
+ * From PostgreSQL 17, a scan of a temporary table reads ahead through a read
+ * stream that may pin as many local buffers as temp_buffers holds (PG 18.3):
+ * with effective_io_concurrency = 200 (the chart's value) and the default 8MB
+ * temp_buffers, a large scan fails with "no empty local buffer available".
+ * The functions that read their
+ * temporary tables cap the read-ahead (unspent_node_ids_limit_temp_read_ahead)
+ * and restore it. Here, in a session with the smallest temp_buffers (fixed
+ * by its first temporary table, as on a pooled connection) and
+ * effective_io_concurrency = 200: an uncapped copy between temporary tables
+ * larger than the local buffers fails (PG 18+), the capped copy succeeds, the
+ * settings are restored, and a backfill batch, a scope backfill and a job
+ * batch run there with every output NULL again (rolled back).
+ */
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): temporary-table reads fit the session's local buffers`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    // cspell:ignore temp_buffers xact
+    const session = new pg.Client({
+      connectionString: postgresE2eConnectionStringTestDb,
+      options: '-c temp_buffers=800kB -c effective_io_concurrency=200',
+    });
+    await session.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      const setting = async (name: string) =>
+        (
+          await session.query<{ value: string }>(
+            `SELECT current_setting($1) AS value;`,
+            [name]
+          )
+        ).rows[0]!.value;
+      const version = Number(await setting('server_version_num'));
+      t.is(await setting('effective_io_concurrency'), '200');
+      // 40,000 rows: about 180 pages, more than the 100 local buffers
+      await session.query(/* sql */ `
+        CREATE TEMP TABLE read_ahead_source (id bigint PRIMARY KEY, ids integer[] NOT NULL);
+        INSERT INTO read_ahead_source SELECT g, ARRAY[1, 2, 3] FROM generate_series(1, 40000) g;
+        CREATE TEMP TABLE read_ahead_target (id bigint PRIMARY KEY);`);
+      const copy = /* sql */ `
+        INSERT INTO read_ahead_target SELECT s.id FROM read_ahead_source s WHERE s.ids = ARRAY[1, 2, 3];`;
+      await session.query('BEGIN;');
+      const uncapped = await session.query(copy).then(
+        () => undefined,
+        (error: Error) => error.message
+      );
+      await session.query('ROLLBACK;');
+      t.log({ uncapped: uncapped ?? 'ok', version });
+      if (version >= 180000) {
+        t.is(uncapped, 'no empty local buffer available', 'the hazard');
+      }
+      await session.query('BEGIN;');
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        const previous = (
+          await session.query<{ previous: string[] | null }>(
+            `SELECT unspent_node_ids_limit_temp_read_ahead() AS previous;`
+          )
+        ).rows[0]!.previous;
+        t.log({ capped: await setting('effective_io_concurrency'), previous });
+        await session.query(copy);
+        t.is(
+          (
+            await session.query<{ n: string }>(
+              `SELECT count(*) AS n FROM read_ahead_target;`
+            )
+          ).rows[0]!.n,
+          '40000'
+        );
+        await session.query(
+          `SELECT unspent_node_ids_restore_read_ahead($1::text[]);`,
+          [previous]
+        );
+        t.is(await setting('effective_io_concurrency'), '200', 'restored');
+        /*
+         * the job's functions, in this session, with every output NULL again
+         * (their temporary tables then hold every output of the partition);
+         * the partition locks first, so none of them returns busy
+         */
+        await session.query(/* sql */ `
+          SELECT pg_advisory_xact_lock(1970172785, 0), pg_advisory_xact_lock(1970172786, 0);
+          UPDATE output SET unspent_node_ids = NULL;
+          UPDATE unspent_tracking_settings
+            SET tracking_start_transaction_internal_id = (SELECT max(internal_id) FROM transaction);
+          UPDATE unspent_tracking_progress
+            SET backfill_transaction_internal_id = 0, input_transaction_internal_id = 0, block_internal_id = 0
+            WHERE partition_index = 0;`);
+        const backfill = (
+          await session.query<{
+            result: { [key: string]: unknown };
+          }>(/* sql */ `
+            SELECT unspent_node_ids_backfill_batch(0, p.partition_count, 65536) AS result
+              FROM unspent_tracking_progress p WHERE p.partition_index = 0;`)
+        ).rows[0]!.result;
+        t.is(backfill.previousBackfillWatermark, 0, 'the backfill batch ran');
+        const scope = (
+          await session.query<{ changed: string }>(
+            `SELECT unspent_node_ids_backfill_scope(NULL, NULL) AS changed;`
+          )
+        ).rows[0]!.changed;
+        t.true(Number(scope) > 0, 'the scope backfill ran');
+        const batch = (
+          await session.query<{
+            result: { [key: string]: unknown };
+          }>(/* sql */ `
+            SELECT unspent_node_ids_run_batch(0, p.partition_count,
+              (SELECT max(internal_id) FROM transaction), (SELECT max(internal_id) FROM block),
+              (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq),
+              65536, 65536, 65536, 0) AS result
+              FROM unspent_tracking_progress p WHERE p.partition_index = 0;`)
+        ).rows[0]!.result;
+        t.log({ backfill, batch, scope });
+        t.is(batch.previousInputWatermark, 0, 'the job batch ran');
+        t.is(
+          (
+            await session.query<{ n: string }>(
+              `SELECT count(*) AS n FROM output WHERE unspent_node_ids IS NULL;`
+            )
+          ).rows[0]!.n,
+          '0',
+          'every output written'
+        );
+        t.is(
+          await setting('effective_io_concurrency'),
+          '200',
+          'restored after the batches'
+        );
+      } finally {
+        await session.query('ROLLBACK;');
+      }
+    } finally {
+      await session.end();
+    }
+  }
+);
+
+/**
+ * Re-partitioning preserves progress: each new partition (a range of first
+ * hash bytes) starts at the minimum watermarks of the old partitions whose
+ * ranges overlap its own, not at the global minimum (otherwise a change from
+ * 32 to 64 partitions would restart every partition from the lowest
+ * watermark).
+ */
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentNodeIdsEnabled
+  )}): repartition starts each partition at the overlapping old watermarks`,
+  async (t) => {
+    if (!unspentNodeIdsEnabled) {
+      t.pass();
+      return;
+    }
+    const progress = async () =>
+      (
+        await client.query<{
+          backfill: string;
+          block: string;
+          consumed: string;
+          count: number;
+          input: string;
+          partition: number;
+        }>(/* sql */ `
+SELECT partition_index AS partition, partition_count AS count,
+       input_transaction_internal_id::text AS input, block_internal_id::text AS block,
+       consumed_event_id::text AS consumed, backfill_transaction_internal_id::text AS backfill
+  FROM unspent_tracking_progress ORDER BY partition_index;`)
+      ).rows;
+    const repartition = async (count: number) =>
+      (
+        await client.query<{ repartitioned: boolean }>(
+          /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`,
+          [count]
+        )
+      ).rows[0]!.repartitioned;
+    /**
+     * Old partition p of n covers first bytes b with floor(b * n / 256) = p: the
+     * expected start of new partition q of m is the minimum over the old
+     * partitions sharing a byte with it (the global minimum if it has none).
+     */
+    const expected = (
+      old: {
+        block: string;
+        consumed: string;
+        input: string;
+        backfill: string;
+      }[],
+      m: number
+    ) =>
+      Array.from({ length: m }, (_, q) => {
+        const overlapping = Array.from({ length: 256 }, (_b, b) => b)
+          .filter((b) => Math.floor((b * m) / 256) === q)
+          .map((b) => old[Math.floor((b * old.length) / 256)]!);
+        const from = overlapping.length === 0 ? old : overlapping;
+        const min = (key: 'backfill' | 'block' | 'consumed' | 'input') =>
+          String(Math.min(...from.map((row) => Number(row[key]))));
+        return {
+          backfill: min('backfill'),
+          block: min('block'),
+          consumed: min('consumed'),
+          count: m,
+          input: min('input'),
+          partition: q,
+        };
+      });
+    await client.query('BEGIN;');
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      const initial = (await progress()).length;
+      t.true(initial > 0, 'tracking initialized');
+      if (initial !== 4) {
+        t.true(await repartition(4), 'to 4 partitions');
+      }
+      // distinct, non-monotonic watermarks per partition
+      await client.query(/* sql */ `
+UPDATE unspent_tracking_progress
+  SET input_transaction_internal_id = 1000 + 10 * ((partition_index * 7) % 4),
+      block_internal_id = 500 + (partition_index * 3) % 4,
+      consumed_event_id = 100 + (partition_index * 5) % 4,
+      backfill_transaction_internal_id = 10 + partition_index;`);
+      const transitions = [8, 3, 5, 300, 2];
+      await transitions.reduce(async (previous, m) => {
+        await previous;
+        const before = await progress();
+        t.true(await repartition(m), `to ${m} partitions`);
+        const after = await progress();
+        t.deepEqual(after, expected(before, m), `${before.length} to ${m}`);
+        t.is(
+          Math.min(...after.map((row) => Number(row.input))),
+          Math.min(...before.map((row) => Number(row.input))),
+          'global minimum unchanged'
+        );
+      }, Promise.resolve());
+      t.false(await repartition(2), 'unchanged count: no-op');
+    } finally {
+      await client.query('ROLLBACK;');
+    }
+  }
+);
+
+/* eslint-enable @typescript-eslint/no-magic-numbers */
+/* eslint-enable max-params, require-atomic-updates, @typescript-eslint/no-shadow, prefer-destructuring */
+
 /**
  * The below tests run concurrently after all serial tests have completed.
  */
@@ -3303,8 +5270,13 @@ test.serial(
         // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
         rollback().then(async () => Promise.reject(error))
     );
+    /*
+     * Either copy: the two are identical, and once Postgres has auto-analyzed
+     * `output` the managed index has expression statistics the fresh copy
+     * lacks, which tips the planner's tie towards it.
+     */
     plans.forEach((plan) => {
-      t.true(plan.includes('test_output_search_index'), plan);
+      t.true(/\b(?:test_)?output_search_index\b/u.test(plan), plan);
       t.false(plan.includes('Seq Scan'), plan);
     });
   }

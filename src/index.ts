@@ -5,10 +5,30 @@ import bitcoreP2pCash from '@chaingraph/bitcore-p2p-cash';
 
 import { Agent, cancelableDelay } from './agent.js';
 import { chaingraphInternalApiPort } from './config.js';
+import { pool, unspentNodeIdsJobPool } from './db.js';
 import { instantiateLogger } from './logging.js';
+import {
+  describePostgresError,
+  handlePoolConnectionErrors,
+} from './postgres-errors.js';
 
 const logger = instantiateLogger();
 logger.info(`Starting Chaingraph...`);
+
+handlePoolConnectionErrors(pool, (err) => {
+  logger.warn(
+    `Postgres connection lost (${describePostgresError(
+      err
+    )}); discarded it, the next query opens a new connection.`
+  );
+});
+handlePoolConnectionErrors(unspentNodeIdsJobPool, (err) => {
+  logger.warn(
+    `Unspent tracking job: Postgres connection lost (${describePostgresError(
+      err
+    )}); discarded it, the next pass opens a new connection.`
+  );
+});
 
 const shutdownTasks = [] as (() => void)[];
 const agent = new Agent({
