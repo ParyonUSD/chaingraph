@@ -98,8 +98,10 @@ const startEnvironment = async (context, label, nodeSpecs) => {
     await client.end();
   };
   try {
-    await Promise.all(nodes.map((node) => node.waitForPeer()));
-    await agent.waitForSteadyState();
+    // wait for the handshakes and steady state together: the steady-state wait
+    // carries the agent exit detection and the timeout, so an agent that exits
+    // (or stalls) before connecting fails startup instead of hanging here
+    await Promise.all([...nodes.map((node) => node.waitForPeer()), agent.waitForSteadyState()]);
     // let post-sync housekeeping (incomplete block repair, expiration scan) settle
     await new Promise((resolve) => setTimeout(resolve, 1000));
   } catch (error) {
