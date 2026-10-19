@@ -500,7 +500,7 @@ WITH serialized AS (
 expiry AS (
     SELECT node_internal_id, transaction_internal_id, replaced_at
       FROM serialized
-      CROSS JOIN unnest($1::smallint[], $2::bigint[], $3::timestamp[])
+      CROSS JOIN unnest($1::integer[], $2::bigint[], $3::timestamp[])
         AS expiry (node_internal_id, transaction_internal_id, replaced_at)
 ),
 locked AS (

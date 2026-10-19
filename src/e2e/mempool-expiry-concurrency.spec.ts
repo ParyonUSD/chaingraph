@@ -37,7 +37,7 @@ test.before(async (t) => {
 DROP SCHEMA IF EXISTS ${schema} CASCADE;
 CREATE SCHEMA ${schema};
 SET search_path = ${schema};
-CREATE TABLE node (internal_id smallint PRIMARY KEY, name text);
+CREATE TABLE node (internal_id integer PRIMARY KEY, name text);
 CREATE TABLE transaction (internal_id bigint PRIMARY KEY, hash bytea UNIQUE);
 CREATE TABLE output (transaction_hash bytea, output_index integer,
   PRIMARY KEY (transaction_hash, output_index));
@@ -45,16 +45,16 @@ CREATE TABLE input (transaction_internal_id bigint, input_index integer,
   outpoint_transaction_hash bytea, outpoint_index integer,
   PRIMARY KEY (transaction_internal_id, input_index));
 CREATE INDEX input_outpoint ON input (outpoint_transaction_hash, outpoint_index);
-CREATE TABLE node_transaction (node_internal_id smallint,
+CREATE TABLE node_transaction (node_internal_id integer,
   transaction_internal_id bigint, validated_at timestamp NOT NULL,
   PRIMARY KEY (node_internal_id, transaction_internal_id));
-CREATE TABLE node_transaction_history (node_internal_id smallint,
+CREATE TABLE node_transaction_history (node_internal_id integer,
   transaction_internal_id bigint, validated_at timestamp, replaced_at timestamp,
   PRIMARY KEY (node_internal_id, transaction_internal_id, validated_at));
 CREATE TABLE block_transaction (block_internal_id bigint,
   transaction_internal_id bigint,
   PRIMARY KEY (transaction_internal_id, block_internal_id));
-CREATE TABLE node_block (node_internal_id smallint,
+CREATE TABLE node_block (node_internal_id integer,
   block_internal_id bigint, accepted_at timestamp NOT NULL,
   PRIMARY KEY (node_internal_id, block_internal_id));
 ${cascadeFunction}
@@ -82,7 +82,9 @@ const createStaleMempool = async (db: typeof database) => {
   await db.pool.query(/* sql */ `
 TRUNCATE node, transaction, output, input, node_transaction,
   node_transaction_history, block_transaction, node_block;
-INSERT INTO node VALUES (1, 'alpha'), (2, 'beta');
+-- production node ids are integers; node registration consumes sequence
+-- values even for known nodes, so ids above the smallint range are routine
+INSERT INTO node VALUES (40001, 'alpha'), (40002, 'beta');
 INSERT INTO transaction
   SELECT id, sha256(int8send(id)) FROM generate_series(1, ${chains * depth}) id;
 INSERT INTO output SELECT hash, o FROM transaction, generate_series(0, 1) o;

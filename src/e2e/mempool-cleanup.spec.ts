@@ -25,7 +25,7 @@ test.beforeEach(async (t) => {
 BEGIN;
 SET LOCAL search_path = pg_temp;
 SET LOCAL statement_timeout = '5s';
-CREATE TEMP TABLE node (internal_id smallint PRIMARY KEY, name text);
+CREATE TEMP TABLE node (internal_id integer PRIMARY KEY, name text);
 CREATE TEMP TABLE transaction (internal_id bigint PRIMARY KEY, hash bytea UNIQUE);
 CREATE TEMP TABLE output (transaction_hash bytea, output_index integer,
   PRIMARY KEY (transaction_hash, output_index));
@@ -33,16 +33,16 @@ CREATE TEMP TABLE input (transaction_internal_id bigint, input_index integer,
   outpoint_transaction_hash bytea, outpoint_index integer,
   PRIMARY KEY (transaction_internal_id, input_index));
 CREATE INDEX input_outpoint ON input (outpoint_transaction_hash, outpoint_index);
-CREATE TEMP TABLE node_transaction (node_internal_id smallint,
+CREATE TEMP TABLE node_transaction (node_internal_id integer,
   transaction_internal_id bigint, validated_at timestamp DEFAULT '2026-01-01',
   PRIMARY KEY (node_internal_id, transaction_internal_id));
-CREATE TEMP TABLE node_transaction_history (node_internal_id smallint,
+CREATE TEMP TABLE node_transaction_history (node_internal_id integer,
   transaction_internal_id bigint, validated_at timestamp, replaced_at timestamp,
   PRIMARY KEY (node_internal_id, transaction_internal_id, validated_at));
 CREATE TEMP TABLE block_transaction (block_internal_id bigint,
   transaction_internal_id bigint,
   PRIMARY KEY (transaction_internal_id, block_internal_id));
-CREATE TEMP TABLE node_block (node_internal_id smallint,
+CREATE TEMP TABLE node_block (node_internal_id integer,
   block_internal_id bigint, accepted_at timestamp NOT NULL,
   PRIMARY KEY (node_internal_id, block_internal_id));
 INSERT INTO node VALUES (1, 'alpha'), (2, 'beta');
