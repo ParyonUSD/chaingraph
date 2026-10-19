@@ -1,6 +1,6 @@
 /* eslint-disable sort-keys, max-params */
 /**
- * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_NODE_IDS`): SQL and pure
+ * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_TRACKING`): SQL and pure
  * helpers for the tracking job and its configuration. See migration
  * `1791500000000_unspent_node_ids` for the schema, the job batch and the
  * query root.
@@ -27,7 +27,7 @@ export const coveringBytecodeMaxBytes = 1000;
  * - `category`: token outputs by (category, capability), covering every
  *   column the usual token queries read (index-only scans), for locking
  *   bytecode up to {@link coveringBytecodeMaxBytes};
- * - `category_rest`: every other stored output (no token, or a longer
+ * - `category_other`: every other stored output (no token, or a longer
  *   locking bytecode), by (category, capability), so a category filter is an
  *   index condition on both stored arms of the query root (the outputs
  *   without a token share the NULL key and deduplicate);
@@ -37,7 +37,7 @@ export const coveringBytecodeMaxBytes = 1000;
  */
 export const nodeIndexDefinitions = (nodeInternalId: number) => ({
   [`output_unspent_node_${nodeInternalId}_category_index`]: /* sql */ `CREATE INDEX output_unspent_node_${nodeInternalId}_category_index ON output USING btree (token_category, nonfungible_token_capability) INCLUDE (transaction_hash, output_index, value_satoshis, fungible_token_amount, nonfungible_token_commitment, locking_bytecode) WHERE ${nodeInternalId} = ANY (unspent_node_ids) AND token_category IS NOT NULL AND octet_length(locking_bytecode) <= ${coveringBytecodeMaxBytes};`,
-  [`output_unspent_node_${nodeInternalId}_category_rest_index`]: /* sql */ `CREATE INDEX output_unspent_node_${nodeInternalId}_category_rest_index ON output USING btree (token_category, nonfungible_token_capability) WHERE ${nodeInternalId} = ANY (unspent_node_ids) AND (token_category IS NULL OR octet_length(locking_bytecode) > ${coveringBytecodeMaxBytes});`,
+  [`output_unspent_node_${nodeInternalId}_category_other_index`]: /* sql */ `CREATE INDEX output_unspent_node_${nodeInternalId}_category_other_index ON output USING btree (token_category, nonfungible_token_capability) WHERE ${nodeInternalId} = ANY (unspent_node_ids) AND (token_category IS NULL OR octet_length(locking_bytecode) > ${coveringBytecodeMaxBytes});`,
   [`output_unspent_node_${nodeInternalId}_search_index`]: /* sql */ `CREATE INDEX output_unspent_node_${nodeInternalId}_search_index ON output USING btree (substring(locking_bytecode, 0, 26)) WHERE ${nodeInternalId} = ANY (unspent_node_ids);`,
 });
 
@@ -64,8 +64,11 @@ export const clearNodeIndexedSql = (nodeInternalId: number) =>
 export const nodeIndexNamePattern = /^output_unspent_node_\d+_/u;
 
 export const trackingTriggers = [
-  ['node_block', 'trigger_unspent_tracking_node_block_delete'],
-  ['node_transaction', 'trigger_unspent_tracking_node_transaction_delete'],
+  ['node_block', 'trigger_public_node_block_delete_unspent_tracking'],
+  [
+    'node_transaction',
+    'trigger_public_node_transaction_delete_unspent_tracking',
+  ],
 ] as const;
 
 export const trackingTriggerNames = trackingTriggers.map(([, name]) => name);
@@ -90,24 +93,24 @@ export const configureTrackingTriggersSql = (
         } TRIGGER ${name};`
     );
 
-export const readSettingsSql = /* sql */ `SELECT hash_max_transactions::text AS "hashMaxTransactions", fallback_transactions::text AS "fallbackTransactions", fallback_events::text AS "fallbackEvents" FROM unspent_tracking_settings;`;
-export const writeSettingsSql = /* sql */ `UPDATE unspent_tracking_settings SET hash_max_transactions = $1::bigint, fallback_transactions = $2::bigint, fallback_events = $3::bigint;`;
-export const buildRootSql = /* sql */ `SELECT unspent_node_ids_build_root();`;
-export const stopTrackingSql = /* sql */ `SELECT unspent_node_ids_stop() AS stopped;`;
+export const readSettingsSql = /* sql */ `SELECT read_hashed_max_transactions::text AS "readHashedMaxTransactions", read_probed_max_transactions::text AS "readProbedMaxTransactions", read_stored_max_events::text AS "readStoredMaxEvents" FROM unspent_tracking_settings;`;
+export const writeSettingsSql = /* sql */ `UPDATE unspent_tracking_settings SET read_hashed_max_transactions = $1::bigint, read_probed_max_transactions = $2::bigint, read_stored_max_events = $3::bigint;`;
+export const buildRootSql = /* sql */ `SELECT unspent_tracking_build_root();`;
+export const stopTrackingSql = /* sql */ `SELECT unspent_tracking_stop() AS stopped;`;
 /**
  * Advisory lock key serializing the agent's unspent tracking DDL (trigger
  * configuration, root builds, per-node index creation) across agents and
- * concurrent callers; `unspent_node_ids_build_root()` takes the same key.
+ * concurrent callers; `unspent_tracking_build_root()` takes the same key.
  */
 export const configurationLockKey = 1970172787;
 
 /**
  * Settling the watermark limits. The sequences are read first; after a short
- * grace the next transaction id is taken (`pg_current_xact_id()` in its own
+ * settle delay the next transaction id is taken (`pg_current_xact_id()` in its own
  * statement, so every transaction that allocated an id at or below the values
  * read has a smaller xid); once the current snapshot's xmin (the oldest xid
  * still running) has passed it, every id at or below the values read has
- * either committed or will never commit. (The grace covers the gap between a
+ * either committed or will never commit. (The settle delay covers the gap between a
  * statement's `nextval` and the assignment of its transaction id.) A
  * snapshot's in-progress list is not enough: it omits running transactions
  * whose xid is at or above the snapshot's xmax. Event ids are settled the same
@@ -122,8 +125,8 @@ SELECT
 export const nextTransactionIdSql = /* sql */ `SELECT pg_current_xact_id()::text AS "nextXid";`;
 export const snapshotSettledSql = /* sql */ `SELECT pg_snapshot_xmin(pg_current_snapshot()) > $1::xid8 AS settled;`;
 
-export const initializeSql = /* sql */ `SELECT unspent_node_ids_initialize($1::integer, $2::bigint, $3::bigint, $4::bigint) AS initialized;`;
-export const repartitionSql = /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`;
+export const initializeSql = /* sql */ `SELECT unspent_tracking_initialize($1::integer, $2::bigint, $3::bigint, $4::bigint) AS initialized;`;
+export const repartitionSql = /* sql */ `SELECT unspent_tracking_repartition($1::integer) AS repartitioned;`;
 export const progressSql = /* sql */ `
 SELECT count(*)::text AS partitions,
        min(partition_count)::text AS "partitionCount",
@@ -133,15 +136,15 @@ SELECT count(*)::text AS partitions,
        min(consumed_event_id)::text AS "consumedEventId",
        min(backfill_transaction_internal_id)::text AS "backfillWatermark",
        (SELECT backfill_complete FROM unspent_tracking_settings) AS "backfillComplete",
-       unspent_node_ids_backfill_pending() AS "backfillPending",
+       unspent_tracking_backfill_pending() AS "backfillPending",
        (SELECT rebuild_required FROM unspent_tracking_settings) AS "rebuildRequired",
-       unspent_node_ids_read_tier() AS "readTier"
+       unspent_tracking_read_mode() AS "readMode"
   FROM unspent_tracking_progress;`;
-export const runBatchSql = /* sql */ `SELECT unspent_node_ids_run_batch($1::integer, $2::integer, $3::bigint, $4::bigint, $5::bigint, $6::integer, $7::integer, $8::integer, $9::bigint) AS result;`;
-export const watchPassSql = /* sql */ `SELECT unspent_node_ids_watch_pass($1::bigint) AS result;`;
+export const runBatchSql = /* sql */ `SELECT unspent_tracking_run_batch($1::integer, $2::integer, $3::bigint, $4::bigint, $5::bigint, $6::integer, $7::integer, $8::integer, $9::bigint) AS result;`;
+export const watchPassSql = /* sql */ `SELECT unspent_tracking_watch_pass($1::bigint) AS result;`;
 
 /**
- * Result of the once-per-pass watch-set check (`unspent_node_ids_watch_pass`):
+ * Result of the once-per-pass watch-set check (`unspent_tracking_watch_pass`):
  * released transactions added, transactions watched, "accepted" events
  * written for re-acceptances, entries expired.
  */
@@ -164,14 +167,14 @@ export const parseWatchPassResult = (raw: {
   ...(raw.uninitialized === true ? { uninitialized: true } : {}),
   watched: Number(raw.watched ?? 0),
 });
-export const backfillBatchSql = /* sql */ `SELECT unspent_node_ids_backfill_batch($1::integer, $2::integer, $3::integer) AS result;`;
+export const backfillBatchSql = /* sql */ `SELECT unspent_tracking_backfill_batch($1::integer, $2::integer, $3::integer) AS result;`;
 /**
- * Whether the job must backfill whatever CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL
+ * Whether the job must backfill whatever CHAINGRAPH_UNSPENT_TRACKING_BACKFILL
  * says: a rebuild after a stop (until it completes, reads use the live
  * predicate, so the rebuild always runs).
  */
 export const rebuildRequiredSql = /* sql */ `SELECT rebuild_required AS "rebuildRequired" FROM unspent_tracking_settings;`;
-export const deleteConsumedEventsSql = /* sql */ `SELECT unspent_node_ids_delete_consumed_events()::text AS deleted;`;
+export const deleteConsumedEventsSql = /* sql */ `SELECT unspent_tracking_delete_consumed_events()::text AS deleted;`;
 /**
  * Backlog seen by the job (logs, metrics, tests): highest transaction id,
  * unconsumed events and their age.
@@ -230,7 +233,7 @@ INSERT INTO unspent_tracking_events (event_kind, node_internal_id, transaction_i
       AND nt.xmin = pg_current_xact_id()::xid;`;
 
 /**
- * Result of one job batch (`unspent_node_ids_run_batch`).
+ * Result of one job batch (`unspent_tracking_run_batch`).
  */
 export interface BatchResult {
   affected: number;
@@ -304,7 +307,7 @@ export const batchReachedLimits = (
  * Whether a partition's tracking lets the backfill run: it reached the
  * settled limits, or it has nothing left to do now but wait for a missing
  * parent output (a child saved before its parent: stalled, up to
- * CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS per transaction). A partition still
+ * CHAINGRAPH_UNSPENT_TRACKING_STALL_MAX_MS per transaction). A partition still
  * working through a backlog (the pass ran out of time) holds the backfill
  * back, so catch-ups keep priority.
  *
@@ -377,7 +380,7 @@ export interface SettledLimits {
 
 /**
  * Settling candidate: sequence values read at `readAt`, then (after the
- * grace) the next xid; usable once every xid up to it has finished.
+ * settle delay) the next xid; usable once every xid up to it has finished.
  */
 export interface SettleCandidate {
   blockLimit: number;

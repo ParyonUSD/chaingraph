@@ -29,7 +29,7 @@ import got from 'got';
 import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
-import { configureTrackingTriggersSql } from '../components/unspent-node-ids.js';
+import { configureTrackingTriggersSql } from '../components/unspent-tracking.js';
 import type * as DbModule from '../db.js';
 import type {
   ChaingraphBlock,
@@ -177,10 +177,10 @@ const e2eEnvVariables = {
   CHAINGRAPH_POSTGRES_CONNECTION_STRING: postgresE2eConnectionStringTestDb,
   CHAINGRAPH_TRUSTED_NODES: e2eTrustedNodesSet1,
   /*
-   * The unspent_node_ids tests drive the tracking job themselves; a job in the
+   * The unspent tracking tests drive the tracking job themselves; a job in the
    * spawned agents would race them (and hold the partitions they drain).
    */
-  CHAINGRAPH_UNSPENT_NODE_IDS_JOB: 'false',
+  CHAINGRAPH_UNSPENT_TRACKING_RUN_JOB: 'false',
   NODE_ENV: 'production',
   /* eslint-enable @typescript-eslint/naming-convention */
 };
@@ -816,7 +816,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
   ).rows
     .map((row) => row.indexname)
     /*
-     * CHAINGRAPH_UNSPENT_NODE_IDS=true adds three partial indexes per node
+     * CHAINGRAPH_UNSPENT_TRACKING=true adds three partial indexes per node
      * when its job starts (checked by the unspent tracking tests).
      */
     .filter((name) => !/^output_unspent_node_\d+_/u.test(name));
@@ -2757,14 +2757,14 @@ test.serial('[e2e] [api] /send-transaction: valid', async (t) => {
 
 /* eslint-disable max-params, require-atomic-updates, @typescript-eslint/no-shadow, prefer-destructuring */
 /**
- * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_NODE_IDS=true`): the
+ * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_TRACKING=true`): the
  * reference is the per-node unspent test (the semantics of the
  * `unspent_output(node_name)` query root) evaluated live for one node. Run the e2e suite with
- * `CHAINGRAPH_UNSPENT_NODE_IDS=true` (the tests below pass trivially
+ * `CHAINGRAPH_UNSPENT_TRACKING=true` (the tests below pass trivially
  * otherwise).
  */
-const unspentNodeIdsEnabled =
-  process.env.CHAINGRAPH_UNSPENT_NODE_IDS === 'true';
+const unspentTrackingEnabled =
+  process.env.CHAINGRAPH_UNSPENT_TRACKING === 'true';
 const nodeAccepts = (
   transactionInternalId: string,
   nodeId: number
@@ -2985,7 +2985,7 @@ const runUnspentTrackingScenario = async (
     await check('re-org replaced the spender (stale removed first)', db);
   } finally {
     await db.pool.end();
-    await db.unspentNodeIdsJobPool.end();
+    await db.unspentTrackingJobPool.end();
     if (originalPostgresConnectionString === undefined) {
       delete process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
     } else {
@@ -2996,7 +2996,7 @@ const runUnspentTrackingScenario = async (
 };
 
 /**
- * `CHAINGRAPH_UNSPENT_TRACKING`: concurrent parent/child saves. The agent saves
+ * `CHAINGRAPH_UNSPENT_TRACKING=true`: concurrent parent/child saves. The agent saves
  * up to 16 blocks at once; under READ COMMITTED a child's spend statement
  * cannot see its parent's uncommitted outputs, and the parent's resolve cannot
  * see the child's uncommitted inputs. The post-commit pass must close that
@@ -3032,11 +3032,11 @@ const concurrencyTransaction = (
 
 /**
  * The tracking job is driven from the tests (run the e2e suite with
- * `CHAINGRAPH_UNSPENT_NODE_IDS_JOB=false`, so the spawned agents leave it
- * alone, and a short `CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS`). After each
+ * `CHAINGRAPH_UNSPENT_TRACKING_RUN_JOB=false`, so the spawned agents leave it
+ * alone, and a short `CHAINGRAPH_UNSPENT_TRACKING_STALL_MAX_MS`). After each
  * step the query root is compared with the per-node reference before the
  * job runs (backlog correction), while it is stalled, and after it caught up,
- * for every node and read tier; then the stored values are compared too.
+ * for every node and read mode; then the stored values are compared too.
  */
 const e2eDefaultStallMaxMs = '2000';
 /*
@@ -3044,18 +3044,18 @@ const e2eDefaultStallMaxMs = '2000';
  * production default (1 minute) would make every stall in the scenario
  * below sleep for 10 minutes.
  */
-process.env.CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS ??= e2eDefaultStallMaxMs;
+process.env.CHAINGRAPH_UNSPENT_TRACKING_STALL_MAX_MS ??= e2eDefaultStallMaxMs;
 const deferredStallMaxMs = Number(
-  process.env.CHAINGRAPH_UNSPENT_NODE_IDS_STALL_MAX_MS
+  process.env.CHAINGRAPH_UNSPENT_TRACKING_STALL_MAX_MS
 );
 /**
- * The unspent_node_ids tests compare every read tier for every node after
+ * The unspent tracking tests compare every read mode for every node after
  * every step; on the e2e chain (pre-tracking, answered live) one comparison
  * takes about a second, so a test runs for minutes without finishing a test
  * (AVA's --timeout).
  */
 const unspentTestTimeoutMs = 45 * 60_000;
-const deferredReadTiers = ['auto', 'hash', 'probe', 'fallback'] as const;
+const deferredReadModes = ['auto', 'hash', 'probe', 'live'] as const;
 const deferredRows = async (sql: string, filter?: (row: string) => boolean) =>
   (await client.query<{ outpoint: string }>(sql)).rows
     .map((row) => row.outpoint)
@@ -3073,7 +3073,7 @@ const deferredSleep = async (ms: number) =>
   });
 
 /**
- * The query root equals the reference for every node and every read tier.
+ * The query root equals the reference for every node and every read mode.
  * Returns the number of comparisons.
  */
 const compareDeferredQueryRoot = async (
@@ -3091,13 +3091,13 @@ const compareDeferredQueryRoot = async (
           nodeUnspentReferenceSql(node.id),
           filter
         );
-        await deferredReadTiers.reduce<Promise<unknown>>(
-          async (tierChain, tier) =>
-            tierChain.then(async () => {
+        await deferredReadModes.reduce<Promise<unknown>>(
+          async (modeChain, mode) =>
+            modeChain.then(async () => {
               await client.query(
-                tier === 'auto'
-                  ? `RESET chaingraph.unspent_read_tier;`
-                  : `SET chaingraph.unspent_read_tier = '${tier}';`
+                mode === 'auto'
+                  ? `RESET chaingraph.unspent_read_mode;`
+                  : `SET chaingraph.unspent_read_mode = '${mode}';`
               );
               const actual = await deferredRows(
                 /* sql */ `SELECT encode(u.transaction_hash, 'hex') || ':' || u.output_index AS outpoint
@@ -3107,13 +3107,13 @@ const compareDeferredQueryRoot = async (
               t.deepEqual(
                 actual,
                 expected,
-                `${label}: node ${node.name}, tier ${tier}`
+                `${label}: node ${node.name}, mode ${mode}`
               );
               comparisons += 1;
             }),
           Promise.resolve()
         );
-        await client.query(`RESET chaingraph.unspent_read_tier;`);
+        await client.query(`RESET chaingraph.unspent_read_mode;`);
       }),
     Promise.resolve()
   );
@@ -3183,14 +3183,14 @@ const drainDeferred = async (
   label: string,
   filter?: (row: string) => boolean
 ) => {
-  const first = await db.drainUnspentNodeIdsJob(120_000);
+  const first = await db.drainUnspentTrackingJob(120_000);
   const stalled = first.stalled;
   if (stalled) {
     // a stall (child saved before its parent) does not hold the backfill back
     t.true(first.backfillReady, `${label}: backfill not gated by the stall`);
     await compareDeferredQueryRoot(t, `${label} (job stalled)`, filter);
     await deferredSleep(deferredStallMaxMs + 100);
-    const second = await db.drainUnspentNodeIdsJob(120_000);
+    const second = await db.drainUnspentTrackingJob(120_000);
     // fixtures spend outputs that never exist: the stall limit lets the job pass them
     t.true(!second.stalled, `${label}: stall resolved`);
   }
@@ -3198,11 +3198,11 @@ const drainDeferred = async (
 };
 
 test.serial(
-  `[e2e] unspent_node_ids (${String(
-    unspentNodeIdsEnabled
+  `[e2e] unspent tracking (${String(
+    unspentTrackingEnabled
   )}): deferred job and query root equal the per-node reference`,
   async (t) => {
-    if (!unspentNodeIdsEnabled) {
+    if (!unspentTrackingEnabled) {
       t.pass();
       return;
     }
@@ -3218,11 +3218,11 @@ test.serial(
       const enabledTriggers = (
         await client.query<{ tgname: string }>(/* sql */ `
         SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgenabled <> 'D'
-          AND (tgname LIKE 'trigger_unspent_%') ORDER BY tgname;`)
+          AND (tgname LIKE '%_unspent_tracking') ORDER BY tgname;`)
       ).rows.map((row) => row.tgname);
       t.deepEqual(enabledTriggers, [
-        'trigger_unspent_tracking_node_block_delete',
-        'trigger_unspent_tracking_node_transaction_delete',
+        'trigger_public_node_block_delete_unspent_tracking',
+        'trigger_public_node_transaction_delete_unspent_tracking',
       ]);
       t.is(
         Number(
@@ -3236,7 +3236,7 @@ test.serial(
         'no triggers on output, input, transaction or block_transaction'
       );
       // the agent creates them when its job starts (disabled in the e2e agents)
-      await setup.ensureUnspentNodeIdsIndexes();
+      await setup.ensureUnspentTrackingIndexes();
       const indexes = (
         await client.query<{ indexname: string }>(
           /* sql */ `SELECT indexname FROM pg_indexes WHERE indexname LIKE 'output_unspent_%' ORDER BY indexname;`
@@ -3246,7 +3246,7 @@ test.serial(
       t.is(indexes.length, nodeCount * 3, indexes.join(', '));
       t.true(
         indexes.includes('output_unspent_node_1_category_index') &&
-          indexes.includes('output_unspent_node_1_category_rest_index') &&
+          indexes.includes('output_unspent_node_1_category_other_index') &&
           indexes.includes('output_unspent_node_1_search_index'),
         indexes.join(', ')
       );
@@ -3357,7 +3357,7 @@ test.serial(
         transactionInternalId: preChildId,
       });
       // the job starts tracking at the current tip: the e2e chain stays unprocessed (NULL)
-      await setup.drainUnspentNodeIdsJob(120_000);
+      await setup.drainUnspentTrackingJob(120_000);
       trackingStart =
         Number(
           (
@@ -3423,7 +3423,7 @@ test.serial(
       await compareDeferredQueryRoot(t, 'pre-tracking release re-accepted');
     } finally {
       await setup.pool.end();
-      await setup.unspentNodeIdsJobPool.end();
+      await setup.unspentTrackingJobPool.end();
     }
     const stalls: string[] = [];
     // eslint-disable-next-line functional/no-let
@@ -3451,11 +3451,11 @@ test.serial(
 );
 
 test.serial(
-  `[e2e] unspent_node_ids (${String(
-    unspentNodeIdsEnabled
+  `[e2e] unspent tracking (${String(
+    unspentTrackingEnabled
   )}): concurrent parent/child saves with the deferred job running`,
   async (t) => {
-    if (!unspentNodeIdsEnabled) {
+    if (!unspentTrackingEnabled) {
       t.pass();
       return;
     }
@@ -3544,7 +3544,7 @@ test.serial(
       if (!saving) {
         return;
       }
-      const pass = await db.runUnspentNodeIdsJobPass({
+      const pass = await db.runUnspentTrackingJobPass({
         maxMs: 200,
         settleWaitMs: 20,
       });
@@ -3652,7 +3652,7 @@ test.serial(
     } finally {
       saving = false;
       await db.pool.end();
-      await db.unspentNodeIdsJobPool.end();
+      await db.unspentTrackingJobPool.end();
       if (originalPostgresConnectionString !== undefined) {
         process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
           originalPostgresConnectionString;
@@ -3662,11 +3662,11 @@ test.serial(
 );
 
 test.serial(
-  `[e2e] unspent_node_ids (${String(
-    unspentNodeIdsEnabled
+  `[e2e] unspent tracking (${String(
+    unspentTrackingEnabled
   )}): query root equals the per-node reference with a backlog`,
   async (t) => {
-    if (!unspentNodeIdsEnabled) {
+    if (!unspentTrackingEnabled) {
       t.pass();
       return;
     }
@@ -3844,10 +3844,10 @@ test.serial(
           await client.query<{ n: string }>(/* sql */ `
           SELECT count(*) AS n FROM output o JOIN transaction ct ON ct.hash = o.transaction_hash
             WHERE o.unspent_node_ids IS NULL
-              AND unspent_node_ids_accepting(ct.internal_id) <> '{}'
+              AND unspent_tracking_accepting(ct.internal_id) <> '{}'
               AND EXISTS (SELECT 1 FROM input i WHERE i.outpoint_transaction_hash = o.transaction_hash AND i.outpoint_index = o.output_index)
               AND NOT EXISTS (SELECT 1 FROM input i WHERE i.outpoint_transaction_hash = o.transaction_hash AND i.outpoint_index = o.output_index
-                                AND unspent_node_ids_accepting(i.transaction_internal_id) <> '{}');`)
+                                AND unspent_tracking_accepting(i.transaction_internal_id) <> '{}');`)
         ).rows[0]!.n
       );
       t.true(
@@ -3865,7 +3865,7 @@ test.serial(
       t.true(
         (
           await client.query<{ pending: boolean }>(
-            `SELECT unspent_node_ids_backfill_pending() AS pending;`
+            `SELECT unspent_tracking_backfill_pending() AS pending;`
           )
         ).rows[0]!.pending,
         'pending is derived from the backfill cursors, not the flag'
@@ -3878,7 +3878,7 @@ test.serial(
         `UPDATE unspent_tracking_settings SET backfill_complete = false;`
       );
       const backfillPass = async (remaining: number): Promise<void> => {
-        await db.runUnspentNodeIdsJobPass({
+        await db.runUnspentTrackingJobPass({
           backfill: true,
           maxMs: 60_000,
           settleWaitMs: 2_000,
@@ -3904,8 +3904,8 @@ test.serial(
       await compareDeferredStored(t, 'backfill complete (whole table)', 0);
       await compareDeferredQueryRoot(t, 'backfill complete (whole table)');
       /*
-       * Tracking stopped (CHAINGRAPH_UNSPENT_NODE_IDS=false: triggers off,
-       * then unspent_node_ids_stop()), an acceptance change while stopped
+       * Tracking stopped (CHAINGRAPH_UNSPENT_TRACKING=false: triggers off,
+       * then unspent_tracking_stop()), an acceptance change while stopped
        * (no event), then restarted at the tip: the root answers live
        * while stopped and until the rebuild (a backfill of every
        * pre-tracking output) is complete; then the stored values are exact.
@@ -3914,26 +3914,26 @@ test.serial(
         client.query(
           configureTrackingTriggersSql(enabled, {
             // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
-            trigger_unspent_tracking_node_block_delete: !enabled,
+            trigger_public_node_block_delete_unspent_tracking: !enabled,
             // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
-            trigger_unspent_tracking_node_transaction_delete: !enabled,
+            trigger_public_node_transaction_delete_unspent_tracking: !enabled,
           }).join(' ')
         );
-      const readTier = async () =>
+      const readMode = async () =>
         (
-          await client.query<{ tier: string }>(
-            `SELECT unspent_node_ids_read_tier() AS tier;`
+          await client.query<{ mode: string }>(
+            `SELECT unspent_tracking_read_mode() AS mode;`
           )
-        ).rows[0]!.tier;
+        ).rows[0]!.mode;
       await stopTriggers(false);
       t.true(
         (
           await client.query<{ stopped: boolean }>(
-            `SELECT unspent_node_ids_stop() AS stopped;`
+            `SELECT unspent_tracking_stop() AS stopped;`
           )
         ).rows[0]!.stopped
       );
-      t.is(await readTier(), 'fallback', 'stopped: live');
+      t.is(await readMode(), 'live', 'stopped: live');
       // while stopped: node A drops its mempool spender of f0:1 (no release event)
       await db.archiveMempoolTransaction({
         nodeInternalId: nodeA,
@@ -3943,7 +3943,7 @@ test.serial(
       await compareDeferredQueryRoot(t, 'tracking stopped', ours);
       await stopTriggers(true);
       // restart without the rebuild (an explicit no-backfill pass), to observe the pending state
-      await db.runUnspentNodeIdsJobPass({
+      await db.runUnspentTrackingJobPass({
         backfill: false,
         maxMs: 60_000,
         settleWaitMs: 2_000,
@@ -3955,11 +3955,11 @@ test.serial(
           )
         ).rows[0]!.rebuild
       );
-      t.is(await readTier(), 'fallback', 'rebuild pending: live');
+      t.is(await readMode(), 'live', 'rebuild pending: live');
       await compareDeferredQueryRoot(t, 'tracking restarted, rebuild pending');
-      // the default pass runs the rebuild whatever CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL says
+      // the default pass runs the rebuild whatever CHAINGRAPH_UNSPENT_TRACKING_BACKFILL says
       const rebuildPass = async (remaining: number): Promise<void> => {
-        await db.runUnspentNodeIdsJobPass({
+        await db.runUnspentTrackingJobPass({
           maxMs: 60_000,
           settleWaitMs: 2_000,
         });
@@ -3986,7 +3986,7 @@ test.serial(
       await compareDeferredQueryRoot(t, 'rebuild complete (whole table)');
     } finally {
       await db.pool.end();
-      await db.unspentNodeIdsJobPool.end();
+      await db.unspentTrackingJobPool.end();
       if (originalPostgresConnectionString !== undefined) {
         process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
           originalPostgresConnectionString;
@@ -3996,11 +3996,11 @@ test.serial(
 );
 
 test.serial(
-  `[e2e] unspent_node_ids (${String(
-    unspentNodeIdsEnabled
+  `[e2e] unspent tracking (${String(
+    unspentTrackingEnabled
   )}): events committed out of id order, watch-set re-acceptance, idle pass`,
   async (t) => {
-    if (!unspentNodeIdsEnabled) {
+    if (!unspentTrackingEnabled) {
       t.pass();
       return;
     }
@@ -4101,7 +4101,7 @@ test.serial(
         )
       ).rows.map((row) => Number(row.id));
       t.true(ids.length > 0, 'committed event visible');
-      await db.runUnspentNodeIdsJobPass({ maxMs: 5_000, settleWaitMs: 500 });
+      await db.runUnspentTrackingJobPass({ maxMs: 5_000, settleWaitMs: 500 });
       await holder.query('COMMIT;');
       await drainDeferred(t, db, 'event order: drained');
       t.is(
@@ -4141,7 +4141,7 @@ test.serial(
         /* sql */ `INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validated_at) VALUES ($1, $2, now());`,
         [nodeA, await transactionId('02')]
       );
-      const reAcceptance = await db.runUnspentNodeIdsJobPass({
+      const reAcceptance = await db.runUnspentTrackingJobPass({
         maxMs: 5_000,
         settleWaitMs: 2_000,
       });
@@ -4218,7 +4218,7 @@ test.serial(
         ours
       );
       const idleStart = Date.now();
-      const idle = await db.runUnspentNodeIdsJobPass({
+      const idle = await db.runUnspentTrackingJobPass({
         maxMs: 5_000,
         settleWaitMs: 2_000,
       });
@@ -4256,11 +4256,11 @@ test.serial(
           )
         ).rows[0]!.id
       );
-      await client.query(`SELECT unspent_node_ids_build_root();`);
+      await client.query(`SELECT unspent_tracking_build_root();`);
       const storedPath = async (name: string) =>
         (
           await client.query<{ stored: boolean }>(
-            `SELECT unspent_node_ids_stored_path($1) AS stored;`,
+            `SELECT unspent_tracking_serves_node($1) AS stored;`,
             [name]
           )
         ).rows[0]!.stored;
@@ -4279,7 +4279,7 @@ test.serial(
       await client.query(
         `UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'output_unspent_node_${nodeA}_search_index'::regclass;`
       );
-      const indexStatements = await db.ensureUnspentNodeIdsIndexes();
+      const indexStatements = await db.ensureUnspentTrackingIndexes();
       t.true(
         indexStatements.includes(
           `DROP INDEX CONCURRENTLY IF EXISTS output_unspent_node_${nodeA}_search_index;`
@@ -4316,7 +4316,7 @@ test.serial(
     } finally {
       await holder.end();
       await db.pool.end();
-      await db.unspentNodeIdsJobPool.end();
+      await db.unspentTrackingJobPool.end();
       if (originalPostgresConnectionString !== undefined) {
         process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
           originalPostgresConnectionString;
@@ -4326,18 +4326,18 @@ test.serial(
 );
 
 /**
- * Every pass calls unspent_node_ids_repartition. With the partition count
+ * Every pass calls unspent_tracking_repartition. With the partition count
  * unchanged it must not queue for the progress table lock behind a batch in
  * flight (another job's, holding its progress row): the queued EXCLUSIVE
  * request made every later batch wait behind it. A real re-partition gives up
  * after lock_timeout (55P03) instead of waiting.
  */
 test.serial(
-  `[e2e] unspent_node_ids (${String(
-    unspentNodeIdsEnabled
+  `[e2e] unspent tracking (${String(
+    unspentTrackingEnabled
   )}): repartition does not queue behind a batch in flight`,
   async (t) => {
-    if (!unspentNodeIdsEnabled) {
+    if (!unspentTrackingEnabled) {
       t.pass();
       return;
     }
@@ -4368,7 +4368,7 @@ test.serial(
       t.false(
         (
           await client.query<{ repartitioned: boolean }>(
-            /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`,
+            /* sql */ `SELECT unspent_tracking_repartition($1::integer) AS repartitioned;`,
             [partitionCount]
           )
         ).rows[0]!.repartitioned,
@@ -4393,7 +4393,7 @@ test.serial(
       const changeStart = Date.now();
       const error = await t.throwsAsync(async () =>
         client.query(
-          /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`,
+          /* sql */ `SELECT unspent_tracking_repartition($1::integer) AS repartitioned;`,
           [partitionCount + 1]
         )
       );
@@ -4428,7 +4428,7 @@ test.serial(
  * with effective_io_concurrency = 200 (the chart's value) and the default 8MB
  * temp_buffers, a large scan fails with "no empty local buffer available".
  * The functions that read their
- * temporary tables cap the read-ahead (unspent_node_ids_limit_temp_read_ahead)
+ * temporary tables cap the read-ahead (unspent_tracking_limit_temp_read_ahead)
  * and restore it. Here, in a session with the smallest temp_buffers (fixed
  * by its first temporary table, as on a pooled connection) and
  * effective_io_concurrency = 200: an uncapped copy between temporary tables
@@ -4437,11 +4437,11 @@ test.serial(
  * batch run there with every output NULL again (rolled back).
  */
 test.serial(
-  `[e2e] unspent_node_ids (${String(
-    unspentNodeIdsEnabled
+  `[e2e] unspent tracking (${String(
+    unspentTrackingEnabled
   )}): temporary-table reads fit the session's local buffers`,
   async (t) => {
-    if (!unspentNodeIdsEnabled) {
+    if (!unspentTrackingEnabled) {
       t.pass();
       return;
     }
@@ -4484,7 +4484,7 @@ test.serial(
       try {
         const previous = (
           await session.query<{ previous: string[] | null }>(
-            `SELECT unspent_node_ids_limit_temp_read_ahead() AS previous;`
+            `SELECT unspent_tracking_limit_temp_read_ahead() AS previous;`
           )
         ).rows[0]!.previous;
         t.log({ capped: await setting('effective_io_concurrency'), previous });
@@ -4498,7 +4498,7 @@ test.serial(
           '40000'
         );
         await session.query(
-          `SELECT unspent_node_ids_restore_read_ahead($1::text[]);`,
+          `SELECT unspent_tracking_restore_read_ahead($1::text[]);`,
           [previous]
         );
         t.is(await setting('effective_io_concurrency'), '200', 'restored');
@@ -4519,13 +4519,13 @@ test.serial(
           await session.query<{
             result: { [key: string]: unknown };
           }>(/* sql */ `
-            SELECT unspent_node_ids_backfill_batch(0, p.partition_count, 65536) AS result
+            SELECT unspent_tracking_backfill_batch(0, p.partition_count, 65536) AS result
               FROM unspent_tracking_progress p WHERE p.partition_index = 0;`)
         ).rows[0]!.result;
         t.is(backfill.previousBackfillWatermark, 0, 'the backfill batch ran');
         const scope = (
           await session.query<{ changed: string }>(
-            `SELECT unspent_node_ids_backfill_scope(NULL, NULL) AS changed;`
+            `SELECT unspent_tracking_backfill_scope(NULL, NULL) AS changed;`
           )
         ).rows[0]!.changed;
         t.true(Number(scope) > 0, 'the scope backfill ran');
@@ -4533,7 +4533,7 @@ test.serial(
           await session.query<{
             result: { [key: string]: unknown };
           }>(/* sql */ `
-            SELECT unspent_node_ids_run_batch(0, p.partition_count,
+            SELECT unspent_tracking_run_batch(0, p.partition_count,
               (SELECT max(internal_id) FROM transaction), (SELECT max(internal_id) FROM block),
               (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq),
               65536, 65536, 65536, 0) AS result
@@ -4572,11 +4572,11 @@ test.serial(
  * watermark).
  */
 test.serial(
-  `[e2e] unspent_node_ids (${String(
-    unspentNodeIdsEnabled
+  `[e2e] unspent tracking (${String(
+    unspentTrackingEnabled
   )}): repartition starts each partition at the overlapping old watermarks`,
   async (t) => {
-    if (!unspentNodeIdsEnabled) {
+    if (!unspentTrackingEnabled) {
       t.pass();
       return;
     }
@@ -4598,7 +4598,7 @@ SELECT partition_index AS partition, partition_count AS count,
     const repartition = async (count: number) =>
       (
         await client.query<{ repartitioned: boolean }>(
-          /* sql */ `SELECT unspent_node_ids_repartition($1::integer) AS repartitioned;`,
+          /* sql */ `SELECT unspent_tracking_repartition($1::integer) AS repartitioned;`,
           [count]
         )
       ).rows[0]!.repartitioned;

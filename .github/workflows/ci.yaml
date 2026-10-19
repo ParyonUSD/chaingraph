@@ -9,11 +9,11 @@ jobs:
       matrix:
         # 14: the oldest supported; 18.3: production. Read streams (17+)
         # behave differently with temporary tables (see the
-        # unspent_node_ids migration), so both are tested.
+        # unspent tracking migration), so both are tested.
         postgres: ['14', '18.3']
-        unspent-node-ids: ['false', 'true']
+        unspent-tracking: ['false', 'true']
     env:
-      CHAINGRAPH_UNSPENT_NODE_IDS: ${{ matrix.unspent-node-ids }}
+      CHAINGRAPH_UNSPENT_TRACKING: ${{ matrix.unspent-tracking }}
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -58,7 +58,7 @@ jobs:
         uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: e2e-test-log-pg${{ matrix.postgres }}-unspent-${{ matrix.unspent-node-ids }}
+          name: e2e-test-log-pg${{ matrix.postgres }}-unspent-${{ matrix.unspent-tracking }}
           path: data/chaingraph/log-e2e.ndjson
 
   check-yarn-cache:

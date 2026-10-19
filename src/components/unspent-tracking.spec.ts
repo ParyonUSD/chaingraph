@@ -13,13 +13,13 @@ import {
   parseBatchResult,
   partitionOf,
   readyForBackfill,
-} from './unspent-node-ids.js';
+} from './unspent-tracking.js';
 
 test('nodeIndexDefinitions: three partial indexes per node, keyed on the node id', (t) => {
   const definitions = nodeIndexDefinitions(7);
   t.deepEqual(Object.keys(definitions), [
     'output_unspent_node_7_category_index',
-    'output_unspent_node_7_category_rest_index',
+    'output_unspent_node_7_category_other_index',
     'output_unspent_node_7_search_index',
   ]);
   Object.entries(definitions).forEach(([name, definition]) => {
@@ -42,7 +42,7 @@ test('nodeIndexDefinitions: three partial indexes per node, keyed on the node id
     )
   );
   t.true(
-    definitions.output_unspent_node_7_category_rest_index!.includes(
+    definitions.output_unspent_node_7_category_other_index!.includes(
       `(token_category IS NULL OR octet_length(locking_bytecode) > ${coveringBytecodeMaxBytes})`
     )
   );
@@ -56,21 +56,21 @@ test('nodeIndexDefinitions: three partial indexes per node, keyed on the node id
 test('configureTrackingTriggersSql: only triggers whose state differs', (t) => {
   t.deepEqual(
     configureTrackingTriggersSql(true, {
-      trigger_unspent_tracking_node_block_delete: false,
-      trigger_unspent_tracking_node_transaction_delete: true,
+      trigger_public_node_block_delete_unspent_tracking: false,
+      trigger_public_node_transaction_delete_unspent_tracking: true,
     }),
     [
-      'ALTER TABLE node_block ENABLE TRIGGER trigger_unspent_tracking_node_block_delete;',
+      'ALTER TABLE node_block ENABLE TRIGGER trigger_public_node_block_delete_unspent_tracking;',
     ]
   );
   t.deepEqual(
     configureTrackingTriggersSql(false, {
-      trigger_unspent_tracking_node_block_delete: true,
-      trigger_unspent_tracking_node_transaction_delete: true,
+      trigger_public_node_block_delete_unspent_tracking: true,
+      trigger_public_node_transaction_delete_unspent_tracking: true,
     }),
     [
-      'ALTER TABLE node_block DISABLE TRIGGER trigger_unspent_tracking_node_block_delete;',
-      'ALTER TABLE node_transaction DISABLE TRIGGER trigger_unspent_tracking_node_transaction_delete;',
+      'ALTER TABLE node_block DISABLE TRIGGER trigger_public_node_block_delete_unspent_tracking;',
+      'ALTER TABLE node_transaction DISABLE TRIGGER trigger_public_node_transaction_delete_unspent_tracking;',
     ]
   );
   t.deepEqual(configureTrackingTriggersSql(true, {}), []);
