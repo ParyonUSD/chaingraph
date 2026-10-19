@@ -662,6 +662,51 @@ const waitForBlockTransactionCount = async (
   );
 };
 
+/**
+ * When several mock nodes announce the same block, the agent's "Saved new
+ * block" log line lists only the nodes whose headers arrived before the save;
+ * later announcers are recorded via "accepted existing blocks" instead. Header
+ * arrival order across peer connections isn't deterministic, so tests check
+ * the resulting node_block rows rather than the log line.
+ */
+const blockAcceptancePollingAttempts = 100;
+const blockAcceptancePollingIntervalMs = 100;
+const getAcceptingNodeNames = async (blockHash: string) =>
+  (
+    await client.query<{ nodeName: string }>(
+      /* sql */ `
+      SELECT node.name AS "nodeName"
+        FROM node_block
+        INNER JOIN node ON node.internal_id = node_block.node_internal_id
+        INNER JOIN block ON block.internal_id = node_block.block_internal_id
+        WHERE block.hash = $1
+        ORDER BY node.name;
+    `,
+      [hexToBin(blockHash)]
+    )
+  ).rows.map((row) => row.nodeName);
+const waitForBlockAcceptedByNodes = async (
+  blockHash: string,
+  expectedNodeNames: string[],
+  remainingAttempts = blockAcceptancePollingAttempts
+): Promise<string[]> => {
+  const acceptingNodeNames = await getAcceptingNodeNames(blockHash);
+  if (
+    expectedNodeNames.every((nodeName) =>
+      acceptingNodeNames.includes(nodeName)
+    ) ||
+    remainingAttempts === 0
+  ) {
+    return acceptingNodeNames;
+  }
+  await sleep(blockAcceptancePollingIntervalMs);
+  return waitForBlockAcceptedByNodes(
+    blockHash,
+    expectedNodeNames,
+    remainingAttempts - 1
+  );
+};
+
 const mempoolExpirationPollingAttempts = 50;
 const mempoolExpirationPollingIntervalMs = 100;
 const getExpiredMempoolArchiveState = async () =>
@@ -2056,10 +2101,13 @@ test.serial(
       ),
       '3 of 4 transactions should be new in tip A block 3001. Has the mockchain changed? (If so, update this test.)'
     );
-    await waitForStdout(
-      /Saved new block – height:\s+3001[^\n]+nodes: node2, node3/u
+    t.deepEqual(
+      await waitForBlockAcceptedByNodes(tipB[0]!.header.hash, [
+        'node2',
+        'node3',
+      ]),
+      ['node2', 'node3']
     );
-    t.pass();
   }
 );
 
@@ -2078,10 +2126,10 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   await waitForStdout(
     /Saved new block – height:\s+3002[^\n]+hash: a44a664d5acc560305fceb9ba3c7f195a5d78236c1705d5ae7434ba784005689[^\n]+nodes: node2/u
   );
-  await waitForStdout(
-    /Saved new block – height:\s+3002[^\n]+hash: 9c4feec6f35a54f2244f2ab14e1370e60713097be2ead8402e4ef68f96e07c8c[^\n]+nodes: node1, node3/u
+  t.deepEqual(
+    await waitForBlockAcceptedByNodes(tipA[1]!.header.hash, ['node1', 'node3']),
+    ['node1', 'node3']
   );
-  t.pass();
 });
 
 test.serial('[e2e] new block saved after reorg', async (t) => {
@@ -2124,10 +2172,13 @@ test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
     /node3: re-organization detected beginning at height: 3001. The following stale blocks were removed:/u
   );
   await waitForStdout(/Saved new block – height:\s+3006[^\n]+nodes: node1/u);
-  await waitForStdout(
-    /Saved new block – height:\s+3006[^\n]+nodes: node2, node3/u
+  t.deepEqual(
+    await waitForBlockAcceptedByNodes(tipB[tipEnd - 1]!.header.hash, [
+      'node2',
+      'node3',
+    ]),
+    ['node2', 'node3']
   );
-  t.pass();
 });
 
 test.serial('[e2e] handles re-org of 6 blocks', async (t) => {
@@ -2143,10 +2194,13 @@ test.serial('[e2e] handles re-org of 6 blocks', async (t) => {
   await waitForStdout(
     /node3: re-organization detected beginning at height: 3001. The following stale blocks were removed:/u
   );
-  await waitForStdout(
-    /Saved new block – height:\s+3007[^\n]+nodes: node1, node3/u
+  t.deepEqual(
+    await waitForBlockAcceptedByNodes(tipA[tipEnd - 1]!.header.hash, [
+      'node1',
+      'node3',
+    ]),
+    ['node1', 'node3']
   );
-  t.pass();
 });
 
 test.serial('[e2e] handles reversal of 6 block re-org', async (t) => {
@@ -2162,10 +2216,13 @@ test.serial('[e2e] handles reversal of 6 block re-org', async (t) => {
   await waitForStdout(
     /node3: re-organization detected beginning at height: 3001. The following stale blocks were removed:/u
   );
-  await waitForStdout(
-    /Saved new block – height:\s+3008[^\n]+nodes: node2, node3/u
+  t.deepEqual(
+    await waitForBlockAcceptedByNodes(tipB[tipEnd - 1]!.header.hash, [
+      'node2',
+      'node3',
+    ]),
+    ['node2', 'node3']
   );
-  t.pass();
 });
 
 /**
