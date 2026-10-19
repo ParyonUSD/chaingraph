@@ -165,8 +165,8 @@ export const getIncompleteBlocks = async ({
   /*
    * If any node has never completed an audit, every block it accepted must be
    * audited anyway, so use the original (unbounded) filter: on a full audit
-   * it is measurably cheaper than the per-node join (E13, 831k blocks: 413 s
-   * vs 552 s for the same bytes read). The per-node bounded filter is used
+   * it is measurably cheaper than the per-node join (measured on an 831k-block
+   * mainnet checkpoint: 413 s vs 552 s for the same bytes read). The per-node bounded filter is used
    * only when every node has a marker.
    */
   const minimumAuditedThrough = Math.min(...auditedThrough);
