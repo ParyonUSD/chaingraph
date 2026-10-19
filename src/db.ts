@@ -12,7 +12,7 @@ import type {
   SettledLimits,
   StallState,
   WatchPassResult,
-} from './components/unspent-node-ids.js';
+} from './components/unspent-tracking.js';
 import {
   backfillBatchSql,
   backfillPrepareSql,
@@ -49,12 +49,12 @@ import {
   transactionReacceptedEventsSql,
   watchPassSql,
   writeSettingsSql,
-} from './components/unspent-node-ids.js';
+} from './components/unspent-tracking.js';
 import {
   postgresConnectionString,
   postgresMaxConnections,
   postgresSynchronousCommit,
-  unspentNodeIds,
+  unspentTracking,
 } from './config.js';
 import type {
   ChaingraphBlock,
@@ -71,9 +71,9 @@ export const pool = new pg.Pool({
  * settling and bookkeeping), outside the agent's pool (block saves can hold
  * every pooled connection for minutes during a sync).
  */
-export const unspentNodeIdsJobPool = new pg.Pool({
+export const unspentTrackingJobPool = new pg.Pool({
   connectionString: postgresConnectionString,
-  max: unspentNodeIds.connections + 1,
+  max: unspentTracking.connections + 1,
 });
 
 /**
@@ -897,7 +897,7 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id, validat
     }
     await client.query(saveNodeValidations, [transactionInternalId]);
     if (
-      unspentNodeIds.enabled &&
+      unspentTracking.enabled &&
       Number(savedTransactionResult.rows[0]?.count ?? 0) === 0
     ) {
       /*
@@ -937,7 +937,7 @@ export const recordNodeValidation = async (
    */
   // eslint-disable-next-line functional/no-try-statement
   try {
-    if (unspentNodeIds.enabled) {
+    if (unspentTracking.enabled) {
       await client.query('BEGIN;');
     }
     await client.query(/* sql */ `
@@ -957,7 +957,7 @@ export const recordNodeValidation = async (
         CROSS JOIN known_transaction
       ON CONFLICT ON CONSTRAINT "node_transaction_pkey" DO NOTHING;
   `);
-    if (unspentNodeIds.enabled) {
+    if (unspentTracking.enabled) {
       // unspent tracking: a known transaction gains an acceptance
       const known = await client.query<{ internalId: string }>(
         /* sql */ `SELECT internal_id AS "internalId" FROM transaction WHERE hash = $1;`,
@@ -972,7 +972,7 @@ export const recordNodeValidation = async (
       await client.query('COMMIT;');
     }
   } catch (err) {
-    if (unspentNodeIds.enabled) {
+    if (unspentTracking.enabled) {
       await client.query('ROLLBACK;');
     }
     // eslint-disable-next-line functional/no-throw-statement
@@ -1220,7 +1220,7 @@ SELECT
       addBlockResult.rows[0]!.joinedTransactionCount
     );
     if (
-      unspentNodeIds.enabled &&
+      unspentTracking.enabled &&
       Number(addBlockResult.rows[0]!.insertedNodeBlockCount) > 0
     ) {
       /*
@@ -1326,7 +1326,7 @@ export const acceptBlocksViaHeaders = async (
   try {
     // unspent tracking: the inserted node_block rows are re-acceptances
     const nodeBlockInsertResult = await client.query(
-      unspentNodeIds.enabled
+      unspentTracking.enabled
         ? headersAcceptedEventsSql(nodeInternalId, insertNodeBlocks)
         : insertNodeBlocks
     );
@@ -1494,7 +1494,7 @@ JOIN pg_stat_activity a ON p.pid = a.pid;
 
 /* eslint-disable complexity, max-params, @typescript-eslint/no-magic-numbers, require-atomic-updates, @typescript-eslint/init-declarations */
 /*
- * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_NODE_IDS`): configuration,
+ * Stored per-node unspent set (`CHAINGRAPH_UNSPENT_TRACKING`): configuration,
  * per-node indexes and the tracking job. See migration
  * `1791500000000_unspent_node_ids`.
  */
@@ -1506,7 +1506,7 @@ const unspentTrackingLog: {
   info: () => undefined,
   warn: () => undefined,
 };
-export const setUnspentNodeIdsLoggers = (
+export const setUnspentTrackingLoggers = (
   loggers: typeof unspentTrackingLog
 ) => {
   unspentTrackingLog.info = loggers.info;
@@ -1523,14 +1523,14 @@ const runStatements = async (client: pg.PoolClient, statements: string[]) =>
  * Enable the release-event triggers when tracking is on, write the read
  * thresholds and rebuild the query root for the registered nodes. When
  * tracking is off on a database where it had started, disable the triggers
- * and stop tracking (`unspent_node_ids_stop()`: the query root answers with
+ * and stop tracking (`unspent_tracking_stop()`: the query root answers with
  * the live per-node test, and the next start rebuilds the stored values,
  * which stop following acceptance changes once the triggers are off). One
  * transaction, serialized across agents by an advisory lock. Returns the
  * statements run (none if the migration is missing and tracking is off).
  */
 // cspell:ignore xact
-export const configureUnspentNodeIds = async () => {
+export const configureUnspentTracking = async () => {
   const client = await pool.connect();
   // eslint-disable-next-line functional/no-try-statement
   try {
@@ -1549,35 +1549,35 @@ export const configureUnspentNodeIds = async () => {
     );
     if (Object.keys(existing).length === 0) {
       await client.query('COMMIT;');
-      if (unspentNodeIds.enabled) {
+      if (unspentTracking.enabled) {
         // eslint-disable-next-line functional/no-throw-statement
         throw new Error(
-          'CHAINGRAPH_UNSPENT_NODE_IDS=true requires migration 1791500000000_unspent_node_ids.'
+          'CHAINGRAPH_UNSPENT_TRACKING=true requires migration 1791500000000_unspent_node_ids.'
         );
       }
       return [];
     }
     const statements = configureTrackingTriggersSql(
-      unspentNodeIds.enabled,
+      unspentTracking.enabled,
       existing
     );
     await runStatements(client, statements);
-    if (!unspentNodeIds.enabled) {
+    if (!unspentTracking.enabled) {
       const stopped =
         (await client.query<{ stopped: boolean }>(stopTrackingSql)).rows[0]
           ?.stopped === true;
       await client.query('COMMIT;');
       if (stopped) {
         unspentTrackingLog.warn(
-          'Unspent tracking stopped (CHAINGRAPH_UNSPENT_NODE_IDS=false on a database where it had started): unspent_output now answers with the live predicate; enabling tracking again rebuilds the stored values (backfill) before the stored set is used.'
+          'Unspent tracking stopped (CHAINGRAPH_UNSPENT_TRACKING=false on a database where it had started): unspent_output now answers with the live predicate; enabling tracking again rebuilds the stored values (backfill) before the stored set is used.'
         );
       }
       return stopped ? [...statements, stopTrackingSql] : statements;
     }
     await client.query(writeSettingsSql, [
-      unspentNodeIds.hashMaxTransactions,
-      unspentNodeIds.fallbackTransactions,
-      unspentNodeIds.fallbackEvents,
+      unspentTracking.readHashedMaxTransactions,
+      unspentTracking.readProbedMaxTransactions,
+      unspentTracking.readStoredMaxEvents,
     ]);
     await client.query(buildRootSql);
     await client.query('COMMIT;');
@@ -1605,8 +1605,8 @@ export const configureUnspentNodeIds = async () => {
  * the concurrent builds, which run outside any transaction). Returns the
  * statements run.
  */
-export const ensureUnspentNodeIdsIndexes = async () => {
-  if (!unspentNodeIds.enabled) {
+export const ensureUnspentTrackingIndexes = async () => {
+  if (!unspentTracking.enabled) {
     return [];
   }
   const client = await pool.connect();
@@ -1692,9 +1692,9 @@ let rebuildWarned = false;
 const partitionStalls = new Map<number, StallState | undefined>();
 const partitionSkipThrough = new Map<number, number>();
 // eslint-disable-next-line functional/no-let
-let passInFlight: Promise<UnspentNodeIdsPassSummary> | undefined;
+let passInFlight: Promise<UnspentTrackingPassSummary> | undefined;
 
-export interface UnspentNodeIdsPassSummary {
+export interface UnspentTrackingPassSummary {
   backfillBatches: number;
   backfillChanged: number;
   /**
@@ -1721,8 +1721,8 @@ const sleep = async (ms: number) =>
   });
 
 /**
- * Advance `settledLimits`: read the sequences (new candidate), wait the grace,
- * take the next xid, then poll until every xid up to it has finished or
+ * Advance `settledLimits`: read the sequences (new candidate), wait the settle
+ * delay, take the next xid, then poll until every xid up to it has finished or
  * `waitMs` elapsed (the candidate is kept for the next call).
  */
 const settleLimits = async (client: pg.PoolClient, waitMs: number) => {
@@ -1744,9 +1744,10 @@ const settleLimits = async (client: pg.PoolClient, waitMs: number) => {
   }
   const candidate = settleCandidate;
   if (candidate.nextXid === undefined) {
-    const graceLeft = unspentNodeIds.graceMs - (Date.now() - candidate.readAt);
-    if (graceLeft > 0) {
-      await sleep(graceLeft);
+    const settleLeft =
+      unspentTracking.settleMs - (Date.now() - candidate.readAt);
+    if (settleLeft > 0) {
+      await sleep(settleLeft);
     }
     candidate.nextXid = (
       await client.query<{ nextXid: string }>(nextTransactionIdSql)
@@ -1802,7 +1803,7 @@ const runPartitionBatch = async (
     partitionSkipThrough.get(partition) ?? 0,
     partitionStalls.get(partition),
     Date.now(),
-    unspentNodeIds.stallMaxMs,
+    unspentTracking.stallMaxMs,
     limits.transactionLimit
   );
   partitionSkipThrough.set(partition, skipThrough);
@@ -1816,7 +1817,7 @@ const runPartitionBatch = async (
         limits.transactionLimit,
         limits.blockLimit,
         limits.eventLimit,
-        Math.max(unspentNodeIds.batchInputs * partitionCount, 1),
+        Math.max(unspentTracking.batchInputs * partitionCount, 1),
         maxBlocks,
         maxEvents,
         skipThrough,
@@ -1854,7 +1855,7 @@ const runBackfillBatch = async (
     const raw = (
       await client.query<{ result: { [key: string]: unknown } }>(
         backfillBatchSql,
-        [partition, partitionCount, unspentNodeIds.backfillPrefixes]
+        [partition, partitionCount, unspentTracking.backfillBatchPrefixes]
       )
     ).rows[0]!.result;
     await client.query('COMMIT;');
@@ -1965,22 +1966,22 @@ const ensureInitialized = async (
     (
       await client.query<{ initialized: boolean }>(initializeSql, [
         partitionCount,
-        unspentNodeIds.startAtGenesis ? 0 : limits.transactionLimit,
-        unspentNodeIds.startAtGenesis ? 0 : limits.blockLimit,
+        unspentTracking.startAtGenesis ? 0 : limits.transactionLimit,
+        unspentTracking.startAtGenesis ? 0 : limits.blockLimit,
         limits.eventLimit,
       ])
     ).rows[0]?.initialized === true;
   if (initialized) {
     unspentTrackingLog.info(
       `Unspent tracking job: tracking started at ${
-        unspentNodeIds.startAtGenesis
+        unspentTracking.startAtGenesis
           ? 'genesis'
           : `transaction ${limits.transactionLimit} / block ${limits.blockLimit}; the stored values of earlier outputs are used once backfilled`
       } (${partitionCount} partitions).`
     );
-    if (!unspentNodeIds.startAtGenesis && !unspentNodeIds.backfill) {
+    if (!unspentTracking.startAtGenesis && !unspentTracking.backfill) {
       unspentTrackingLog.warn(
-        'Unspent tracking job: CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false, so outputs saved before tracking started are not backfilled, and unspent_output answers with the live predicate (exact, but slow) until a backfill completes (unspent_tracking_settings.backfill_complete).'
+        'Unspent tracking job: CHAINGRAPH_UNSPENT_TRACKING_BACKFILL=false, so outputs saved before tracking started are not backfilled, and unspent_output answers with the live predicate (exact, but slow) until a backfill completes (unspent_tracking_settings.backfill_complete).'
       );
     }
     return;
@@ -2016,17 +2017,17 @@ const ensureInitialized = async (
  * up or only stalled on missing parents (`readyForBackfill`), backfill.
  * Concurrent callers share the pass in flight.
  */
-export const runUnspentNodeIdsJobPass = async (
+export const runUnspentTrackingJobPass = async (
   options: { backfill?: boolean; maxMs?: number; settleWaitMs?: number } = {}
-): Promise<UnspentNodeIdsPassSummary> => {
+): Promise<UnspentTrackingPassSummary> => {
   if (passInFlight !== undefined) {
     return passInFlight;
   }
-  const partitionCount = unspentNodeIds.connections;
+  const partitionCount = unspentTracking.connections;
   const start = Date.now();
-  const maxMs = options.maxMs ?? unspentNodeIds.passMaxMs;
-  const pass = async (): Promise<UnspentNodeIdsPassSummary> => {
-    const summary: UnspentNodeIdsPassSummary = {
+  const maxMs = options.maxMs ?? unspentTracking.passMaxMs;
+  const pass = async (): Promise<UnspentTrackingPassSummary> => {
+    const summary: UnspentTrackingPassSummary = {
       backfillBatches: 0,
       backfillChanged: 0,
       backfillReady: false,
@@ -2041,15 +2042,15 @@ export const runUnspentNodeIdsJobPass = async (
       stalled: false,
       watch: undefined,
     };
-    if (!unspentNodeIds.enabled) {
+    if (!unspentTracking.enabled) {
       return summary;
     }
-    const coordinator = await unspentNodeIdsJobPool.connect();
+    const coordinator = await unspentTrackingJobPool.connect();
     // eslint-disable-next-line functional/no-try-statement
     try {
       await settleLimits(
         coordinator,
-        options.settleWaitMs ?? Math.max(unspentNodeIds.graceMs * 5, 1_000)
+        options.settleWaitMs ?? Math.max(unspentTracking.settleMs * 5, 1_000)
       );
       const limits = settledLimits;
       if (limits === undefined) {
@@ -2059,7 +2060,7 @@ export const runUnspentNodeIdsJobPass = async (
       summary.watch = await runWatchPass(coordinator, limits);
       const partitionResults = await Promise.all(
         Array.from({ length: partitionCount }, async (_, partition) => {
-          const client = await unspentNodeIdsJobPool.connect();
+          const client = await unspentTrackingJobPool.connect();
           const state = {
             batches: 0,
             caughtUp: false,
@@ -2142,21 +2143,21 @@ export const runUnspentNodeIdsJobPass = async (
             rebuildRequiredSql
           )
         ).rows[0]?.rebuildRequired === true;
-      if (rebuildRequired && !unspentNodeIds.backfill && !rebuildWarned) {
+      if (rebuildRequired && !unspentTracking.backfill && !rebuildWarned) {
         rebuildWarned = true;
         unspentTrackingLog.warn(
-          'Unspent tracking job: a rebuild after a stop is pending; it runs although CHAINGRAPH_UNSPENT_NODE_IDS_BACKFILL=false (until it completes, unspent_output answers with the live predicate).'
+          'Unspent tracking job: a rebuild after a stop is pending; it runs although CHAINGRAPH_UNSPENT_TRACKING_BACKFILL=false (until it completes, unspent_output answers with the live predicate).'
         );
       }
       if (
-        (options.backfill ?? (unspentNodeIds.backfill || rebuildRequired)) &&
+        (options.backfill ?? (unspentTracking.backfill || rebuildRequired)) &&
         summary.backfillReady &&
         Date.now() - start < maxMs &&
         (await prepareBackfill(coordinator, limits))
       ) {
         const backfillResults = await Promise.all(
           Array.from({ length: partitionCount }, async (_, partition) => {
-            const client = await unspentNodeIdsJobPool.connect();
+            const client = await unspentTrackingJobPool.connect();
             const state = { batches: 0, changed: 0, stale: false };
             // eslint-disable-next-line functional/no-try-statement
             try {
@@ -2233,8 +2234,8 @@ export const runUnspentNodeIdsJobPass = async (
  * read now and every partition's last batch found nothing left (a stalled
  * partition counts as done once its stall persists).
  */
-export const drainUnspentNodeIdsJob = async (timeoutMs = 120_000) => {
-  const client = await unspentNodeIdsJobPool.connect();
+export const drainUnspentTrackingJob = async (timeoutMs = 120_000) => {
+  const client = await unspentTrackingJobPool.connect();
   const target = await client
     .query<{
       blockLimit: string;
@@ -2246,14 +2247,14 @@ export const drainUnspentNodeIdsJob = async (timeoutMs = 120_000) => {
       client.release();
     });
   const start = Date.now();
-  const attempt = async (): Promise<UnspentNodeIdsPassSummary> => {
-    const summary = await runUnspentNodeIdsJobPass({
+  const attempt = async (): Promise<UnspentTrackingPassSummary> => {
+    const summary = await runUnspentTrackingJobPass({
       maxMs: timeoutMs,
       settleWaitMs: 2_000,
     });
     const limits = settledLimits;
     const done =
-      !unspentNodeIds.enabled ||
+      !unspentTracking.enabled ||
       (limits !== undefined &&
         limits.transactionLimit >= Number(target.transactionLimit) &&
         limits.blockLimit >= Number(target.blockLimit) &&
@@ -2286,11 +2287,11 @@ export const drainUnspentNodeIdsJob = async (timeoutMs = 120_000) => {
 /**
  * The job's watermarks and backlog (logs, metrics, tests).
  */
-export const getUnspentNodeIdsStatus = async () => {
-  if (!unspentNodeIds.enabled) {
+export const getUnspentTrackingStatus = async () => {
+  if (!unspentTracking.enabled) {
     return undefined;
   }
-  const client = await unspentNodeIdsJobPool.connect();
+  const client = await unspentTrackingJobPool.connect();
   // eslint-disable-next-line functional/no-try-statement
   try {
     const [progress] = (
