@@ -1,5 +1,5 @@
 /**
- * Spawn a built chaingraph agent (any revision) against the gate's mock nodes.
+ * Spawn a built chaingraph agent (any revision) against the check's mock nodes.
  */
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -38,7 +38,7 @@ export class AgentProcess {
         CHAINGRAPH_POSTGRES_MAX_CONNECTIONS: String(settings.postgresMaxConnections),
         CHAINGRAPH_TRUSTED_NODES: trustedNodes,
         HOME: process.env.HOME,
-        INGESTION_GATE_HEAP_SAMPLES: this.heapSamplePath,
+        INGESTION_CHECK_HEAP_SAMPLES: this.heapSamplePath,
         NODE_ENV: 'production',
         PATH: process.env.PATH,
       },

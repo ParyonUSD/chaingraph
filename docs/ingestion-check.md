@@ -1,39 +1,39 @@
-# Ingestion gate
+# Ingestion check
 
 A reproducible local harness that every schema or agent change must pass
 **before** query benchmarking. It exists because an earlier schema experiment
 (since abandoned) passed every query benchmark and then turned out to serialise
 ingestion (6,578 tx/s → 2 tx/s in production; a 31.75 MB block went from 4.2 s
-to 27.4 s). Query benchmarks only look at reads; this gate looks at writes.
+to 27.4 s). Query benchmarks only look at reads; this check looks at writes.
 
-The gate runs the real agent (`bin/chaingraph.js` of any built checkout)
+The check runs the real agent (`bin/chaingraph.js` of any built checkout)
 against mock P2P nodes (the same `@chaingraph/bitcore-p2p-cash` approach as
 `src/e2e/e2e.spec.ts`, no BCHN needed) and a throwaway Postgres, then prints a
-table, writes `ingestion-gate.json`, and exits non-zero if any scenario errors,
+table, writes `ingestion-check.json`, and exits non-zero if any scenario errors,
 fails a correctness check or crosses a threshold.
 
 ## Running
 
 ```sh
-yarn test:ingestion-gate        # yarn build, then all scenarios (~1 min on an M-series laptop; ~5 min for a regressed build)
-yarn ingestion-gate             # same, without rebuilding
-yarn ingestion-gate --scenarios max-block,burst --quick
+yarn test:ingestion-check        # yarn build, then all scenarios (~1 min on an M-series laptop; ~5 min for a regressed build)
+yarn ingestion-check             # same, without rebuilding
+yarn ingestion-check --scenarios max-block,burst --quick
 ```
 
-Options (`node scripts/ingestion-gate/run.mjs --help`):
+Options (`node scripts/ingestion-check/run.mjs --help`):
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--agent-dir <dir>` | this checkout | Built chaingraph checkout to test (needs `build/` and `node_modules/`). Migrations are taken from the same dir. |
 | `--scenarios a,b` | all | Subset of `max-block,burst,reorg,concurrent,catch-up`. |
 | `--quick` | off | Catch-up with 1,000 instead of 10,000 blocks. |
-| `--thresholds <file>` | `scripts/ingestion-gate/thresholds.json` | Threshold file (see below). |
-| `--out <file>` | `ingestion-gate.json` | Machine-readable report (gitignored). |
+| `--thresholds <file>` | `scripts/ingestion-check/thresholds.json` | Threshold file (see below). |
+| `--out <file>` | `ingestion-check.json` | Machine-readable report (gitignored). |
 | `--pg auto\|docker\|host` | `auto` | Postgres backend (see below). |
-| `--pg-image` | `postgres:18` | Docker image (`INGESTION_GATE_PG_IMAGE`). |
-| `--pg-bin` | `/opt/homebrew/opt/postgresql@18/bin` | Host binaries for `--pg host` (`INGESTION_GATE_PG_BIN`). |
+| `--pg-image` | `postgres:18` | Docker image (`INGESTION_CHECK_PG_IMAGE`). |
+| `--pg-bin` | `/opt/homebrew/opt/postgresql@18/bin` | Host binaries for `--pg host` (`INGESTION_CHECK_PG_BIN`). |
 | `--pg-port` | `55432` | Port for the throwaway server. |
-| `--pg-url` | – | Use an existing server instead (`postgres://user:pass@host:port`; the gate creates/drops `chaingraph_ingestion_gate`). |
+| `--pg-url` | – | Use an existing server instead (`postgres://user:pass@host:port`; the check creates/drops `chaingraph_ingestion_check`). |
 | `--keep-pg` | off | Leave the server and last scenario DB running for inspection. |
 | `--seed` | `1` | Fixture seed. |
 | `--label` | – | Free text stored in the report. |
@@ -43,17 +43,17 @@ memory (the agent sends each block as a few very large statements), so the
 3-block burst needs ~10 GB. On a Docker Desktop VM with the default 8 GB the
 burst is OOM-killed. `--pg auto` therefore uses Docker only when the VM has
 ≥ 14 GB, otherwise a private host cluster (`initdb` into
-`data/ingestion-gate/pg-<pid>`, trust auth on 127.0.0.1, deleted afterwards).
+`data/ingestion-check/pg-<pid>`, trust auth on 127.0.0.1, deleted afterwards).
 Both use `shared_buffers=256MB, max_wal_size=8GB, checkpoint_timeout=30min`.
 
 **What is pinned** so runs are comparable: agent env
 `CHAINGRAPH_BLOCK_BUFFER_TARGET_SIZE_MB=128` (auto-sizing depends on free
 memory), `CHAINGRAPH_POSTGRES_MAX_CONNECTIONS=8` (default is CPU count),
 `NODE_ENV=production`, stdout at `info`, a debug log per scenario under
-`data/ingestion-gate/runs/<timestamp>/<scenario>/`.
+`data/ingestion-check/runs/<timestamp>/<scenario>/`.
 
 **Fixtures** are generated deterministically (AES-CTR stream keyed by the
-seed) and cached under `data/ingestion-gate/fixtures/` (gitignored, ~320 MB).
+seed) and cached under `data/ingestion-check/fixtures/` (gitignored, ~320 MB).
 Only transaction payloads are cached; headers are built at run time with a
 fresh timestamp so blocks attach to each scenario's base chain and count as
 "live" blocks. Transactions are 1-input/2-output, ~318 bytes, P2PKH outputs,
@@ -76,7 +76,7 @@ indexes built, triggers enabled – the production write path), then measure.
 - **tx/s** – `block_transaction` rows of the measured blocks ÷ wall time. The
   agent's "active seconds" statistics are deliberately not used.
 - **WAL** – `pg_wal_lsn_diff(pg_current_wal_lsn(), start)` across the window
-  (cluster-wide; the server is private to the gate).
+  (cluster-wide; the server is private to the check).
 - **Peak heap** – the agent is started with `node --import
   lib/heap-sampler.mjs`, which logs `process.memoryUsage()` every 100 ms; the
   report takes the max `heapUsed` in the window. Sampling pauses while the main
@@ -94,7 +94,7 @@ indexes built, triggers enabled – the production write path), then measure.
 
 ## Thresholds
 
-`scripts/ingestion-gate/thresholds.json`:
+`scripts/ingestion-check/thresholds.json`:
 
 ```json
 {
@@ -108,7 +108,7 @@ indexes built, triggers enabled – the production write path), then measure.
 
 `max*` keys fail when the metric is above the limit, `min*` keys when below.
 `knownFailingChecks` lists substrings of correctness checks that are known to
-fail on master; they are reported as `PASS*` instead of failing the gate.
+fail on master; they are reported as `PASS*` instead of failing the check.
 Remove an entry as soon as the underlying bug is fixed.
 
 **How the defaults were chosen.** From three master runs and one baseline b19783b run
@@ -119,7 +119,7 @@ reference run (max-block 10 s vs 5.2 s; burst 30 s vs 12.4 s; reorg 6 s vs
 bimodal at ~715 or ~950 blocks/s run-to-run on this machine), concurrency
 ratio 0.6 (reference 0.79–0.80; full serialisation gives ≤ 0.5). A plain 3×
 time limit would *not* have caught the abandoned experiment e800183 on max-block wall time alone
-(2.4×), which is why WAL is gated tighter.
+(2.4×), which is why the WAL threshold is tighter.
 
 **Calibrating on a new machine.**
 
@@ -128,7 +128,7 @@ time limit would *not* have caught the abandoned experiment e800183 on max-block
    current master into separate directories, e.g.
    `git archive b19783b | tar -x -C /tmp/agents/b19783b`, symlink
    `node_modules`, run `./node_modules/.bin/tsc`.
-2. Run the gate on each two or three times with `--agent-dir` and keep the
+2. Run the check on each two or three times with `--agent-dir` and keep the
    JSON reports.
 3. Set time limits to ~2× the slowest reference run, WAL to ~1.5×, heap to
    ~2×, `minBlocksPerSecond` to ~0.4× of the slowest run; keep
@@ -152,18 +152,18 @@ five scenarios.
 | reorg converge | 1.26 s | 1.31–1.36 s | **35.34 s** |
 | concurrent ratio (together vs alone+alone tx/s) | 0.79 (32,953 vs 20,935 + 20,984) | 0.79–0.80 (~33,000 vs ~20,700 + ~21,100) | **0.39** (4,696 vs 7,305 + 4,653) |
 | catch-up 10,000 blocks | 950 blocks/s | 715–950 blocks/s | **130 blocks/s** |
-| whole gate | 58 s | 58–62 s | 288 s |
+| whole check | 58 s | 58–62 s | 288 s |
 
 ## Adding a scenario
 
-1. Write `async (context) => result` in `scripts/ingestion-gate/lib/scenarios.mjs`
+1. Write `async (context) => result` in `scripts/ingestion-check/lib/scenarios.mjs`
    and register it in `scenarios`. Use `startEnvironment(context, label,
    [nodeSpec…])` to get `{ agent, client, nodes, cleanup }` in steady state,
    `loadOrGenerateBlockSequence` for cached fixtures, `linkBlocks` to attach
    payloads to a node's tip, and `measureIngestion` for the standard
    announce → wait → metrics flow. Always `cleanup()` in `finally`.
 2. Return `correct` (or `checks` + `failedChecks`) plus the metrics you want to
-   gate; compute rates from DB row counts and wall clock.
+   check; compute rates from DB row counts and wall clock.
 3. Add `[metric, thresholdKey, 'max'|'min']` rules to `thresholdRules` in
    `run.mjs`, a headline in `summaryColumns`, and defaults in
    `thresholds.json`. Calibrate as above and document it here.
@@ -176,15 +176,15 @@ five scenarios.
   the response are blocks the agent already has. `BlockTree.updateHeaders`
   splices them out as "stale" anyway, and the agent's async
   `removeStaleBlocksForNode` races `acceptBlocksViaHeaders`, leaving those
-  blocks without `node_block` rows for the node. The gate's mock reproduces
+  blocks without `node_block` rows for the node. The check's mock reproduces
   this (fork at height 5, locator falls back to genesis); allow-listed in
   `thresholds.json` until fixed.
 - Postgres memory per 32 MB block save is ~3 GB (see backend note). Not
-  gated yet; TODO: sample `docker stats`/backend RSS and gate on it.
+  checked yet; TODO: sample `docker stats`/backend RSS and check it.
 - TODO: optionally pre-fill `transaction`/`input`/`output` with millions of
   rows so planner regressions that only appear on large tables (e.g. the
   block-confirmation conflict lookup scanning `input`) show up; currently all
   tables are small.
 - TODO: mempool-heavy variant (confirming thousands of mempool txs per block).
-- TODO: repeat each timing N times and gate on the median to reduce noise.
+- TODO: repeat each timing N times and check the median to reduce noise.
 - TODO: run in CI (needs a ≥ 14 GB runner or `--quick` with a smaller dense block).

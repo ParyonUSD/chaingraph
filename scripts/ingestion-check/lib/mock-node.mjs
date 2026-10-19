@@ -53,7 +53,7 @@ export class MockNode {
     this.mempool = new Map();
     this.peer = undefined;
     this.readyWaiters = [];
-    const networkName = `ingestion-gate-${name}-${port}`;
+    const networkName = `ingestion-check-${name}-${port}`;
     if (!registeredNetworks.has(networkName)) {
       Networks.add({ name: networkName, networkMagic: parseInt(magicHex, 16), port });
       registeredNetworks.add(networkName);
@@ -62,7 +62,7 @@ export class MockNode {
       dnsSeed: false,
       listenAddr: false,
       network: networkName,
-      subversion: userAgent ?? `/ingestion-gate-${name}:0.0.0/`,
+      subversion: userAgent ?? `/ingestion-check-${name}:0.0.0/`,
       version: 70016,
     });
     this.pool.on('peerready', (peer) => {

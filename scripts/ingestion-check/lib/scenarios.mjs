@@ -1,5 +1,5 @@
 /**
- * Ingestion gate scenarios. Each scenario gets a fresh database (all
+ * Ingestion check scenarios. Each scenario gets a fresh database (all
  * migrations of the agent under test), fresh mock nodes and a fresh agent,
  * waits until the agent reaches steady state (initial sync done, managed
  * indexes built, mempool tracking enabled – i.e. the production write path,
@@ -30,7 +30,7 @@ const mainnetLikeMagic = magicFromLabel('grph');
 const chipnetLikeMagic = magicFromLabel('grpc');
 /* eslint-enable no-bitwise */
 
-const databaseName = 'chaingraph_ingestion_gate';
+const databaseName = 'chaingraph_ingestion_check';
 const baseChainLength = 5;
 let nonceCounter = 1;
 let nextPort = 19433;

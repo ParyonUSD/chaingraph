@@ -16,5 +16,5 @@ data
 client/generated
 .scratch
 
-# ingestion gate report (fixtures/runs live under data/)
-ingestion-gate.json
+# ingestion check report (fixtures/runs live under data/)
+ingestion-check.json

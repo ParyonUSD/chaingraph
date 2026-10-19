@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Chaingraph ingestion gate – see docs/ingestion-gate.md.
+ * Chaingraph ingestion check – see docs/ingestion-check.md.
  *
- *   yarn ingestion-gate [--agent-dir <built chaingraph checkout>]
+ *   yarn ingestion-check [--agent-dir <built chaingraph checkout>]
  *                       [--scenarios max-block,burst,reorg,concurrent,catch-up]
  *                       [--quick] [--thresholds <file.json>] [--out <file.json>] [--keep-pg]
  *                       [--pg auto|docker|host] [--pg-image postgres:18] [--pg-bin <dir>]
@@ -27,16 +27,16 @@ const repositoryRoot = resolve(harnessDirectory, '../..');
 const { values: options } = parseArgs({
   options: {
     'agent-dir': { default: repositoryRoot, type: 'string' },
-    'cache-dir': { default: join(repositoryRoot, 'data/ingestion-gate/fixtures'), type: 'string' },
+    'cache-dir': { default: join(repositoryRoot, 'data/ingestion-check/fixtures'), type: 'string' },
     quick: { default: false, type: 'boolean' },
     help: { default: false, type: 'boolean' },
     'keep-pg': { default: false, type: 'boolean' },
     label: { type: 'string' },
-    out: { default: 'ingestion-gate.json', type: 'string' },
-    pg: { default: process.env.INGESTION_GATE_PG ?? 'auto', type: 'string' },
-    'pg-bin': { default: process.env.INGESTION_GATE_PG_BIN ?? '/opt/homebrew/opt/postgresql@18/bin', type: 'string' },
-    'pg-image': { default: process.env.INGESTION_GATE_PG_IMAGE ?? 'postgres:18', type: 'string' },
-    'pg-port': { default: process.env.INGESTION_GATE_PG_PORT ?? '55432', type: 'string' },
+    out: { default: 'ingestion-check.json', type: 'string' },
+    pg: { default: process.env.INGESTION_CHECK_PG ?? 'auto', type: 'string' },
+    'pg-bin': { default: process.env.INGESTION_CHECK_PG_BIN ?? '/opt/homebrew/opt/postgresql@18/bin', type: 'string' },
+    'pg-image': { default: process.env.INGESTION_CHECK_PG_IMAGE ?? 'postgres:18', type: 'string' },
+    'pg-port': { default: process.env.INGESTION_CHECK_PG_PORT ?? '55432', type: 'string' },
     'pg-url': { type: 'string' },
     scenarios: { default: Object.keys(scenarios).join(','), type: 'string' },
     seed: { default: '1', type: 'string' },
@@ -49,7 +49,7 @@ if (options.help) {
   process.exit(0);
 }
 
-const log = (message) => console.log(`[ingestion-gate ${new Date().toISOString().slice(11, 19)}] ${message}`);
+const log = (message) => console.log(`[ingestion-check ${new Date().toISOString().slice(11, 19)}] ${message}`);
 const agentDirectory = resolve(options['agent-dir']);
 const thresholds = JSON.parse(readFileSync(options.thresholds, 'utf8'));
 const selectedScenarios = options.scenarios.split(',').map((name) => name.trim()).filter(Boolean);
@@ -81,7 +81,7 @@ const settings = {
 };
 
 const runId = new Date().toISOString().replace(/[:.]/g, '-');
-const runDirectory = join(repositoryRoot, 'data/ingestion-gate/runs', runId);
+const runDirectory = join(repositoryRoot, 'data/ingestion-check/runs', runId);
 mkdirSync(runDirectory, { recursive: true });
 
 let postgresServer;
@@ -104,12 +104,12 @@ const startPostgres = async () => {
     const hostAvailable = existsSync(join(options['pg-bin'], 'pg_ctl'));
     mode = dockerMemory >= minimumDockerMemoryBytes || !hostAvailable ? 'docker' : 'host';
     log(`--pg auto: Docker VM memory ${(dockerMemory / 1e9).toFixed(1)} GB, host binaries ${hostAvailable ? 'found' : 'not found'} -> ${mode}`);
-    if (mode === 'docker' && dockerMemory < minimumDockerMemoryBytes) log('WARNING: Docker VM has < 14 GB; the burst scenario may be OOM-killed (see docs/ingestion-gate.md).');
+    if (mode === 'docker' && dockerMemory < minimumDockerMemoryBytes) log('WARNING: Docker VM has < 14 GB; the burst scenario may be OOM-killed (see docs/ingestion-check.md).');
   }
   const port = Number(options['pg-port']);
   return mode === 'host'
-    ? startHostPostgres({ binDirectory: options['pg-bin'], dataDirectory: join(repositoryRoot, `data/ingestion-gate/pg-${process.pid}`), log, port })
-    : startDockerPostgres({ image: options['pg-image'], log, name: `chaingraph-ingestion-gate-pg-${process.pid}`, port });
+    ? startHostPostgres({ binDirectory: options['pg-bin'], dataDirectory: join(repositoryRoot, `data/ingestion-check/pg-${process.pid}`), log, port })
+    : startDockerPostgres({ image: options['pg-image'], log, name: `chaingraph-ingestion-check-pg-${process.pid}`, port });
 };
 process.on('SIGINT', () => cleanupAndExit(130));
 process.on('SIGTERM', () => cleanupAndExit(143));
@@ -178,7 +178,7 @@ const summaryColumns = (name, result) => {
 };
 
 const main = async () => {
-  const gateStarted = Date.now();
+  const checkStarted = Date.now();
   postgresServer = await startPostgres();
   const { baseUrl } = postgresServer;
   const report = {
@@ -197,7 +197,7 @@ const main = async () => {
     runDirectory,
     scenarios: {},
     settings: { ...settings, quick: options.quick, seed: options.seed },
-    startedAt: new Date(gateStarted).toISOString(),
+    startedAt: new Date(checkStarted).toISOString(),
     thresholds,
   };
   log(`agent under test: ${agentDirectory} @ ${report.agent.revision}`);
@@ -226,9 +226,9 @@ const main = async () => {
     log(`scenario ${name}: ${entry.passed ? 'PASS' : 'FAIL'} (${entry.scenarioSeconds.toFixed(0)} s)${entry.failures.length ? ` – ${entry.failures.join('; ')}` : ''}`);
     writeFileSync(options.out, `${JSON.stringify(report, null, 2)}\n`);
   }
-  if (options['keep-pg']) log(`--keep-pg: leaving Postgres running at ${baseUrl}/chaingraph_ingestion_gate (stop it yourself)`);
-  else await dropDatabase({ baseUrl, databaseName: 'chaingraph_ingestion_gate' }).catch(() => {});
-  report.totalSeconds = (Date.now() - gateStarted) / 1000;
+  if (options['keep-pg']) log(`--keep-pg: leaving Postgres running at ${baseUrl}/chaingraph_ingestion_check (stop it yourself)`);
+  else await dropDatabase({ baseUrl, databaseName: 'chaingraph_ingestion_check' }).catch(() => {});
+  report.totalSeconds = (Date.now() - checkStarted) / 1000;
   writeFileSync(options.out, `${JSON.stringify(report, null, 2)}\n`);
 
   const rows = selectedScenarios.map((name) => {
@@ -242,7 +242,7 @@ const main = async () => {
   const line = (cells) => cells.map((cell, index) => String(cell).padEnd(widths[index])).join(' | ');
   console.log(`\n${line(header)}\n${widths.map((width) => '-'.repeat(width)).join('-|-')}\n${rows.map(line).join('\n')}\n`);
   selectedScenarios.forEach((name) => (report.scenarios[name].result?.knownFailures ?? []).forEach((check) => log(`PASS* ${name}: known failing check (allow-listed in thresholds): ${check}`)));
-  log(`total ${report.totalSeconds.toFixed(0)} s – report written to ${resolve(options.out)} – ${report.passed ? 'GATE PASSED' : 'GATE FAILED'}`);
+  log(`total ${report.totalSeconds.toFixed(0)} s – report written to ${resolve(options.out)} – ${report.passed ? 'CHECK PASSED' : 'CHECK FAILED'}`);
   return report.passed ? 0 : 1;
 };
 

@@ -1,5 +1,5 @@
 /**
- * Deterministic block fixtures for the ingestion gate.
+ * Deterministic block fixtures for the ingestion check.
  *
  * Transactions are NOT valid (signatures are random bytes, inputs may spend
  * nonexistent outpoints) – the mock nodes never validate, and the agent only
@@ -122,6 +122,7 @@ export const generateTransactionPayload = ({
       {
         prevIndex: 0xffffffff,
         prevTxHash: Buffer.alloc(32),
+        // fixture payload bytes predate the rename; kept so cached fixtures and thresholds stay valid
         script: Buffer.concat([Buffer.from('ingestion-gate:'), Buffer.from(String(seed)), random.bytes(8)]),
       },
     ],
