@@ -434,10 +434,14 @@ export interface MempoolTransactionExpiry {
 // cspell:words xact unnest
 const deadlockDetectedCode = '40P01';
 const serializationFailureCode = '40001';
+/** A descendant walked by the archival statement was deleted before its lock. */
+const descendantVanishedCode = 'chaingraph-expiry-descendant-vanished';
 const isRetriedConflict = (err: unknown) =>
-  [deadlockDetectedCode, serializationFailureCode].includes(
-    (err as { code?: string } | undefined)?.code ?? ''
-  );
+  [
+    deadlockDetectedCode,
+    serializationFailureCode,
+    descendantVanishedCode,
+  ].includes((err as { code?: string } | undefined)?.code ?? '');
 const expiryRetryLimit = 6;
 const expiryRetryBaseMs = 50;
 const expiryBatchSize = 500;
@@ -492,6 +496,10 @@ const acceptedBlockResolution = (node: string, transaction: string) => {
  * sees block inclusions committed while expiry waited, and no expired row
  * deleted meanwhile (e.g. confirmed by block acceptance) can seed the
  * descendant walk, as rows it has locked cannot be deleted under it.
+ * Descendants are only locked by the archival statement itself, after its walk:
+ * if one was deleted meanwhile (e.g. confirmed, ending the cascade there), the
+ * walk may have reached its own descendants through it, so the statement
+ * deletes nothing and the transaction is retried with a fresh snapshot.
  *
  * An expired row is left in place (not returned) if the transaction, or a
  * conflicting spend of one of its outpoints, is already in a block accepted by
@@ -528,9 +536,11 @@ const acceptedBlockResolution = (node: string, transaction: string) => {
  * runs one batch at a time (see {@link expireMempoolTransaction}), under a
  * transaction-level advisory lock (also across agents sharing the database),
  * locks the rows it archives in (node, transaction) order (the expired rows,
- * then their descendants) before deleting them, and retries a deadlock or
- * serialization failure against other writers (block acceptance, double-spend
- * replacement) with backoff.
+ * then their descendants) before deleting them, and retries a deadlock,
+ * serialization failure or vanished descendant (see above) against other
+ * writers (block acceptance, double-spend replacement) with backoff; once
+ * retries are exhausted it throws, leaving the rows for the next expiration
+ * scan.
  */
 export const archiveMempoolTransactions = async (
   expiries: MempoolTransactionExpiry[]
@@ -569,8 +579,8 @@ SELECT 1
         [nodeInternalIds, transactionInternalIds]
       );
       const result = await client.query<{
-        nodeInternalId: string;
-        transactionInternalId: string;
+        archived: string | null;
+        complete: boolean;
       }>(
         /* sql */ `
 WITH RECURSIVE expiry AS (
@@ -653,10 +663,15 @@ locked AS (
       ORDER BY node_transaction.node_internal_id, node_transaction.transaction_internal_id
       FOR UPDATE OF node_transaction
 ),
+-- false if a walked row was deleted before its lock (the walk may be stale)
+complete AS (
+    SELECT (SELECT count(*) FROM locked) = (SELECT count(*) FROM archive_rows) AS complete
+),
 deleted_rows AS (
     DELETE FROM node_transaction
       USING locked
-      WHERE node_transaction.node_internal_id = locked.node_internal_id
+      WHERE (SELECT complete FROM complete)
+        AND node_transaction.node_internal_id = locked.node_internal_id
         AND node_transaction.transaction_internal_id = locked.transaction_internal_id
       RETURNING node_transaction.node_internal_id,
                 node_transaction.transaction_internal_id,
@@ -669,9 +684,10 @@ inserted_history AS (
         FROM deleted_rows
       RETURNING node_internal_id, transaction_internal_id
 )
-SELECT node_internal_id::text AS "nodeInternalId",
-       transaction_internal_id::text AS "transactionInternalId"
-  FROM inserted_history;
+SELECT complete.complete,
+       inserted_history.node_internal_id || ':' || inserted_history.transaction_internal_id AS archived
+  FROM complete
+  LEFT JOIN inserted_history ON true;
 `,
         [
           nodeInternalIds,
@@ -679,12 +695,17 @@ SELECT node_internal_id::text AS "nodeInternalId",
           sorted.map((expiry) => expiry.replacedAt.toISOString()),
         ]
       );
+      if (result.rows[0]?.complete !== true) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw Object.assign(
+          new Error(
+            'Mempool expiry: a descendant was deleted while the expiry waited for its lock.'
+          ),
+          { code: descendantVanishedCode }
+        );
+      }
       await client.query('COMMIT;');
-      const archived = new Set(
-        result.rows.map(
-          (row) => `${row.nodeInternalId}:${row.transactionInternalId}`
-        )
-      );
+      const archived = new Set(result.rows.map((row) => row.archived));
       return sorted.filter((expiry) =>
         archived.has(`${expiry.nodeInternalId}:${expiry.transactionInternalId}`)
       );

@@ -401,3 +401,41 @@ INSERT INTO node_transaction_history
     ]);
   }
 );
+
+/*
+ * Regression: the archival statement walked descendants in a snapshot taken
+ * before it waited for their row locks. For P (1) → C (2) → G (3) with only P
+ * expiring, C confirmed concurrently (deleted with replaced_at NULL, ending
+ * the cascade) was skipped by the row locks, but the walk had already reached
+ * G through the old C, so G was archived with P's expiry.
+ */
+test.serial(
+  '[e2e] expiry leaves the grandchild of a child confirmed while the expiry waits',
+  async (t) => {
+    const { db } = t.context;
+    const archived = await expireWhileBlocked(db, {
+      blocker: `INSERT INTO block_transaction VALUES (1, 2);
+INSERT INTO node_block VALUES (40001, 1, '2026-01-02');
+WITH confirmed AS (
+  DELETE FROM node_transaction
+    WHERE node_internal_id = 40001 AND transaction_internal_id = 2
+    RETURNING node_internal_id, transaction_internal_id, validated_at)
+INSERT INTO node_transaction_history
+  SELECT node_internal_id, transaction_internal_id, validated_at, NULL
+    FROM confirmed;`,
+      prepare: `INSERT INTO transaction VALUES (3, sha256(int8send(3::bigint)));
+INSERT INTO output VALUES (sha256(int8send(3::bigint)), 0);
+INSERT INTO input SELECT 3, 0, hash, 0 FROM transaction WHERE internal_id = 2;
+INSERT INTO node_transaction VALUES (40001, 3, '2026-01-01');`,
+    });
+    t.deepEqual(
+      archived.map((expiry) => expiry.transactionInternalId),
+      [1]
+    );
+    t.deepEqual(await currentAndHistory(db), [
+      { replaced: null, table: 'current', tx: 3 },
+      { replaced: '2026-01-01 01:00:00', table: 'history', tx: 1 },
+      { replaced: null, table: 'history', tx: 2 },
+    ]);
+  }
+);
