@@ -6,7 +6,7 @@ import baseTest from 'ava';
 
 import type * as database from '../db.js';
 
-// cspell:words lpad
+// cspell:words lpad xact
 const test = baseTest as TestFn<{ db: typeof database; schema: string }>;
 const host = process.env.CHAINGRAPH_E2E_POSTGRES_HOST ?? 'localhost';
 const port = process.env.CHAINGRAPH_E2E_POSTGRES_PORT ?? '5432';
@@ -267,5 +267,137 @@ test.serial(
       )
     );
     await expectAllArchived(t, errors, '2026-01-01 01:00:01');
+  }
+);
+
+/*
+ * Expire transaction 1 of a two-transaction mempool for alpha (2 spends 1, and
+ * `prepare` runs first) while another connection's transaction, `blocker`,
+ * holds a lock the expiry waits for. Once the expiry waits, `concurrently` is
+ * committed on a third connection, then `blocker`.
+ */
+const expireWhileBlocked = async (
+  db: typeof database,
+  {
+    blocker,
+    concurrently = '',
+    prepare = '',
+  }: { blocker: string; concurrently?: string; prepare?: string }
+) => {
+  await db.pool.query(/* sql */ `
+TRUNCATE node, transaction, output, input, node_transaction,
+  node_transaction_history, block_transaction, node_block;
+INSERT INTO node VALUES (40001, 'alpha');
+INSERT INTO transaction
+  SELECT id, sha256(int8send(id)) FROM generate_series(1, 2) id;
+INSERT INTO output SELECT hash, 0 FROM transaction;
+INSERT INTO input SELECT 2, 0, hash, 0 FROM transaction WHERE internal_id = 1;
+INSERT INTO node_transaction
+  SELECT 40001, internal_id, '2026-01-01' FROM transaction;
+${prepare}
+`);
+  const blocking = await db.pool.connect();
+  const concurrent = await db.pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    await blocking.query(`BEGIN; ${blocker}`);
+    const expiry = db.archiveMempoolTransactions([
+      {
+        nodeInternalId: 40001,
+        replacedAt: new Date('2026-01-01T01:00:00.000Z'),
+        transactionInternalId: 1,
+      },
+    ]);
+    const waitForExpiryToBlock = async (): Promise<void> => {
+      const waiting = await db.pool.query(
+        /* sql */ `SELECT 1 FROM pg_locks WHERE NOT granted;`
+      );
+      if (waiting.rowCount === 0) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 10);
+        });
+        return waitForExpiryToBlock();
+      }
+      return undefined;
+    };
+    await waitForExpiryToBlock();
+    if (concurrently !== '') {
+      await concurrent.query(concurrently);
+    }
+    await blocking.query('COMMIT;');
+    return await expiry;
+  } finally {
+    blocking.release();
+    concurrent.release();
+  }
+};
+
+const currentAndHistory = async (db: typeof database) =>
+  (
+    await db.pool.query<{
+      replaced: string | null;
+      table: string;
+      tx: number;
+    }>(/* sql */ `
+SELECT 'current' AS table, transaction_internal_id::integer AS tx,
+       NULL AS replaced
+  FROM node_transaction
+UNION ALL
+SELECT 'history', transaction_internal_id::integer, replaced_at::text
+  FROM node_transaction_history
+ORDER BY 1, 2;`)
+  ).rows;
+
+/*
+ * Regression: the advisory lock was taken inside the archival statement, whose
+ * snapshot predates the wait, so a block inclusion committed while it waited
+ * (here, block_transaction repaired for a block the node already accepted)
+ * was invisible to the accepted-block guard and the confirmed transaction was
+ * archived with its expiry.
+ */
+test.serial(
+  '[e2e] expiry sees a block inclusion committed while it waits for the expiry lock',
+  async (t) => {
+    const { db } = t.context;
+    const archived = await expireWhileBlocked(db, {
+      // another agent's expiry batch
+      blocker: `SELECT pg_advisory_xact_lock(${db.expiryAdvisoryLockKey});`,
+      concurrently: `INSERT INTO block_transaction VALUES (1, 1);`,
+      prepare: `INSERT INTO node_block VALUES (40001, 1, '2026-01-02');`,
+    });
+    t.deepEqual(archived, []);
+    t.deepEqual(await currentAndHistory(db), [
+      { replaced: null, table: 'current', tx: 1 },
+      { replaced: null, table: 'current', tx: 2 },
+    ]);
+  }
+);
+
+/*
+ * Regression: an expiring parent confirmed concurrently (deleted by block
+ * acceptance, as by the node_block trigger) was skipped by the archival
+ * statement's row locks, but its snapshot still had the parent, so its
+ * unconfirmed child was archived with the parent's expiry.
+ */
+test.serial(
+  '[e2e] expiry leaves the child of a parent confirmed while the expiry waits',
+  async (t) => {
+    const { db } = t.context;
+    const archived = await expireWhileBlocked(db, {
+      blocker: `INSERT INTO block_transaction VALUES (1, 1);
+INSERT INTO node_block VALUES (40001, 1, '2026-01-02');
+WITH confirmed AS (
+  DELETE FROM node_transaction
+    WHERE node_internal_id = 40001 AND transaction_internal_id = 1
+    RETURNING node_internal_id, transaction_internal_id, validated_at)
+INSERT INTO node_transaction_history
+  SELECT node_internal_id, transaction_internal_id, validated_at, NULL
+    FROM confirmed;`,
+    });
+    t.deepEqual(archived, []);
+    t.deepEqual(await currentAndHistory(db), [
+      { replaced: null, table: 'current', tx: 2 },
+      { replaced: null, table: 'history', tx: 1 },
+    ]);
   }
 );

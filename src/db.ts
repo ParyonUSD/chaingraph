@@ -445,7 +445,7 @@ const expiryBatchSize = 500;
  * Advisory lock key serializing mempool expiry across every agent sharing the
  * database (the agent also runs expiry batches one at a time).
  */
-const expiryAdvisoryLockKey = 1970172700;
+export const expiryAdvisoryLockKey = 1970172700;
 
 /**
  * Resolution of mempool transaction `transaction` for node `node` by the blocks
@@ -486,7 +486,12 @@ const acceptedBlockResolution = (node: string, transaction: string) => {
 
 /**
  * Archive expired node_transaction rows, and their same-node descendants, in
- * one statement.
+ * one transaction: take the expiry advisory lock, lock the expired rows, then
+ * archive them in one statement. Each is a separate command, so (in READ
+ * COMMITTED) the archival statement's snapshot is taken after both waits: it
+ * sees block inclusions committed while expiry waited, and no expired row
+ * deleted meanwhile (e.g. confirmed by block acceptance) can seed the
+ * descendant walk, as rows it has locked cannot be deleted under it.
  *
  * An expired row is left in place (not returned) if the transaction, or a
  * conflicting spend of one of its outpoints, is already in a block accepted by
@@ -522,9 +527,10 @@ const acceptedBlockResolution = (node: string, transaction: string) => {
  * all at once on every pool connection, live-locked this way. Expiry therefore
  * runs one batch at a time (see {@link expireMempoolTransaction}), under a
  * transaction-level advisory lock (also across agents sharing the database),
- * locks all rows it archives in (node, transaction) order before deleting
- * them, and retries a deadlock or serialization failure against other writers
- * (block acceptance, double-spend replacement) with backoff.
+ * locks the rows it archives in (node, transaction) order (the expired rows,
+ * then their descendants) before deleting them, and retries a deadlock or
+ * serialization failure against other writers (block acceptance, double-spend
+ * replacement) with backoff.
  */
 export const archiveMempoolTransactions = async (
   expiries: MempoolTransactionExpiry[]
@@ -537,24 +543,39 @@ export const archiveMempoolTransactions = async (
       a.nodeInternalId - b.nodeInternalId ||
       a.transactionInternalId - b.transactionInternalId
   );
+  const nodeInternalIds = sorted.map((expiry) => expiry.nodeInternalId);
+  const transactionInternalIds = sorted.map(
+    (expiry) => expiry.transactionInternalId
+  );
   const archiveOnce = async () => {
     const client = await pool.connect();
     // eslint-disable-next-line functional/no-try-statement
     try {
+      await client.query('BEGIN;');
+      await client.query('SELECT pg_advisory_xact_lock($1::bigint);', [
+        expiryAdvisoryLockKey,
+      ]);
+      await client.query(
+        /* sql */ `
+SELECT 1
+  FROM node_transaction
+  JOIN unnest($1::integer[], $2::bigint[])
+    AS expiry (node_internal_id, transaction_internal_id)
+    ON node_transaction.node_internal_id = expiry.node_internal_id
+   AND node_transaction.transaction_internal_id = expiry.transaction_internal_id
+  ORDER BY node_transaction.node_internal_id, node_transaction.transaction_internal_id
+  FOR UPDATE OF node_transaction;
+`,
+        [nodeInternalIds, transactionInternalIds]
+      );
       const result = await client.query<{
         nodeInternalId: string;
         transactionInternalId: string;
       }>(
         /* sql */ `
-WITH RECURSIVE serialized AS (
-    -- volatile, so materialized: scanned (and the lock taken) before any
-    -- joined row can be produced, i.e. before any row lock below
-    SELECT pg_advisory_xact_lock($4::bigint)
-),
-expiry AS (
+WITH RECURSIVE expiry AS (
     SELECT node_internal_id, transaction_internal_id, replaced_at
-      FROM serialized
-      CROSS JOIN unnest($1::integer[], $2::bigint[], $3::timestamp[])
+      FROM unnest($1::integer[], $2::bigint[], $3::timestamp[])
         AS expiry (node_internal_id, transaction_internal_id, replaced_at)
 ),
 expired AS (
@@ -653,12 +674,12 @@ SELECT node_internal_id::text AS "nodeInternalId",
   FROM inserted_history;
 `,
         [
-          sorted.map((expiry) => expiry.nodeInternalId),
-          sorted.map((expiry) => expiry.transactionInternalId),
+          nodeInternalIds,
+          transactionInternalIds,
           sorted.map((expiry) => expiry.replacedAt.toISOString()),
-          expiryAdvisoryLockKey,
         ]
       );
+      await client.query('COMMIT;');
       const archived = new Set(
         result.rows.map(
           (row) => `${row.nodeInternalId}:${row.transactionInternalId}`
@@ -667,6 +688,10 @@ SELECT node_internal_id::text AS "nodeInternalId",
       return sorted.filter((expiry) =>
         archived.has(`${expiry.nodeInternalId}:${expiry.transactionInternalId}`)
       );
+    } catch (err) {
+      await client.query('ROLLBACK;');
+      // eslint-disable-next-line functional/no-throw-statement
+      throw err;
     } finally {
       client.release();
     }

@@ -11,8 +11,9 @@ const host = process.env.CHAINGRAPH_E2E_POSTGRES_HOST ?? 'localhost';
 const port = process.env.CHAINGRAPH_E2E_POSTGRES_PORT ?? '5432';
 
 /*
- * A single connection keeps every operation inside the same temporary schema
- * and rollback transaction. No persistent tables are created or modified.
+ * A single connection keeps every operation inside the same temporary schema,
+ * discarded after each test (not a rollback transaction: expiry runs its own
+ * transaction). No persistent tables are created or modified.
  */
 test.before(async (t) => {
   process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING = `postgres://chaingraph:very_insecure_postgres_password@${host}:${port}/postgres`;
@@ -22,9 +23,8 @@ test.before(async (t) => {
 
 test.beforeEach(async (t) => {
   await t.context.db.pool.query(/* sql */ `
-BEGIN;
-SET LOCAL search_path = pg_temp;
-SET LOCAL statement_timeout = '5s';
+SET search_path = pg_temp;
+SET statement_timeout = '5s';
 CREATE TEMP TABLE node (internal_id integer PRIMARY KEY, name text);
 CREATE TEMP TABLE transaction (internal_id bigint PRIMARY KEY, hash bytea UNIQUE);
 CREATE TEMP TABLE output (transaction_hash bytea, output_index integer,
@@ -72,7 +72,7 @@ CREATE TRIGGER cascade_history AFTER INSERT ON node_transaction_history
 });
 
 test.afterEach.always(async (t) => {
-  await t.context.db.pool.query('ROLLBACK;');
+  await t.context.db.pool.query('DISCARD TEMP;');
 });
 
 test.after.always(async (t) => {
