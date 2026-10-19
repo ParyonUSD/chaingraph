@@ -331,3 +331,91 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
     ]);
   }
 );
+
+/*
+ * Regression: a batch holding an expired parent and an expired descendant
+ * deleted both directly, so the descendant (and, via the history trigger,
+ * everything below it) recorded its own, later expiry instead of the
+ * parent's earlier one.
+ */
+test.serial(
+  '[e2e] a batched expiry records the earliest ancestor expiry for every descendant',
+  async (t) => {
+    const { pool, archiveMempoolTransactions } = t.context.db;
+    // chain 1 <- 2 <- 3 <- 4; only 1 and 3 are in the batch
+    await pool.query(/* sql */ `
+INSERT INTO input
+  SELECT 2, 0, hash, 0 FROM transaction WHERE internal_id = 1
+  UNION ALL SELECT 3, 0, hash, 0 FROM transaction WHERE internal_id = 2
+  UNION ALL SELECT 4, 0, hash, 0 FROM transaction WHERE internal_id = 3;
+INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
+  SELECT 1, tx FROM generate_series(1, 4) tx;
+`);
+    const archived = await archiveMempoolTransactions([
+      {
+        nodeInternalId: 1,
+        replacedAt: new Date('2026-01-01T02:00:00.000Z'),
+        transactionInternalId: 3,
+      },
+      {
+        nodeInternalId: 1,
+        replacedAt: new Date('2026-01-01T01:00:00.000Z'),
+        transactionInternalId: 1,
+      },
+    ]);
+    t.deepEqual(
+      archived.map((expiry) => ({ tx: expiry.transactionInternalId })),
+      [{ tx: 1 }, { tx: 3 }]
+    );
+    t.deepEqual((await pool.query(membershipQuery)).rows, []);
+    t.deepEqual((await pool.query(historyQuery)).rows, [
+      { node: 1, replaced: '2026-01-01 01:00:00', tx: 1 },
+      { node: 1, replaced: '2026-01-01 01:00:00', tx: 2 },
+      { node: 1, replaced: '2026-01-01 01:00:00', tx: 3 },
+      { node: 1, replaced: '2026-01-01 01:00:00', tx: 4 },
+    ]);
+  }
+);
+
+/*
+ * Regression: the block guard only covered the expired rows themselves. The
+ * history trigger then archived a descendant also replaced by a block accepted
+ * by the node (and the descendant's own descendants) with the parent's expiry,
+ * so the accepted-block archive could no longer record the block's accepted_at.
+ */
+test.serial(
+  '[e2e] expiry archives a descendant replaced by an accepted block with the block time',
+  async (t) => {
+    const { pool, archiveMempoolTransactions } = t.context.db;
+    // 2 spends 1 and 10; 5 (mined for alpha only) also spends 10; 3 spends 2
+    await pool.query(/* sql */ `
+INSERT INTO input
+  SELECT 2, 0, hash, 0 FROM transaction WHERE internal_id = 1
+  UNION ALL SELECT 2, 1, hash, 0 FROM transaction WHERE internal_id = 10
+  UNION ALL SELECT 5, 0, hash, 0 FROM transaction WHERE internal_id = 10
+  UNION ALL SELECT 3, 0, hash, 0 FROM transaction WHERE internal_id = 2;
+INSERT INTO block_transaction VALUES (1, 5);
+INSERT INTO node_block VALUES (1, 1, '2026-01-03');
+INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
+  SELECT node, tx FROM generate_series(1, 2) node, generate_series(1, 3) tx;
+`);
+    const replacedAt = new Date('2026-01-01T01:00:00.000Z');
+    const archived = await archiveMempoolTransactions([
+      { nodeInternalId: 1, replacedAt, transactionInternalId: 1 },
+      { nodeInternalId: 2, replacedAt, transactionInternalId: 1 },
+    ]);
+    t.deepEqual(
+      archived.map((expiry) => ({ node: expiry.nodeInternalId })),
+      [{ node: 1 }, { node: 2 }]
+    );
+    t.deepEqual((await pool.query(membershipQuery)).rows, []);
+    t.deepEqual((await pool.query(historyQuery)).rows, [
+      { node: 1, replaced: '2026-01-01 01:00:00', tx: 1 },
+      { node: 1, replaced: '2026-01-03 00:00:00', tx: 2 },
+      { node: 1, replaced: '2026-01-03 00:00:00', tx: 3 },
+      { node: 2, replaced: '2026-01-01 01:00:00', tx: 1 },
+      { node: 2, replaced: '2026-01-01 01:00:00', tx: 2 },
+      { node: 2, replaced: '2026-01-01 01:00:00', tx: 3 },
+    ]);
+  }
+);

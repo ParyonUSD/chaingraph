@@ -448,27 +448,77 @@ const expiryBatchSize = 500;
 const expiryAdvisoryLockKey = 1970172700;
 
 /**
- * Archive expired node_transaction rows in one statement. Existing history
- * triggers handle any same-node descendants: those not in the batch get the
- * replaced_at of their archived ancestor.
+ * Resolution of mempool transaction `transaction` for node `node` by the blocks
+ * that node accepted, as recorded by
+ * {@link archiveMempoolTransactionsAcceptedByBlocks}: `accepted` if the
+ * transaction is in one of them, otherwise `replaced_at` is the earliest
+ * accepted_at of a block spending one of its outpoints (NULL if none).
+ */
+const acceptedBlockResolution = (
+  node: string,
+  transaction: string
+) => /* sql */ `
+    SELECT EXISTS (
+             SELECT 1
+               FROM block_transaction
+               JOIN node_block
+                 ON node_block.node_internal_id = ${node}
+                AND node_block.block_internal_id = block_transaction.block_internal_id
+               WHERE block_transaction.transaction_internal_id = ${transaction}
+           ) AS accepted,
+           (SELECT MIN(node_block.accepted_at)
+              FROM input mempool_input
+              JOIN input accepted_input
+                ON accepted_input.outpoint_transaction_hash = mempool_input.outpoint_transaction_hash
+               AND accepted_input.outpoint_index = mempool_input.outpoint_index
+               AND accepted_input.transaction_internal_id != ${transaction}
+              JOIN block_transaction
+                ON block_transaction.transaction_internal_id = accepted_input.transaction_internal_id
+              JOIN node_block
+                ON node_block.node_internal_id = ${node}
+               AND node_block.block_internal_id = block_transaction.block_internal_id
+              WHERE mempool_input.transaction_internal_id = ${transaction}
+                AND mempool_input.outpoint_transaction_hash != '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
+           ) AS replaced_at`;
+
+/**
+ * Archive expired node_transaction rows, and their same-node descendants, in
+ * one statement.
  *
- * A row is left in place (not returned) if the transaction, or a conflicting
- * spend of one of its outpoints, is already in a block accepted by the same
- * node: {@link archiveMempoolTransactionsAcceptedByBlocks} archives those with
- * the correct replaced_at (NULL or the block's accepted_at). The guard is part
- * of the statement that locks and deletes the row, so it is evaluated against
- * the row being archived, not a read taken earlier: a row inserted after the
- * agent's accepted-block archive but before its expiry scan would otherwise be
- * archived as expired/replaced even though it is confirmed.
+ * An expired row is left in place (not returned) if the transaction, or a
+ * conflicting spend of one of its outpoints, is already in a block accepted by
+ * the same node: {@link archiveMempoolTransactionsAcceptedByBlocks} archives
+ * those with the correct replaced_at (NULL or the block's accepted_at). The
+ * guard is part of the statement that locks and deletes the row, so it is
+ * evaluated against the row being archived, not a read taken earlier: a row
+ * inserted after the agent's accepted-block archive but before its expiry scan
+ * would otherwise be archived as expired/replaced even though it is confirmed.
+ * (Such a row is still archived if it descends from another row archived
+ * here, with the replaced_at described below.)
  *
- * Deadlocks: archiving a mempool transaction also archives its descendants
- * (the history trigger's recursive cascade), so concurrent single-row expiries
- * of a parent and of its descendants lock the same rows in opposite orders
- * (each locks its own row, then the cascade waits for the other's) and
- * deadlock; a restarted agent's stale mempool, expiring all at once on every
- * pool connection, live-locked this way. Expiry therefore runs one batch at a
- * time (see {@link expireMempoolTransaction}), under a transaction-level
- * advisory lock (also across agents sharing the database), locks its rows in (node, transaction) order before deleting
+ * Descendants are archived here rather than by the history trigger's cascade
+ * (which then finds none left), for two reasons:
+ * - a descendant gets the earliest expiry among its archived ancestors, also
+ *   when it is itself in the batch with a later expiry (the trigger only
+ *   reaches descendants still in node_transaction, so it cannot carry an
+ *   ancestor's expiry through a descendant this statement deletes itself);
+ * - a descendant resolved by a block accepted by the node gets the
+ *   replaced_at the accepted-block archive would give it (NULL if confirmed,
+ *   ending the cascade there; otherwise the block's accepted_at, passed on to
+ *   its own descendants) instead of its ancestor's expiry.
+ *
+ * Only expired rows without an expired parent expiring no later seed the
+ * cascade (the others are reached from that parent with an earlier or equal
+ * replaced_at), so an expired chain is walked once rather than once per row.
+ *
+ * Deadlocks: archiving a mempool transaction also archives its descendants, so
+ * concurrent single-row expiries of a parent and of its descendants lock the
+ * same rows in opposite orders (each locks its own row, then the cascade waits
+ * for the other's) and deadlock; a restarted agent's stale mempool, expiring
+ * all at once on every pool connection, live-locked this way. Expiry therefore
+ * runs one batch at a time (see {@link expireMempoolTransaction}), under a
+ * transaction-level advisory lock (also across agents sharing the database),
+ * locks all rows it archives in (node, transaction) order before deleting
  * them, and retries a deadlock or serialization failure against other writers
  * (block acceptance, double-spend replacement) with backoff.
  */
@@ -492,7 +542,7 @@ export const archiveMempoolTransactions = async (
         transactionInternalId: string;
       }>(
         /* sql */ `
-WITH serialized AS (
+WITH RECURSIVE serialized AS (
     -- volatile, so materialized: scanned (and the lock taken) before any
     -- joined row can be produced, i.e. before any row lock below
     SELECT pg_advisory_xact_lock($4::bigint)
@@ -503,37 +553,77 @@ expiry AS (
       CROSS JOIN unnest($1::integer[], $2::bigint[], $3::timestamp[])
         AS expiry (node_internal_id, transaction_internal_id, replaced_at)
 ),
-locked AS (
-    SELECT node_transaction.node_internal_id,
-           node_transaction.transaction_internal_id,
+expired AS (
+    SELECT expiry.node_internal_id,
+           expiry.transaction_internal_id,
            expiry.replaced_at
       FROM expiry
       JOIN node_transaction
         ON node_transaction.node_internal_id = expiry.node_internal_id
        AND node_transaction.transaction_internal_id = expiry.transaction_internal_id
+      CROSS JOIN LATERAL (${acceptedBlockResolution(
+        'expiry.node_internal_id',
+        'expiry.transaction_internal_id'
+      )}
+      ) resolution
+      WHERE NOT resolution.accepted
+        AND resolution.replaced_at IS NULL
+),
+invalidated (node_internal_id, transaction_internal_id, replaced_at) AS (
+    SELECT node_internal_id, transaction_internal_id, replaced_at
+      FROM expired
       WHERE NOT EXISTS (
           SELECT 1
-            FROM block_transaction
-            JOIN node_block
-              ON node_block.node_internal_id = expiry.node_internal_id
-             AND node_block.block_internal_id = block_transaction.block_internal_id
-            WHERE block_transaction.transaction_internal_id = expiry.transaction_internal_id
+            FROM input
+            JOIN transaction parent_transaction
+              ON parent_transaction.hash = input.outpoint_transaction_hash
+            JOIN expired expired_parent
+              ON expired_parent.node_internal_id = expired.node_internal_id
+             AND expired_parent.transaction_internal_id = parent_transaction.internal_id
+             AND expired_parent.replaced_at <= expired.replaced_at
+            WHERE input.transaction_internal_id = expired.transaction_internal_id
         )
-        AND NOT EXISTS (
-          SELECT 1
-            FROM input mempool_input
-            JOIN input accepted_input
-              ON accepted_input.outpoint_transaction_hash = mempool_input.outpoint_transaction_hash
-             AND accepted_input.outpoint_index = mempool_input.outpoint_index
-             AND accepted_input.transaction_internal_id != expiry.transaction_internal_id
-            JOIN block_transaction
-              ON block_transaction.transaction_internal_id = accepted_input.transaction_internal_id
-            JOIN node_block
-              ON node_block.node_internal_id = expiry.node_internal_id
-             AND node_block.block_internal_id = block_transaction.block_internal_id
-            WHERE mempool_input.transaction_internal_id = expiry.transaction_internal_id
-              AND mempool_input.outpoint_transaction_hash != '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
-        )
+    UNION
+    SELECT child.node_internal_id,
+           child.transaction_internal_id,
+           CASE
+             WHEN resolution.accepted THEN NULL::timestamp without time zone
+             ELSE COALESCE(resolution.replaced_at, parent.replaced_at)
+           END
+      FROM invalidated parent
+      JOIN transaction parent_transaction
+        ON parent_transaction.internal_id = parent.transaction_internal_id
+      JOIN input child_input
+        ON child_input.outpoint_transaction_hash = parent_transaction.hash
+      JOIN node_transaction child
+        ON child.node_internal_id = parent.node_internal_id
+       AND child.transaction_internal_id = child_input.transaction_internal_id
+      CROSS JOIN LATERAL (${acceptedBlockResolution(
+        'child.node_internal_id',
+        'child.transaction_internal_id'
+      )}
+      ) resolution
+      WHERE parent.replaced_at IS NOT NULL
+),
+archive_rows AS (
+    -- confirmation takes precedence, then the earliest invalidation
+    SELECT node_internal_id,
+           transaction_internal_id,
+           CASE
+             WHEN bool_or(replaced_at IS NULL) THEN NULL::timestamp without time zone
+             ELSE MIN(replaced_at)
+           END AS replaced_at
+      FROM invalidated
+      GROUP BY node_internal_id, transaction_internal_id
+),
+locked AS (
+    SELECT node_transaction.node_internal_id,
+           node_transaction.transaction_internal_id,
+           archive_rows.replaced_at
+      FROM archive_rows
+      JOIN node_transaction
+        ON node_transaction.node_internal_id = archive_rows.node_internal_id
+       AND node_transaction.transaction_internal_id = archive_rows.transaction_internal_id
       ORDER BY node_transaction.node_internal_id, node_transaction.transaction_internal_id
       FOR UPDATE OF node_transaction
 ),
@@ -614,7 +704,16 @@ const pendingExpiries = new Map<
 let expiryDrain: Promise<void> | undefined;
 
 const drainExpiries = async (): Promise<void> => {
-  const batch = [...pendingExpiries.entries()].slice(0, expiryBatchSize);
+  /*
+   * Earliest first: an ancestor's expiry is never in a later batch than its
+   * descendant's (which would then be archived with its own, later expiry).
+   */
+  const batch = [...pendingExpiries.entries()]
+    .sort(
+      ([, a], [, b]) =>
+        a.expiry.replacedAt.getTime() - b.expiry.replacedAt.getTime()
+    )
+    .slice(0, expiryBatchSize);
   if (batch.length === 0) {
     return undefined;
   }

@@ -78,7 +78,10 @@ const depth = 40;
  * transaction at the same depth, all validated at the same moment for two
  * nodes: a restarted agent's stale mempool, all expiring at once.
  */
-const createStaleMempool = async (db: typeof database) => {
+const createStaleMempool = async (
+  db: typeof database,
+  validatedAt = `'2026-01-01'::timestamp`
+) => {
   await db.pool.query(/* sql */ `
 TRUNCATE node, transaction, output, input, node_transaction,
   node_transaction_history, block_transaction, node_block;
@@ -102,7 +105,7 @@ INSERT INTO input
   }) d
     JOIN transaction parent ON parent.internal_id = (c - 1) * ${depth} + d + 1;
 INSERT INTO node_transaction
-  SELECT node.internal_id, transaction.internal_id, '2026-01-01'
+  SELECT node.internal_id, transaction.internal_id, ${validatedAt}
     FROM node CROSS JOIN transaction;
 `);
 };
@@ -136,7 +139,8 @@ const shuffled = <T>(items: T[], seed: number) => {
 
 const expectAllArchived = async (
   t: ExecutionContext<{ db: typeof database; schema: string }>,
-  errors: unknown[]
+  errors: unknown[],
+  replaced = '2026-01-01 01:00:00'
 ) => {
   t.deepEqual(
     errors.map((err) => (err as { code?: string }).code ?? err),
@@ -150,11 +154,11 @@ const expectAllArchived = async (
   const replacedAt = await t.context.db.pool.query<{ replaced: string }>(
     /* sql */ `SELECT DISTINCT replaced_at::text AS replaced FROM node_transaction_history;`
   );
-  t.deepEqual(replacedAt.rows, [{ replaced: '2026-01-01 01:00:00' }]);
+  t.deepEqual(replacedAt.rows, [{ replaced }]);
 };
 
-const staleExpiries = async (db: typeof database) => {
-  await createStaleMempool(db);
+const staleExpiries = async (db: typeof database, validatedAt?: string) => {
+  await createStaleMempool(db, validatedAt);
   const expiring = await db.getMempoolTransactionsExpiringBefore({
     expirationMs: 3_600_000,
     expiresBefore: new Date('2026-01-10T00:00:00.000Z'),
@@ -238,5 +242,30 @@ test.serial(
     );
     // a duplicate request for an already-archived row resolves false
     t.false(await db.expireMempoolTransaction(expiries[0]!));
+  }
+);
+
+/*
+ * Every transaction descends from transaction 1, the first validated, so every
+ * row must record its expiry, also when a descendant's expiry is queued before
+ * its ancestors' and the queue needs several batches.
+ */
+test.serial(
+  '[e2e] the expiry queue archives every descendant with its earliest ancestor expiry',
+  async (t) => {
+    const { db } = t.context;
+    const expiries = await staleExpiries(
+      db,
+      `'2026-01-01'::timestamp + transaction.internal_id * interval '1 second'`
+    );
+    const errors: unknown[] = [];
+    await Promise.all(
+      expiries.map(async (expiry) =>
+        db.expireMempoolTransaction(expiry).catch((err: unknown) => {
+          errors.push(err);
+        })
+      )
+    );
+    await expectAllArchived(t, errors, '2026-01-01 01:00:01');
   }
 );
