@@ -451,22 +451,12 @@ const expiryAdvisoryLockKey = 1970172700;
  * Resolution of mempool transaction `transaction` for node `node` by the blocks
  * that node accepted, as recorded by
  * {@link archiveMempoolTransactionsAcceptedByBlocks}: `accepted` if the
- * transaction is in one of them, otherwise `replaced_at` is the earliest
- * accepted_at of a block spending one of its outpoints (NULL if none).
+ * transaction is in one of them; `replaced` if one of them spends one of its
+ * outpoints, with `replaced_at` the earliest such block's accepted_at (NULL if
+ * unknown: blocks accepted before Chaingraph began monitoring).
  */
-const acceptedBlockResolution = (
-  node: string,
-  transaction: string
-) => /* sql */ `
-    SELECT EXISTS (
-             SELECT 1
-               FROM block_transaction
-               JOIN node_block
-                 ON node_block.node_internal_id = ${node}
-                AND node_block.block_internal_id = block_transaction.block_internal_id
-               WHERE block_transaction.transaction_internal_id = ${transaction}
-           ) AS accepted,
-           (SELECT MIN(node_block.accepted_at)
+const acceptedBlockResolution = (node: string, transaction: string) => {
+  const conflictingAcceptedSpends = /* sql */ `
               FROM input mempool_input
               JOIN input accepted_input
                 ON accepted_input.outpoint_transaction_hash = mempool_input.outpoint_transaction_hash
@@ -478,8 +468,21 @@ const acceptedBlockResolution = (
                 ON node_block.node_internal_id = ${node}
                AND node_block.block_internal_id = block_transaction.block_internal_id
               WHERE mempool_input.transaction_internal_id = ${transaction}
-                AND mempool_input.outpoint_transaction_hash != '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
+                AND mempool_input.outpoint_transaction_hash != '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea`;
+  return /* sql */ `
+    SELECT EXISTS (
+             SELECT 1
+               FROM block_transaction
+               JOIN node_block
+                 ON node_block.node_internal_id = ${node}
+                AND node_block.block_internal_id = block_transaction.block_internal_id
+               WHERE block_transaction.transaction_internal_id = ${transaction}
+           ) AS accepted,
+           EXISTS (SELECT 1 ${conflictingAcceptedSpends}
+           ) AS replaced,
+           (SELECT MIN(node_block.accepted_at) ${conflictingAcceptedSpends}
            ) AS replaced_at`;
+};
 
 /**
  * Archive expired node_transaction rows, and their same-node descendants, in
@@ -505,7 +508,8 @@ const acceptedBlockResolution = (
  * - a descendant resolved by a block accepted by the node gets the
  *   replaced_at the accepted-block archive would give it (NULL if confirmed,
  *   ending the cascade there; otherwise the block's accepted_at, passed on to
- *   its own descendants) instead of its ancestor's expiry.
+ *   its own descendants, or NULL if that is unknown, again ending the cascade)
+ *   instead of its ancestor's expiry.
  *
  * Only expired rows without an expired parent expiring no later seed the
  * cascade (the others are reached from that parent with an earlier or equal
@@ -567,7 +571,7 @@ expired AS (
       )}
       ) resolution
       WHERE NOT resolution.accepted
-        AND resolution.replaced_at IS NULL
+        AND NOT resolution.replaced
 ),
 invalidated (node_internal_id, transaction_internal_id, replaced_at) AS (
     SELECT node_internal_id, transaction_internal_id, replaced_at
@@ -588,7 +592,8 @@ invalidated (node_internal_id, transaction_internal_id, replaced_at) AS (
            child.transaction_internal_id,
            CASE
              WHEN resolution.accepted THEN NULL::timestamp without time zone
-             ELSE COALESCE(resolution.replaced_at, parent.replaced_at)
+             WHEN resolution.replaced THEN resolution.replaced_at
+             ELSE parent.replaced_at
            END
       FROM invalidated parent
       JOIN transaction parent_transaction

@@ -43,7 +43,7 @@ CREATE TEMP TABLE block_transaction (block_internal_id bigint,
   transaction_internal_id bigint,
   PRIMARY KEY (transaction_internal_id, block_internal_id));
 CREATE TEMP TABLE node_block (node_internal_id integer,
-  block_internal_id bigint, accepted_at timestamp NOT NULL,
+  block_internal_id bigint, accepted_at timestamp,
   PRIMARY KEY (node_internal_id, block_internal_id));
 INSERT INTO node VALUES (1, 'alpha'), (2, 'beta');
 INSERT INTO transaction
@@ -417,5 +417,55 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
       { node: 2, replaced: '2026-01-01 01:00:00', tx: 2 },
       { node: 2, replaced: '2026-01-01 01:00:00', tx: 3 },
     ]);
+  }
+);
+
+/*
+ * Regression: blocks accepted before Chaingraph began monitoring have a NULL
+ * accepted_at, which MIN(accepted_at) could not tell apart from no conflicting
+ * block at all. Expiry then archived a root replaced by such a block with its
+ * expiry, and gave such a descendant its ancestor's expiry, instead of leaving
+ * the root for the accepted-block archive and giving the descendant the
+ * accepted-block archive's NULL (which, as there, ends the cascade).
+ */
+test.serial(
+  '[e2e] expiry treats a conflict in a block with a NULL accepted_at as replaced',
+  async (t) => {
+    const {
+      pool,
+      archiveMempoolTransactions,
+      archiveMempoolTransactionsAcceptedByBlocks: archive,
+    } = t.context.db;
+    // 4 and 5 (mined) spend 10; chain 1 <- 2 <- 3, 2 and 6 (mined) spend 11
+    await pool.query(/* sql */ `
+INSERT INTO input
+  SELECT 4, 0, hash, 0 FROM transaction WHERE internal_id = 10
+  UNION ALL SELECT 5, 0, hash, 0 FROM transaction WHERE internal_id = 10
+  UNION ALL SELECT 2, 0, hash, 0 FROM transaction WHERE internal_id = 1
+  UNION ALL SELECT 2, 1, hash, 0 FROM transaction WHERE internal_id = 11
+  UNION ALL SELECT 6, 0, hash, 0 FROM transaction WHERE internal_id = 11
+  UNION ALL SELECT 3, 0, hash, 0 FROM transaction WHERE internal_id = 2;
+INSERT INTO block_transaction VALUES (1, 5), (2, 6);
+INSERT INTO node_block VALUES (1, 1, NULL), (1, 2, NULL);
+INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
+  VALUES (1, 1), (1, 2), (1, 3), (1, 4);
+`);
+    const replacedAt = new Date('2026-01-01T01:00:00.000Z');
+    const archived = await archiveMempoolTransactions([
+      { nodeInternalId: 1, replacedAt, transactionInternalId: 1 },
+      { nodeInternalId: 1, replacedAt, transactionInternalId: 4 },
+    ]);
+    t.deepEqual(
+      archived.map((expiry) => ({ tx: expiry.transactionInternalId })),
+      [{ tx: 1 }]
+    );
+    t.deepEqual((await pool.query(historyQuery)).rows, [
+      { node: 1, replaced: '2026-01-01 01:00:00', tx: 1 },
+      { node: 1, replaced: null, tx: 2 },
+    ]);
+    t.deepEqual(await archive(), [
+      { hash: hash('04'), nodeName: 'alpha', replacedAt: null },
+    ]);
+    t.deepEqual((await pool.query(membershipQuery)).rows, [{ node: 1, tx: 3 }]);
   }
 );

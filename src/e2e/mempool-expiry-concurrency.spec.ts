@@ -55,7 +55,7 @@ CREATE TABLE block_transaction (block_internal_id bigint,
   transaction_internal_id bigint,
   PRIMARY KEY (transaction_internal_id, block_internal_id));
 CREATE TABLE node_block (node_internal_id integer,
-  block_internal_id bigint, accepted_at timestamp NOT NULL,
+  block_internal_id bigint, accepted_at timestamp,
   PRIMARY KEY (node_internal_id, block_internal_id));
 ${cascadeFunction}
 CREATE TRIGGER cascade_history AFTER INSERT ON node_transaction_history
