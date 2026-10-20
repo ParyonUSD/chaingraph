@@ -200,56 +200,6 @@ BEGIN
 END;
 $$;
 
--- Temporary tables and read-ahead. From PostgreSQL 17, scans read through
--- read streams, which pin up to (effective_io_concurrency + 1) *
--- io_combine_limit buffers ahead (maintenance_io_concurrency for ANALYZE); on
--- a temporary table the only bound is the session's local buffers
--- (temp_buffers). A scan of a temporary table larger than temp_buffers can
--- then pin every local buffer, and the statement's next local buffer (a write
--- to another temporary table, a second scan) fails with "no empty local buffer
--- available": on PG 18.3, effective_io_concurrency = 200 (the chart's value)
--- and the default 8MB temp_buffers are enough to hit it. temp_buffers cannot
--- be raised once the session has used a temporary table (the agent's pooled
--- connections), so the functions that read their temporary tables lower the
--- read-ahead instead, for those statements only:
--- one stream then pins at most a quarter of the local buffers. Returns the
--- settings to restore (unspent_tracking_restore_read_ahead), or NULL when
--- nothing changed (no read streams before 17, or already low enough). Set
--- for the transaction: restored at its end at the latest.
-CREATE FUNCTION unspent_tracking_limit_temp_read_ahead ()
-  RETURNS text[] LANGUAGE plpgsql AS $$
-DECLARE
-  previous text[] := ARRAY[current_setting('effective_io_concurrency'), current_setting('maintenance_io_concurrency')];
-  combine integer;
-  local_buffers integer;
-  cap integer;
-BEGIN
-  -- both in blocks; io_combine_limit exists from 17 (the first read streams)
-  SELECT s.setting::integer INTO combine FROM pg_settings s WHERE s.name = 'io_combine_limit';
-  SELECT s.setting::integer INTO local_buffers FROM pg_settings s WHERE s.name = 'temp_buffers';
-  IF combine IS NULL OR local_buffers IS NULL THEN
-    RETURN NULL;
-  END IF;
-  cap := GREATEST(local_buffers / (4 * GREATEST(combine, 1)) - 1, 0);
-  IF previous[1]::integer <= cap AND previous[2]::integer <= cap THEN
-    RETURN NULL;
-  END IF;
-  PERFORM set_config('effective_io_concurrency', LEAST(previous[1]::integer, cap)::text, true);
-  PERFORM set_config('maintenance_io_concurrency', LEAST(previous[2]::integer, cap)::text, true);
-  RETURN previous;
-END;
-$$;
-
-CREATE FUNCTION unspent_tracking_restore_read_ahead (previous text[])
-  RETURNS void LANGUAGE plpgsql AS $$
-BEGIN
-  IF previous IS NOT NULL THEN
-    PERFORM set_config('effective_io_concurrency', previous[1], true);
-    PERFORM set_config('maintenance_io_concurrency', previous[2], true);
-  END IF;
-END;
-$$;
-
 CREATE FUNCTION unspent_tracking_temp_tables ()
   RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
@@ -297,7 +247,6 @@ DECLARE
   n_changed bigint := 0;
   n_fresh bigint := 0;
   max_event bigint;
-  read_ahead text[];
 BEGIN
   -- one worker per partition (also across agents): a second caller returns at once
   IF NOT pg_try_advisory_xact_lock(1970172785, part) THEN
@@ -314,7 +263,6 @@ BEGIN
     RETURN jsonb_build_object('repartition', true);
   END IF;
   PERFORM unspent_tracking_temp_tables();
-  read_ahead := unspent_tracking_limit_temp_read_ahead();
 
   -- 1. events above this partition's consumed id, up to the settled limit, in id order
   INSERT INTO unspent_tracking_consumed
@@ -465,7 +413,6 @@ BEGIN
         consumed_event_id = GREATEST(p.consumed_event_id, COALESCE(max_event, 0)),
         updated_at = now()
     WHERE p.partition_index = part;
-  PERFORM unspent_tracking_restore_read_ahead(read_ahead);
 
   RETURN jsonb_build_object(
     'inputWatermark', upper_tx, 'previousInputWatermark', w,
@@ -499,7 +446,6 @@ DECLARE
   stored_count integer;
   n_affected bigint := 0;
   n_changed bigint := 0;
-  read_ahead text[];
 BEGIN
   IF NOT pg_try_advisory_xact_lock(1970172786, part) THEN
     RETURN jsonb_build_object('busy', true);
@@ -518,7 +464,6 @@ BEGIN
   END IF;
   upper_tx := LEAST(cursor_tx + GREATEST(max_transactions, 1), start_tx);
   PERFORM unspent_tracking_temp_tables();
-  read_ahead := unspent_tracking_limit_temp_read_ahead();
   INSERT INTO unspent_tracking_affected (h, i)
     SELECT o.transaction_hash, o.output_index
       FROM transaction t
@@ -530,7 +475,6 @@ BEGIN
   IF n_affected > 0 THEN
     n_changed := unspent_tracking_recompute();
   END IF;
-  PERFORM unspent_tracking_restore_read_ahead(read_ahead);
   UPDATE unspent_tracking_progress SET backfill_transaction_internal_id = upper_tx, updated_at = now()
     WHERE partition_index = part;
   RETURN jsonb_build_object('previousBackfillWatermark', cursor_tx, 'backfillWatermark', upper_tx,
@@ -548,7 +492,6 @@ CREATE FUNCTION unspent_tracking_backfill_scope (category bytea, bytecode_prefix
   RETURNS bigint LANGUAGE plpgsql
   SET enable_hashjoin = off SET enable_mergejoin = off SET jit = off AS $$
 DECLARE
-  read_ahead text[];
   changed bigint;
 BEGIN
   PERFORM unspent_tracking_temp_tables();
@@ -558,9 +501,7 @@ BEGIN
       WHERE o.unspent_node_ids IS NULL
         AND (category IS NULL OR o.token_category = category)
         AND (bytecode_prefix IS NULL OR substring(o.locking_bytecode, 0, 26) = bytecode_prefix);
-  read_ahead := unspent_tracking_limit_temp_read_ahead();
   changed := unspent_tracking_recompute();
-  PERFORM unspent_tracking_restore_read_ahead(read_ahead);
   RETURN changed;
 END;
 $$;

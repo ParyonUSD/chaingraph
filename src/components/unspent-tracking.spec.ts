@@ -13,6 +13,7 @@ import {
   parseBatchResult,
   partitionOf,
   readyForBackfill,
+  serverVersionError,
 } from './unspent-tracking.js';
 
 test('nodeIndexDefinitions: three partial indexes per node, keyed on the node id', (t) => {
@@ -153,4 +154,18 @@ test('readyForBackfill: caught up, or only waiting for a missing parent', (t) =>
   t.false(
     readyForBackfill({ caughtUp: false, last: undefined, settled: false })
   );
+});
+
+test('serverVersionError: unspent tracking requires PostgreSQL 18.6 or later', (t) => {
+  t.is(serverVersionError({ version: '18.6', versionNum: 180006 }), undefined);
+  t.is(
+    serverVersionError({ version: '19.0 (Debian 19.0-1)', versionNum: 190000 }),
+    undefined
+  );
+  const tooOld = serverVersionError({ version: '18.5', versionNum: 180005 });
+  t.true(tooOld?.includes('requires PostgreSQL 18.6 or later'));
+  t.true(tooOld?.includes('the server is 18.5'));
+  t.true(tooOld?.includes('no empty local buffer available'));
+  t.not(serverVersionError({ version: '17.6', versionNum: 170006 }), undefined);
+  t.not(serverVersionError({ version: '14.6', versionNum: 140006 }), undefined);
 });
