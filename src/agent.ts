@@ -39,9 +39,9 @@ import {
 } from './config.js';
 import {
   acceptBlocksViaHeaders,
-  archiveMempoolTransaction,
   archiveMempoolTransactionsAcceptedByBlocks,
   createIndexes,
+  expireMempoolTransaction,
   getAllKnownBlockHashes,
   getIncompleteBlocks,
   getIndexCreationProgress,
@@ -1113,14 +1113,15 @@ export class Agent {
   }
 
   async expireMempoolTransaction(transaction: ExpiringMempoolTransaction) {
-    const archivedCount = await archiveMempoolTransaction({
+    // queued: expiries run one ordered batch at a time (see expireMempoolTransaction in db.ts)
+    const archived = await expireMempoolTransaction({
       nodeInternalId: transaction.nodeInternalId,
       replacedAt: transaction.expiresAt,
       transactionInternalId: transaction.transactionInternalId,
     });
-    if (archivedCount === 0) {
+    if (!archived) {
       this.logger.debug(
-        `Agent: skipped expiry of mempool transaction ${transaction.hash} for node ${transaction.nodeName}; it has already left node_transaction.`
+        `Agent: skipped expiry of mempool transaction ${transaction.hash} for node ${transaction.nodeName}; it has already left node_transaction, or it (or a conflicting spend) is in a block accepted by the node and is left for the accepted-block archive.`
       );
       return;
     }
