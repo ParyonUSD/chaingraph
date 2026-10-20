@@ -93,6 +93,31 @@ export const configureTrackingTriggersSql = (
         } TRIGGER ${name};`
     );
 
+/**
+ * The lowest PostgreSQL version (`server_version_num`) unspent tracking runs
+ * on. PostgreSQL 18.0 to 18.5 let a read stream over a temporary table pin
+ * every local buffer, so a later statement step that needs one more (the
+ * tracking job reads and writes its own temporary tables) fails with "no
+ * empty local buffer available"; 18.6 caps the read stream at a quarter of
+ * the local buffers (upstream commit ed8050370b7, "Make local buffers pin
+ * limit more conservative").
+ */
+export const minimumServerVersionNum = 180006;
+export const serverVersionSql = /* sql */ `SELECT current_setting('server_version_num')::integer AS "versionNum", current_setting('server_version') AS version;`;
+
+/**
+ * The error refusing unspent tracking on a server older than
+ * {@link minimumServerVersionNum}, or `undefined` when the server is recent
+ * enough.
+ */
+export const serverVersionError = (server: {
+  version: string;
+  versionNum: number;
+}) =>
+  server.versionNum >= minimumServerVersionNum
+    ? undefined
+    : `CHAINGRAPH_UNSPENT_TRACKING=true requires PostgreSQL 18.6 or later, but the server is ${server.version}: PostgreSQL 18.0 to 18.5 can fail the tracking job's temporary-table reads with "no empty local buffer available" (a read-stream bug fixed in 18.6). Upgrade PostgreSQL, or set CHAINGRAPH_UNSPENT_TRACKING=false.`;
+
 export const readSettingsSql = /* sql */ `SELECT read_hashed_max_transactions::text AS "readHashedMaxTransactions", read_probed_max_transactions::text AS "readProbedMaxTransactions", read_stored_max_events::text AS "readStoredMaxEvents" FROM unspent_tracking_settings;`;
 export const writeSettingsSql = /* sql */ `UPDATE unspent_tracking_settings SET read_hashed_max_transactions = $1::bigint, read_probed_max_transactions = $2::bigint, read_stored_max_events = $3::bigint;`;
 export const buildRootSql = /* sql */ `SELECT unspent_tracking_build_root();`;

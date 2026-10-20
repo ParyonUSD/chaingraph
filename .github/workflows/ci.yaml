@@ -3,32 +3,28 @@ on: [push, pull_request]
 
 jobs:
   e2e-tests:
-    runs-on: ubuntu-latest
+    name: e2e-tests (unspent-tracking ${{ matrix.unspent-tracking }})
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
-        # 14: the oldest supported; 18.3: production. Read streams (17+)
-        # behave differently with temporary tables (see the
-        # unspent tracking migration), so both are tested.
-        postgres: ['14', '18.3']
         unspent-tracking: ['false', 'true']
     env:
       CHAINGRAPH_UNSPENT_TRACKING: ${{ matrix.unspent-tracking }}
-    services:
-      postgres:
-        image: postgres:${{ matrix.postgres }}
-        env:
-          POSTGRES_DB: chaingraph
-          POSTGRES_USER: chaingraph
-          POSTGRES_PASSWORD: very_insecure_postgres_password
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
     steps:
+      # the runner image ships PostgreSQL with the service disabled; Ubuntu's
+      # defaults listen on localhost with scram-sha-256 auth for TCP
+      - name: Start the runner's PostgreSQL
+        run: |
+          sudo systemctl start postgresql.service
+          until pg_isready -h localhost -p 5432; do sleep 1; done
+          sudo -u postgres psql -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE chaingraph WITH LOGIN SUPERUSER PASSWORD 'very_insecure_postgres_password'" \
+            -c "CREATE DATABASE chaingraph OWNER chaingraph"
+      - name: Print the PostgreSQL version
+        env:
+          PGPASSWORD: very_insecure_postgres_password
+        run: psql -h localhost -U chaingraph -d chaingraph -c 'select version()'
       - name: Check out repository code
         uses: actions/checkout@v7
         with:
@@ -58,7 +54,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: e2e-test-log-pg${{ matrix.postgres }}-unspent-${{ matrix.unspent-tracking }}
+          name: e2e-test-log-unspent-${{ matrix.unspent-tracking }}
           path: data/chaingraph/log-e2e.ndjson
 
   check-yarn-cache:

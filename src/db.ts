@@ -43,6 +43,8 @@ import {
   rebuildRequiredSql,
   repartitionSql,
   runBatchSql,
+  serverVersionError,
+  serverVersionSql,
   snapshotSettledSql,
   stopTrackingSql,
   trackingTriggerNames,
@@ -1528,12 +1530,26 @@ const runStatements = async (client: pg.PoolClient, statements: string[]) =>
  * which stop following acceptance changes once the triggers are off). One
  * transaction, serialized across agents by an advisory lock. Returns the
  * statements run (none if the migration is missing and tracking is off).
+ * With tracking on, it first refuses a server older than PostgreSQL 18.6
+ * ({@link serverVersionError}); the agent then shuts down.
  */
 // cspell:ignore xact
 export const configureUnspentTracking = async () => {
   const client = await pool.connect();
   // eslint-disable-next-line functional/no-try-statement
   try {
+    if (unspentTracking.enabled) {
+      const server = (
+        await client.query<{ version: string; versionNum: number }>(
+          serverVersionSql
+        )
+      ).rows[0]!;
+      const versionError = serverVersionError(server);
+      if (versionError !== undefined) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw new Error(versionError);
+      }
+    }
     await client.query('BEGIN;');
     await client.query(/* sql */ `SELECT pg_advisory_xact_lock($1::bigint);`, [
       configurationLockKey,

@@ -22,8 +22,6 @@ DROP FUNCTION IF EXISTS unspent_tracking_backfill_prepare (bigint, bigint, bigin
 DROP FUNCTION IF EXISTS unspent_tracking_backfill_node_blocks (bigint, bigint, bigint);
 DROP FUNCTION IF EXISTS unspent_tracking_run_batch (integer, integer, bigint, bigint, bigint, integer, integer, integer, bigint);
 DROP FUNCTION IF EXISTS unspent_tracking_temp_tables ();
-DROP FUNCTION IF EXISTS unspent_tracking_restore_read_ahead (text[]);
-DROP FUNCTION IF EXISTS unspent_tracking_limit_temp_read_ahead ();
 DROP FUNCTION IF EXISTS unspent_tracking_recompute ();
 DROP FUNCTION IF EXISTS unspent_tracking_accepting (bigint);
 DROP TRIGGER IF EXISTS trigger_public_node_block_delete_unspent_tracking ON node_block;
@@ -33,6 +31,8 @@ DROP FUNCTION IF EXISTS trigger_node_transaction_delete_unspent_tracking ();
 -- names and signatures from development builds of this migration (lab
 -- databases), including those from before the unspent tracking rename
 DROP FUNCTION IF EXISTS unspent_output_stored (text);
+DROP FUNCTION IF EXISTS unspent_tracking_restore_read_ahead (text[]);
+DROP FUNCTION IF EXISTS unspent_tracking_limit_temp_read_ahead ();
 DROP TRIGGER IF EXISTS trigger_unspent_tracking_node_block_delete ON node_block;
 DROP TRIGGER IF EXISTS trigger_unspent_tracking_node_transaction_delete ON node_transaction;
 DROP FUNCTION IF EXISTS unspent_node_ids_build_root ();
