@@ -229,6 +229,22 @@ INSERT INTO unspent_tracking_events (event_kind, node_internal_id, block_interna
     WHERE b.hash = $1::bytea AND b.xmin <> pg_current_xact_id()::xid;`;
 
 /**
+ * A save of a block that already existed which linked transactions the block
+ * was missing (incomplete-block repair): those transactions are now accepted
+ * by every node accepting the block, so every node_block row of the block
+ * gets an event (`$1` block hash).
+ */
+export const blockRepairedEventsSql = /* sql */ `
+INSERT INTO unspent_tracking_events (event_kind, node_internal_id, block_internal_id)
+  SELECT 'accepted', nb.node_internal_id, nb.block_internal_id
+    FROM block b
+    CROSS JOIN LATERAL (
+      SELECT node_internal_id, block_internal_id FROM node_block
+        WHERE node_block.block_internal_id = b.internal_id
+    ) nb
+    WHERE b.hash = $1::bytea;`;
+
+/**
  * Headers acceptance (the blocks exist already): `insertNodeBlocks` is the
  * agent's node_block insert (returning `block_internal_id`), wrapped so the
  * inserted rows also get an "accepted" event.

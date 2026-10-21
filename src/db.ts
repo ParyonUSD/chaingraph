@@ -18,6 +18,7 @@ import {
   batchDidWork,
   batchReachedLimits,
   blockReacceptedEventsSql,
+  blockRepairedEventsSql,
   buildRootSql,
   clearNodeIndexedSql,
   concurrentIndexDefinition,
@@ -1223,6 +1224,7 @@ inserted_node_blocks AS (
   RETURNING block_internal_id
 )
 SELECT
+  (SELECT COUNT(*)::bigint FROM inserted_block) AS "insertedBlockCount",
   (SELECT COUNT(*)::bigint FROM joined_transactions) AS "joinedTransactionCount",
   (SELECT COUNT(*)::bigint FROM inserted_block_transactions) AS "insertedBlockTransactionCount",
   (SELECT COUNT(*)::bigint FROM inserted_node_blocks) AS "insertedNodeBlockCount";`;
@@ -1240,6 +1242,7 @@ SELECT
     const transactionCacheMisses =
       attemptedSavedTransactions.length - savedTransactionCount;
     const addBlockResult = await client.query<{
+      insertedBlockCount: string;
       insertedBlockTransactionCount: string;
       insertedNodeBlockCount: string;
       joinedTransactionCount: string;
@@ -1248,7 +1251,23 @@ SELECT
     const joinedTransactionCount = Number(
       addBlockResult.rows[0]!.joinedTransactionCount
     );
+    const blockExisted =
+      Number(addBlockResult.rows[0]!.insertedBlockCount) === 0;
     if (
+      unspentTracking.enabled &&
+      blockExisted &&
+      Number(addBlockResult.rows[0]!.insertedBlockTransactionCount) > 0
+    ) {
+      /*
+       * Unspent tracking: a block that already existed (its id may be below
+       * the job's block watermark) got transactions it was missing; every
+       * node accepting it now accepts them, so every node_block row of the
+       * block is recorded as an event.
+       */
+      await client.query(blockRepairedEventsSql, [
+        Buffer.from(block.hash, 'hex'),
+      ]);
+    } else if (
       unspentTracking.enabled &&
       Number(addBlockResult.rows[0]!.insertedNodeBlockCount) > 0
     ) {

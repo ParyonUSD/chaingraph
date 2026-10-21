@@ -4274,6 +4274,46 @@ test.serial(
         await transactionId('f0'),
         ours
       );
+      /*
+       * Incomplete-block repair: saving a block node A already accepts links
+       * a transaction the block was missing, without inserting a node_block
+       * row. Node A now accepts that transaction: its outputs become unspent
+       * for node A, in the query root at once and in the stored values once
+       * the job has run.
+       */
+      const repairedBlock = fundingBlock('b3', [
+        transaction('f3', [[hash('fd'), 0]], 2),
+      ]);
+      await saveFor(repairedBlock);
+      await drainDeferred(t, db, 'repair: block saved', ours);
+      await client.query(
+        /* sql */ `DELETE FROM block_transaction WHERE transaction_internal_id = $1;`,
+        [await transactionId('f3')]
+      );
+      await client.query(
+        /* sql */ `UPDATE output SET unspent_node_ids = '{}' WHERE transaction_hash = $1;`,
+        [hexToBin(hash('f3'))]
+      );
+      await compareDeferredStored(
+        t,
+        'repair: link missing',
+        await transactionId('f0'),
+        ours
+      );
+      await saveFor(repairedBlock);
+      await compareDeferredQueryRoot(t, 'repair: link restored', ours);
+      await drainDeferred(t, db, 'repair: link restored', ours);
+      await compareDeferredStored(
+        t,
+        'repair: link restored, job drained',
+        await transactionId('f0'),
+        ours
+      );
+      await compareDeferredQueryRoot(
+        t,
+        'repair: link restored, job drained',
+        ours
+      );
       const idleStart = Date.now();
       const idle = await db.runUnspentTrackingJobPass({
         maxMs: 5_000,
