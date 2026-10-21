@@ -125,6 +125,16 @@ helm list # show releases
 helm status my-chaingraph > status.txt
 ```
 
+#### Post-upgrade: extended statistics on `output`
+
+The migration `1791100003000_output_category_capability_statistics` (fork-only) creates the extended statistics object `output_category_capability_stats` on `output (token_category, nonfungible_token_capability)` with a statistics target of 10000. It does not run `ANALYZE`, because analyzing `output` takes several minutes on a mainnet database. After the upgrade, run this once against the Chaingraph database:
+
+```sql
+ANALYZE output;
+```
+
+Until then the planner behaves as before; Postgres's background auto-analyze will also populate the statistics eventually.
+
 ## Architecture
 
 Chaingraph is a Kubernetes application which manages a stack of open source software including one or more Bitcoin Cash full nodes, a syncing agent, a Postgres SQL database, and a Hasura instance.
