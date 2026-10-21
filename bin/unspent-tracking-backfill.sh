@@ -24,11 +24,14 @@ seconds() { printf '%d.%03d' $(($1 / 1000)) $(($1 % 1000)); }
 
 wal_start=$(sql -c 'SELECT pg_current_wal_lsn()')
 start=$(now_ms)
+event_floor=$(sql -c 'SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq')
+# events above the floor are kept until the backfill is complete (published before the preparation's snapshot)
+sql -c "SELECT unspent_tracking_backfill_retain_events($event_floor)" >/dev/null
 sql -c 'BEGIN ISOLATION LEVEL REPEATABLE READ' -c "
   SELECT unspent_tracking_backfill_prepare(
     (SELECT max(internal_id) FROM transaction),
     (SELECT COALESCE(max(internal_id), 0) FROM block),
-    (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq))" -c 'COMMIT' >>"$log"
+    $event_floor)" -c 'COMMIT' >>"$log"
 prepared=$(now_ms)
 
 run_partition() {

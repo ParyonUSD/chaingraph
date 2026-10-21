@@ -96,10 +96,11 @@ CREATE TABLE unspent_tracking_settings (
   read_hashed_max_transactions bigint NOT NULL DEFAULT 20000,
   read_probed_max_transactions bigint NOT NULL DEFAULT 200000,
   read_stored_max_events bigint NOT NULL DEFAULT 10000,
-  watch_consumed_event_id bigint NOT NULL DEFAULT 0
+  watch_consumed_event_id bigint NOT NULL DEFAULT 0,
+  backfill_event_floor bigint
 );
 INSERT INTO unspent_tracking_settings DEFAULT VALUES;
-COMMENT ON TABLE unspent_tracking_settings IS 'Unspent tracking state and read thresholds (written by the agent from CHAINGRAPH_UNSPENT_TRACKING_* settings). tracking_start_*: outputs of earlier transactions are pre-tracking (their values are used once backfilled); backfill_complete: every partition''s backfill covered its whole range, so every pre-tracking value is exact (status only: reads derive it from the cursors, never from this flag); rebuild_required: tracking was stopped (stored values may be stale; the backfill takes every value that is not ''{}''), and reads use the live per-node test until that backfill is complete and the job has passed rebuild_through_transaction_internal_id (the highest transaction id when tracking restarted). Reads correct a backlog of up to read_hashed_max_transactions unprocessed transactions with one hashed set, up to read_probed_max_transactions with per-row probes, and use the live per-node test above it (or above read_stored_max_events unconsumed events). Not tracked by Hasura.';
+COMMENT ON TABLE unspent_tracking_settings IS 'Unspent tracking state and read thresholds (written by the agent from CHAINGRAPH_UNSPENT_TRACKING_* settings). tracking_start_*: outputs of earlier transactions are pre-tracking (their values are used once backfilled); backfill_complete: every partition''s backfill covered its whole range, so every pre-tracking value is exact (status only: reads derive it from the cursors, never from this flag); rebuild_required: tracking was stopped (stored values may be stale; the backfill takes every value that is not ''{}''), and reads use the live per-node test until that backfill is complete and the job has passed rebuild_through_transaction_internal_id (the highest transaction id when tracking restarted). Reads correct a backlog of up to read_hashed_max_transactions unprocessed transactions with one hashed set, up to read_probed_max_transactions with per-row probes, and use the live per-node test above it (or above read_stored_max_events unconsumed events). backfill_event_floor: events above it are kept until the backfill is complete (published before the backfill''s preparation takes its snapshot: unspent_tracking_backfill_retain_events). Not tracked by Hasura.';
 
 CREATE TABLE unspent_tracking_watch (
   transaction_internal_id bigint NOT NULL,
@@ -551,11 +552,13 @@ COMMENT ON FUNCTION unspent_tracking_run_batch (integer, integer, bigint, bigint
 -- i.e. '{}' again. Likewise an output with no spender whose creator is not in
 -- X is unspent for exactly F. Losses of acceptance always write an event (the
 -- release triggers), and the agent writes an "accepted" event whenever it adds
--- a node_block row to an existing block or a node_transaction row to an
+-- a node_block row to an existing block, a block_transaction row to an
+-- existing block (incomplete-block repair) or a node_transaction row to an
 -- existing transaction; a batch stops ("stale") if the node table changed or a
 -- node's node_block rows at or below the block floor changed in a way its
 -- events do not account for (then unspent_tracking_backfill_reset).
--- Events above the event floor are kept while the backfill is prepared.
+-- Events above the event floor are kept from before the preparation's
+-- snapshot until the backfill is complete (unspent_tracking_backfill_retain_events).
 -- Whatever the batch writes is computed from S and commits with the
 -- partition's progress row, so later job batches of the partition see it, and
 -- every acceptance change committed after S is still ahead of them.
@@ -696,24 +699,37 @@ END;
 $$;
 COMMENT ON FUNCTION unspent_tracking_backfill_prepare (bigint, bigint, bigint) IS 'Prepare the backfill of pre-tracking outputs (once; call in a REPEATABLE READ transaction with settled sequence values); see migration 1791500000000_unspent_node_ids.';
 
--- Forget the prepared backfill (a batch found it stale): the partitions whose
--- backfill is not complete restart from the beginning of their range after a
--- new preparation (done partitions stay done: their values were exact at
--- their snapshots, and every later change is the job's).
+-- Forget the prepared backfill (a batch found it stale): every partition,
+-- complete ones included, restarts from the beginning of its range after a
+-- new preparation. The change that made the preparation stale (a node_block
+-- row added or removed without an event) may concern outputs a complete
+-- partition already wrote, and the job does not see it.
 CREATE FUNCTION unspent_tracking_backfill_reset ()
   RETURNS boolean LANGUAGE plpgsql SET lock_timeout = '2s' AS $$
-DECLARE
-  start_tx bigint;
 BEGIN
   LOCK TABLE unspent_tracking_progress IN EXCLUSIVE MODE;
-  SELECT tracking_start_transaction_internal_id INTO start_tx FROM unspent_tracking_settings;
   DELETE FROM unspent_tracking_backfill;
   TRUNCATE unspent_tracking_backfill_nodes, unspent_tracking_backfill_transactions,
     unspent_tracking_backfill_spends, unspent_tracking_backfill_rows;
-  UPDATE unspent_tracking_progress SET backfill_prefix = 0, updated_at = now()
-    WHERE backfill_transaction_internal_id < COALESCE(start_tx, 0);
+  UPDATE unspent_tracking_progress
+    SET backfill_prefix = 0, backfill_transaction_internal_id = 0, updated_at = now();
   RETURN true;
 END;
+$$;
+
+-- Keep the events above `event_floor` (the floor of a backfill about to be
+-- prepared) until the backfill is complete. The agent calls it in its own
+-- transaction before the preparation's REPEATABLE READ transaction starts:
+-- unspent_tracking_delete_consumed_events locks the settings row before it
+-- reads the floor, so this update waits for every deletion in flight, and no
+-- event above the floor is deleted after the preparation's snapshot (by any
+-- agent). An event deleted before the snapshot is already reflected in the
+-- state the preparation reads. The floor only moves down while a backfill is
+-- pending; it is cleared when the backfill is complete or tracking stops.
+CREATE FUNCTION unspent_tracking_backfill_retain_events (event_floor bigint)
+  RETURNS void LANGUAGE sql AS $$
+  UPDATE unspent_tracking_settings
+    SET backfill_event_floor = LEAST(COALESCE(backfill_event_floor, event_floor), event_floor);
 $$;
 
 -- One backfill batch of partition `part`: the next `max_prefixes` two-byte
@@ -932,7 +948,8 @@ BEGIN
         backfill_complete = (input_watermark = 0),
         rebuild_through_transaction_internal_id = CASE WHEN rebuild_required
           THEN GREATEST(input_watermark, (SELECT COALESCE(max(internal_id), 0) FROM transaction)) END,
-        watch_consumed_event_id = 0;
+        watch_consumed_event_id = 0,
+        backfill_event_floor = NULL;
   DELETE FROM unspent_tracking_backfill;
   TRUNCATE unspent_tracking_backfill_nodes, unspent_tracking_backfill_transactions,
     unspent_tracking_backfill_spends, unspent_tracking_backfill_rows;
@@ -1146,23 +1163,30 @@ BEGIN
         backfill_complete = false,
         rebuild_required = true,
         rebuild_through_transaction_internal_id = NULL,
-        watch_consumed_event_id = 0;
+        watch_consumed_event_id = 0,
+        backfill_event_floor = NULL;
   RETURN true;
 END;
 $$;
 
 -- Events consumed by every partition and by the watch pass (READ COMMITTED,
--- after a round), except those above a prepared backfill's event floor (its
--- batches re-check their transactions). Once the backfill is complete, its
--- state is emptied.
+-- after a round), except those above a pending backfill's event floor (its
+-- batches re-check their transactions). The settings row is locked before the
+-- floor is read (see unspent_tracking_backfill_retain_events). Once the
+-- backfill is complete, its state and floor are emptied.
 CREATE FUNCTION unspent_tracking_delete_consumed_events ()
   RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
   deleted bigint;
+  watch_consumed bigint;
+  retained_floor bigint;
 BEGIN
+  SELECT s.watch_consumed_event_id, s.backfill_event_floor INTO watch_consumed, retained_floor
+    FROM unspent_tracking_settings s FOR UPDATE;
   DELETE FROM unspent_tracking_events
     WHERE id <= LEAST((SELECT COALESCE(min(consumed_event_id), 0) FROM unspent_tracking_progress),
-                      (SELECT watch_consumed_event_id FROM unspent_tracking_settings),
+                      watch_consumed,
+                      COALESCE(retained_floor, 9223372036854775807),
                       COALESCE((SELECT b.event_floor FROM unspent_tracking_backfill b), 9223372036854775807));
   GET DIAGNOSTICS deleted = ROW_COUNT;
   IF NOT (SELECT backfill_complete FROM unspent_tracking_settings)
@@ -1173,6 +1197,9 @@ BEGIN
     DELETE FROM unspent_tracking_backfill;
     TRUNCATE unspent_tracking_backfill_nodes, unspent_tracking_backfill_transactions,
       unspent_tracking_backfill_spends, unspent_tracking_backfill_rows;
+  END IF;
+  IF retained_floor IS NOT NULL AND NOT unspent_tracking_backfill_pending() THEN
+    UPDATE unspent_tracking_settings SET backfill_event_floor = NULL;
   END IF;
   IF (SELECT rebuild_required FROM unspent_tracking_settings) AND NOT unspent_tracking_rebuild_pending() THEN
     UPDATE unspent_tracking_settings SET rebuild_required = false, rebuild_through_transaction_internal_id = NULL;

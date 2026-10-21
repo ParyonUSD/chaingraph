@@ -30,6 +30,7 @@ import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
 import {
+  backfillRetainEventsSql,
   configureTrackingTriggersSql,
   partitionOf,
 } from '../components/unspent-tracking.js';
@@ -4887,6 +4888,48 @@ test.serial(
       t.is(await stored('f0', 5), null, 'fixtures saved after the default');
       await client.query('ANALYZE;');
       await compareDeferredQueryRoot(t, 'fast backfill: pending');
+      /*
+       * Event retention for a backfill about to be prepared (in a rolled-back
+       * transaction): once the floor is published, before the preparation's
+       * snapshot, events above it are kept although every partition and the
+       * watch pass consumed them.
+       */
+      await client.query('BEGIN;');
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        const eventIds = (
+          await client.query<{ id: string }>(
+            /* sql */ `INSERT INTO unspent_tracking_events (event_kind, node_internal_id, block_internal_id)
+              SELECT 'accepted', $1::bigint, 0 FROM generate_series(1, 3) RETURNING id;`,
+            [nodeA]
+          )
+        ).rows
+          .map((row) => Number(row.id))
+          .sort((a, b) => a - b);
+        const [floorId, , lastId] = eventIds as [number, number, number];
+        await client.query(
+          `UPDATE unspent_tracking_progress SET consumed_event_id = $1;`,
+          [lastId]
+        );
+        await client.query(
+          `UPDATE unspent_tracking_settings SET watch_consumed_event_id = $1;`,
+          [lastId]
+        );
+        await client.query(backfillRetainEventsSql, [floorId]);
+        await client.query(`SELECT unspent_tracking_delete_consumed_events();`);
+        t.deepEqual(
+          (
+            await client.query<{ id: string }>(
+              `SELECT id FROM unspent_tracking_events WHERE id = ANY ($1::bigint[]) ORDER BY id;`,
+              [eventIds]
+            )
+          ).rows.map((row) => Number(row.id)),
+          eventIds.slice(1),
+          'events above the published floor kept'
+        );
+      } finally {
+        await client.query('ROLLBACK;');
+      }
       // values before the backfill, to check what it writes
       await client.query(/* sql */ `
         CREATE TEMP TABLE fast_backfill_before AS
@@ -4935,13 +4978,16 @@ test.serial(
         [{ hash: lagging.hash, height: blockHeight }],
         new Date()
       );
-      // half of the partitions run their whole backfill now
+      /*
+       * Every partition but the first runs its whole backfill now (the
+       * fixtures' hashes start with 0xec: a complete partition holds them).
+       */
       const partitions = await partitionCount();
-      const firstHalf = Array.from(
-        { length: Math.ceil(partitions / 2) },
-        (_, partition) => partition
+      const completedFirst = Array.from(
+        { length: partitions - 1 },
+        (_, index) => index + 1
       );
-      const firstResults = await firstHalf.reduce<
+      const firstResults = await completedFirst.reduce<
         Promise<{ [key: string]: unknown }[]>
       >(
         async (chain, partition) =>
@@ -4955,22 +5001,22 @@ test.serial(
         firstResults.every((result) => result.done === true),
         JSON.stringify(firstResults)
       );
-      t.true(await pending(), 'still pending: other partitions');
+      t.true(await pending(), 'still pending: the first partition');
       t.is(await readMode(), 'live', 'partly backfilled: live');
-      await compareDeferredQueryRoot(t, 'fast backfill: half done');
+      await compareDeferredQueryRoot(t, 'fast backfill: partly done');
       /*
        * A node gains a block below the floor without an "accepted" event (a
-       * path the preparation cannot account for): the next batch reports the
-       * preparation stale.
+       * path the preparation cannot account for; it changes outputs a
+       * complete partition already wrote): the next batch reports the
+       * preparation stale, and every partition is backfilled again.
        */
       await client.query(
         /* sql */ `INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
           SELECT $1::bigint, internal_id, now() FROM block WHERE hash = $2;`,
         [nodeB, hexToBin(hash('b2'))]
       );
-      const lastPartition = partitions - 1;
       t.true(
-        (await runBatch(lastPartition, partitions)).stale === true,
+        (await runBatch(0, partitions)).stale === true,
         'stale preparation detected'
       );
       /*

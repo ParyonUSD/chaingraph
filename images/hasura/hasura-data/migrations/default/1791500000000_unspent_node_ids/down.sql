@@ -18,6 +18,7 @@ DROP FUNCTION IF EXISTS unspent_tracking_initialize (integer, bigint, bigint, bi
 DROP FUNCTION IF EXISTS unspent_tracking_backfill_scope (bytea, bytea);
 DROP FUNCTION IF EXISTS unspent_tracking_backfill_batch (integer, integer, integer);
 DROP FUNCTION IF EXISTS unspent_tracking_backfill_reset ();
+DROP FUNCTION IF EXISTS unspent_tracking_backfill_retain_events (bigint);
 DROP FUNCTION IF EXISTS unspent_tracking_backfill_prepare (bigint, bigint, bigint);
 DROP FUNCTION IF EXISTS unspent_tracking_backfill_node_blocks (bigint, bigint, bigint);
 DROP FUNCTION IF EXISTS unspent_tracking_run_batch (integer, integer, bigint, bigint, bigint, integer, integer, integer, bigint);

@@ -200,6 +200,11 @@ export const parseWatchPassResult = (raw: {
 export const backfillPrepareSql = /* sql */ `SELECT unspent_tracking_backfill_prepare($1::bigint, $2::bigint, $3::bigint) AS result;`;
 export const backfillBatchSql = /* sql */ `SELECT unspent_tracking_backfill_batch($1::integer, $2::integer, $3::integer) AS result;`;
 export const backfillResetSql = /* sql */ `SELECT unspent_tracking_backfill_reset() AS reset;`;
+/**
+ * Keep the events above a backfill's event floor (`$1`) until the backfill is
+ * complete; run in its own transaction before the preparation's.
+ */
+export const backfillRetainEventsSql = /* sql */ `SELECT unspent_tracking_backfill_retain_events($1::bigint);`;
 export const backfillStateSql = /* sql */ `SELECT unspent_tracking_backfill_pending() AS pending, EXISTS (SELECT 1 FROM unspent_tracking_backfill) AS prepared;`;
 /**
  * Whether the job must backfill whatever CHAINGRAPH_UNSPENT_TRACKING_BACKFILL

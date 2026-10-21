@@ -17,6 +17,7 @@ import {
   backfillBatchSql,
   backfillPrepareSql,
   backfillResetSql,
+  backfillRetainEventsSql,
   backfillStateSql,
   batchDidWork,
   batchReachedLimits,
@@ -1951,7 +1952,9 @@ const runBackfillBatch = async (
 
 /**
  * Prepare the backfill once, in its own REPEATABLE READ transaction, at the
- * settled limits (floors). Returns whether a prepared backfill is pending.
+ * settled limits (floors), after publishing the event floor (events above it
+ * are kept until the backfill is complete). Returns whether a prepared
+ * backfill is pending.
  */
 const prepareBackfill = async (
   client: pg.PoolClient,
@@ -1969,6 +1972,11 @@ const prepareBackfill = async (
     return true;
   }
   const start = Date.now();
+  /*
+   * Committed before the preparation's snapshot: no agent deletes an event
+   * above the floor once the snapshot is taken.
+   */
+  await client.query(backfillRetainEventsSql, [limits.eventLimit]);
   await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ;');
   // eslint-disable-next-line functional/no-try-statement
   try {
@@ -2284,7 +2292,7 @@ export const runUnspentTrackingJobPass = async (
            * backfill cannot account for: prepare again (next pass).
            */
           unspentTrackingLog.warn(
-            'Unspent tracking backfill: the prepared state is stale (the node table changed, or a node gained blocks without "accepted" events); the partitions not yet complete restart after a new preparation.'
+            'Unspent tracking backfill: the prepared state is stale (the node table changed, or a node gained or lost blocks without events); every partition restarts its backfill after a new preparation.'
           );
           await coordinator.query(backfillResetSql).catch((err: unknown) => {
             if (!isLockNotAvailable(err)) {
