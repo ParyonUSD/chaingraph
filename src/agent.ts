@@ -59,6 +59,10 @@ import {
   saveTransactionForNodes,
 } from './db.js';
 import type { ExpiringMempoolTransaction, IncompleteBlock } from './db.js';
+import {
+  describePostgresError,
+  isPostgresConnectionError,
+} from './postgres-errors.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -117,6 +121,11 @@ const renderSyncPercentage = (value: number) => {
 };
 
 const msPerSecond = 1000;
+/**
+ * Delay before retrying an incomplete block repair scan which failed because
+ * the Postgres connection was lost (e.g. Postgres is restarting).
+ */
+const incompleteBlockRepairRetryDelayMs = 5_000;
 const durationDecimalPlaces = 1;
 const transactionRateDecimalPlaces = 2;
 
@@ -1171,6 +1180,20 @@ export class Agent {
     this.incompleteBlockRepairTimeout = setTimeout(() => {
       this.scheduledIncompleteBlockRepair = false;
       this.repairIncompleteBlocks().catch((err) => {
+        if (isPostgresConnectionError(err) && !this.willShutdown) {
+          this.logger.warn(
+            `Agent: incomplete block repair scan lost its Postgres connection (${describePostgresError(
+              err
+            )}); retrying in ${
+              incompleteBlockRepairRetryDelayMs / msPerSecond
+            } seconds.`
+          );
+          this.incompleteBlockRepairTimeout = setTimeout(() => {
+            this.incompleteBlockRepairTimeout = undefined;
+            this.scheduleIncompleteBlockRepair();
+          }, incompleteBlockRepairRetryDelayMs);
+          return;
+        }
         this.logger.fatal(err);
         this.shutdown().catch((shutdownErr) => {
           this.logger.error(shutdownErr);
