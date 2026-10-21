@@ -23,6 +23,12 @@ declare module '@chaingraph/bitcore-p2p-cash' {
     Block: {
       fromBuffer: (rawBlock: Buffer) => BlockMessage;
     };
+
+    constructor(options?: {
+      Block?: typeof Block;
+      network?: ReturnType<typeof bitcoreModule.Networks.get>;
+      Transaction?: typeof Transaction;
+    });
   }
 
   export const enum BitcoreInventoryType {
@@ -70,6 +76,7 @@ declare module '@chaingraph/bitcore-p2p-cash' {
     inventory: BitcoreInventory[];
   }
   export class SendHeadersMessage extends Message<SendHeadersMessage> {}
+  export class MemPoolMessage extends Message<MemPoolMessage> {}
 
   export class TransactionMessage extends Message<TransactionMessage> {
     transaction: Transaction;
@@ -88,6 +95,7 @@ declare module '@chaingraph/bitcore-p2p-cash' {
     getdata: () => void;
     headers: (message: HeadersMessage) => void;
     inv: (message: InventoryMessage) => void;
+    mempool: (message: MemPoolMessage) => void;
     ready: () => void;
     tx: (message: TransactionMessage) => void;
   }
@@ -114,6 +122,7 @@ declare module '@chaingraph/bitcore-p2p-cash' {
         forTransaction: (transactionHash: Buffer | string) => InventoryMessage;
       };
       SendHeaders: typeof SendHeadersMessage;
+      MemPool: typeof MemPoolMessage;
       Transaction: typeof TransactionMessage;
     };
 
@@ -129,6 +138,7 @@ declare module '@chaingraph/bitcore-p2p-cash' {
 
     constructor(config: {
       host?: string;
+      messages?: Messages;
       network?: string;
       port?: number;
       relay?: boolean;
