@@ -655,6 +655,135 @@ const acceptedBlockResolution = (node: string, transaction: string) => {
 };
 
 /**
+ * The statement archiving a batch of expired node_transaction rows and their
+ * same-node descendants (see {@link archiveMempoolTransactions}): `$1` to `$4`
+ * are the batch's node internal IDs, transaction internal IDs, replaced_at
+ * timestamps and scheduled validated_at timestamps (NULL to skip that check).
+ *
+ * Each step of the descendant walk looks up the spending transaction's
+ * node_transaction row by its full key behind an OFFSET 0 planning barrier.
+ * Without it, Postgres can join the walked rows to node_transaction by node
+ * alone (then filter by the spending inputs), reading the node's whole mempool
+ * once per walked row: it does so when node_transaction statistics predate
+ * the current mempool (e.g. last analyzed just after a block emptied it), so
+ * archiving a large mempool would take time quadratic in its size.
+ */
+export const mempoolExpiryArchivalStatement = /* sql */ `
+WITH RECURSIVE expiry AS (
+    SELECT node_internal_id, transaction_internal_id, replaced_at, validated_at
+      FROM unnest($1::integer[], $2::bigint[], $3::timestamp[], $4::timestamp[])
+        AS expiry (node_internal_id, transaction_internal_id, replaced_at, validated_at)
+),
+expired AS (
+    SELECT expiry.node_internal_id,
+           expiry.transaction_internal_id,
+           expiry.replaced_at
+      FROM expiry
+      JOIN node_transaction
+        ON node_transaction.node_internal_id = expiry.node_internal_id
+       AND node_transaction.transaction_internal_id = expiry.transaction_internal_id
+      CROSS JOIN LATERAL (${acceptedBlockResolution(
+        'expiry.node_internal_id',
+        'expiry.transaction_internal_id'
+      )}
+      ) resolution
+      WHERE NOT resolution.accepted
+        AND NOT resolution.replaced
+        -- validated_at has microseconds; the scheduled Date has milliseconds
+        AND (expiry.validated_at IS NULL
+          OR date_trunc('milliseconds', node_transaction.validated_at) <= expiry.validated_at)
+),
+invalidated (node_internal_id, transaction_internal_id, replaced_at) AS (
+    SELECT node_internal_id, transaction_internal_id, replaced_at
+      FROM expired
+      WHERE NOT EXISTS (
+          SELECT 1
+            FROM input
+            JOIN transaction parent_transaction
+              ON parent_transaction.hash = input.outpoint_transaction_hash
+            JOIN expired expired_parent
+              ON expired_parent.node_internal_id = expired.node_internal_id
+             AND expired_parent.transaction_internal_id = parent_transaction.internal_id
+             AND expired_parent.replaced_at <= expired.replaced_at
+            WHERE input.transaction_internal_id = expired.transaction_internal_id
+        )
+    UNION
+    SELECT child.node_internal_id,
+           child.transaction_internal_id,
+           CASE
+             WHEN resolution.accepted THEN NULL::timestamp without time zone
+             WHEN resolution.replaced THEN resolution.replaced_at
+             ELSE parent.replaced_at
+           END
+      FROM invalidated parent
+      JOIN transaction parent_transaction
+        ON parent_transaction.internal_id = parent.transaction_internal_id
+      JOIN input child_input
+        ON child_input.outpoint_transaction_hash = parent_transaction.hash
+      CROSS JOIN LATERAL (
+        SELECT node_internal_id, transaction_internal_id
+          FROM node_transaction
+          WHERE node_internal_id = parent.node_internal_id
+            AND transaction_internal_id = child_input.transaction_internal_id
+          OFFSET 0
+      ) child
+      CROSS JOIN LATERAL (${acceptedBlockResolution(
+        'child.node_internal_id',
+        'child.transaction_internal_id'
+      )}
+      ) resolution
+      WHERE parent.replaced_at IS NOT NULL
+),
+archive_rows AS (
+    -- confirmation takes precedence, then the earliest invalidation
+    SELECT node_internal_id,
+           transaction_internal_id,
+           CASE
+             WHEN bool_or(replaced_at IS NULL) THEN NULL::timestamp without time zone
+             ELSE MIN(replaced_at)
+           END AS replaced_at
+      FROM invalidated
+      GROUP BY node_internal_id, transaction_internal_id
+),
+locked AS (
+    SELECT node_transaction.node_internal_id,
+           node_transaction.transaction_internal_id,
+           archive_rows.replaced_at
+      FROM archive_rows
+      JOIN node_transaction
+        ON node_transaction.node_internal_id = archive_rows.node_internal_id
+       AND node_transaction.transaction_internal_id = archive_rows.transaction_internal_id
+      ORDER BY node_transaction.node_internal_id, node_transaction.transaction_internal_id
+      FOR UPDATE OF node_transaction
+),
+-- false if a walked row was deleted before its lock (the walk may be stale)
+complete AS (
+    SELECT (SELECT count(*) FROM locked) = (SELECT count(*) FROM archive_rows) AS complete
+),
+deleted_rows AS (
+    DELETE FROM node_transaction
+      USING locked
+      WHERE (SELECT complete FROM complete)
+        AND node_transaction.node_internal_id = locked.node_internal_id
+        AND node_transaction.transaction_internal_id = locked.transaction_internal_id
+      RETURNING node_transaction.node_internal_id,
+                node_transaction.transaction_internal_id,
+                node_transaction.validated_at,
+                locked.replaced_at
+),
+inserted_history AS (
+    INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id, validated_at, replaced_at)
+      SELECT node_internal_id, transaction_internal_id, validated_at, replaced_at
+        FROM deleted_rows
+      RETURNING node_internal_id, transaction_internal_id
+)
+SELECT complete.complete,
+       inserted_history.node_internal_id || ':' || inserted_history.transaction_internal_id AS archived
+  FROM complete
+  LEFT JOIN inserted_history ON true;
+`;
+
+/**
  * Archive expired node_transaction rows, and their same-node descendants, in
  * one transaction: take the expiry advisory lock, lock the expired rows, then
  * archive them in one statement. Each is a separate command, so (in READ
@@ -747,124 +876,12 @@ SELECT 1
       const result = await client.query<{
         archived: string | null;
         complete: boolean;
-      }>(
-        /* sql */ `
-WITH RECURSIVE expiry AS (
-    SELECT node_internal_id, transaction_internal_id, replaced_at, validated_at
-      FROM unnest($1::integer[], $2::bigint[], $3::timestamp[], $4::timestamp[])
-        AS expiry (node_internal_id, transaction_internal_id, replaced_at, validated_at)
-),
-expired AS (
-    SELECT expiry.node_internal_id,
-           expiry.transaction_internal_id,
-           expiry.replaced_at
-      FROM expiry
-      JOIN node_transaction
-        ON node_transaction.node_internal_id = expiry.node_internal_id
-       AND node_transaction.transaction_internal_id = expiry.transaction_internal_id
-      CROSS JOIN LATERAL (${acceptedBlockResolution(
-        'expiry.node_internal_id',
-        'expiry.transaction_internal_id'
-      )}
-      ) resolution
-      WHERE NOT resolution.accepted
-        AND NOT resolution.replaced
-        -- validated_at has microseconds; the scheduled Date has milliseconds
-        AND (expiry.validated_at IS NULL
-          OR date_trunc('milliseconds', node_transaction.validated_at) <= expiry.validated_at)
-),
-invalidated (node_internal_id, transaction_internal_id, replaced_at) AS (
-    SELECT node_internal_id, transaction_internal_id, replaced_at
-      FROM expired
-      WHERE NOT EXISTS (
-          SELECT 1
-            FROM input
-            JOIN transaction parent_transaction
-              ON parent_transaction.hash = input.outpoint_transaction_hash
-            JOIN expired expired_parent
-              ON expired_parent.node_internal_id = expired.node_internal_id
-             AND expired_parent.transaction_internal_id = parent_transaction.internal_id
-             AND expired_parent.replaced_at <= expired.replaced_at
-            WHERE input.transaction_internal_id = expired.transaction_internal_id
-        )
-    UNION
-    SELECT child.node_internal_id,
-           child.transaction_internal_id,
-           CASE
-             WHEN resolution.accepted THEN NULL::timestamp without time zone
-             WHEN resolution.replaced THEN resolution.replaced_at
-             ELSE parent.replaced_at
-           END
-      FROM invalidated parent
-      JOIN transaction parent_transaction
-        ON parent_transaction.internal_id = parent.transaction_internal_id
-      JOIN input child_input
-        ON child_input.outpoint_transaction_hash = parent_transaction.hash
-      JOIN node_transaction child
-        ON child.node_internal_id = parent.node_internal_id
-       AND child.transaction_internal_id = child_input.transaction_internal_id
-      CROSS JOIN LATERAL (${acceptedBlockResolution(
-        'child.node_internal_id',
-        'child.transaction_internal_id'
-      )}
-      ) resolution
-      WHERE parent.replaced_at IS NOT NULL
-),
-archive_rows AS (
-    -- confirmation takes precedence, then the earliest invalidation
-    SELECT node_internal_id,
-           transaction_internal_id,
-           CASE
-             WHEN bool_or(replaced_at IS NULL) THEN NULL::timestamp without time zone
-             ELSE MIN(replaced_at)
-           END AS replaced_at
-      FROM invalidated
-      GROUP BY node_internal_id, transaction_internal_id
-),
-locked AS (
-    SELECT node_transaction.node_internal_id,
-           node_transaction.transaction_internal_id,
-           archive_rows.replaced_at
-      FROM archive_rows
-      JOIN node_transaction
-        ON node_transaction.node_internal_id = archive_rows.node_internal_id
-       AND node_transaction.transaction_internal_id = archive_rows.transaction_internal_id
-      ORDER BY node_transaction.node_internal_id, node_transaction.transaction_internal_id
-      FOR UPDATE OF node_transaction
-),
--- false if a walked row was deleted before its lock (the walk may be stale)
-complete AS (
-    SELECT (SELECT count(*) FROM locked) = (SELECT count(*) FROM archive_rows) AS complete
-),
-deleted_rows AS (
-    DELETE FROM node_transaction
-      USING locked
-      WHERE (SELECT complete FROM complete)
-        AND node_transaction.node_internal_id = locked.node_internal_id
-        AND node_transaction.transaction_internal_id = locked.transaction_internal_id
-      RETURNING node_transaction.node_internal_id,
-                node_transaction.transaction_internal_id,
-                node_transaction.validated_at,
-                locked.replaced_at
-),
-inserted_history AS (
-    INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id, validated_at, replaced_at)
-      SELECT node_internal_id, transaction_internal_id, validated_at, replaced_at
-        FROM deleted_rows
-      RETURNING node_internal_id, transaction_internal_id
-)
-SELECT complete.complete,
-       inserted_history.node_internal_id || ':' || inserted_history.transaction_internal_id AS archived
-  FROM complete
-  LEFT JOIN inserted_history ON true;
-`,
-        [
-          nodeInternalIds,
-          transactionInternalIds,
-          sorted.map((expiry) => expiry.replacedAt.toISOString()),
-          sorted.map((expiry) => expiry.validatedAt?.toISOString() ?? null),
-        ]
-      );
+      }>(mempoolExpiryArchivalStatement, [
+        nodeInternalIds,
+        transactionInternalIds,
+        sorted.map((expiry) => expiry.replacedAt.toISOString()),
+        sorted.map((expiry) => expiry.validatedAt?.toISOString() ?? null),
+      ]);
       if (result.rows[0]?.complete !== true) {
         // eslint-disable-next-line functional/no-throw-statement
         throw Object.assign(

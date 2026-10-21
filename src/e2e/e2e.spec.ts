@@ -859,6 +859,32 @@ const waitForConfirmedMempoolArchive = async (
   return waitForConfirmedMempoolArchive(remainingAttempts - 1);
 };
 
+const mempoolPollingAttempts = 50;
+const mempoolPollingIntervalMs = 100;
+const getMempoolTransactionHashes = async () =>
+  (
+    await client.query<{ hash: string }>(
+      /* sql */ `SELECT encode(hash, 'hex') AS hash FROM node_transaction JOIN transaction ON node_transaction.transaction_internal_id = transaction.internal_id ORDER BY hash ASC;`
+    )
+  ).rows.map((row) => row.hash);
+/**
+ * Poll node_transaction until its hashes (as listed by
+ * {@link getMempoolTransactionHashes}) satisfy `expected`: the agent saves
+ * transactions received from peers asynchronously. Returns the last hashes
+ * read.
+ */
+const waitForMempoolTransactionHashes = async (
+  expected: (hashes: string[]) => boolean,
+  remainingAttempts = mempoolPollingAttempts
+): Promise<string[]> => {
+  const hashes = await getMempoolTransactionHashes();
+  if (expected(hashes) || remainingAttempts === 0) {
+    return hashes;
+  }
+  await sleep(mempoolPollingIntervalMs);
+  return waitForMempoolTransactionHashes(expected, remainingAttempts - 1);
+};
+
 test.serial(
   '[e2e] ignores inbound transactions before initial sync is complete',
   async (t) => {
@@ -2130,6 +2156,14 @@ test.serial(
     const [, tx1] = tipA[0]!.transactions;
     peers.node1.sendMessage(new peers.node1.messages.Transaction(tx1));
     logger.debug(`node1: sent tipA[0] transaction 0: ${tx1!.hash}`);
+    // the block must arrive after the transaction is saved for it to be known
+    t.true(
+      (
+        await waitForMempoolTransactionHashes((hashes) =>
+          hashes.includes(tx1!.hash)
+        )
+      ).includes(tx1!.hash)
+    );
     newBlocks('node1', [tipA[0]!]);
     newBlocks('node2', [tipB[0]!]);
     newBlocks('node3', [tipB[0]!]);
@@ -2487,20 +2521,21 @@ test.serial(
     peers.node1.sendMessage(new peers.node1.messages.Transaction(tx2));
     logger.debug(`node1: sent tx2: ${tx2!.hash}`);
     peers.node1.sendMessage(new peers.node1.messages.Transaction(tx3));
-    logger.debug(`node1: sent tx3: ${tx2!.hash}`);
-    const delay = 100;
-    await sleep(delay);
-    const mempool1 = await client.query<{ encode: string }>(
-      /* sql */ `SELECT encode(hash, 'hex') FROM node_transaction JOIN transaction ON node_transaction.transaction_internal_id = transaction.internal_id ORDER BY hash ASC;`
+    logger.debug(`node1: sent tx3: ${tx3!.hash}`);
+    const expectedMempool = [
+      tx1!.hash,
+      tx3!.hash,
+      tx2!.hash,
+      chipnetCashTokensTxHash,
+      halTxSpent,
+      halTxHash,
+    ];
+    t.deepEqual(
+      await waitForMempoolTransactionHashes(
+        (hashes) => hashes.join() === expectedMempool.join()
+      ),
+      expectedMempool
     );
-    t.deepEqual(mempool1.rows, [
-      { encode: tx1!.hash },
-      { encode: tx3!.hash },
-      { encode: tx2!.hash },
-      { encode: chipnetCashTokensTxHash },
-      { encode: halTxSpent },
-      { encode: halTxHash },
-    ]);
     newBlocks('node1', [tipA[161]!]);
     newBlocks('node2', [tipB[161]!]);
     newBlocks('node3', [tipA[161]!]);
@@ -2512,13 +2547,10 @@ test.serial(
     await waitForStdout(
       /Saved new block – height:\s+3162[^\n]+nodes: node1, node3/u
     );
-    const mempool2 = await client.query<{ encode: string }>(
-      /* sql */ `SELECT encode(hash, 'hex') FROM node_transaction JOIN transaction ON node_transaction.transaction_internal_id = transaction.internal_id ORDER BY hash ASC;`
-    );
-    t.deepEqual(mempool2.rows, [
-      { encode: chipnetCashTokensTxHash },
-      { encode: halTxSpent },
-      { encode: halTxHash },
+    t.deepEqual(await getMempoolTransactionHashes(), [
+      chipnetCashTokensTxHash,
+      halTxSpent,
+      halTxHash,
     ]);
     t.pass();
   }
