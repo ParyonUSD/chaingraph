@@ -2610,6 +2610,24 @@ test.serial(
         oneNodeUnaudited.incompleteBlocks.map((block) => block.hash),
         [historicalRepairBlockHash]
       );
+      /*
+       * All markers positive (the bounded per-node join, not the full-audit
+       * fallback): node4's marker is below the block, so the block is still
+       * returned although node1 has already audited it.
+       */
+      const blockInternalId = Number(removedRow.blockInternalId);
+      t.true(blockInternalId > 1);
+      const oneNodeAuditedBelow = await scan(
+        [auditedNode1.nodeInternalId, auditedNode4.nodeInternalId],
+        [
+          Number(auditedNode1.auditedThroughBlockInternalId),
+          blockInternalId - 1,
+        ]
+      );
+      t.deepEqual(
+        oneNodeAuditedBelow.incompleteBlocks.map((block) => block.hash),
+        [historicalRepairBlockHash]
+      );
     } finally {
       await client.query(
         /* sql */ `
