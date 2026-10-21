@@ -20,6 +20,7 @@ import {
 import { BlockBuffer } from './components/block-buffer.js';
 import { BlockTree } from './components/block-tree.js';
 import type { indexDefinitions } from './components/db-utils.js';
+import { MempoolResync } from './components/mempool-resync.js';
 import { SyncState } from './components/sync-state.js';
 import {
   formatBytes,
@@ -32,6 +33,8 @@ import {
   chaingraphUserAgent,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
+  mempoolResync,
+  mempoolResyncMinIntervalMs,
   mempoolTransactionExpirationMs,
   mempoolTransactionExpirationScanIntervalMs,
   postgresMaxConnections,
@@ -321,6 +324,32 @@ export class Agent {
   };
 
   nodesByInternalId = [] as [nodeName: string, node: Node][];
+
+  /**
+   * Requests the mempool of trusted nodes (BIP35) after mempool tracking is
+   * enabled, on reconnection, and after re-organizations, so transactions
+   * which nodes don't re-announce (e.g. those returned to the mempool by a
+   * re-organization) are recorded in `node_transaction`. See
+   * https://github.com/bitauth/chaingraph/issues/81.
+   */
+  mempoolResync = new MempoolResync<Node>({
+    enabled: mempoolResync,
+    getReadyNode: (nodeName) => {
+      const node = this.nodes[nodeName];
+      return node?.internalId !== undefined && node.peer.status === 'ready'
+        ? node
+        : undefined;
+    },
+    minimumIntervalMs: mempoolResyncMinIntervalMs,
+    onRequestSent: (nodeName, triggers) => {
+      this.logger.info(
+        `${nodeName}: requested node mempool (BIP35) – triggers: ${triggers.join(
+          ', '
+        )}`
+      );
+    },
+    transactionCache: this.transactionCache,
+  });
 
   heartbeatInterval: NodeJS.Timeout;
 
@@ -612,6 +641,7 @@ export class Agent {
           }
           nodeRegisteredResolver();
           this.requestHeaders(node.name);
+          this.mempoolResync.handleConnect(node.name);
         });
       });
 
@@ -942,6 +972,9 @@ export class Agent {
                       }
                       this.logger.info('Agent: enabled mempool tracking.');
                       this.saveInboundTransactions = true;
+                      this.mempoolResync.enableMempoolTracking(
+                        Object.keys(this.nodes)
+                      );
                       this.scheduleIncompleteBlockRepair();
                       this.scheduleMempoolTransactionExpirationScan();
                     });
@@ -1118,6 +1151,7 @@ export class Agent {
       nodeInternalId: transaction.nodeInternalId,
       replacedAt: transaction.expiresAt,
       transactionInternalId: transaction.transactionInternalId,
+      validatedAt: transaction.validatedAt,
     });
     if (!archived) {
       this.logger.debug(
@@ -1918,6 +1952,7 @@ export class Agent {
           staleChain,
           `${nodeName}: re-organization detected beginning at height: ${firstHeight}. The following stale blocks were removed:`
         );
+        this.mempoolResync.handleReorganization(nodeName);
         this.scheduleBlockBufferFill();
       })
       .catch((err) => {
@@ -2242,6 +2277,7 @@ export class Agent {
       return this.shutdownPromise;
     }
     this.willShutdown = true;
+    this.mempoolResync.stop();
     clearInterval(eventLoopDurationInterval);
     clearInterval(this.heartbeatInterval);
     if (this.incompleteBlockRepairTimeout !== undefined) {

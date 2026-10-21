@@ -42,6 +42,8 @@ const expectedOptions = [
   'CHAINGRAPH_LOG_LEVEL_STDOUT',
   'CHAINGRAPH_LOG_LEVEL_PATH',
   'CHAINGRAPH_LOG_PATH',
+  'CHAINGRAPH_MEMPOOL_RESYNC',
+  'CHAINGRAPH_MEMPOOL_RESYNC_MIN_INTERVAL_MS',
   'CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_MS',
   'CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS',
   'CHAINGRAPH_POSTGRES_CONNECTION_STRING',
@@ -151,6 +153,34 @@ if (
   // eslint-disable-next-line functional/no-throw-statement
   throw new Error(
     'The CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS environment variable must be an integer greater than 0.'
+  );
+}
+
+if (
+  configuration.CHAINGRAPH_MEMPOOL_RESYNC.toLowerCase() !== 'true' &&
+  configuration.CHAINGRAPH_MEMPOOL_RESYNC.toLowerCase() !== 'false'
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_MEMPOOL_RESYNC' environment variable: ${configuration.CHAINGRAPH_MEMPOOL_RESYNC}. Must be one of the following: true, false`
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_MEMPOOL_RESYNC` environment variable.
+ */
+const mempoolResync =
+  configuration.CHAINGRAPH_MEMPOOL_RESYNC.toLowerCase() === 'true';
+
+const mempoolResyncMinIntervalMs = Number(
+  configuration.CHAINGRAPH_MEMPOOL_RESYNC_MIN_INTERVAL_MS
+);
+if (
+  !Number.isInteger(mempoolResyncMinIntervalMs) ||
+  mempoolResyncMinIntervalMs < 0
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    'The CHAINGRAPH_MEMPOOL_RESYNC_MIN_INTERVAL_MS environment variable must be an integer greater than or equal to 0.'
   );
 }
 
@@ -419,6 +449,8 @@ export {
   chaingraphUserAgent,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
+  mempoolResync,
+  mempoolResyncMinIntervalMs,
   mempoolTransactionExpirationMs,
   mempoolTransactionExpirationScanIntervalMs,
   postgresMaxConnections,
