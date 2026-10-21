@@ -28,6 +28,7 @@ import got from 'got';
 import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
+import type * as DbModule from '../db.js';
 import type { ChaingraphTransaction } from '../types/chaingraph.js';
 
 import { chaingraphE2eLogPath, logger } from './e2e.spec.logging.helper.js';
@@ -90,6 +91,7 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100003000_output_category_capability_statistics/up.sql'
   ),
+  migration('default/1791200000000_add_incomplete_block_audit/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -169,6 +171,7 @@ const e2eEnvVariables = {
   CHAINGRAPH_INTERNAL_API_PORT: chaingraphInternalApiPort,
   CHAINGRAPH_LOG_FIREHOSE: logP2pMessage.toString(),
   CHAINGRAPH_LOG_PATH: chaingraphE2eLogPath,
+  CHAINGRAPH_MEMPOOL_RESYNC_MIN_INTERVAL_MS: '100',
   CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS: '100',
   CHAINGRAPH_POSTGRES_CONNECTION_STRING: postgresE2eConnectionStringTestDb,
   CHAINGRAPH_TRUSTED_NODES: e2eTrustedNodesSet1,
@@ -192,6 +195,40 @@ const peers = {
   node1: placeholder,
   node2: placeholder,
   node3: placeholder,
+};
+
+/**
+ * The transaction hashes (hex, as displayed) each mock node announces in reply
+ * to a BIP35 `mempool` request, and the number of requests each has received.
+ */
+const mempoolReplies: { [nodeName in keyof typeof peers]: string[] } = {
+  node1: [],
+  node2: [],
+  node3: [],
+};
+const mempoolRequestCounts: { [nodeName in keyof typeof peers]: number } = {
+  node1: 0,
+  node2: 0,
+  node3: 0,
+};
+const respondToMempoolRequests = (nodeName: keyof typeof peers, peer: Peer) => {
+  peer.on('mempool', () => {
+    mempoolRequestCounts[nodeName] += 1;
+    logger.debug(
+      `e2e: ${nodeName} received mempool request, announcing: ${mempoolReplies[
+        nodeName
+      ].join(', ')}`
+    );
+    /**
+     * BIP35 replies may be split across multiple `inv` messages; announce each
+     * transaction in its own message.
+     */
+    mempoolReplies[nodeName].forEach((hash) => {
+      peer.sendMessage(
+        peer.messages.Inventory.forTransaction(Buffer.from(hash, 'hex'))
+      );
+    });
+  });
 };
 
 test.beforeEach((t) => {
@@ -246,15 +283,24 @@ test.before(async () => {
   };
   node1.on('peerready', (peer) => {
     logPeerConnection(`node1`, peer);
-    if (!peer.subversion.includes('tx-broadcast')) peers.node1 = peer;
+    if (!peer.subversion.includes('tx-broadcast')) {
+      peers.node1 = peer;
+      respondToMempoolRequests('node1', peer);
+    }
   });
   node2.on('peerready', (peer) => {
     logPeerConnection(`node2`, peer);
-    if (!peer.subversion.includes('tx-broadcast')) peers.node2 = peer;
+    if (!peer.subversion.includes('tx-broadcast')) {
+      peers.node2 = peer;
+      respondToMempoolRequests('node2', peer);
+    }
   });
   node3.on('peerready', (peer) => {
     logPeerConnection(`node3`, peer);
-    if (!peer.subversion.includes('tx-broadcast')) peers.node3 = peer;
+    if (!peer.subversion.includes('tx-broadcast')) {
+      peers.node3 = peer;
+      respondToMempoolRequests('node3', peer);
+    }
   });
 
   if (logP2pMessage) {
@@ -653,6 +699,51 @@ const waitForBlockTransactionCount = async (
   );
 };
 
+/**
+ * When several mock nodes announce the same block, the agent's "Saved new
+ * block" log line lists only the nodes whose headers arrived before the save;
+ * later announcers are recorded via "accepted existing blocks" instead. Header
+ * arrival order across peer connections isn't deterministic, so tests check
+ * the resulting node_block rows rather than the log line.
+ */
+const blockAcceptancePollingAttempts = 100;
+const blockAcceptancePollingIntervalMs = 100;
+const getAcceptingNodeNames = async (blockHash: string) =>
+  (
+    await client.query<{ nodeName: string }>(
+      /* sql */ `
+      SELECT node.name AS "nodeName"
+        FROM node_block
+        INNER JOIN node ON node.internal_id = node_block.node_internal_id
+        INNER JOIN block ON block.internal_id = node_block.block_internal_id
+        WHERE block.hash = $1
+        ORDER BY node.name;
+    `,
+      [hexToBin(blockHash)]
+    )
+  ).rows.map((row) => row.nodeName);
+const waitForBlockAcceptedByNodes = async (
+  blockHash: string,
+  expectedNodeNames: string[],
+  remainingAttempts = blockAcceptancePollingAttempts
+): Promise<string[]> => {
+  const acceptingNodeNames = await getAcceptingNodeNames(blockHash);
+  if (
+    expectedNodeNames.every((nodeName) =>
+      acceptingNodeNames.includes(nodeName)
+    ) ||
+    remainingAttempts === 0
+  ) {
+    return acceptingNodeNames;
+  }
+  await sleep(blockAcceptancePollingIntervalMs);
+  return waitForBlockAcceptedByNodes(
+    blockHash,
+    expectedNodeNames,
+    remainingAttempts - 1
+  );
+};
+
 const mempoolExpirationPollingAttempts = 50;
 const mempoolExpirationPollingIntervalMs = 100;
 const getExpiredMempoolArchiveState = async () =>
@@ -795,6 +886,27 @@ test.serial('[e2e] completes initial sync', async (t) => {
   t.pass();
 });
 
+test.serial(
+  '[e2e] requests the mempool of each node once mempool tracking is enabled',
+  async (t) => {
+    await waitForStdout('Agent: enabled mempool tracking.');
+    await waitForStdout(
+      'node1: requested node mempool (BIP35) – triggers: mempool-tracking-enabled'
+    );
+    await waitForStdout(
+      'node2: requested node mempool (BIP35) – triggers: mempool-tracking-enabled'
+    );
+    await waitForStdout(
+      'node3: requested node mempool (BIP35) – triggers: mempool-tracking-enabled'
+    );
+    const delay = 500;
+    await sleep(delay);
+    t.true(mempoolRequestCounts.node1 >= 1);
+    t.true(mempoolRequestCounts.node2 >= 1);
+    t.true(mempoolRequestCounts.node3 >= 1);
+  }
+);
+
 test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
   await waitForStdout('Agent: all managed indexes have been created.');
   await waitForStdout('Agent: enabled mempool tracking.');
@@ -812,6 +924,7 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'block_internal_id_key',
     'block_pkey',
     'block_transaction_pkey',
+    'incomplete_block_audit_pkey',
     'input_pkey',
     'node_block_history_pkey',
     'node_block_pkey',
@@ -1979,6 +2092,37 @@ const newBlocks = (
 };
 
 test.serial(
+  '[e2e] survives Postgres terminating its connections (e.g. a restart)',
+  async (t) => {
+    const crashGracePeriodMs = 2_000;
+    const logStart = stdoutBuffer.length;
+    const terminated = await client.query<{ terminated: boolean }>(
+      /* sql */ `
+      SELECT pg_terminate_backend(pid) AS terminated FROM pg_stat_activity
+        -- cspell:disable-next-line
+        WHERE datname = $1
+          AND pid <> pg_backend_pid();
+    `,
+      [e2eTestDbName]
+    );
+    t.true(
+      terminated.rows.some((row) => row.terminated),
+      'Expected the agent to hold at least one Postgres connection.'
+    );
+    await waitForStdout('Postgres connection lost');
+    // give a crash (uncaught 'error' event → shutdown) time to happen
+    await sleep(crashGracePeriodMs);
+    const logsSinceTermination = stdoutBuffer.slice(logStart);
+    t.false(logsSinceTermination.includes('uncaughtException'));
+    t.false(logsSinceTermination.includes('Shutting down...'));
+    const healthCheckResponse = await got(
+      `http://localhost:${chaingraphInternalApiPort}/health-check`
+    );
+    t.deepEqual(healthCheckResponse.statusCode, StatusCode.success);
+  }
+);
+
+test.serial(
   '[e2e] syncs blocks as they arrive, handles multiple chain tips',
   async (t) => {
     const [, tx1] = tipA[0]!.transactions;
@@ -1998,10 +2142,80 @@ test.serial(
       ),
       '3 of 4 transactions should be new in tip A block 3001. Has the mockchain changed? (If so, update this test.)'
     );
-    await waitForStdout(
-      /Saved new block – height:\s+3001[^\n]+nodes: node2, node3/u
+    t.deepEqual(
+      await waitForBlockAcceptedByNodes(tipB[0]!.header.hash, [
+        'node2',
+        'node3',
+      ]),
+      ['node2', 'node3']
     );
-    t.pass();
+  }
+);
+
+const getNodeValidationCount = async (nodeName: string, hash: string) =>
+  Number(
+    (
+      await client.query<{ count: string }>(
+        /* sql */ `
+        SELECT COUNT(*) FROM node_transaction
+          INNER JOIN node
+            ON node.internal_id = node_transaction.node_internal_id
+          INNER JOIN transaction
+            ON transaction.internal_id = node_transaction.transaction_internal_id
+          WHERE node.name = $1 AND transaction.hash = $2;
+      `,
+        [nodeName, hexToBin(hash)]
+      )
+    ).rows[0]!.count
+  );
+const deleteNodeValidation = async (nodeName: string, hash: string) =>
+  client.query(
+    /* sql */ `
+    DELETE FROM node_transaction
+      USING node, transaction
+      WHERE node_transaction.node_internal_id = node.internal_id
+        AND node_transaction.transaction_internal_id = transaction.internal_id
+        AND node.name = $1
+        AND transaction.hash = $2;
+    `,
+    [nodeName, hexToBin(hash)]
+  );
+const nodeValidationPollingAttempts = 50;
+const nodeValidationPollingIntervalMs = 100;
+/**
+ * Wait for the node's `node_transaction` row for the transaction, returning
+ * the final count of matching rows (`0` if it never appeared).
+ */
+const waitForNodeValidation = async (
+  nodeName: string,
+  hash: string,
+  remainingAttempts = nodeValidationPollingAttempts
+): Promise<number> => {
+  const count = await getNodeValidationCount(nodeName, hash);
+  if (count !== 0 || remainingAttempts === 0) {
+    return count;
+  }
+  await sleep(nodeValidationPollingIntervalMs);
+  return waitForNodeValidation(nodeName, hash, remainingAttempts - 1);
+};
+
+/**
+ * Model https://github.com/bitauth/chaingraph/issues/81: node3 accepted a
+ * transaction (its `node_transaction` row was saved and the agent cached
+ * node3's acknowledgement), the transaction was later confirmed (archiving the
+ * row), then a re-organization returned it to node3's mempool. Nodes don't
+ * re-announce such transactions; they only appear in replies to `mempool`.
+ */
+test.serial(
+  '[e2e] prepares a transaction for return to the mempool by a re-org',
+  async (t) => {
+    peers.node3.sendMessage(
+      new peers.node3.messages.Transaction(new Transaction(halTxRaw))
+    );
+    t.is(await waitForNodeValidation('node3', halTxHash), 1);
+    await deleteNodeValidation('node3', halTxHash);
+    t.is(await getNodeValidationCount('node3', halTxHash), 0);
+    mempoolReplies.node3 = [halTxHash];
   }
 );
 
@@ -2020,21 +2234,37 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
   await waitForStdout(
     /Saved new block – height:\s+3002[^\n]+hash: a44a664d5acc560305fceb9ba3c7f195a5d78236c1705d5ae7434ba784005689[^\n]+nodes: node2/u
   );
-  await waitForStdout(
-    /Saved new block – height:\s+3002[^\n]+hash: 9c4feec6f35a54f2244f2ab14e1370e60713097be2ead8402e4ef68f96e07c8c[^\n]+nodes: node1, node3/u
+  t.deepEqual(
+    await waitForBlockAcceptedByNodes(tipA[1]!.header.hash, ['node1', 'node3']),
+    ['node1', 'node3']
   );
-  t.pass();
 });
 
 test.serial(
-  '[e2e] new block saved after reorg',
+  '[e2e] re-records transactions returned to the mempool by a re-org',
   async (t) => {
-    const acceptedBlocks = (
-      await client.query<{
-        hash: string;
-        nodeName: string;
-      }>(
-        /* sql */ `
+    await waitForStdout(
+      'node3: requested node mempool (BIP35) – triggers: reorganization'
+    );
+    t.is(await waitForNodeValidation('node3', halTxHash), 1);
+    /**
+     * Clean up: stop announcing the transaction, wait for any pending replies,
+     * then remove node3's validation so later tests are unaffected.
+     */
+    mempoolReplies.node3 = [];
+    const delay = 500;
+    await sleep(delay);
+    await deleteNodeValidation('node3', halTxHash);
+  }
+);
+
+test.serial('[e2e] new block saved after reorg', async (t) => {
+  const acceptedBlocks = (
+    await client.query<{
+      hash: string;
+      nodeName: string;
+    }>(
+      /* sql */ `
       SELECT node.name AS "nodeName", encode(block.hash, 'hex') AS hash
         FROM node_block
         INNER JOIN node
@@ -2045,14 +2275,13 @@ test.serial(
           AND block.height = $1
         ORDER BY block.hash;
     `,
-        [splitHeight + 1]
-      )
-    ).rows;
-    t.deepEqual(acceptedBlocks, [
-      { hash: tipA[0]!.header.hash, nodeName: 'node3' },
-    ]);
-  }
-);
+      [splitHeight + 1]
+    )
+  ).rows;
+  t.deepEqual(acceptedBlocks, [
+    { hash: tipA[0]!.header.hash, nodeName: 'node3' },
+  ]);
+});
 
 test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
   const tipStartIndex = 2;
@@ -2069,10 +2298,13 @@ test.serial('[e2e] handles reversal of single-block re-org', async (t) => {
     /node3: re-organization detected beginning at height: 3001. The following stale blocks were removed:/u
   );
   await waitForStdout(/Saved new block – height:\s+3006[^\n]+nodes: node1/u);
-  await waitForStdout(
-    /Saved new block – height:\s+3006[^\n]+nodes: node2, node3/u
+  t.deepEqual(
+    await waitForBlockAcceptedByNodes(tipB[tipEnd - 1]!.header.hash, [
+      'node2',
+      'node3',
+    ]),
+    ['node2', 'node3']
   );
-  t.pass();
 });
 
 test.serial('[e2e] handles re-org of 6 blocks', async (t) => {
@@ -2088,10 +2320,13 @@ test.serial('[e2e] handles re-org of 6 blocks', async (t) => {
   await waitForStdout(
     /node3: re-organization detected beginning at height: 3001. The following stale blocks were removed:/u
   );
-  await waitForStdout(
-    /Saved new block – height:\s+3007[^\n]+nodes: node1, node3/u
+  t.deepEqual(
+    await waitForBlockAcceptedByNodes(tipA[tipEnd - 1]!.header.hash, [
+      'node1',
+      'node3',
+    ]),
+    ['node1', 'node3']
   );
-  t.pass();
 });
 
 test.serial('[e2e] handles reversal of 6 block re-org', async (t) => {
@@ -2107,10 +2342,13 @@ test.serial('[e2e] handles reversal of 6 block re-org', async (t) => {
   await waitForStdout(
     /node3: re-organization detected beginning at height: 3001. The following stale blocks were removed:/u
   );
-  await waitForStdout(
-    /Saved new block – height:\s+3008[^\n]+nodes: node2, node3/u
+  t.deepEqual(
+    await waitForBlockAcceptedByNodes(tipB[tipEnd - 1]!.header.hash, [
+      'node2',
+      'node3',
+    ]),
+    ['node2', 'node3']
   );
-  t.pass();
 });
 
 /**
@@ -2397,6 +2635,204 @@ test.serial(
       ),
       historicalRepairBlock.transactions.length
     );
+  }
+);
+
+const getIncompleteBlockAuditMarkers = async () =>
+  (
+    await client.query<{
+      auditedThroughBlockInternalId: string;
+      nodeInternalId: number;
+      nodeName: string;
+    }>(/* sql */ `
+      SELECT node.name AS "nodeName",
+             node.internal_id AS "nodeInternalId",
+             incomplete_block_audit.audited_through_block_internal_id
+               AS "auditedThroughBlockInternalId"
+        FROM incomplete_block_audit
+        INNER JOIN node
+          ON node.internal_id = incomplete_block_audit.node_internal_id
+        ORDER BY node.name;
+    `)
+  ).rows;
+
+const waitForIncompleteBlockAuditMarker = async (
+  nodeName: string,
+  remainingAttempts = blockRepairPollingAttempts
+): Promise<Awaited<ReturnType<typeof getIncompleteBlockAuditMarkers>>> => {
+  const markers = await getIncompleteBlockAuditMarkers();
+  if (
+    remainingAttempts <= 0 ||
+    markers.some((marker) => marker.nodeName === nodeName)
+  ) {
+    return markers;
+  }
+  await sleep(blockRepairPollingIntervalMs);
+  return waitForIncompleteBlockAuditMarker(nodeName, remainingAttempts - 1);
+};
+
+test.serial(
+  '[e2e] records incomplete block audit markers and skips audited blocks on restart',
+  async (t) => {
+    t.timeout(oneMinute);
+    const markers = await waitForIncompleteBlockAuditMarker('node4');
+    const markersByNode = new Map(
+      markers.map((marker) => [marker.nodeName, marker])
+    );
+    ['node1', 'node2', 'node4'].forEach((nodeName) => {
+      t.true(markersByNode.has(nodeName), `missing marker for ${nodeName}`);
+    });
+    const maxBlockInternalId = Number(
+      (
+        await client.query<{ max: string }>(
+          /* sql */ `SELECT MAX(internal_id) AS max FROM block;`
+        )
+      ).rows[0]!.max
+    );
+    markers.forEach((marker) => {
+      const auditedThrough = Number(marker.auditedThroughBlockInternalId);
+      t.true(auditedThrough > 0 && auditedThrough <= maxBlockInternalId);
+    });
+    /*
+     * The previous agent process completed a scan for node1 and node2, so this
+     * process loaded their markers (and skipped their audited blocks); node4 is
+     * new, so all of its blocks were audited (which repaired the incomplete
+     * historical block above).
+     */
+    t.regex(
+      stdoutBuffer,
+      new RegExp(
+        `starting incomplete block repair scan;[^\\n]*${
+          markersByNode.get('node1')!.nodeInternalId
+        }: \\d+[^\\n]*${markersByNode.get('node4')!.nodeInternalId}: none`,
+        'u'
+      )
+    );
+  }
+);
+
+test.serial(
+  '[e2e] getIncompleteBlocks skips blocks already audited for a node',
+  async (t) => {
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+      postgresE2eConnectionStringTestDb;
+    /*
+     * An earlier test ends the shared `db.js` pool, so load a fresh module
+     * instance (with its own pool) for this test.
+     */
+    const freshDbModuleUrl = `../db.js?incomplete-block-audit=${Date.now()}`;
+    const { getIncompleteBlocks, pool: freshDbPool } = (await import(
+      freshDbModuleUrl
+    )) as typeof DbModule;
+    const markersByNode = new Map(
+      (await getIncompleteBlockAuditMarkers()).map((marker) => [
+        marker.nodeName,
+        marker,
+      ])
+    );
+    const auditedNode1 = markersByNode.get('node1')!;
+    const auditedNode4 = markersByNode.get('node4')!;
+    const removedRow = (
+      await client.query<{
+        blockInternalId: string;
+        transactionIndex: number;
+        transactionInternalId: string;
+      }>(
+        /* sql */ `
+        DELETE FROM block_transaction
+          USING block
+          WHERE block.internal_id = block_transaction.block_internal_id
+            AND block.hash = $1
+            AND block_transaction.transaction_index = $2
+          RETURNING block_transaction.block_internal_id AS "blockInternalId",
+            block_transaction.transaction_internal_id
+              AS "transactionInternalId",
+            block_transaction.transaction_index AS "transactionIndex";
+      `,
+        [hexToBin(historicalRepairBlockHash), historicalRepairTransactionIndex]
+      )
+    ).rows[0]!;
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      t.true(
+        Number(removedRow.blockInternalId) <=
+          Number(auditedNode1.auditedThroughBlockInternalId)
+      );
+      const height = historicalRepairTipIndex + splitHeight + 1;
+      const scan = async (
+        nodeInternalIds: number[],
+        auditedThroughBlockInternalIds?: number[]
+      ) =>
+        getIncompleteBlocks({
+          auditedThroughBlockInternalIds,
+          excludedBlockHashes: [],
+          heightLowerBound: height,
+          heightUpperBound: height + 1,
+          limit: 10,
+          nodeInternalIds,
+        });
+      t.deepEqual(
+        await scan(
+          [auditedNode1.nodeInternalId],
+          [Number(auditedNode1.auditedThroughBlockInternalId)]
+        ),
+        { incompleteBlocks: [], scannedBlockCount: 0 }
+      );
+      const unaudited = await scan([auditedNode1.nodeInternalId]);
+      t.deepEqual(unaudited.scannedBlockCount, 1);
+      t.deepEqual(
+        unaudited.incompleteBlocks.map((block) => block.hash),
+        [historicalRepairBlockHash]
+      );
+      const oneNodeUnaudited = await scan(
+        [auditedNode1.nodeInternalId, auditedNode4.nodeInternalId],
+        [Number(auditedNode1.auditedThroughBlockInternalId), 0]
+      );
+      t.deepEqual(
+        oneNodeUnaudited.incompleteBlocks.map((block) => block.hash),
+        [historicalRepairBlockHash]
+      );
+      /*
+       * All markers positive (the bounded per-node join, not the full-audit
+       * fallback): node4's marker is below the block, so the block is still
+       * returned although node1 has already audited it.
+       */
+      const blockInternalId = Number(removedRow.blockInternalId);
+      t.true(blockInternalId > 1);
+      const oneNodeAuditedBelow = await scan(
+        [auditedNode1.nodeInternalId, auditedNode4.nodeInternalId],
+        [
+          Number(auditedNode1.auditedThroughBlockInternalId),
+          blockInternalId - 1,
+        ]
+      );
+      t.deepEqual(
+        oneNodeAuditedBelow.incompleteBlocks.map((block) => block.hash),
+        [historicalRepairBlockHash]
+      );
+    } finally {
+      await client.query(
+        /* sql */ `
+        INSERT INTO block_transaction
+          (block_internal_id, transaction_internal_id, transaction_index)
+          VALUES ($1, $2, $3);
+      `,
+        [
+          removedRow.blockInternalId,
+          removedRow.transactionInternalId,
+          removedRow.transactionIndex,
+        ]
+      );
+      await freshDbPool.end();
+      if (originalPostgresConnectionString === undefined) {
+        delete process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+      } else {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
   }
 );
 
@@ -3306,8 +3742,13 @@ test.serial(
         // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
         rollback().then(async () => Promise.reject(error))
     );
+    /*
+     * Either copy: the two are identical, and once Postgres has auto-analyzed
+     * `output` the managed index has expression statistics the fresh copy
+     * lacks, which tips the planner's tie towards it.
+     */
     plans.forEach((plan) => {
-      t.true(plan.includes('test_output_search_index'), plan);
+      t.true(/\b(?:test_)?output_search_index\b/u.test(plan), plan);
       t.false(plan.includes('Seq Scan'), plan);
     });
   }
