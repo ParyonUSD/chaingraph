@@ -439,6 +439,12 @@ export interface MempoolTransactionExpiry {
   nodeInternalId: number;
   replacedAt: Date;
   transactionInternalId: number;
+  /**
+   * The `validated_at` of the validation this expiry was scheduled for. When
+   * set, a row validated again later (e.g. restored by a mempool resync after a
+   * re-org) is left alone; it expires at its own deadline.
+   */
+  validatedAt?: Date;
 }
 
 // cspell:words xact unnest
@@ -594,9 +600,9 @@ SELECT 1
       }>(
         /* sql */ `
 WITH RECURSIVE expiry AS (
-    SELECT node_internal_id, transaction_internal_id, replaced_at
-      FROM unnest($1::integer[], $2::bigint[], $3::timestamp[])
-        AS expiry (node_internal_id, transaction_internal_id, replaced_at)
+    SELECT node_internal_id, transaction_internal_id, replaced_at, validated_at
+      FROM unnest($1::integer[], $2::bigint[], $3::timestamp[], $4::timestamp[])
+        AS expiry (node_internal_id, transaction_internal_id, replaced_at, validated_at)
 ),
 expired AS (
     SELECT expiry.node_internal_id,
@@ -613,6 +619,9 @@ expired AS (
       ) resolution
       WHERE NOT resolution.accepted
         AND NOT resolution.replaced
+        -- validated_at has microseconds; the scheduled Date has milliseconds
+        AND (expiry.validated_at IS NULL
+          OR date_trunc('milliseconds', node_transaction.validated_at) <= expiry.validated_at)
 ),
 invalidated (node_internal_id, transaction_internal_id, replaced_at) AS (
     SELECT node_internal_id, transaction_internal_id, replaced_at
@@ -703,6 +712,7 @@ SELECT complete.complete,
           nodeInternalIds,
           transactionInternalIds,
           sorted.map((expiry) => expiry.replacedAt.toISOString()),
+          sorted.map((expiry) => expiry.validatedAt?.toISOString() ?? null),
         ]
       );
       if (result.rows[0]?.complete !== true) {
