@@ -2,13 +2,13 @@ CREATE OR REPLACE FUNCTION trigger_node_block_insert() RETURNS trigger
   LANGUAGE plpgsql
 AS $$
 DECLARE
-  inserted_node_ids smallint[];
+  inserted_node_ids integer[];
   inserted_block_ids bigint[];
   inserted_timestamps timestamp without time zone[];
-  confirmed_node_ids smallint[];
+  confirmed_node_ids integer[];
   confirmed_transaction_ids bigint[];
   confirmed_timestamps timestamp without time zone[];
-  spent_node_ids smallint[];
+  spent_node_ids integer[];
   spent_transaction_ids bigint[];
   spent_timestamps timestamp without time zone[];
   spent_outpoint_hashes bytea[];

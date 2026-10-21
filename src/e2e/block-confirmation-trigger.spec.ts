@@ -34,16 +34,16 @@ CREATE TEMP TABLE input (transaction_internal_id bigint, input_index bigint,
   outpoint_transaction_hash bytea, outpoint_index bigint,
   PRIMARY KEY (transaction_internal_id, input_index));
 CREATE INDEX spent_by_index ON input (outpoint_transaction_hash, outpoint_index);
-CREATE TEMP TABLE node_transaction (node_internal_id smallint,
+CREATE TEMP TABLE node_transaction (node_internal_id integer,
   transaction_internal_id bigint, validated_at timestamp DEFAULT '2026-01-01',
   PRIMARY KEY (node_internal_id, transaction_internal_id));
-CREATE TEMP TABLE node_transaction_history (node_internal_id smallint,
+CREATE TEMP TABLE node_transaction_history (node_internal_id integer,
   transaction_internal_id bigint, validated_at timestamp, replaced_at timestamp,
   PRIMARY KEY (node_internal_id, transaction_internal_id, validated_at));
 CREATE TEMP TABLE block_transaction (block_internal_id bigint,
   transaction_internal_id bigint,
   PRIMARY KEY (transaction_internal_id, block_internal_id));
-CREATE TEMP TABLE node_block (node_internal_id smallint,
+CREATE TEMP TABLE node_block (node_internal_id integer,
   block_internal_id bigint, accepted_at timestamp NOT NULL,
   PRIMARY KEY (node_internal_id, block_internal_id));
 `);
@@ -118,8 +118,8 @@ INSERT INTO block_transaction VALUES (100, 10), (101, 11);
     const legacyDirectRows = await t.context.db.pool.query(/* sql */ `
 WITH new_rows(node_internal_id, block_internal_id, accepted_at) AS (
   VALUES
-    (1::smallint, 100::bigint, '2026-02-01'::timestamp),
-    (2::smallint, 101::bigint, '2026-02-02'::timestamp)
+    (1::integer, 100::bigint, '2026-02-01'::timestamp),
+    (2::integer, 101::bigint, '2026-02-02'::timestamp)
 ),
 accepted_transactions AS (
   SELECT new_rows.node_internal_id, block_transaction.transaction_internal_id,
@@ -177,6 +177,28 @@ SELECT node_internal_id AS node, transaction_internal_id::integer AS tx
       ).rows,
       [{ node: 2, tx: 1 }]
     );
+  }
+);
+
+test.serial(
+  '[e2e] block confirmation accepts node IDs above the smallint range',
+  async (t) => {
+    await t.context.db.pool.query(/* sql */ `
+INSERT INTO transaction VALUES
+  (1, decode(repeat('01', 32), 'hex')),
+  (2, decode(repeat('02', 32), 'hex'));
+INSERT INTO input VALUES
+  (1, 0, decode(repeat('aa', 32), 'hex'), 0),
+  (2, 0, decode(repeat('aa', 32), 'hex'), 0);
+INSERT INTO node_transaction (node_internal_id, transaction_internal_id) VALUES
+  (32768, 1), (32768, 2);
+INSERT INTO block_transaction VALUES (100, 2);
+INSERT INTO node_block VALUES (32768, 100, '2026-02-01');
+`);
+    t.deepEqual((await t.context.db.pool.query(rows)).rows, [
+      { node: 32768, replaced: '2026-02-01 00:00:00', tx: 1 },
+      { node: 32768, replaced: null, tx: 2 },
+    ]);
   }
 );
 
