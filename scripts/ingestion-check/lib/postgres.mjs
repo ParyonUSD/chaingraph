@@ -56,7 +56,8 @@ export const dockerMemoryBytes = () => {
   }
 };
 
-export const startDockerPostgres = async ({ image, port, name, log }) => {
+/** `onLaunched(stop)` runs as soon as the server process exists, before the readiness wait, so callers can stop it on failure or signal. */
+export const startDockerPostgres = async ({ image, port, name, log, onLaunched }) => {
   log(`starting ${image} as container ${name} on 127.0.0.1:${port}`);
   execFileSync('docker', [
     'run', '-d', '--rm', '--name', name,
@@ -67,7 +68,6 @@ export const startDockerPostgres = async ({ image, port, name, log }) => {
     image,
     ...serverSettings.flatMap((setting) => ['-c', setting]),
   ], { stdio: 'ignore' });
-  const baseUrl = await waitUntilReady(`postgres://${postgresUser}:${postgresPassword}@127.0.0.1:${port}`, true);
   const stop = () => {
     try {
       execFileSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
@@ -75,11 +75,13 @@ export const startDockerPostgres = async ({ image, port, name, log }) => {
       // already gone
     }
   };
+  onLaunched?.(stop);
+  const baseUrl = await waitUntilReady(`postgres://${postgresUser}:${postgresPassword}@127.0.0.1:${port}`, true);
   return { baseUrl, description: `docker ${image}`, stop };
 };
 
 /** initdb a private cluster with the host's Postgres binaries (`--pg-bin`). */
-export const startHostPostgres = async ({ binDirectory, dataDirectory, port, log }) => {
+export const startHostPostgres = async ({ binDirectory, dataDirectory, port, log, onLaunched }) => {
   log(`starting host Postgres from ${binDirectory} in ${dataDirectory} on 127.0.0.1:${port}`);
   rmSync(dataDirectory, { force: true, recursive: true });
   mkdirSync(dataDirectory, { recursive: true });
@@ -92,8 +94,6 @@ export const startHostPostgres = async ({ binDirectory, dataDirectory, port, log
     rmSync(dataDirectory, { force: true, recursive: true });
     throw new Error(`host Postgres failed to start on port ${port} (in use? try --pg-port):\n${serverLog}`);
   }
-  const baseUrl = await waitUntilReady(`postgres://${postgresUser}:${postgresPassword}@127.0.0.1:${port}`, false);
-  const version = execFileSync(join(binDirectory, 'postgres'), ['--version'], { encoding: 'utf8' }).trim();
   const stop = () => {
     try {
       execFileSync(join(binDirectory, 'pg_ctl'), ['-D', dataDirectory, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' });
@@ -102,6 +102,9 @@ export const startHostPostgres = async ({ binDirectory, dataDirectory, port, log
     }
     rmSync(dataDirectory, { force: true, recursive: true });
   };
+  onLaunched?.(stop);
+  const baseUrl = await waitUntilReady(`postgres://${postgresUser}:${postgresPassword}@127.0.0.1:${port}`, false);
+  const version = execFileSync(join(binDirectory, 'postgres'), ['--version'], { encoding: 'utf8' }).trim();
   return { baseUrl, description: `host ${version}`, stop };
 };
 
@@ -173,12 +176,21 @@ export const blockTransactionCount = async (client, blockHashes) =>
   );
 
 export const waitFor = async (predicate, { timeoutMs, intervalMs = 25, description }) => {
-  const started = Date.now();
+  const deadline = Date.now() + timeoutMs;
+  const timeoutError = () =>
+    new Error(`timed out after ${timeoutMs / 1000}s waiting for: ${description}`);
   for (;;) {
-    if (await predicate()) return Date.now();
-    if (Date.now() - started > timeoutMs) {
-      throw new Error(`timed out after ${timeoutMs / 1000}s waiting for: ${description}`);
+    // race each check against the deadline so a stalled query cannot hang the run
+    let deadlineTimer;
+    const deadlinePassed = new Promise((_, reject) => {
+      deadlineTimer = setTimeout(() => reject(timeoutError()), Math.max(0, deadline - Date.now()));
+    });
+    try {
+      if (await Promise.race([predicate(), deadlinePassed])) return Date.now();
+    } finally {
+      clearTimeout(deadlineTimer);
     }
+    if (Date.now() > deadline) throw timeoutError();
     await sleep(intervalMs);
   }
 };

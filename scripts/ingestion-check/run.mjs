@@ -85,8 +85,10 @@ const runDirectory = join(repositoryRoot, 'data/ingestion-check/runs', runId);
 mkdirSync(runDirectory, { recursive: true });
 
 let postgresServer;
+// set as soon as the server is launched, so a failure or signal during the readiness wait still stops it
+let stopPostgres;
 const cleanupAndExit = (code) => {
-  if (postgresServer !== undefined && !options['keep-pg']) postgresServer.stop();
+  if (stopPostgres !== undefined && !options['keep-pg']) stopPostgres();
   process.exit(code);
 };
 
@@ -97,7 +99,7 @@ const cleanupAndExit = (code) => {
  */
 const minimumDockerMemoryBytes = 14e9;
 const startPostgres = async () => {
-  if (options['pg-url'] !== undefined) return { baseUrl: options['pg-url'], description: 'external', stop: () => {} };
+  if (options['pg-url'] !== undefined) return { baseUrl: options['pg-url'], description: 'external' };
   let mode = options.pg;
   if (mode === 'auto') {
     const dockerMemory = dockerMemoryBytes();
@@ -107,9 +109,12 @@ const startPostgres = async () => {
     if (mode === 'docker' && dockerMemory < minimumDockerMemoryBytes) log('WARNING: Docker VM has < 14 GB; the burst scenario may be OOM-killed (see docs/ingestion-check.md).');
   }
   const port = Number(options['pg-port']);
+  const onLaunched = (stop) => {
+    stopPostgres = stop;
+  };
   return mode === 'host'
-    ? startHostPostgres({ binDirectory: options['pg-bin'], dataDirectory: join(repositoryRoot, `data/ingestion-check/pg-${process.pid}`), log, port })
-    : startDockerPostgres({ image: options['pg-image'], log, name: `chaingraph-ingestion-check-pg-${process.pid}`, port });
+    ? startHostPostgres({ binDirectory: options['pg-bin'], dataDirectory: join(repositoryRoot, `data/ingestion-check/pg-${process.pid}`), log, onLaunched, port })
+    : startDockerPostgres({ image: options['pg-image'], log, name: `chaingraph-ingestion-check-pg-${process.pid}`, onLaunched, port });
 };
 process.on('SIGINT', () => cleanupAndExit(130));
 process.on('SIGTERM', () => cleanupAndExit(143));
