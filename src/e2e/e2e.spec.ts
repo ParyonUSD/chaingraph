@@ -30,6 +30,7 @@ import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
 import {
+  backfillRetainEventsSql,
   configureTrackingTriggersSql,
   partitionOf,
 } from '../components/unspent-tracking.js';
@@ -889,6 +890,12 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'token_category_index',
     'transaction_hash_key',
     'transaction_pkey',
+    'unspent_tracking_backfill_nodes_pkey',
+    'unspent_tracking_backfill_pkey',
+    'unspent_tracking_backfill_rows_pkey',
+    'unspent_tracking_backfill_spends_pkey',
+    'unspent_tracking_backfill_transactions_hash',
+    'unspent_tracking_backfill_transactions_pkey',
     'unspent_tracking_events_pkey',
     'unspent_tracking_nodes_pkey',
     'unspent_tracking_progress_pkey',
@@ -4647,12 +4654,660 @@ test.serial(
   }
 );
 
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentTrackingEnabled
+  )}): backfill from the column default writes only what can be unspent, exact under changes during the backfill`,
+  async (t) => {
+    if (!unspentTrackingEnabled) {
+      t.pass();
+      return;
+    }
+    t.timeout(unspentTestTimeoutMs);
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const db = await deferredDbModule('unspent-fast-backfill');
+    const hash = (byte: string) => `ec${byte.repeat(31)}`;
+    const zeroHash = '00'.repeat(32);
+    const coinbaseIndex = 0xffffffff;
+    const transaction = (
+      byte: string,
+      spends: [string, number][],
+      outputCount = 2,
+      isCoinbase = false
+    ): ChaingraphTransaction => ({
+      hash: hash(byte),
+      inputs: spends.map(([outpointTransactionHash, outpointIndex]) => ({
+        outpointIndex,
+        outpointTransactionHash,
+        sequenceNumber: 0,
+        unlockingBytecode: '51',
+      })),
+      isCoinbase,
+      locktime: 0,
+      outputs: Array.from({ length: outputCount }, () => ({
+        lockingBytecode: '51',
+        valueSatoshis: 1000n,
+      })),
+      sizeBytes: 60,
+      version: 2,
+    });
+    const blockHeight = 999_700;
+    const block = (byte: string, transactions: ChaingraphTransaction[]) => ({
+      bits: 0,
+      hash: hash(byte),
+      height: blockHeight,
+      merkleRoot: '00'.repeat(32),
+      nonce: 0,
+      previousBlockHash: '00'.repeat(32),
+      sizeBytes: 0,
+      timestamp: 0,
+      transactions,
+      version: 1,
+    });
+    const nodes = await deferredNodes();
+    const [nodeA, nodeB] = [nodes[0]!.id, nodes[1]!.id];
+    const saveBlockFor = async (
+      blockToSave: ChaingraphBlock,
+      nodeIds: number[]
+    ) =>
+      db.saveBlock({
+        block: blockToSave,
+        nodeAcceptances: nodeIds.map((nodeInternalId) => ({
+          acceptedAt: new Date(),
+          nodeInternalId,
+          nodeName: 'fast-backfill',
+        })),
+        transactionCache: new Map() as unknown as Parameters<
+          typeof db.saveBlock
+        >[0]['transactionCache'],
+      });
+    const mempool = async (
+      transactionToSave: ChaingraphTransaction,
+      nodeIds: number[]
+    ) =>
+      db.saveTransactionForNodes(
+        transactionToSave,
+        nodeIds.map((nodeInternalId) => ({
+          nodeInternalId,
+          validatedAt: new Date(),
+        }))
+      );
+    const transactionId = async (byte: string) =>
+      Number(
+        (
+          await client.query<{ id: string }>(
+            /* sql */ `SELECT internal_id AS id FROM transaction WHERE hash = $1;`,
+            [hexToBin(hash(byte))]
+          )
+        ).rows[0]!.id
+      );
+    const drop = async (byte: string, nodeInternalId: number) =>
+      db.archiveMempoolTransaction({
+        nodeInternalId,
+        replacedAt: new Date(),
+        transactionInternalId: await transactionId(byte),
+      });
+    const stored = async (byte: string, index: number) =>
+      (
+        await client.query<{ ids: number[] | null }>(
+          /* sql */ `SELECT unspent_node_ids AS ids FROM output WHERE transaction_hash = $1 AND output_index = $2;`,
+          [hexToBin(hash(byte)), index]
+        )
+      ).rows[0]!.ids;
+    const count = async (sql: string) =>
+      Number((await client.query<{ n: string }>(sql)).rows[0]!.n);
+    const trackingTriggers = async (enabled: boolean) =>
+      client.query(
+        configureTrackingTriggersSql(enabled, {
+          // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
+          trigger_public_node_block_delete_unspent_tracking: !enabled,
+          // eslint-disable-next-line @typescript-eslint/naming-convention, camelcase
+          trigger_public_node_transaction_delete_unspent_tracking: !enabled,
+        }).join(' ')
+      );
+    const readMode = async () =>
+      (
+        await client.query<{ mode: string }>(
+          `SELECT unspent_tracking_read_mode() AS mode;`
+        )
+      ).rows[0]!.mode;
+    const pending = async () =>
+      (
+        await client.query<{ pending: boolean }>(
+          `SELECT unspent_tracking_backfill_pending() AS pending;`
+        )
+      ).rows[0]!.pending;
+    const partitionCount = async () =>
+      count(`SELECT count(*) AS n FROM unspent_tracking_progress;`);
+    const runBatch = async (partition: number, partitions: number) => {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ;');
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        const result = (
+          await client.query<{ result: { [key: string]: unknown } }>(
+            /* sql */ `SELECT unspent_tracking_backfill_batch($1::integer, $2::integer, 256) AS result;`,
+            [partition, partitions]
+          )
+        ).rows[0]!.result;
+        await client.query('COMMIT;');
+        return result;
+      } catch (err) {
+        await client.query('ROLLBACK;');
+        // eslint-disable-next-line functional/no-throw-statement
+        throw err;
+      }
+    };
+    const runPartition = async (
+      partition: number,
+      partitions: number,
+      remaining = 10_000
+    ): Promise<{ [key: string]: unknown }> => {
+      const result = await runBatch(partition, partitions);
+      return result.done === true || remaining <= 0
+        ? result
+        : runPartition(partition, partitions, remaining - 1);
+    };
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      /*
+       * Tracking stopped, every stored value reset to '{}': the state of a
+       * database whose rows existed when the migration added the column with
+       * its default (not a rebuild). Rows saved from now on are NULL.
+       */
+      await trackingTriggers(false);
+      await client.query(`SELECT unspent_tracking_stop();`);
+      await client.query(
+        `UPDATE output SET unspent_node_ids = '{}' WHERE unspent_node_ids IS DISTINCT FROM '{}';`
+      );
+      await client.query(
+        `UPDATE unspent_tracking_settings SET rebuild_required = false;`
+      );
+      /*
+       * Fixtures saved while tracking is off (no events), one edge case per
+       * output of f0 (accepted by nodes A and B).
+       */
+      await saveBlockFor(
+        block('b0', [transaction('f0', [[hash('ff'), 0]], 12)]),
+        [nodeA, nodeB]
+      );
+      // f0:0 dropped mempool spender (re-accepted after the preparation)
+      await mempool(transaction('d1', [[hash('f0'), 0]]), [nodeA]);
+      await drop('d1', nodeA);
+      // f0:1 spender in a block both nodes removed (re-org)
+      const reorged = block('b1', [transaction('e1', [[hash('f0'), 1]])]);
+      await saveBlockFor(reorged, [nodeA, nodeB]);
+      await db.removeStaleBlocksForNode(nodeA, [reorged.hash]);
+      await db.removeStaleBlocksForNode(nodeB, [reorged.hash]);
+      // f0:2 spender accepted by node A only (its mempool)
+      await mempool(transaction('51', [[hash('f0'), 2]]), [nodeA]);
+      // f0:3 double spend: the winner in a block of node A, the loser dropped from B's mempool
+      await saveBlockFor(block('b2', [transaction('71', [[hash('f0'), 3]])]), [
+        nodeA,
+      ]);
+      await mempool(transaction('72', [[hash('f0'), 3]]), [nodeB]);
+      await drop('72', nodeB);
+      // f0:4 spent in a block both nodes accept (the common case)
+      await saveBlockFor(block('b3', [transaction('a4', [[hash('f0'), 4]])]), [
+        nodeA,
+        nodeB,
+      ]);
+      /*
+       * f0:5 unspent; f0:6 .. f0:11 spent during the backfill. Coinbase: cb:0
+       * unspent, cb:1 spent in a block both nodes accept.
+       */
+      await saveBlockFor(
+        block('b4', [
+          transaction('cb', [[zeroHash, coinbaseIndex]], 2, true),
+          transaction('c1', [[hash('cb'), 1]]),
+        ]),
+        [nodeA, nodeB]
+      );
+      // created by a transaction no node accepts (dropped), one output spent by B's mempool
+      await mempool(transaction('91', [[hash('fe'), 0]]), [nodeA]);
+      await drop('91', nodeA);
+      await mempool(transaction('92', [[hash('91'), 0]]), [nodeB]);
+      // created in a block only node A accepts (node B accepts it via headers during the backfill)
+      const lagging = block('b5', [transaction('61', [[hash('fd'), 0]])]);
+      await saveBlockFor(lagging, [nodeA]);
+      // created in a block both accept (node B drops it during the backfill)
+      const dropped = block('b6', [transaction('31', [[hash('fc'), 0]])]);
+      await saveBlockFor(dropped, [nodeA, nodeB]);
+      /*
+       * Tracking starts at the tip: every pre-tracking value ('{}' from the
+       * default, NULL for the fixtures) is unprocessed, so reads use the live per-node test.
+       */
+      await trackingTriggers(true);
+      await db.runUnspentTrackingJobPass({
+        backfill: false,
+        maxMs: 60_000,
+        settleWaitMs: 2_000,
+      });
+      t.true(await pending(), 'backfill pending');
+      t.is(await readMode(), 'live', 'backfill pending: live');
+      t.is(await stored('f0', 5), null, 'fixtures saved after the default');
+      await client.query('ANALYZE;');
+      await compareDeferredQueryRoot(t, 'fast backfill: pending');
+      /*
+       * Event retention for a backfill about to be prepared (in a rolled-back
+       * transaction): once the floor is published, before the preparation's
+       * snapshot, events above it are kept although every partition and the
+       * watch pass consumed them.
+       */
+      await client.query('BEGIN;');
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        const eventIds = (
+          await client.query<{ id: string }>(
+            /* sql */ `INSERT INTO unspent_tracking_events (event_kind, node_internal_id, block_internal_id)
+              SELECT 'accepted', $1::bigint, 0 FROM generate_series(1, 3) RETURNING id;`,
+            [nodeA]
+          )
+        ).rows
+          .map((row) => Number(row.id))
+          .sort((a, b) => a - b);
+        const [floorId, , lastId] = eventIds as [number, number, number];
+        await client.query(
+          `UPDATE unspent_tracking_progress SET consumed_event_id = $1;`,
+          [lastId]
+        );
+        await client.query(
+          `UPDATE unspent_tracking_settings SET watch_consumed_event_id = $1;`,
+          [lastId]
+        );
+        await client.query(backfillRetainEventsSql, [floorId]);
+        await client.query(`SELECT unspent_tracking_delete_consumed_events();`);
+        t.deepEqual(
+          (
+            await client.query<{ id: string }>(
+              `SELECT id FROM unspent_tracking_events WHERE id = ANY ($1::bigint[]) ORDER BY id;`,
+              [eventIds]
+            )
+          ).rows.map((row) => Number(row.id)),
+          eventIds.slice(1),
+          'events above the published floor kept'
+        );
+      } finally {
+        await client.query('ROLLBACK;');
+      }
+      // values before the backfill, to check what it writes
+      await client.query(/* sql */ `
+        CREATE TEMP TABLE fast_backfill_before AS
+          SELECT transaction_hash, output_index, unspent_node_ids FROM output;`);
+      const outputsBefore = await count(
+        `SELECT count(*) AS n FROM fast_backfill_before;`
+      );
+      // cspell:ignore xact xmin
+      const preparedAtXid = (
+        await client.query<{ xid: string }>(
+          `SELECT (pg_current_xact_id()::text::bigint % 4294967296)::text AS xid;`
+        )
+      ).rows[0]!.xid;
+      /*
+       * Preparation (settled floors: this test is the only writer).
+       */
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ;');
+      const prepared = (
+        await client.query<{ result: { [key: string]: unknown } }>(/* sql */ `
+          SELECT unspent_tracking_backfill_prepare(
+            (SELECT max(internal_id) FROM transaction),
+            (SELECT max(internal_id) FROM block),
+            (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq)) AS result;`)
+      ).rows[0]!.result;
+      await client.query('COMMIT;');
+      t.log({ prepared });
+      t.true(Number(prepared.rows) > 0, 'NULL rows (saved after the default)');
+      t.true(
+        Number(prepared.transactions) > 0,
+        'transactions not accepted by exactly the full set'
+      );
+      /*
+       * Changes after the preparation: a re-acceptance (an "accepted"
+       * event), a spend in a new block, a mempool spend, a re-org, an
+       * existing block accepted via headers (an "accepted" event).
+       */
+      await mempool(transaction('d1', [[hash('f0'), 0]]), [nodeA]);
+      await saveBlockFor(block('b7', [transaction('a6', [[hash('f0'), 6]])]), [
+        nodeA,
+        nodeB,
+      ]);
+      await mempool(transaction('87', [[hash('f0'), 7]]), [nodeB]);
+      await db.removeStaleBlocksForNode(nodeB, [dropped.hash]);
+      await db.acceptBlocksViaHeaders(
+        nodeB,
+        [{ hash: lagging.hash, height: blockHeight }],
+        new Date()
+      );
+      /*
+       * Every partition but the first runs its whole backfill now (the
+       * fixtures' hashes start with 0xec: a complete partition holds them).
+       */
+      const partitions = await partitionCount();
+      const completedFirst = Array.from(
+        { length: partitions - 1 },
+        (_, index) => index + 1
+      );
+      const firstResults = await completedFirst.reduce<
+        Promise<{ [key: string]: unknown }[]>
+      >(
+        async (chain, partition) =>
+          chain.then(async (results) => [
+            ...results,
+            await runPartition(partition, partitions),
+          ]),
+        Promise.resolve([])
+      );
+      t.true(
+        firstResults.every((result) => result.done === true),
+        JSON.stringify(firstResults)
+      );
+      t.true(await pending(), 'still pending: the first partition');
+      t.is(await readMode(), 'live', 'partly backfilled: live');
+      await compareDeferredQueryRoot(t, 'fast backfill: partly done');
+      /*
+       * A node gains a block below the floor without an "accepted" event (a
+       * path the preparation cannot account for; it changes outputs a
+       * complete partition already wrote): the next batch reports the
+       * preparation stale, and every partition is backfilled again.
+       */
+      await client.query(
+        /* sql */ `INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
+          SELECT $1::bigint, internal_id, now() FROM block WHERE hash = $2;`,
+        [nodeB, hexToBin(hash('b2'))]
+      );
+      t.true(
+        (await runBatch(0, partitions)).stale === true,
+        'stale preparation detected'
+      );
+      /*
+       * The agent's pass (reset, a new preparation, the remaining
+       * partitions) while blocks and mempool transactions keep arriving.
+       */
+      const backfillPasses = async (remaining: number): Promise<number> => {
+        await db.runUnspentTrackingJobPass({
+          backfill: true,
+          maxMs: 60_000,
+          settleWaitMs: 2_000,
+        });
+        return (await pending()) && remaining > 0
+          ? backfillPasses(remaining - 1)
+          : remaining;
+      };
+      const concurrentSaves = async () => {
+        await saveBlockFor(
+          block('b8', [transaction('a8', [[hash('f0'), 8]])]),
+          [nodeA]
+        );
+        await mempool(transaction('89', [[hash('f0'), 9]]), [nodeA, nodeB]);
+        await saveBlockFor(
+          block('b9', [
+            transaction('aa', [[hash('f0'), 10]]),
+            transaction('89', [[hash('f0'), 9]]),
+          ]),
+          [nodeA, nodeB]
+        );
+        await mempool(transaction('ab', [[hash('f0'), 11]]), [nodeB]);
+        await drop('51', nodeA);
+      };
+      await Promise.all([backfillPasses(50), concurrentSaves()]);
+      await backfillPasses(50);
+      t.false(await pending(), 'backfill complete');
+      t.true(
+        (
+          await client.query<{ done: boolean }>(
+            `SELECT backfill_complete AS done FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.done
+      );
+      t.is(
+        await count(
+          `SELECT count(*) AS n FROM unspent_tracking_backfill_transactions;`
+        ),
+        0,
+        'backfill state emptied'
+      );
+      await drainDeferred(t, db, 'fast backfill complete');
+      t.not(await readMode(), 'live', 'backfill complete: stored set');
+      t.is(
+        await count(
+          `SELECT count(*) AS n FROM output WHERE unspent_node_ids IS NULL;`
+        ),
+        0,
+        'no output left NULL'
+      );
+      await client.query('ANALYZE;');
+      await compareDeferredStored(t, 'fast backfill complete (whole table)', 0);
+      await compareDeferredQueryRoot(t, 'fast backfill complete (whole table)');
+      // spot checks (two nodes: A and B)
+      const both = [nodeA, nodeB].sort((x, y) => x - y);
+      t.deepEqual(await stored('f0', 0), [nodeB], 'f0:0 re-accepted spender');
+      t.deepEqual(
+        await stored('f0', 1),
+        both,
+        'f0:1 spender removed by a re-org'
+      );
+      t.deepEqual(await stored('f0', 2), both, 'f0:2 spender dropped');
+      t.deepEqual(await stored('f0', 4), [], 'f0:4 spent by both');
+      t.deepEqual(await stored('f0', 5), both, 'f0:5 unspent');
+      t.deepEqual(await stored('cb', 0), both, 'coinbase output unspent');
+      t.deepEqual(await stored('cb', 1), [], 'coinbase output spent');
+      t.deepEqual(await stored('91', 1), [], 'creator accepted by no node');
+      t.deepEqual(await stored('92', 0), [nodeB], 'mempool of node B');
+      t.deepEqual(await stored('61', 0), both, 'block accepted via headers');
+      t.deepEqual(await stored('31', 0), [nodeA], 'block dropped by node B');
+      /*
+       * The backfill never rewrote a row whose value stays '{}' (outside the
+       * rows the changes above touched): the default is kept, not rewritten.
+       */
+      const rewrittenEmpty = await count(/* sql */ `
+        SELECT count(*) AS n FROM output o
+          JOIN fast_backfill_before b ON b.transaction_hash = o.transaction_hash AND b.output_index = o.output_index
+          WHERE b.unspent_node_ids = '{}' AND o.unspent_node_ids = '{}'
+            AND o.xmin::text::bigint > ${preparedAtXid}
+            AND substring(o.transaction_hash FROM 1 FOR 1) <> '\\xec'::bytea;`);
+      const written = await count(/* sql */ `
+        SELECT count(*) AS n FROM output o WHERE o.xmin::text::bigint > ${preparedAtXid};`);
+      t.log({ outputsBefore, written });
+      t.is(rewrittenEmpty, 0, 'rows staying {} are never rewritten');
+      t.true(written < outputsBefore, `${written} of ${outputsBefore} written`);
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS fast_backfill_before;`);
+      await db.pool.end();
+      await db.unspentTrackingJobPool.end();
+      if (originalPostgresConnectionString !== undefined) {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+  }
+);
+
+/**
+ * A plan node of `EXPLAIN (FORMAT JSON)` (auto_explain), as far as read here.
+ */
+interface PlanNode {
+  /* eslint-disable @typescript-eslint/naming-convention */
+  'Index Cond'?: string;
+  'Node Type': string;
+  Plans?: PlanNode[];
+  'Recheck Cond'?: string;
+  'Relation Name'?: string;
+  /* eslint-enable @typescript-eslint/naming-convention */
+}
+const planNodes = (node: PlanNode): PlanNode[] => [
+  node,
+  ...(node.Plans ?? []).flatMap(planNodes),
+];
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentTrackingEnabled
+  )}): backfill preparation and batch probes stay keyed under mainnet-scale statistics`,
+  async (t) => {
+    if (!unspentTrackingEnabled) {
+      t.pass();
+      return;
+    }
+    // cspell:ignore indrelid relpages reltuples rolname rolsuper
+    const superuser = (
+      await client.query<{ superuser: boolean }>(
+        `SELECT rolsuper AS superuser FROM pg_roles WHERE rolname = current_user;`
+      )
+    ).rows[0]!.superuser;
+    if (!superuser) {
+      t.log('skipped: needs a superuser (auto_explain, pg_class statistics)');
+      t.pass();
+      return;
+    }
+    /*
+     * On mainnet the preparation's spends and "other blocks" statements
+     * walked whole indexes (input_pkey, spent_by_index) or scanned whole
+     * tables, because the planner's estimates for the big tables dwarfed the
+     * small driving sets (M, the other blocks); test data is far too small to
+     * show it. So, in a transaction that is rolled back: every big table (and
+     * its indexes) is made to look 100,000 times larger, a backfill is made
+     * pending, and the preparation runs with auto_explain reporting the plan
+     * of each statement it runs. Every access to a big table in those two
+     * statements must be a keyed index probe, driven from the small side.
+     * Then one batch of partition 0 over its whole range: its affected-set
+     * statement read the inputs of the dynamic transactions through the
+     * prefix range of spent_by_index (millions of inputs per batch on mainnet,
+     * few of them kept); every big-table access in it must be keyed too.
+     */
+    const plans: { query: string; plan: PlanNode }[] = [];
+    const onNotice = (notice: { message?: string }) => {
+      const message = notice.message ?? '';
+      const start = message.indexOf('{');
+      if (!message.startsWith('duration:') || start < 0) {
+        return;
+      }
+      const parsed = JSON.parse(message.slice(start)) as {
+        /* eslint-disable @typescript-eslint/naming-convention */
+        Plan: PlanNode;
+        'Query Text': string;
+        /* eslint-enable @typescript-eslint/naming-convention */
+      };
+      plans.push({ plan: parsed.Plan, query: parsed['Query Text'] });
+    };
+    const bigTables = [
+      'block',
+      'block_transaction',
+      'input',
+      'node_block',
+      'output',
+      'transaction',
+    ];
+    await client.query('BEGIN;');
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await client.query(`ANALYZE ${bigTables.join(', ')};`);
+      await client.query(
+        /* sql */ `
+        UPDATE pg_class SET relpages = GREATEST(relpages, 1), reltuples = GREATEST(reltuples, 1) * 100000
+          WHERE oid IN (SELECT c.oid FROM pg_class c WHERE c.relname = ANY ($1::text[])
+                        UNION ALL
+                        SELECT i.indexrelid FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
+                          WHERE c.relname = ANY ($1::text[]));`,
+        [bigTables]
+      );
+      // a pending backfill, not prepared
+      await client.query(/* sql */ `
+        DELETE FROM unspent_tracking_backfill;
+        UPDATE unspent_tracking_progress SET backfill_transaction_internal_id = 0, backfill_prefix = 0;`);
+      await client.query(/* sql */ `
+        LOAD 'auto_explain';
+        SET LOCAL auto_explain.log_min_duration = 0;
+        SET LOCAL auto_explain.log_nested_statements = on;
+        SET LOCAL auto_explain.log_format = json;
+        SET LOCAL auto_explain.log_level = notice;
+        SET LOCAL client_min_messages = notice;`);
+      client.on('notice', onNotice);
+      const prepared = (
+        await client.query<{ result: { [key: string]: unknown } }>(/* sql */ `
+          SELECT unspent_tracking_backfill_prepare(
+            (SELECT max(internal_id) FROM transaction),
+            (SELECT max(internal_id) FROM block),
+            (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq)) AS result;`)
+      ).rows[0]!.result;
+      t.log({ prepared });
+      t.true(Number(prepared.transactions) > 0, 'M is not empty');
+      const batch = (
+        await client.query<{ result: { [key: string]: unknown } }>(/* sql */ `
+          SELECT unspent_tracking_backfill_batch(0, p.partition_count, 65536) AS result
+            FROM unspent_tracking_progress p WHERE p.partition_index = 0;`)
+      ).rows[0]!.result;
+      client.removeListener('notice', onNotice);
+      t.log({ batch });
+      t.is(batch.previousPrefix, 0, 'the batch ran from the first prefix');
+    } finally {
+      client.removeListener('notice', onNotice);
+      await client.query('ROLLBACK;');
+    }
+    const keyed = (label: string, plan: PlanNode, driver: string) => {
+      const scans = planNodes(plan).filter(
+        (node) =>
+          node['Relation Name'] !== undefined &&
+          node['Node Type'] !== 'ModifyTable'
+      );
+      t.is(
+        scans[0]?.['Relation Name'],
+        driver,
+        `${label}: driven from ${driver}`
+      );
+      scans
+        .filter((node) => bigTables.includes(node['Relation Name']!))
+        .forEach((node) => {
+          t.true(
+            ['Index Scan', 'Index Only Scan'].includes(node['Node Type']) &&
+              node['Index Cond'] !== undefined,
+            `${label}: ${node['Node Type']} on ${node[
+              'Relation Name'
+            ]!} must be a keyed probe\n${JSON.stringify(plan, undefined, 1)}`
+          );
+        });
+    };
+    const statement = (marker: string) =>
+      plans.find(({ query }) => query.includes(marker));
+    const otherBlocks = statement('unspent_tracking_other_blocks ob');
+    const spends = statement('INSERT INTO unspent_tracking_backfill_spends');
+    t.not(otherBlocks, undefined, 'plan of the other-blocks statement');
+    t.not(spends, undefined, 'plan of the spends statement');
+    keyed('other blocks', otherBlocks!.plan, 'unspent_tracking_other_blocks');
+    keyed('spends', spends!.plan, 'unspent_tracking_backfill_transactions');
+    const exact = statement('INSERT INTO unspent_tracking_affected');
+    t.not(exact, undefined, 'plan of the batch affected-set statement');
+    const exactScans = planNodes(exact!.plan).filter((node) =>
+      bigTables.includes(node['Relation Name'] ?? '')
+    );
+    exactScans.forEach((node) => {
+      t.true(
+        ['Index Scan', 'Index Only Scan'].includes(node['Node Type']) &&
+          node['Index Cond'] !== undefined,
+        `batch affected set: ${node['Node Type']} on ${node[
+          'Relation Name'
+        ]!} must be a keyed probe\n${JSON.stringify(exact!.plan, undefined, 1)}`
+      );
+    });
+    t.true(
+      exactScans.some(
+        (node) =>
+          node['Relation Name'] === 'input' &&
+          (node['Index Cond'] ?? '').includes('transaction_internal_id')
+      ),
+      'batch affected set: dynamic inputs probed by transaction (input_pkey)'
+    );
+  }
+);
+
 /**
  * Re-partitioning preserves progress: each new partition (a range of first
  * hash bytes) starts at the minimum watermarks of the old partitions whose
  * ranges overlap its own, not at the global minimum (otherwise a change from
  * 32 to 64 partitions would restart every partition from the lowest
- * watermark).
+ * watermark). The backfill's prefix cursor (backfill_prefix) is carried
+ * over too: a new partition resumes at the lowest cursor of the overlapping old
+ * partitions whose backfill is not complete, and never counts a prefix as
+ * backfilled that was not.
  */
 test.serial(
   `[e2e] unspent tracking (${String(
@@ -4672,10 +5327,12 @@ test.serial(
           count: number;
           input: string;
           partition: number;
+          prefix: number;
         }>(/* sql */ `
 SELECT partition_index AS partition, partition_count AS count,
        input_transaction_internal_id::text AS input, block_internal_id::text AS block,
-       consumed_event_id::text AS consumed, backfill_transaction_internal_id::text AS backfill
+       consumed_event_id::text AS consumed, backfill_transaction_internal_id::text AS backfill,
+       backfill_prefix AS prefix
   FROM unspent_tracking_progress ORDER BY partition_index;`)
       ).rows;
     const repartition = async (count: number) =>
@@ -4685,20 +5342,37 @@ SELECT partition_index AS partition, partition_count AS count,
           [count]
         )
       ).rows[0]!.repartitioned;
+    // backfill complete for a partition at this cursor (set below)
+    const trackingStart = 50;
+    type Progress = Awaited<ReturnType<typeof progress>>;
+    /**
+     * The two-byte prefixes of partition p of n (the backfill batch's range):
+     * first bytes b with floor(b * n / 256) = p.
+     */
+    const rangeStart = (p: number, n: number) => Math.ceil((p * 256) / n) * 256;
+    const rangeEnd = (p: number, n: number) => rangeStart(p + 1, n);
+    const complete = (row: Progress[number]) =>
+      Number(row.backfill) >= trackingStart;
+    /** The prefix the partition's next batch starts at (the batch's p1). */
+    const effectivePrefix = (row: Progress[number], n: number) =>
+      Math.min(
+        Math.max(row.prefix, rangeStart(row.partition, n)),
+        rangeEnd(row.partition, n)
+      );
+    /** Is the two-byte prefix `x` backfilled under the progress rows? */
+    const backfilled = (rows: Progress, x: number) => {
+      // eslint-disable-next-line no-bitwise
+      const row = rows[Math.floor(((x >> 8) * rows.length) / 256)]!;
+      return complete(row) || x < effectivePrefix(row, rows.length);
+    };
     /**
      * Old partition p of n covers first bytes b with floor(b * n / 256) = p: the
      * expected start of new partition q of m is the minimum over the old
-     * partitions sharing a byte with it (the global minimum if it has none).
+     * partitions sharing a byte with it (the global minimum if it has none);
+     * its prefix cursor the minimum effective cursor of the incomplete ones
+     * within its range (the range end if all are complete, 0 if it shares no byte).
      */
-    const expected = (
-      old: {
-        block: string;
-        consumed: string;
-        input: string;
-        backfill: string;
-      }[],
-      m: number
-    ) =>
+    const expected = (old: Progress, m: number) =>
       Array.from({ length: m }, (_, q) => {
         const overlapping = Array.from({ length: 256 }, (_b, b) => b)
           .filter((b) => Math.floor((b * m) / 256) === q)
@@ -4706,6 +5380,7 @@ SELECT partition_index AS partition, partition_count AS count,
         const from = overlapping.length === 0 ? old : overlapping;
         const min = (key: 'backfill' | 'block' | 'consumed' | 'input') =>
           String(Math.min(...from.map((row) => Number(row[key]))));
+        const incomplete = overlapping.filter((row) => !complete(row));
         return {
           backfill: min('backfill'),
           block: min('block'),
@@ -4713,6 +5388,22 @@ SELECT partition_index AS partition, partition_count AS count,
           count: m,
           input: min('input'),
           partition: q,
+          prefix:
+            overlapping.length === 0
+              ? 0
+              : incomplete.length === 0
+              ? rangeEnd(q, m)
+              : Math.min(
+                  Math.max(
+                    Math.min(
+                      ...incomplete.map((row) =>
+                        effectivePrefix(row, old.length)
+                      )
+                    ),
+                    rangeStart(q, m)
+                  ),
+                  rangeEnd(q, m)
+                ),
         };
       });
     await client.query('BEGIN;');
@@ -4723,13 +5414,28 @@ SELECT partition_index AS partition, partition_count AS count,
       if (initial !== 4) {
         t.true(await repartition(4), 'to 4 partitions');
       }
-      // distinct, non-monotonic watermarks per partition
-      await client.query(/* sql */ `
+      /*
+       * distinct, non-monotonic watermarks per partition; backfill: partition
+       * 1 complete, 0 and 3 part-way through their ranges ([0, 16384) and
+       * [49152, 65536)), 2 not started
+       */
+      await client.query(
+        /* sql */ `UPDATE unspent_tracking_settings SET tracking_start_transaction_internal_id = $1;`,
+        [trackingStart]
+      );
+      await client.query(
+        /* sql */ `
 UPDATE unspent_tracking_progress
   SET input_transaction_internal_id = 1000 + 10 * ((partition_index * 7) % 4),
       block_internal_id = 500 + (partition_index * 3) % 4,
       consumed_event_id = 100 + (partition_index * 5) % 4,
-      backfill_transaction_internal_id = 10 + partition_index;`);
+      backfill_transaction_internal_id = CASE WHEN partition_index = 1 THEN $1 ELSE 10 + partition_index END,
+      backfill_prefix = (ARRAY[5000, 32768, 0, 60000])[partition_index + 1];`,
+        [trackingStart]
+      );
+      const prefixes = Array.from({ length: 65536 }, (_, x) => x);
+      const backfilledCount = (rows: Progress) =>
+        prefixes.filter((x) => backfilled(rows, x)).length;
       const transitions = [8, 3, 5, 300, 2];
       await transitions.reduce(async (previous, m) => {
         await previous;
@@ -4737,6 +5443,26 @@ UPDATE unspent_tracking_progress
         t.true(await repartition(m), `to ${m} partitions`);
         const after = await progress();
         t.deepEqual(after, expected(before, m), `${before.length} to ${m}`);
+        t.deepEqual(
+          prefixes.filter(
+            (x) => backfilled(after, x) && !backfilled(before, x)
+          ),
+          [],
+          `${before.length} to ${m}: no prefix newly counted as backfilled`
+        );
+        if (m === 8) {
+          // splitting loses nothing: each half keeps its old partition's cursor
+          t.is(
+            backfilledCount(after),
+            backfilledCount(before),
+            'split: all kept'
+          );
+          t.deepEqual(
+            after.map((row) => row.prefix),
+            [5000, 8192, 24576, 32768, 32768, 40960, 57344, 60000],
+            'split: cursors'
+          );
+        }
         t.is(
           Math.min(...after.map((row) => Number(row.input))),
           Math.min(...before.map((row) => Number(row.input))),
