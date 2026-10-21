@@ -889,13 +889,15 @@ export class Agent {
       this.initializationInProgress = true;
       // eslint-disable-next-line functional/no-let
       let fatalInitializationError = false;
-      // eslint-disable-next-line functional/no-let
-      let configuringUnspentTracking = false;
       optionallyDisableSynchronousCommit()
         .then((disabled) => {
           if (disabled) {
             this.logger.debug('Disabled synchronous_commit for initial sync.');
           }
+        })
+        .catch((err: unknown) => {
+          // optional: initialization continues without it
+          this.logger.error(err);
         })
         .then(async () => {
           setUnspentTrackingLoggers({
@@ -906,7 +908,6 @@ export class Agent {
               this.logger.warn(message);
             },
           });
-          configuringUnspentTracking = true;
           return configureUnspentTracking();
         })
         .then((statements) => {
@@ -919,22 +920,23 @@ export class Agent {
           }
         })
         .catch((err: unknown) => {
-          if (unspentTracking.enabled && configuringUnspentTracking) {
-            /*
-             * Tracking on but not configured (release-event triggers possibly
-             * off): syncing would leave the stored set stale.
-             */
-            fatalInitializationError = true;
-            this.logger.fatal(
-              err,
-              'Agent: failed to configure unspent tracking (CHAINGRAPH_UNSPENT_TRACKING=true); shutting down.'
-            );
-            this.shutdown().catch((shutdownErr) => {
-              this.logger.error(shutdownErr);
-            });
-            return;
-          }
-          this.logger.error(err);
+          /*
+           * Tracking not configured as the setting says: with tracking on, the
+           * release-event triggers may be off (the stored set would go
+           * stale); with tracking off on a database where it had started, the
+           * query root may still serve stored values this agent no longer
+           * keeps up to date. Either way, syncing must not start.
+           */
+          fatalInitializationError = true;
+          this.logger.fatal(
+            err,
+            `Agent: failed to configure unspent tracking (CHAINGRAPH_UNSPENT_TRACKING=${String(
+              unspentTracking.enabled
+            )}); shutting down.`
+          );
+          this.shutdown().catch((shutdownErr) => {
+            this.logger.error(shutdownErr);
+          });
         })
         .finally(() => {
           this.initializationInProgress = false;

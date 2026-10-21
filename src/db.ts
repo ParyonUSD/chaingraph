@@ -21,6 +21,7 @@ import {
   batchDidWork,
   batchReachedLimits,
   blockReacceptedEventsSql,
+  blockRepairedEventsSql,
   buildRootSql,
   clearNodeIndexedSql,
   concurrentIndexDefinition,
@@ -507,7 +508,9 @@ const expiryAdvisoryLockKey = 1970172700;
 /**
  * Archive expired node_transaction rows in one statement. Existing history
  * triggers handle any same-node descendants: those not in the batch get the
- * replaced_at of their archived ancestor.
+ * replaced_at of their archived ancestor. A row in the batch that descends
+ * from another row in the batch gets the earliest replaced_at of itself and
+ * its archived ancestors, as the cascade would give it.
  *
  * A row is left in place (not returned) if the transaction, or a conflicting
  * spend of one of its outpoints, is already in a block accepted by the same
@@ -550,7 +553,7 @@ export const archiveMempoolTransactions = async (
         transactionInternalId: string;
       }>(
         /* sql */ `
-WITH serialized AS (
+WITH RECURSIVE serialized AS (
     -- volatile, so materialized: scanned (and the lock taken) before any
     -- joined row can be produced, i.e. before any row lock below
     SELECT pg_advisory_xact_lock($4::bigint)
@@ -558,7 +561,7 @@ WITH serialized AS (
 expiry AS (
     SELECT node_internal_id, transaction_internal_id, replaced_at
       FROM serialized
-      CROSS JOIN unnest($1::smallint[], $2::bigint[], $3::timestamp[])
+      CROSS JOIN unnest($1::integer[], $2::bigint[], $3::timestamp[])
         AS expiry (node_internal_id, transaction_internal_id, replaced_at)
 ),
 locked AS (
@@ -595,15 +598,43 @@ locked AS (
       ORDER BY node_transaction.node_internal_id, node_transaction.transaction_internal_id
       FOR UPDATE OF node_transaction
 ),
+-- every same-node mempool descendant of a locked row, with the times of the
+-- locked ancestors it descends from (the history cascade's walk)
+invalidated_by AS (
+    SELECT node_internal_id, transaction_internal_id, replaced_at
+      FROM locked
+    UNION
+    SELECT child.node_internal_id, child.transaction_internal_id, parent.replaced_at
+      FROM invalidated_by parent
+      JOIN transaction parent_transaction
+        ON parent_transaction.internal_id = parent.transaction_internal_id
+      JOIN input
+        ON input.outpoint_transaction_hash = parent_transaction.hash
+      JOIN node_transaction child
+        ON child.transaction_internal_id = input.transaction_internal_id
+       AND child.node_internal_id = parent.node_internal_id
+),
+-- a locked row descending from another locked row is archived with the
+-- earliest invalidation time, as the cascade archives descendants
+archive_rows AS (
+    SELECT locked.node_internal_id,
+           locked.transaction_internal_id,
+           min(invalidated_by.replaced_at) AS replaced_at
+      FROM locked
+      JOIN invalidated_by
+        ON invalidated_by.node_internal_id = locked.node_internal_id
+       AND invalidated_by.transaction_internal_id = locked.transaction_internal_id
+      GROUP BY locked.node_internal_id, locked.transaction_internal_id
+),
 deleted_rows AS (
     DELETE FROM node_transaction
-      USING locked
-      WHERE node_transaction.node_internal_id = locked.node_internal_id
-        AND node_transaction.transaction_internal_id = locked.transaction_internal_id
+      USING archive_rows
+      WHERE node_transaction.node_internal_id = archive_rows.node_internal_id
+        AND node_transaction.transaction_internal_id = archive_rows.transaction_internal_id
       RETURNING node_transaction.node_internal_id,
                 node_transaction.transaction_internal_id,
                 node_transaction.validated_at,
-                locked.replaced_at
+                archive_rows.replaced_at
 ),
 inserted_history AS (
     INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id, validated_at, replaced_at)
@@ -1196,6 +1227,7 @@ inserted_node_blocks AS (
   RETURNING block_internal_id
 )
 SELECT
+  (SELECT COUNT(*)::bigint FROM inserted_block) AS "insertedBlockCount",
   (SELECT COUNT(*)::bigint FROM joined_transactions) AS "joinedTransactionCount",
   (SELECT COUNT(*)::bigint FROM inserted_block_transactions) AS "insertedBlockTransactionCount",
   (SELECT COUNT(*)::bigint FROM inserted_node_blocks) AS "insertedNodeBlockCount";`;
@@ -1213,6 +1245,7 @@ SELECT
     const transactionCacheMisses =
       attemptedSavedTransactions.length - savedTransactionCount;
     const addBlockResult = await client.query<{
+      insertedBlockCount: string;
       insertedBlockTransactionCount: string;
       insertedNodeBlockCount: string;
       joinedTransactionCount: string;
@@ -1221,7 +1254,23 @@ SELECT
     const joinedTransactionCount = Number(
       addBlockResult.rows[0]!.joinedTransactionCount
     );
+    const blockExisted =
+      Number(addBlockResult.rows[0]!.insertedBlockCount) === 0;
     if (
+      unspentTracking.enabled &&
+      blockExisted &&
+      Number(addBlockResult.rows[0]!.insertedBlockTransactionCount) > 0
+    ) {
+      /*
+       * Unspent tracking: a block that already existed (its id may be below
+       * the job's block watermark) got transactions it was missing; every
+       * node accepting it now accepts them, so every node_block row of the
+       * block is recorded as an event.
+       */
+      await client.query(blockRepairedEventsSql, [
+        Buffer.from(block.hash, 'hex'),
+      ]);
+    } else if (
       unspentTracking.enabled &&
       Number(addBlockResult.rows[0]!.insertedNodeBlockCount) > 0
     ) {
@@ -1679,11 +1728,25 @@ export const ensureUnspentTrackingIndexes = async () => {
         client,
         statements.filter((statement) => !statement.startsWith('DELETE'))
       );
-      await runStatements(
-        client,
-        nodeIds.map((id) => markNodeIndexedSql(id))
-      );
-      await client.query(buildRootSql);
+      /*
+       * The readiness rows and the root with the nodes' stored arms commit
+       * together: a node is never served from the stored set by a root
+       * without its arms.
+       */
+      await client.query('BEGIN;');
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        await runStatements(
+          client,
+          nodeIds.map((id) => markNodeIndexedSql(id))
+        );
+        await client.query(buildRootSql);
+        await client.query('COMMIT;');
+      } catch (err) {
+        await client.query('ROLLBACK;');
+        // eslint-disable-next-line functional/no-throw-statement
+        throw err;
+      }
       return statements;
     } finally {
       await client.query(/* sql */ `SELECT pg_advisory_unlock($1::bigint);`, [

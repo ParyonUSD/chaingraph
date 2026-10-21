@@ -275,6 +275,11 @@ $$;
 -- below them has finished). Events are consumed up to `event_limit` only: an
 -- event id is allocated when its row is inserted, so a later id can commit
 -- first, and consuming past an uncommitted id would skip that event forever.
+-- Every row up to the settled limits is visible in the batch's snapshot, so
+-- when fewer than `max_blocks` blocks or `max_events` events remain below
+-- them, the block watermark and the consumed event id advance to the limits,
+-- past ids no committed row took (rolled-back inserts, conflicting block
+-- inserts).
 -- `max_inputs` bounds the inputs of all partitions walked by one batch. `skip_stall_through`: inputs of transactions up to this id whose
 -- output row is missing are passed instead of stopping the batch (0 = never skip).
 CREATE FUNCTION unspent_tracking_run_batch (part integer, part_count integer, tx_limit bigint, block_limit bigint,
@@ -418,6 +423,10 @@ BEGIN
                                   AND block_transaction.transaction_internal_id <= w OFFSET 0) bt;
       GET DIAGNOSTICS n_block_txs = ROW_COUNT;
     END IF;
+    -- no block left up to the settled limit: pass the ids no block took
+    IF n_blocks < GREATEST(max_blocks, 1) THEN
+      upper_block := block_limit;
+    END IF;
   END IF;
 
   -- 5. collected transactions -> the outputs they spend and create (this partition)
@@ -463,7 +472,8 @@ BEGIN
   UPDATE unspent_tracking_progress p
     SET input_transaction_internal_id = upper_tx,
         block_internal_id = upper_block,
-        consumed_event_id = GREATEST(p.consumed_event_id, COALESCE(max_event, 0)),
+        consumed_event_id = GREATEST(p.consumed_event_id,
+          CASE WHEN n_events < max_events THEN event_limit ELSE COALESCE(max_event, 0) END),
         updated_at = now()
     WHERE p.partition_index = part;
 
@@ -930,13 +940,16 @@ BEGIN
       block_internal_id, consumed_event_id, backfill_transaction_internal_id)
     SELECT p, part_count, input_watermark, block_watermark, event_watermark, 0 FROM generate_series(0, part_count - 1) p;
   -- child-before-parent across the start of tracking: recent inputs whose
-  -- output is not saved yet (bounded: the last 100,000 transactions)
+  -- parent transaction is not saved at or below the starting watermark
+  -- (missing, or saved above it: its outputs are processed by the job, which
+  -- never walks these inputs), bounded to the last 100,000 transactions
   INSERT INTO unspent_tracking_skipped (outpoint_transaction_hash, outpoint_index, transaction_internal_id)
     SELECT i.outpoint_transaction_hash, i.outpoint_index, i.transaction_internal_id
       FROM input i
       WHERE i.transaction_internal_id > input_watermark - 100000 AND i.transaction_internal_id <= input_watermark
         AND i.outpoint_transaction_hash <> '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
-        AND NOT EXISTS (SELECT 1 FROM output o WHERE o.transaction_hash = i.outpoint_transaction_hash AND o.output_index = i.outpoint_index)
+        AND NOT EXISTS (SELECT 1 FROM transaction t
+                          WHERE t.hash = i.outpoint_transaction_hash AND t.internal_id <= input_watermark)
     ON CONFLICT ON CONSTRAINT unspent_tracking_skipped_pkey DO NOTHING;
   RETURN true;
 END;
@@ -1370,10 +1383,9 @@ $$;
 -- above the minimum block watermark the node accepts, limited to transactions
 -- some partition may have processed (at or below the highest input
 -- watermark; outputs of later transactions are unprocessed and handled by the
--- backlog arm) and leaving out transactions the node already accepted in its
--- mempool (an unconsumed node_transaction release event for the node: the
--- mempool row was removed when the block confirmed it). Only transactions the
--- node accepts now.
+-- backlog arm). Only transactions the node accepts now; the root returns only
+-- their outputs stored without the node (e.g. a mempool transaction confirmed
+-- by the block is already stored with it).
 CREATE FUNCTION unspent_tracking_gained_creators (node_id bigint)
   RETURNS TABLE (hash bytea) LANGUAGE plpgsql STABLE ROWS 100
   SET enable_hashjoin = off SET enable_mergejoin = off SET plan_cache_mode = force_custom_plan AS $$
@@ -1401,10 +1413,7 @@ BEGIN
               JOIN node_block nb ON nb.block_internal_id = nbk.internal_id AND nb.node_internal_id = node_id
               CROSS JOIN LATERAL (SELECT transaction_internal_id FROM block_transaction
                                     WHERE block_transaction.block_internal_id = nbk.internal_id
-                                      AND block_transaction.transaction_internal_id <= w_max OFFSET 0) bt
-              WHERE NOT EXISTS (SELECT 1 FROM unspent_tracking_events e
-                                  WHERE e.event_kind = 'released' AND e.node_internal_id = node_id
-                                    AND e.transaction_internal_id = bt.transaction_internal_id)) x
+                                      AND block_transaction.transaction_internal_id <= w_max OFFSET 0) bt) x
       CROSS JOIN LATERAL (SELECT transaction.hash FROM transaction WHERE transaction.internal_id = x.id OFFSET 0) t
       WHERE EXISTS (SELECT 1 FROM block_transaction bt
                       JOIN node_block nb ON nb.node_internal_id = node_id AND nb.block_internal_id = bt.block_internal_id

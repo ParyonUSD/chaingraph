@@ -37,7 +37,7 @@ test.before(async (t) => {
 DROP SCHEMA IF EXISTS ${schema} CASCADE;
 CREATE SCHEMA ${schema};
 SET search_path = ${schema};
-CREATE TABLE node (internal_id smallint PRIMARY KEY, name text);
+CREATE TABLE node (internal_id integer PRIMARY KEY, name text);
 CREATE TABLE transaction (internal_id bigint PRIMARY KEY, hash bytea UNIQUE);
 CREATE TABLE output (transaction_hash bytea, output_index integer,
   PRIMARY KEY (transaction_hash, output_index));
@@ -45,16 +45,16 @@ CREATE TABLE input (transaction_internal_id bigint, input_index integer,
   outpoint_transaction_hash bytea, outpoint_index integer,
   PRIMARY KEY (transaction_internal_id, input_index));
 CREATE INDEX input_outpoint ON input (outpoint_transaction_hash, outpoint_index);
-CREATE TABLE node_transaction (node_internal_id smallint,
+CREATE TABLE node_transaction (node_internal_id integer,
   transaction_internal_id bigint, validated_at timestamp NOT NULL,
   PRIMARY KEY (node_internal_id, transaction_internal_id));
-CREATE TABLE node_transaction_history (node_internal_id smallint,
+CREATE TABLE node_transaction_history (node_internal_id integer,
   transaction_internal_id bigint, validated_at timestamp, replaced_at timestamp,
   PRIMARY KEY (node_internal_id, transaction_internal_id, validated_at));
 CREATE TABLE block_transaction (block_internal_id bigint,
   transaction_internal_id bigint,
   PRIMARY KEY (transaction_internal_id, block_internal_id));
-CREATE TABLE node_block (node_internal_id smallint,
+CREATE TABLE node_block (node_internal_id integer,
   block_internal_id bigint, accepted_at timestamp NOT NULL,
   PRIMARY KEY (node_internal_id, block_internal_id));
 ${cascadeFunction}
@@ -235,5 +235,76 @@ test.serial(
     );
     // a duplicate request for an already-archived row resolves false
     t.false(await db.expireMempoolTransaction(expiries[0]!));
+  }
+);
+
+/**
+ * Node 40000 (node ids are `integer`) has a mempool chain (parent, child,
+ * grandchild); the parent and the child expire in one batch at different
+ * times, the grandchild is not in the batch.
+ */
+const createExpiringChain = async (db: typeof database) => {
+  await db.pool.query(/* sql */ `
+TRUNCATE node, transaction, output, input, node_transaction,
+  node_transaction_history, block_transaction, node_block;
+INSERT INTO node VALUES (40000, 'large-id');
+INSERT INTO transaction
+  SELECT id, sha256(int8send(id)) FROM generate_series(1, 3) id;
+INSERT INTO output SELECT hash, 0 FROM transaction;
+INSERT INTO input
+  SELECT child.internal_id, 0, parent.hash, 0
+    FROM transaction child
+    JOIN transaction parent ON parent.internal_id = child.internal_id - 1
+    WHERE child.internal_id > 1;
+INSERT INTO node_transaction
+  SELECT 40000, internal_id, '2026-01-01' FROM transaction;
+`);
+};
+
+test.serial(
+  '[e2e] expiry archives rows of nodes with ids above the smallint range',
+  async (t) => {
+    const { db } = t.context;
+    await createExpiringChain(db);
+    const archived = await db.archiveMempoolTransactions([
+      {
+        nodeInternalId: 40000,
+        replacedAt: new Date('2026-01-01T01:00:00.000Z'),
+        transactionInternalId: 1,
+      },
+    ]);
+    t.is(archived.length, 1);
+    t.deepEqual(await countRows(db), { current: 0, history: 3 });
+  }
+);
+
+test.serial(
+  '[e2e] a descendant expiring in the same batch as its ancestor inherits the earlier replaced_at',
+  async (t) => {
+    const { db } = t.context;
+    await createExpiringChain(db);
+    const archived = await db.archiveMempoolTransactions([
+      {
+        nodeInternalId: 40000,
+        replacedAt: new Date('2026-01-01T02:00:00.000Z'),
+        transactionInternalId: 2,
+      },
+      {
+        nodeInternalId: 40000,
+        replacedAt: new Date('2026-01-01T01:00:00.000Z'),
+        transactionInternalId: 1,
+      },
+    ]);
+    t.is(archived.length, 2);
+    const history = await db.pool.query<{
+      replaced: string;
+      tx: string;
+    }>(/* sql */ `SELECT transaction_internal_id::text AS tx, replaced_at::text AS replaced
+        FROM node_transaction_history ORDER BY transaction_internal_id;`);
+    t.deepEqual(history.rows, [
+      { replaced: '2026-01-01 01:00:00', tx: '1' },
+      { replaced: '2026-01-01 01:00:00', tx: '2' },
+      { replaced: '2026-01-01 01:00:00', tx: '3' },
+    ]);
   }
 );
