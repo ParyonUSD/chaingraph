@@ -1706,11 +1706,25 @@ export const ensureUnspentTrackingIndexes = async () => {
         client,
         statements.filter((statement) => !statement.startsWith('DELETE'))
       );
-      await runStatements(
-        client,
-        nodeIds.map((id) => markNodeIndexedSql(id))
-      );
-      await client.query(buildRootSql);
+      /*
+       * The readiness rows and the root with the nodes' stored arms commit
+       * together: a node is never served from the stored set by a root
+       * without its arms.
+       */
+      await client.query('BEGIN;');
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        await runStatements(
+          client,
+          nodeIds.map((id) => markNodeIndexedSql(id))
+        );
+        await client.query(buildRootSql);
+        await client.query('COMMIT;');
+      } catch (err) {
+        await client.query('ROLLBACK;');
+        // eslint-disable-next-line functional/no-throw-statement
+        throw err;
+      }
       return statements;
     } finally {
       await client.query(/* sql */ `SELECT pg_advisory_unlock($1::bigint);`, [
