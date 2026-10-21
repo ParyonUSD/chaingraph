@@ -88,6 +88,9 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
+  migration(
+    'default/1791100002000_bound_block_confirmation_mempool_cleanup/up.sql'
+  ),
   migration('default/1791200000000_add_incomplete_block_audit/up.sql'),
   migration('default/1791600000000_node_block_height/up.sql'),
 ];
