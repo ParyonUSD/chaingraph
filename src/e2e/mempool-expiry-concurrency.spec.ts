@@ -352,6 +352,7 @@ ANALYZE node_transaction;`);
           expiries.map((expiry) => expiry.nodeInternalId),
           expiries.map((expiry) => expiry.transactionInternalId),
           expiries.map((expiry) => expiry.replacedAt.toISOString()),
+          expiries.map(() => null),
         ]
       );
       const scanned = rowsScanned(

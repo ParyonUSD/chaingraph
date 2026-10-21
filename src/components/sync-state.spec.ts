@@ -86,3 +86,39 @@ test('SyncState scales when marking many contiguous heights as pending', (t) => 
     `Expected marking contiguous pending heights to complete in less than ${maximumDurationMs}ms; took ${durationMs}ms.`
   );
 });
+
+test('SyncState scales when marking many pending heights as synced', (t) => {
+  const state = new SyncState({
+    additionalSyncedHeights: [],
+    fullySyncedUpToHeight: 0,
+    pendingSyncOfHeights: [],
+  });
+  /*
+   * Mirrors `catchUpViaHeaders` accepting a long run of already-known blocks
+   * (e.g. a new network sharing history with an existing one): every height is
+   * marked pending, then every height is marked synced in ascending order. With
+   * array-backed state this was quadratic (~7s at 300k heights).
+   */
+  const acceptedThroughHeight = 300_000;
+  const maximumDurationMs = 1_000;
+
+  const startedAt = Date.now();
+  // eslint-disable-next-line functional/no-loop-statement, functional/no-let
+  for (let height = 1; height <= acceptedThroughHeight; height += 1) {
+    state.markHeightAsPendingSync(height);
+  }
+  // eslint-disable-next-line functional/no-loop-statement, functional/no-let
+  for (let height = 1; height <= acceptedThroughHeight; height += 1) {
+    state.markHeightAsSynced(height, 'caught-up');
+  }
+  const durationMs = Date.now() - startedAt;
+
+  t.deepEqual(state.fullySyncedUpToHeight, acceptedThroughHeight);
+  t.deepEqual(state.getPendingSyncHeight(), acceptedThroughHeight);
+  t.deepEqual(state.pendingSyncOfHeights, []);
+  t.deepEqual(state.additionalSyncedHeights, []);
+  t.true(
+    durationMs < maximumDurationMs,
+    `Expected marking pending heights as synced to complete in less than ${maximumDurationMs}ms; took ${durationMs}ms.`
+  );
+});
