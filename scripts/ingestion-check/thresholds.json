@@ -1,0 +1,23 @@
+{
+  "max-block": {
+    "maxWallSeconds": 10,
+    "maxWalBytes": 340000000,
+    "maxPeakHeapBytes": 1700000000
+  },
+  "burst": {
+    "maxDrainSeconds": 30,
+    "maxWalBytes": 1000000000
+  },
+  "reorg": {
+    "maxConvergeSeconds": 6,
+    "knownFailingChecks": [
+      "still accepts genesis+base blocks at or below the fork point"
+    ]
+  },
+  "concurrent": {
+    "minConcurrencyRatio": 0.6
+  },
+  "catch-up": {
+    "minBlocksPerSecond": 300
+  }
+}

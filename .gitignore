@@ -15,3 +15,6 @@ data
 .env
 client/generated
 .scratch
+
+# ingestion check report (fixtures/runs live under data/)
+ingestion-check.json
