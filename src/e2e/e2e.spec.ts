@@ -2086,6 +2086,37 @@ const newBlocks = (
 };
 
 test.serial(
+  '[e2e] survives Postgres terminating its connections (e.g. a restart)',
+  async (t) => {
+    const crashGracePeriodMs = 2_000;
+    const logStart = stdoutBuffer.length;
+    const terminated = await client.query<{ terminated: boolean }>(
+      /* sql */ `
+      SELECT pg_terminate_backend(pid) AS terminated FROM pg_stat_activity
+        -- cspell:disable-next-line
+        WHERE datname = $1
+          AND pid <> pg_backend_pid();
+    `,
+      [e2eTestDbName]
+    );
+    t.true(
+      terminated.rows.some((row) => row.terminated),
+      'Expected the agent to hold at least one Postgres connection.'
+    );
+    await waitForStdout('Postgres connection lost');
+    // give a crash (uncaught 'error' event → shutdown) time to happen
+    await sleep(crashGracePeriodMs);
+    const logsSinceTermination = stdoutBuffer.slice(logStart);
+    t.false(logsSinceTermination.includes('uncaughtException'));
+    t.false(logsSinceTermination.includes('Shutting down...'));
+    const healthCheckResponse = await got(
+      `http://localhost:${chaingraphInternalApiPort}/health-check`
+    );
+    t.deepEqual(healthCheckResponse.statusCode, StatusCode.success);
+  }
+);
+
+test.serial(
   '[e2e] syncs blocks as they arrive, handles multiple chain tips',
   async (t) => {
     const [, tx1] = tipA[0]!.transactions;
