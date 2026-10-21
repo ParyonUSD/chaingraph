@@ -6,7 +6,7 @@ import baseTest from 'ava';
 
 import type * as database from '../db.js';
 
-// cspell:words lpad xact
+// cspell:words autovacuum lpad xact
 const test = baseTest as TestFn<{ db: typeof database; schema: string }>;
 const host = process.env.CHAINGRAPH_E2E_POSTGRES_HOST ?? 'localhost';
 const port = process.env.CHAINGRAPH_E2E_POSTGRES_PORT ?? '5432';
@@ -69,8 +69,19 @@ test.after.always(async (t) => {
   await t.context.db.pool.end();
 });
 
-const chains = 60;
-const depth = 40;
+/** The expiry queue's batch size (`expiryBatchSize` in db.ts). */
+const expiryQueueBatchSize = 500;
+interface MempoolShape {
+  chains: number;
+  depth: number;
+}
+/*
+ * Big enough for several expiry queue batches and many concurrent single-row
+ * expiries of related rows; small enough that the single-row test, which
+ * serializes one transaction per row, stays fast on a slow CI runner.
+ */
+const mempoolShape: MempoolShape = { chains: 20, depth: 15 };
+const mempoolRowCount = ({ chains, depth }: MempoolShape) => chains * depth * 2;
 
 /**
  * `chains` chains of `depth` mempool transactions (each spends output 0 of the
@@ -80,7 +91,8 @@ const depth = 40;
  */
 const createStaleMempool = async (
   db: typeof database,
-  validatedAt = `'2026-01-01'::timestamp`
+  validatedAt = `'2026-01-01'::timestamp`,
+  { chains, depth } = mempoolShape
 ) => {
   await db.pool.query(/* sql */ `
 TRUNCATE node, transaction, output, input, node_transaction,
@@ -149,7 +161,7 @@ const expectAllArchived = async (
   );
   t.deepEqual(await countRows(t.context.db), {
     current: 0,
-    history: chains * depth * 2,
+    history: mempoolRowCount(mempoolShape),
   });
   const replacedAt = await t.context.db.pool.query<{ replaced: string }>(
     /* sql */ `SELECT DISTINCT replaced_at::text AS replaced FROM node_transaction_history;`
@@ -157,8 +169,12 @@ const expectAllArchived = async (
   t.deepEqual(replacedAt.rows, [{ replaced }]);
 };
 
-const staleExpiries = async (db: typeof database, validatedAt?: string) => {
-  await createStaleMempool(db, validatedAt);
+const staleExpiries = async (
+  db: typeof database,
+  validatedAt?: string,
+  shape = mempoolShape
+) => {
+  await createStaleMempool(db, validatedAt, shape);
   const expiring = await db.getMempoolTransactionsExpiringBefore({
     expirationMs: 3_600_000,
     expiresBefore: new Date('2026-01-10T00:00:00.000Z'),
@@ -183,7 +199,7 @@ test.serial(
   async (t) => {
     const { db } = t.context;
     const expiries = await staleExpiries(db);
-    t.is(expiries.length, chains * depth * 2);
+    t.is(expiries.length, mempoolRowCount(mempoolShape));
     const errors: unknown[] = [];
     await Promise.all(
       expiries.map(async (expiry) =>
@@ -267,6 +283,80 @@ test.serial(
       )
     );
     await expectAllArchived(t, errors, '2026-01-01 01:00:01');
+  }
+);
+
+/* eslint-disable @typescript-eslint/naming-convention */
+interface PlanNode {
+  'Actual Loops': number;
+  'Actual Rows': number;
+  'Node Type': string;
+  Plans?: PlanNode[];
+  'Relation Name'?: string;
+}
+/* eslint-enable @typescript-eslint/naming-convention */
+const rowsScanned = (node: PlanNode, relation: string): number =>
+  (node['Relation Name'] === relation && node['Node Type'].endsWith('Scan')
+    ? node['Actual Rows'] * node['Actual Loops']
+    : 0) +
+  (node.Plans ?? []).reduce(
+    (total, child) => total + rowsScanned(child, relation),
+    0
+  );
+
+/*
+ * Regression: with node_transaction statistics taken when the mempool was
+ * nearly empty (as autovacuum may analyze it just after a block), Postgres
+ * joined each walked descendant to node_transaction by node alone, reading the
+ * node's whole mempool per walked row: archiving a stale mempool took time
+ * quadratic in its size (here ~485,000 node_transaction rows read rather than
+ * ~20,000; tens of seconds per batch on CI).
+ */
+test.serial(
+  '[e2e] archiving a stale mempool reads each node_transaction row a few times, also with outdated statistics',
+  async (t) => {
+    const { db } = t.context;
+    // larger, so the quadratic plan reads far more rows than the bound below
+    const largeMempool = { chains: 60, depth: 40 };
+    const mempoolRows = mempoolRowCount(largeMempool);
+    // statistics of a nearly empty mempool, then the stale mempool
+    await createStaleMempool(db, undefined, largeMempool);
+    await db.pool.query(/* sql */ `
+DELETE FROM node_transaction WHERE transaction_internal_id > 3;
+ANALYZE node_transaction;`);
+    // one expiry queue batch, including transaction 1: the ancestor of all
+    const expiries = (await staleExpiries(db, undefined, largeMempool))
+      .sort((a, b) => a.transactionInternalId - b.transactionInternalId)
+      .slice(0, expiryQueueBatchSize);
+    const client = await db.pool.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await client.query('BEGIN;');
+      const explained = await client.query<{
+        // eslint-disable-next-line @typescript-eslint/naming-convention
+        'QUERY PLAN': [{ Plan: PlanNode }];
+      }>(
+        `EXPLAIN (ANALYZE, FORMAT JSON) ${db.mempoolExpiryArchivalStatement}`,
+        [
+          expiries.map((expiry) => expiry.nodeInternalId),
+          expiries.map((expiry) => expiry.transactionInternalId),
+          expiries.map((expiry) => expiry.replacedAt.toISOString()),
+        ]
+      );
+      const scanned = rowsScanned(
+        explained.rows[0]!['QUERY PLAN'][0].Plan,
+        'node_transaction'
+      );
+      t.log(`node_transaction rows scanned: ${scanned}`);
+      t.true(scanned <= mempoolRows * 10, `scanned ${scanned} rows`);
+      const archived = await client.query<{ count: string }>(
+        /* sql */ `SELECT count(*)::text FROM node_transaction_history;`
+      );
+      t.is(Number(archived.rows[0]!.count), mempoolRows);
+    } finally {
+      await client.query('ROLLBACK;');
+      client.release();
+    }
   }
 );
 
