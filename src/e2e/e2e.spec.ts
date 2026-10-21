@@ -3439,6 +3439,51 @@ UPDATE node_block SET block_height = -1
 );
 
 test.serial(
+  '[e2e] [sql] node_block_height migration handles block internal_ids beyond the int4 array range',
+  async (t) => {
+    /*
+     * Array subscripts are int4, so ids above 2^31 - 1 must not take the
+     * array-literal backfill even when the id span is small. The migration
+     * runs against scratch block/node_block tables found first on the
+     * search_path.
+     */
+    const upMigration = readFileSync(
+      migration('default/1791600000000_node_block_height/up.sql'),
+      'utf8'
+    );
+    await client.query('BEGIN;');
+    const backfill = async () => {
+      await client.query(/* sql */ `
+CREATE SCHEMA node_block_height_migration_test;
+SET LOCAL search_path = node_block_height_migration_test, public;
+CREATE TABLE block (internal_id bigint PRIMARY KEY, height integer NOT NULL);
+CREATE TABLE node_block (
+  node_internal_id bigint NOT NULL,
+  block_internal_id bigint NOT NULL REFERENCES block (internal_id),
+  accepted_at timestamp without time zone
+);
+INSERT INTO block VALUES (3000000000, 5);
+INSERT INTO node_block VALUES (1, 3000000000, NULL);
+`);
+      await client.query(upMigration);
+      return (
+        await client.query<{ blockHeight: string }>(
+          'SELECT block_height AS "blockHeight" FROM node_block;'
+        )
+      ).rows;
+    };
+    const rollback = async () => client.query('ROLLBACK;');
+    const rows = await backfill().then(
+      async (result) => rollback().then(() => result),
+      async (error: unknown) =>
+        // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+        rollback().then(async () => Promise.reject(error))
+    );
+    t.deepEqual(rows, [{ blockHeight: '5' }]);
+  }
+);
+
+test.serial(
   '[e2e] [sql] per-node tip query uses node_block_node_height_index',
   async (t) => {
     /*

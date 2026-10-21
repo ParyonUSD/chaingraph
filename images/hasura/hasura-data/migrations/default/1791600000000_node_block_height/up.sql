@@ -42,8 +42,9 @@
 --   is held (no node_block row can appear after that). A per-row SQL function
 --   lookup instead costs a full plan per row under plan_cache_mode =
 --   force_custom_plan (production setting): 33.6 s of lock on 1.3M rows on a
---   production clone. If block internal_ids are too sparse for an array, the
---   function is used with a generic plan.
+--   production clone. If block internal_ids are too sparse for an array, or
+--   outside the int4 range of array subscripts, the function is used with a
+--   generic plan.
 -- - If block_height already exists and is NOT NULL, it is complete and correct
 --   (backfilled, then written by the agent and the trigger below), so it is
 --   not rebuilt; re-applying the migration is a no-op.
@@ -81,8 +82,11 @@ BEGIN
   SELECT min(internal_id), max(internal_id)
     INTO min_block_internal_id, max_block_internal_id FROM block;
 
+  -- Array subscripts are int4, so the array path also needs every id in range.
   IF max_block_internal_id IS NULL
-    OR max_block_internal_id - min_block_internal_id < 5000000 THEN
+    OR (max_block_internal_id - min_block_internal_id < 5000000
+        AND min_block_internal_id >= -2147483648
+        AND max_block_internal_id <= 2147483647) THEN
     -- '[min:max]={h_min,...,h_max}': subscript = block internal_id. Gaps are
     -- -1, never NULL (a NULL makes every subscript scan the null bitmap);
     -- node_block's foreign key guarantees every referenced block exists.
