@@ -16,10 +16,12 @@ import type pino from 'pino';
 import {
   bitcoreBlockToChaingraphBlock,
   bitcoreTransactionToChaingraphTransaction,
+  createPeerMessages,
 } from './bitcore.js';
 import { BlockBuffer } from './components/block-buffer.js';
 import { BlockTree } from './components/block-tree.js';
 import type { indexDefinitions } from './components/db-utils.js';
+import { MempoolResync } from './components/mempool-resync.js';
 import { SyncState } from './components/sync-state.js';
 import {
   formatBytes,
@@ -32,6 +34,8 @@ import {
   chaingraphUserAgent,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
+  mempoolResync,
+  mempoolResyncMinIntervalMs,
   mempoolTransactionExpirationMs,
   mempoolTransactionExpirationScanIntervalMs,
   postgresMaxConnections,
@@ -43,6 +47,7 @@ import {
   createIndexes,
   expireMempoolTransaction,
   getAllKnownBlockHashes,
+  getIncompleteBlockAuditState,
   getIncompleteBlocks,
   getIndexCreationProgress,
   getMempoolTransactionsExpiringBefore,
@@ -55,9 +60,18 @@ import {
   registerTrustedNodeWithDb,
   removeStaleBlocksForNode,
   saveBlock,
+  saveIncompleteBlockAudit,
   saveTransactionForNodes,
 } from './db.js';
-import type { ExpiringMempoolTransaction, IncompleteBlock } from './db.js';
+import type {
+  ExpiringMempoolTransaction,
+  IncompleteBlock,
+  IncompleteBlockAuditState,
+} from './db.js';
+import {
+  describePostgresError,
+  isPostgresConnectionError,
+} from './postgres-errors.js';
 import type { ChaingraphBlock } from './types/chaingraph.js';
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -116,6 +130,11 @@ const renderSyncPercentage = (value: number) => {
 };
 
 const msPerSecond = 1000;
+/**
+ * Delay before retrying an incomplete block repair scan which failed because
+ * the Postgres connection was lost (e.g. Postgres is restarting).
+ */
+const incompleteBlockRepairRetryDelayMs = 5_000;
 const durationDecimalPlaces = 1;
 const transactionRateDecimalPlaces = 2;
 
@@ -313,6 +332,32 @@ export class Agent {
 
   nodesByInternalId = [] as [nodeName: string, node: Node][];
 
+  /**
+   * Requests the mempool of trusted nodes (BIP35) after mempool tracking is
+   * enabled, on reconnection, and after re-organizations, so transactions
+   * which nodes don't re-announce (e.g. those returned to the mempool by a
+   * re-organization) are recorded in `node_transaction`. See
+   * https://github.com/bitauth/chaingraph/issues/81.
+   */
+  mempoolResync = new MempoolResync<Node>({
+    enabled: mempoolResync,
+    getReadyNode: (nodeName) => {
+      const node = this.nodes[nodeName];
+      return node?.internalId !== undefined && node.peer.status === 'ready'
+        ? node
+        : undefined;
+    },
+    minimumIntervalMs: mempoolResyncMinIntervalMs,
+    onRequestSent: (nodeName, triggers) => {
+      this.logger.info(
+        `${nodeName}: requested node mempool (BIP35) – triggers: ${triggers.join(
+          ', '
+        )}`
+      );
+    },
+    transactionCache: this.transactionCache,
+  });
+
   heartbeatInterval: NodeJS.Timeout;
 
   scheduledBlockBufferFill = false;
@@ -342,6 +387,20 @@ export class Agent {
   incompleteBlockRepairNextHeight = 0;
 
   completedIncompleteBlockRepairScan = false;
+
+  /**
+   * State of the in-progress incomplete block repair scan: the audit markers
+   * loaded when it began, and the nodes which were registered for every batch
+   * (only those nodes' markers are advanced when the scan completes).
+   */
+  incompleteBlockAuditPass:
+    | {
+        auditState: IncompleteBlockAuditState;
+        auditedBlockCount: number;
+        nodeInternalIdsInEveryBatch: number[];
+        startedAt: number;
+      }
+    | undefined;
 
   /**
    * The next second after which to log another warning that one or more nodes
@@ -496,7 +555,10 @@ export class Agent {
         subversion: chaingraphUserAgent,
         version: chaingraphProtocolVersion,
       };
-      const peer = new Peer(peerConfig);
+      const peer = new Peer({
+        ...peerConfig,
+        messages: createPeerMessages(node.networkMagicHex),
+      });
       const peerTxBroadcastConnection = new Peer({
         ...peerConfig,
         subversion: `${chaingraphUserAgent}tx-broadcast/`,
@@ -603,6 +665,7 @@ export class Agent {
           }
           nodeRegisteredResolver();
           this.requestHeaders(node.name);
+          this.mempoolResync.handleConnect(node.name);
         });
       });
 
@@ -933,6 +996,9 @@ export class Agent {
                       }
                       this.logger.info('Agent: enabled mempool tracking.');
                       this.saveInboundTransactions = true;
+                      this.mempoolResync.enableMempoolTracking(
+                        Object.keys(this.nodes)
+                      );
                       this.scheduleIncompleteBlockRepair();
                       this.scheduleMempoolTransactionExpirationScan();
                     });
@@ -1109,6 +1175,7 @@ export class Agent {
       nodeInternalId: transaction.nodeInternalId,
       replacedAt: transaction.expiresAt,
       transactionInternalId: transaction.transactionInternalId,
+      validatedAt: transaction.validatedAt,
     });
     if (!archived) {
       this.logger.debug(
@@ -1167,6 +1234,20 @@ export class Agent {
     this.incompleteBlockRepairTimeout = setTimeout(() => {
       this.scheduledIncompleteBlockRepair = false;
       this.repairIncompleteBlocks().catch((err) => {
+        if (isPostgresConnectionError(err) && !this.willShutdown) {
+          this.logger.warn(
+            `Agent: incomplete block repair scan lost its Postgres connection (${describePostgresError(
+              err
+            )}); retrying in ${
+              incompleteBlockRepairRetryDelayMs / msPerSecond
+            } seconds.`
+          );
+          this.incompleteBlockRepairTimeout = setTimeout(() => {
+            this.incompleteBlockRepairTimeout = undefined;
+            this.scheduleIncompleteBlockRepair();
+          }, incompleteBlockRepairRetryDelayMs);
+          return;
+        }
         this.logger.fatal(err);
         this.shutdown().catch((shutdownErr) => {
           this.logger.error(shutdownErr);
@@ -1275,16 +1356,98 @@ export class Agent {
     }, Promise.resolve());
   }
 
+  /**
+   * Begin (or continue) an incomplete block audit pass. Blocks which a
+   * previous, completed pass already audited for a node are skipped for that
+   * node, so restarting a synced agent doesn't re-read every saved
+   * transaction (~51 GB on an 831k-block mainnet database).
+   */
+  async getIncompleteBlockAuditPass(nodeInternalIds: number[]) {
+    if (this.incompleteBlockAuditPass !== undefined) {
+      return this.incompleteBlockAuditPass;
+    }
+    const auditState = await getIncompleteBlockAuditState(nodeInternalIds);
+    const auditPass = {
+      auditState,
+      auditedBlockCount: 0,
+      nodeInternalIdsInEveryBatch: nodeInternalIds,
+      startedAt: Date.now(),
+    };
+    this.incompleteBlockAuditPass = auditPass;
+    if (!auditState.auditTableExists) {
+      this.logger.warn(
+        'Agent: database schema has no incomplete_block_audit table, so the incomplete block repair scan will audit every saved block on each startup. Update the Hasura image to apply migrations.'
+      );
+      return auditPass;
+    }
+    const markers = nodeInternalIds.map(
+      (id) =>
+        `${id}: ${auditState.auditedThroughBlockInternalIds.get(id) ?? 'none'}`
+    );
+    this.logger.info(
+      `Agent: starting incomplete block repair scan; skipping blocks already audited per node (node internal_id: audited through block internal_id) – ${markers.join(
+        ', '
+      )}.`
+    );
+    return auditPass;
+  }
+
+  async completeIncompleteBlockAuditPass() {
+    const auditPass = this.incompleteBlockAuditPass;
+    this.incompleteBlockAuditPass = undefined;
+    if (auditPass === undefined) {
+      return;
+    }
+    const { auditState, auditedBlockCount, nodeInternalIdsInEveryBatch } =
+      auditPass;
+    const durationSeconds = (
+      (Date.now() - auditPass.startedAt) /
+      msPerSecond
+    ).toFixed(1);
+    this.logger.info(
+      `Agent: incomplete block repair scan audited ${auditedBlockCount.toLocaleString()} block(s) in ${durationSeconds} seconds.`
+    );
+    if (!auditState.auditTableExists) {
+      return;
+    }
+    await saveIncompleteBlockAudit({
+      auditedThroughBlockInternalId: auditState.maxBlockInternalId,
+      nodeInternalIds: nodeInternalIdsInEveryBatch,
+    })
+      .then(() => {
+        this.logger.debug(
+          `Agent: recorded incomplete block audit through block internal_id ${
+            auditState.maxBlockInternalId
+          } for node internal_id(s): ${nodeInternalIdsInEveryBatch.join(', ')}.`
+        );
+      })
+      .catch((err) => {
+        this.logger.error(
+          err,
+          'Agent: failed to record incomplete block audit; the next startup will audit these blocks again.'
+        );
+      });
+  }
+
   async repairIncompleteBlocksOnce() {
     const { finalHeight, heightLowerBound, heightUpperBound } =
       this.getIncompleteBlockRepairRange();
+    const nodeInternalIds = this.getRegisteredNodeInternalIds();
+    const auditPass = await this.getIncompleteBlockAuditPass(nodeInternalIds);
+    auditPass.nodeInternalIdsInEveryBatch =
+      auditPass.nodeInternalIdsInEveryBatch.filter((id) =>
+        nodeInternalIds.includes(id)
+      );
     const scanStartTime = Date.now();
     const { incompleteBlocks, scannedBlockCount } = await getIncompleteBlocks({
+      auditedThroughBlockInternalIds: nodeInternalIds.map(
+        (id) => auditPass.auditState.auditedThroughBlockInternalIds.get(id) ?? 0
+      ),
       excludedBlockHashes: [],
       heightLowerBound,
       heightUpperBound,
       limit: incompleteBlockRepairBatchSize,
-      nodeInternalIds: this.getRegisteredNodeInternalIds(),
+      nodeInternalIds,
     });
     const scanDurationMs = Date.now() - scanStartTime;
     const scanRate =
@@ -1293,6 +1456,10 @@ export class Agent {
         : Math.round((scannedBlockCount / scanDurationMs) * msPerSecond);
     const scanPerformanceLog = `scanned ${scannedBlockCount.toLocaleString()} block(s) in ${scanDurationMs.toLocaleString()}ms (${scanRate.toLocaleString()} blocks/s)`;
     if (incompleteBlocks.length === 0) {
+      auditPass.auditedBlockCount += scannedBlockCount;
+      if (heightUpperBound === finalHeight) {
+        await this.completeIncompleteBlockAuditPass();
+      }
       this.updateIncompleteBlockRepairProgress({
         finalHeight,
         heightLowerBound,
@@ -1895,6 +2062,7 @@ export class Agent {
           staleChain,
           `${nodeName}: re-organization detected beginning at height: ${firstHeight}. The following stale blocks were removed:`
         );
+        this.mempoolResync.handleReorganization(nodeName);
         this.scheduleBlockBufferFill();
       })
       .catch((err) => {
@@ -2219,6 +2387,7 @@ export class Agent {
       return this.shutdownPromise;
     }
     this.willShutdown = true;
+    this.mempoolResync.stop();
     clearInterval(eventLoopDurationInterval);
     clearInterval(this.heartbeatInterval);
     if (this.incompleteBlockRepairTimeout !== undefined) {
