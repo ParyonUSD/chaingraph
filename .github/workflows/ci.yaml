@@ -4,6 +4,13 @@ on: [push, pull_request]
 jobs:
   e2e-tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        write-path: [sql, copy]
+    name: e2e-tests (write path ${{ matrix.write-path }})
+    env:
+      CHAINGRAPH_WRITE_PATH: ${{ matrix.write-path }}
     services:
       postgres:
         image: postgres:14
@@ -20,36 +27,36 @@ jobs:
           - 5432:5432
     steps:
       - name: Check out repository code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           submodules: 'true'
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v7
         with:
           node-version: '18'
       - run: yarn install --immutable --immutable-cache
       - run: yarn test
       - run: yarn cov:lcov
       - name: Upload test coverage
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
       - name: Save E2E test logs
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: e2e-test-log
+          name: e2e-test-log-${{ matrix.write-path }}
           path: data/chaingraph/log-e2e.ndjson
 
   check-yarn-cache:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           submodules: 'true'
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v7
         with:
           node-version: '18'
       - run: yarn install --immutable --immutable-cache --check-cache

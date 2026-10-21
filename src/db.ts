@@ -3,10 +3,20 @@ import pg from 'pg';
 
 import type { Agent } from './agent.js';
 import {
+  copyStageTableSql,
+  createStageTablesSql,
+  encodeStageBlockTransactions,
+  encodeStageInputs,
+  encodeStageOutputs,
+  encodeStageTransactions,
+} from './components/block-copy-rows.js';
+import {
   computeIndexCreationProgress,
   indexDefinitions,
 } from './components/db-utils.js';
+import { copyFromBuffers } from './components/pg-binary-copy.js';
 import {
+  chaingraphWritePath,
   postgresConnectionString,
   postgresMaxConnections,
   postgresSynchronousCommit,
@@ -128,14 +138,27 @@ export interface ArchivedMempoolTransaction {
  * Find blocks for which the locally saved block_transaction rows don't sum to
  * the block's saved byte size. This avoids the SQL block encoder so it can
  * detect incomplete blocks even if encoder functions have bugs (e.g. #75).
+ *
+ * Only blocks accepted by one of `nodeInternalIds` are checked, and for each
+ * node only blocks with an `internal_id` above the matching entry of
+ * `auditedThroughBlockInternalIds` (0 if the node has never completed an
+ * audit). Summing `transaction.size_bytes` reads every linked transaction row,
+ * so on a large, already-audited database this filter is what keeps the scan
+ * from re-reading the whole `transaction` table on every startup.
  */
 export const getIncompleteBlocks = async ({
+  auditedThroughBlockInternalIds,
   heightLowerBound,
   heightUpperBound,
   limit,
   nodeInternalIds,
   excludedBlockHashes,
 }: {
+  /**
+   * Aligned with `nodeInternalIds`; defaults to 0 (audit every block) for
+   * each node.
+   */
+  auditedThroughBlockInternalIds?: number[];
   excludedBlockHashes: string[];
   heightLowerBound: number;
   heightUpperBound: number;
@@ -145,6 +168,37 @@ export const getIncompleteBlocks = async ({
   if (nodeInternalIds.length === 0) {
     return { incompleteBlocks: [], scannedBlockCount: 0 };
   }
+  // cspell:ignore unnest
+  const auditedThrough = nodeInternalIds.map(
+    (_, index) => auditedThroughBlockInternalIds?.[index] ?? 0
+  );
+  /*
+   * If any node has never completed an audit, every block it accepted must be
+   * audited anyway, so use the original (unbounded) filter: on a full audit
+   * it is measurably cheaper than the per-node join (measured on an 831k-block
+   * mainnet checkpoint: 413 s vs 552 s for the same bytes read). The per-node bounded filter is used
+   * only when every node has a marker.
+   */
+  const minimumAuditedThrough = Math.min(...auditedThrough);
+  const auditEveryBlock = minimumAuditedThrough === 0;
+  const acceptedByNodeFilter = auditEveryBlock
+    ? /* sql */ `
+      AND EXISTS (
+        SELECT 1 FROM node_block
+          WHERE node_block.block_internal_id = block.internal_id
+            AND node_block.node_internal_id = ANY($1::integer[])
+      )`
+    : /* sql */ `
+      AND block.internal_id > $7
+      AND EXISTS (
+        SELECT 1 FROM node_block
+          INNER JOIN unnest($1::integer[], $6::bigint[])
+            AS audited_node (node_internal_id, audited_through_block_internal_id)
+            ON audited_node.node_internal_id = node_block.node_internal_id
+          WHERE node_block.block_internal_id = block.internal_id
+            AND block.internal_id >
+              audited_node.audited_through_block_internal_id
+      )`;
   const client = await pool.connect();
   // eslint-disable-next-line functional/no-try-statement
   try {
@@ -176,12 +230,7 @@ WITH linked_transactions AS (
       ON transaction.internal_id = block_transaction.transaction_internal_id
     WHERE block.height >= $2
       AND block.height < $3
-      AND NOT (encode(block.hash, 'hex') = ANY($5::text[]))
-      AND EXISTS (
-        SELECT 1 FROM node_block
-          WHERE node_block.block_internal_id = block.internal_id
-            AND node_block.node_internal_id = ANY($1::integer[])
-      )
+      AND NOT (encode(block.hash, 'hex') = ANY($5::text[]))${acceptedByNodeFilter}
     GROUP BY block.internal_id
 ),
 linked_block_sizes AS (
@@ -237,6 +286,7 @@ SELECT
         heightUpperBound,
         limit,
         excludedBlockHashes,
+        ...(auditEveryBlock ? [] : [auditedThrough, minimumAuditedThrough]),
       ]
     );
     const scan = incompleteBlockScan.rows[0]!;
@@ -250,6 +300,116 @@ SELECT
       })),
       scannedBlockCount: Number(scan.scannedBlockCount),
     };
+  } finally {
+    client.release();
+  }
+};
+
+export interface IncompleteBlockAuditState {
+  /**
+   * False if the database schema predates the `incomplete_block_audit` table;
+   * the agent then audits every block on each startup (and saves nothing).
+   */
+  auditTableExists: boolean;
+  /**
+   * Per node internal_id, the block internal_id through which a previous audit
+   * completed.
+   */
+  auditedThroughBlockInternalIds: Map<number, number>;
+  /**
+   * The highest block internal_id currently saved (0 if there are no blocks).
+   * Recorded as the new audit marker once this audit completes.
+   */
+  maxBlockInternalId: number;
+}
+
+/**
+ * Load the incomplete block audit markers for the provided nodes, along with
+ * the current highest block internal_id.
+ */
+export const getIncompleteBlockAuditState = async (
+  nodeInternalIds: number[]
+): Promise<IncompleteBlockAuditState> => {
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const { auditTableExists, maxBlockInternalId } = (
+      await client.query<{
+        auditTableExists: boolean;
+        maxBlockInternalId: string;
+      }>(/* sql */ `
+SELECT
+  to_regclass('incomplete_block_audit') IS NOT NULL AS "auditTableExists",
+  COALESCE((SELECT MAX(internal_id) FROM block), 0)::bigint AS "maxBlockInternalId";
+`)
+    ).rows[0]!;
+    if (!auditTableExists) {
+      return {
+        auditTableExists,
+        auditedThroughBlockInternalIds: new Map(),
+        maxBlockInternalId: Number(maxBlockInternalId),
+      };
+    }
+    const markers = await client.query<{
+      auditedThroughBlockInternalId: string;
+      nodeInternalId: number;
+    }>(
+      /* sql */ `
+SELECT node_internal_id AS "nodeInternalId",
+       audited_through_block_internal_id AS "auditedThroughBlockInternalId"
+  FROM incomplete_block_audit
+  WHERE node_internal_id = ANY($1::integer[]);
+`,
+      [nodeInternalIds]
+    );
+    return {
+      auditTableExists,
+      auditedThroughBlockInternalIds: new Map(
+        markers.rows.map((row) => [
+          row.nodeInternalId,
+          Number(row.auditedThroughBlockInternalId),
+        ])
+      ),
+      maxBlockInternalId: Number(maxBlockInternalId),
+    };
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Record that every block accepted by each of `nodeInternalIds` with an
+ * internal_id at or below `auditedThroughBlockInternalId` has been audited.
+ * Markers never move backwards.
+ */
+export const saveIncompleteBlockAudit = async ({
+  auditedThroughBlockInternalId,
+  nodeInternalIds,
+}: {
+  auditedThroughBlockInternalId: number;
+  nodeInternalIds: number[];
+}) => {
+  if (nodeInternalIds.length === 0) {
+    return;
+  }
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    await client.query(
+      /* sql */ `
+INSERT INTO incomplete_block_audit
+  (node_internal_id, audited_through_block_internal_id, completed_at)
+  SELECT node_internal_id, $2::bigint, now()
+    FROM unnest($1::integer[]) AS audited_node (node_internal_id)
+  ON CONFLICT (node_internal_id) DO UPDATE
+    SET audited_through_block_internal_id = GREATEST(
+          incomplete_block_audit.audited_through_block_internal_id,
+          EXCLUDED.audited_through_block_internal_id
+        ),
+        completed_at = EXCLUDED.completed_at;
+`,
+      [nodeInternalIds, auditedThroughBlockInternalId]
+    );
   } finally {
     client.release();
   }
@@ -425,51 +585,422 @@ SELECT encode(transaction.hash, 'hex') AS "hash",
   }
 };
 
-/**
- * Archive a single node_transaction row. Existing history triggers handle any
- * same-node descendants with the same replaced_at timestamp.
- */
-export const archiveMempoolTransaction = async ({
-  nodeInternalId,
-  replacedAt,
-  transactionInternalId,
-}: {
+export interface MempoolTransactionExpiry {
   nodeInternalId: number;
   replacedAt: Date;
   transactionInternalId: number;
-}) => {
-  const client = await pool.connect();
-  // eslint-disable-next-line functional/no-try-statement
-  try {
-    const result = await client.query<{
-      archivedCount: number;
-    }>(
-      /* sql */ `
-WITH deleted_row AS (
+  /**
+   * The `validated_at` of the validation this expiry was scheduled for. When
+   * set, a row validated again later (e.g. restored by a mempool resync after a
+   * re-org) is left alone; it expires at its own deadline.
+   */
+  validatedAt?: Date;
+}
+
+// cspell:words xact unnest
+const deadlockDetectedCode = '40P01';
+const serializationFailureCode = '40001';
+/** A descendant walked by the archival statement was deleted before its lock. */
+const descendantVanishedCode = 'chaingraph-expiry-descendant-vanished';
+const isRetriedConflict = (err: unknown) =>
+  [
+    deadlockDetectedCode,
+    serializationFailureCode,
+    descendantVanishedCode,
+  ].includes((err as { code?: string } | undefined)?.code ?? '');
+const expiryRetryLimit = 6;
+const expiryRetryBaseMs = 50;
+const expiryBatchSize = 500;
+/**
+ * Advisory lock key serializing mempool expiry across every agent sharing the
+ * database (the agent also runs expiry batches one at a time).
+ */
+export const expiryAdvisoryLockKey = 1970172700;
+
+/**
+ * Resolution of mempool transaction `transaction` for node `node` by the blocks
+ * that node accepted, as recorded by
+ * {@link archiveMempoolTransactionsAcceptedByBlocks}: `accepted` if the
+ * transaction is in one of them; `replaced` if one of them spends one of its
+ * outpoints, with `replaced_at` the earliest such block's accepted_at (NULL if
+ * unknown: blocks accepted before Chaingraph began monitoring).
+ */
+const acceptedBlockResolution = (node: string, transaction: string) => {
+  const conflictingAcceptedSpends = /* sql */ `
+              FROM input mempool_input
+              JOIN input accepted_input
+                ON accepted_input.outpoint_transaction_hash = mempool_input.outpoint_transaction_hash
+               AND accepted_input.outpoint_index = mempool_input.outpoint_index
+               AND accepted_input.transaction_internal_id != ${transaction}
+              JOIN block_transaction
+                ON block_transaction.transaction_internal_id = accepted_input.transaction_internal_id
+              JOIN node_block
+                ON node_block.node_internal_id = ${node}
+               AND node_block.block_internal_id = block_transaction.block_internal_id
+              WHERE mempool_input.transaction_internal_id = ${transaction}
+                AND mempool_input.outpoint_transaction_hash != '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea`;
+  return /* sql */ `
+    SELECT EXISTS (
+             SELECT 1
+               FROM block_transaction
+               JOIN node_block
+                 ON node_block.node_internal_id = ${node}
+                AND node_block.block_internal_id = block_transaction.block_internal_id
+               WHERE block_transaction.transaction_internal_id = ${transaction}
+           ) AS accepted,
+           EXISTS (SELECT 1 ${conflictingAcceptedSpends}
+           ) AS replaced,
+           (SELECT MIN(node_block.accepted_at) ${conflictingAcceptedSpends}
+           ) AS replaced_at`;
+};
+
+/**
+ * Archive expired node_transaction rows, and their same-node descendants, in
+ * one transaction: take the expiry advisory lock, lock the expired rows, then
+ * archive them in one statement. Each is a separate command, so (in READ
+ * COMMITTED) the archival statement's snapshot is taken after both waits: it
+ * sees block inclusions committed while expiry waited, and no expired row
+ * deleted meanwhile (e.g. confirmed by block acceptance) can seed the
+ * descendant walk, as rows it has locked cannot be deleted under it.
+ * Descendants are only locked by the archival statement itself, after its walk:
+ * if one was deleted meanwhile (e.g. confirmed, ending the cascade there), the
+ * walk may have reached its own descendants through it, so the statement
+ * deletes nothing and the transaction is retried with a fresh snapshot.
+ *
+ * An expired row is left in place (not returned) if the transaction, or a
+ * conflicting spend of one of its outpoints, is already in a block accepted by
+ * the same node: {@link archiveMempoolTransactionsAcceptedByBlocks} archives
+ * those with the correct replaced_at (NULL or the block's accepted_at). The
+ * guard is part of the statement that locks and deletes the row, so it is
+ * evaluated against the row being archived, not a read taken earlier: a row
+ * inserted after the agent's accepted-block archive but before its expiry scan
+ * would otherwise be archived as expired/replaced even though it is confirmed.
+ * (Such a row is still archived if it descends from another row archived
+ * here, with the replaced_at described below.)
+ *
+ * Descendants are archived here rather than by the history trigger's cascade
+ * (which then finds none left), for two reasons:
+ * - a descendant gets the earliest expiry among its archived ancestors, also
+ *   when it is itself in the batch with a later expiry (the trigger only
+ *   reaches descendants still in node_transaction, so it cannot carry an
+ *   ancestor's expiry through a descendant this statement deletes itself);
+ * - a descendant resolved by a block accepted by the node gets the
+ *   replaced_at the accepted-block archive would give it (NULL if confirmed,
+ *   ending the cascade there; otherwise the block's accepted_at, passed on to
+ *   its own descendants, or NULL if that is unknown, again ending the cascade)
+ *   instead of its ancestor's expiry.
+ *
+ * Only expired rows without an expired parent expiring no later seed the
+ * cascade (the others are reached from that parent with an earlier or equal
+ * replaced_at), so an expired chain is walked once rather than once per row.
+ *
+ * Deadlocks: archiving a mempool transaction also archives its descendants, so
+ * concurrent single-row expiries of a parent and of its descendants lock the
+ * same rows in opposite orders (each locks its own row, then the cascade waits
+ * for the other's) and deadlock; a restarted agent's stale mempool, expiring
+ * all at once on every pool connection, live-locked this way. Expiry therefore
+ * runs one batch at a time (see {@link expireMempoolTransaction}), under a
+ * transaction-level advisory lock (also across agents sharing the database),
+ * locks the rows it archives in (node, transaction) order (the expired rows,
+ * then their descendants) before deleting them, and retries a deadlock,
+ * serialization failure or vanished descendant (see above) against other
+ * writers (block acceptance, double-spend replacement) with backoff; once
+ * retries are exhausted it throws, leaving the rows for the next expiration
+ * scan.
+ */
+export const archiveMempoolTransactions = async (
+  expiries: MempoolTransactionExpiry[]
+): Promise<MempoolTransactionExpiry[]> => {
+  if (expiries.length === 0) {
+    return [];
+  }
+  const sorted = [...expiries].sort(
+    (a, b) =>
+      a.nodeInternalId - b.nodeInternalId ||
+      a.transactionInternalId - b.transactionInternalId
+  );
+  const nodeInternalIds = sorted.map((expiry) => expiry.nodeInternalId);
+  const transactionInternalIds = sorted.map(
+    (expiry) => expiry.transactionInternalId
+  );
+  const archiveOnce = async () => {
+    const client = await pool.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      await client.query('BEGIN;');
+      await client.query('SELECT pg_advisory_xact_lock($1::bigint);', [
+        expiryAdvisoryLockKey,
+      ]);
+      await client.query(
+        /* sql */ `
+SELECT 1
+  FROM node_transaction
+  JOIN unnest($1::integer[], $2::bigint[])
+    AS expiry (node_internal_id, transaction_internal_id)
+    ON node_transaction.node_internal_id = expiry.node_internal_id
+   AND node_transaction.transaction_internal_id = expiry.transaction_internal_id
+  ORDER BY node_transaction.node_internal_id, node_transaction.transaction_internal_id
+  FOR UPDATE OF node_transaction;
+`,
+        [nodeInternalIds, transactionInternalIds]
+      );
+      const result = await client.query<{
+        archived: string | null;
+        complete: boolean;
+      }>(
+        /* sql */ `
+WITH RECURSIVE expiry AS (
+    SELECT node_internal_id, transaction_internal_id, replaced_at, validated_at
+      FROM unnest($1::integer[], $2::bigint[], $3::timestamp[], $4::timestamp[])
+        AS expiry (node_internal_id, transaction_internal_id, replaced_at, validated_at)
+),
+expired AS (
+    SELECT expiry.node_internal_id,
+           expiry.transaction_internal_id,
+           expiry.replaced_at
+      FROM expiry
+      JOIN node_transaction
+        ON node_transaction.node_internal_id = expiry.node_internal_id
+       AND node_transaction.transaction_internal_id = expiry.transaction_internal_id
+      CROSS JOIN LATERAL (${acceptedBlockResolution(
+        'expiry.node_internal_id',
+        'expiry.transaction_internal_id'
+      )}
+      ) resolution
+      WHERE NOT resolution.accepted
+        AND NOT resolution.replaced
+        -- validated_at has microseconds; the scheduled Date has milliseconds
+        AND (expiry.validated_at IS NULL
+          OR date_trunc('milliseconds', node_transaction.validated_at) <= expiry.validated_at)
+),
+invalidated (node_internal_id, transaction_internal_id, replaced_at) AS (
+    SELECT node_internal_id, transaction_internal_id, replaced_at
+      FROM expired
+      WHERE NOT EXISTS (
+          SELECT 1
+            FROM input
+            JOIN transaction parent_transaction
+              ON parent_transaction.hash = input.outpoint_transaction_hash
+            JOIN expired expired_parent
+              ON expired_parent.node_internal_id = expired.node_internal_id
+             AND expired_parent.transaction_internal_id = parent_transaction.internal_id
+             AND expired_parent.replaced_at <= expired.replaced_at
+            WHERE input.transaction_internal_id = expired.transaction_internal_id
+        )
+    UNION
+    SELECT child.node_internal_id,
+           child.transaction_internal_id,
+           CASE
+             WHEN resolution.accepted THEN NULL::timestamp without time zone
+             WHEN resolution.replaced THEN resolution.replaced_at
+             ELSE parent.replaced_at
+           END
+      FROM invalidated parent
+      JOIN transaction parent_transaction
+        ON parent_transaction.internal_id = parent.transaction_internal_id
+      JOIN input child_input
+        ON child_input.outpoint_transaction_hash = parent_transaction.hash
+      JOIN node_transaction child
+        ON child.node_internal_id = parent.node_internal_id
+       AND child.transaction_internal_id = child_input.transaction_internal_id
+      CROSS JOIN LATERAL (${acceptedBlockResolution(
+        'child.node_internal_id',
+        'child.transaction_internal_id'
+      )}
+      ) resolution
+      WHERE parent.replaced_at IS NOT NULL
+),
+archive_rows AS (
+    -- confirmation takes precedence, then the earliest invalidation
+    SELECT node_internal_id,
+           transaction_internal_id,
+           CASE
+             WHEN bool_or(replaced_at IS NULL) THEN NULL::timestamp without time zone
+             ELSE MIN(replaced_at)
+           END AS replaced_at
+      FROM invalidated
+      GROUP BY node_internal_id, transaction_internal_id
+),
+locked AS (
+    SELECT node_transaction.node_internal_id,
+           node_transaction.transaction_internal_id,
+           archive_rows.replaced_at
+      FROM archive_rows
+      JOIN node_transaction
+        ON node_transaction.node_internal_id = archive_rows.node_internal_id
+       AND node_transaction.transaction_internal_id = archive_rows.transaction_internal_id
+      ORDER BY node_transaction.node_internal_id, node_transaction.transaction_internal_id
+      FOR UPDATE OF node_transaction
+),
+-- false if a walked row was deleted before its lock (the walk may be stale)
+complete AS (
+    SELECT (SELECT count(*) FROM locked) = (SELECT count(*) FROM archive_rows) AS complete
+),
+deleted_rows AS (
     DELETE FROM node_transaction
-      WHERE node_internal_id = $1
-        AND transaction_internal_id = $2
-      RETURNING node_internal_id,
-                transaction_internal_id,
-                validated_at,
-                ${dateToTimestampWithoutTimezone(replacedAt)} AS replaced_at
+      USING locked
+      WHERE (SELECT complete FROM complete)
+        AND node_transaction.node_internal_id = locked.node_internal_id
+        AND node_transaction.transaction_internal_id = locked.transaction_internal_id
+      RETURNING node_transaction.node_internal_id,
+                node_transaction.transaction_internal_id,
+                node_transaction.validated_at,
+                locked.replaced_at
 ),
 inserted_history AS (
     INSERT INTO node_transaction_history (node_internal_id, transaction_internal_id, validated_at, replaced_at)
       SELECT node_internal_id, transaction_internal_id, validated_at, replaced_at
-        FROM deleted_row
-      RETURNING transaction_internal_id
+        FROM deleted_rows
+      RETURNING node_internal_id, transaction_internal_id
 )
-SELECT COUNT(*)::integer AS "archivedCount" FROM inserted_history;
+SELECT complete.complete,
+       inserted_history.node_internal_id || ':' || inserted_history.transaction_internal_id AS archived
+  FROM complete
+  LEFT JOIN inserted_history ON true;
 `,
-      [nodeInternalId, transactionInternalId]
-    );
-    return result.rows[0]!.archivedCount;
-  } finally {
-    client.release();
-  }
+        [
+          nodeInternalIds,
+          transactionInternalIds,
+          sorted.map((expiry) => expiry.replacedAt.toISOString()),
+          sorted.map((expiry) => expiry.validatedAt?.toISOString() ?? null),
+        ]
+      );
+      if (result.rows[0]?.complete !== true) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw Object.assign(
+          new Error(
+            'Mempool expiry: a descendant was deleted while the expiry waited for its lock.'
+          ),
+          { code: descendantVanishedCode }
+        );
+      }
+      await client.query('COMMIT;');
+      const archived = new Set(result.rows.map((row) => row.archived));
+      return sorted.filter((expiry) =>
+        archived.has(`${expiry.nodeInternalId}:${expiry.transactionInternalId}`)
+      );
+    } catch (err) {
+      await client.query('ROLLBACK;');
+      // eslint-disable-next-line functional/no-throw-statement
+      throw err;
+    } finally {
+      client.release();
+    }
+  };
+  const attempt = async (retry: number): Promise<MempoolTransactionExpiry[]> =>
+    archiveOnce().catch(async (err: unknown) => {
+      if (!isRetriedConflict(err) || retry >= expiryRetryLimit) {
+        // eslint-disable-next-line functional/no-throw-statement
+        throw err;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-magic-numbers
+      const backoffMs = expiryRetryBaseMs * 2 ** retry * (1 + Math.random());
+      await new Promise((resolve) => {
+        setTimeout(resolve, backoffMs);
+      });
+      return attempt(retry + 1);
+    });
+  return attempt(0);
 };
 
+/**
+ * Archive a single expired node_transaction row (see
+ * {@link archiveMempoolTransactions}); returns the number archived (0 or 1).
+ */
+export const archiveMempoolTransaction = async (
+  expiry: MempoolTransactionExpiry
+) => (await archiveMempoolTransactions([expiry])).length;
+
+const pendingExpiries = new Map<
+  string,
+  {
+    expiry: MempoolTransactionExpiry;
+    settle: {
+      reject: (err: unknown) => void;
+      resolve: (archived: boolean) => void;
+    }[];
+  }
+>();
+// eslint-disable-next-line functional/no-let, @typescript-eslint/init-declarations
+let expiryDrain: Promise<void> | undefined;
+
+const drainExpiries = async (): Promise<void> => {
+  /*
+   * Earliest first: an ancestor's expiry is never in a later batch than its
+   * descendant's (which would then be archived with its own, later expiry).
+   */
+  const batch = [...pendingExpiries.entries()]
+    .sort(
+      ([, a], [, b]) =>
+        a.expiry.replacedAt.getTime() - b.expiry.replacedAt.getTime()
+    )
+    .slice(0, expiryBatchSize);
+  if (batch.length === 0) {
+    return undefined;
+  }
+  batch.forEach(([key]) => pendingExpiries.delete(key));
+  await archiveMempoolTransactions(batch.map(([, entry]) => entry.expiry))
+    .then((archived) => {
+      const archivedKeys = new Set(
+        archived.map(
+          (expiry) => `${expiry.nodeInternalId}:${expiry.transactionInternalId}`
+        )
+      );
+      batch.forEach(([key, entry]) => {
+        entry.settle.forEach(({ resolve }) => {
+          resolve(archivedKeys.has(key));
+        });
+      });
+    })
+    .catch((err: unknown) => {
+      batch.forEach(([, entry]) => {
+        entry.settle.forEach(({ reject }) => {
+          reject(err);
+        });
+      });
+    });
+  return drainExpiries();
+};
+
+const startExpiryDrain = () => {
+  if (expiryDrain !== undefined) {
+    return;
+  }
+  expiryDrain = new Promise<void>((started) => {
+    // let every timer firing in this tick join the first batch
+    setImmediate(started);
+  })
+    .then(drainExpiries)
+    .finally(() => {
+      expiryDrain = undefined;
+      if (pendingExpiries.size > 0) {
+        startExpiryDrain();
+      }
+    });
+};
+
+/**
+ * Queue an expired mempool transaction for archiving; resolves `true` if it was
+ * archived, `false` if it was left in place (already gone, or accepted by a
+ * block for the node). Expiries run one batch at a time (up to
+ * {@link expiryBatchSize} rows per statement): when many fire at once (a
+ * restarted agent's stale mempool) they are archived in a few ordered
+ * statements on one connection instead of one racing statement per pool
+ * connection.
+ */
+export const expireMempoolTransaction = async (
+  expiry: MempoolTransactionExpiry
+) =>
+  new Promise<boolean>((resolve, reject) => {
+    const key = `${expiry.nodeInternalId}:${expiry.transactionInternalId}`;
+    const pending = pendingExpiries.get(key);
+    if (pending === undefined) {
+      pendingExpiries.set(key, { expiry, settle: [{ reject, resolve }] });
+    } else {
+      pending.settle.push({ reject, resolve });
+    }
+    startExpiryDrain();
+  });
 /**
  * Create or update one or more trusted node in the Chaingraph database,
  * returning it's internal ID.
@@ -676,6 +1207,224 @@ export const recordNodeValidation = async (
 };
 
 /**
+ * Inside a block's DB transaction: throw (so the caller rolls back) unless
+ * every transaction of the block was found and linked via block_transaction.
+ */
+const verifyBlockTransactionsLinked = async (
+  client: pg.PoolClient,
+  block: ChaingraphBlock,
+  joinedTransactionCount: number
+) => {
+  const linkedBlockTransactionCount = Number(
+    (
+      await client.query<{ count: string }>(
+        /* sql */ `
+          SELECT COUNT(*)::bigint AS count
+            FROM block_transaction
+            INNER JOIN block ON block.internal_id = block_transaction.block_internal_id
+            WHERE block.hash = $1;
+        `,
+        [Buffer.from(block.hash, 'hex')]
+      )
+    ).rows[0]!.count
+  );
+  if (
+    joinedTransactionCount !== block.transactions.length ||
+    linkedBlockTransactionCount !== block.transactions.length
+  ) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `Failed to save all transactions for block ${block.height} (${block.hash}): joined ${joinedTransactionCount}/${block.transactions.length}, linked ${linkedBlockTransactionCount}/${block.transactions.length}.`
+    );
+  }
+};
+
+/**
+ * Pooled connections on which the `copy` write path's staging tables exist.
+ * (A replaced connection is a new client object, so it is set up again.)
+ */
+const clientsWithStageTables = new WeakSet<pg.PoolClient>();
+
+/**
+ * The `copy` write path's statement for transactions, outputs and inputs: the
+ * same CTE as `addAllTransactions` in `saveBlock`, reading the staged rows
+ * instead of `VALUES` lists. The text never changes, so Postgres parses it
+ * cheaply; it is deliberately not a named prepared statement, so each block
+ * is planned with the current size of the staging tables.
+ */
+const addAllStagedTransactions = /* sql */ `
+WITH newly_saved_transactions (hash, internal_id) AS (
+  INSERT INTO transaction (hash, version, locktime, size_bytes, is_coinbase)
+    SELECT hash, version, locktime, size_bytes, is_coinbase FROM pg_temp.chaingraph_stage_transaction
+    ON CONFLICT ON CONSTRAINT "transaction_hash_key" DO NOTHING
+    RETURNING hash, internal_id
+),
+newly_saved_outputs AS (
+  INSERT INTO output (transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment)
+    SELECT transaction_hash, output_index, value_satoshis, locking_bytecode, token_category, fungible_token_amount, nonfungible_token_capability, nonfungible_token_commitment FROM pg_temp.chaingraph_stage_output
+    WHERE transaction_hash IN (SELECT hash FROM newly_saved_transactions)
+),
+newly_saved_inputs AS (
+  INSERT INTO input (transaction_internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode)
+    SELECT internal_id, input_index, outpoint_index, sequence_number, outpoint_transaction_hash, unlocking_bytecode
+    FROM pg_temp.chaingraph_stage_input val INNER JOIN newly_saved_transactions txs ON val.transaction_hash = txs.hash
+)
+SELECT COUNT(*) FROM newly_saved_transactions;`;
+
+/**
+ * The `copy` write path's block statement: the same CTE as `addBlockQuery` in
+ * `saveBlock`, with the block's transaction list read from the staging table
+ * and every other value passed as a parameter (so the text is fixed).
+ *
+ * `joined_transactions` is an index lookup per staged transaction (the
+ * `OFFSET 0` keeps the lateral subquery from being flattened into a join).
+ * Temporary tables have no statistics, and Postgres assumes at least 10 pages
+ * for a never-vacuumed table, so a small block's list is estimated at ~1,200
+ * rows; with a free choice the planner can pick a hash join over a full scan
+ * of `transaction`.
+ */
+const addStagedBlock = /* sql */ `
+WITH accepting_nodes (node_internal_id, accepted_at) AS (
+  SELECT * FROM unnest($10::bigint[], $11::timestamp[])
+),
+joined_transactions (internal_id, transaction_index) AS (
+  SELECT db.internal_id, val.transaction_index
+    FROM pg_temp.chaingraph_stage_block_transaction val
+    CROSS JOIN LATERAL (
+      SELECT internal_id FROM transaction WHERE transaction.hash = val.hash OFFSET 0
+    ) db
+),
+inserted_block (internal_id) AS (
+  INSERT INTO block (height, version, timestamp, hash, previous_block_hash, merkle_root, bits, nonce, size_bytes)
+    VALUES ($1::bigint, $2::bigint, $3::bigint, $4::bytea, $5::bytea, $6::bytea, $7::bigint, $8::bigint, $9::bigint)
+  ON CONFLICT ON CONSTRAINT "block_hash_key" DO NOTHING
+  RETURNING internal_id
+),
+new_or_existing_block (internal_id) AS (
+  SELECT COALESCE (
+    (SELECT internal_id FROM inserted_block),
+    (SELECT internal_id FROM block WHERE block.hash = $4::bytea)
+  )
+),
+inserted_block_transactions AS (
+  INSERT INTO block_transaction (block_internal_id, transaction_internal_id, transaction_index)
+    SELECT blk.internal_id, tx.internal_id, tx.transaction_index
+      FROM new_or_existing_block blk CROSS JOIN joined_transactions tx
+    ON CONFLICT ON CONSTRAINT "block_transaction_pkey" DO NOTHING
+    RETURNING transaction_internal_id
+),
+inserted_node_blocks AS (
+  INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
+  SELECT node.node_internal_id, blk.internal_id, node.accepted_at
+    FROM new_or_existing_block blk CROSS JOIN accepting_nodes node
+  ON CONFLICT ON CONSTRAINT "node_block_pkey" DO NOTHING
+  RETURNING block_internal_id
+)
+SELECT
+  (SELECT COUNT(*)::bigint FROM joined_transactions) AS "joinedTransactionCount",
+  (SELECT COUNT(*)::bigint FROM inserted_block_transactions) AS "insertedBlockTransactionCount",
+  (SELECT COUNT(*)::bigint FROM inserted_node_blocks) AS "insertedNodeBlockCount";`;
+
+/**
+ * The `copy` write path (`CHAINGRAPH_WRITE_PATH=copy`) of `saveBlock`: one DB
+ * transaction per block, as in the `sql` path. Rows are streamed with binary
+ * `COPY` into per-connection temporary staging tables, then inserted with the
+ * same statements, constraints and `ON CONFLICT DO NOTHING` handling.
+ */
+const saveBlockViaCopy = async ({
+  block,
+  nodeAcceptances,
+  unknownTransactions,
+}: {
+  block: ChaingraphBlock;
+  nodeAcceptances: {
+    nodeInternalId: number;
+    acceptedAt: Date | null;
+  }[];
+  unknownTransactions: ChaingraphTransaction[];
+}) => {
+  const stagedTransactions = encodeStageTransactions(unknownTransactions);
+  const stagedOutputs = encodeStageOutputs(unknownTransactions);
+  const stagedInputs = encodeStageInputs(unknownTransactions);
+  const stagedBlockTransactions = encodeStageBlockTransactions(block);
+  const blockParameters = [
+    block.height,
+    block.version,
+    block.timestamp,
+    Buffer.from(block.hash, 'hex'),
+    Buffer.from(block.previousBlockHash, 'hex'),
+    Buffer.from(block.merkleRoot, 'hex'),
+    block.bits,
+    block.nonce,
+    block.sizeBytes,
+    nodeAcceptances.map((acceptance) => acceptance.nodeInternalId),
+    nodeAcceptances.map((acceptance) =>
+      acceptance.acceptedAt === null
+        ? null
+        : acceptance.acceptedAt.toISOString()
+    ),
+  ];
+  const client = await pool.connect();
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    if (!clientsWithStageTables.has(client)) {
+      /*
+       * Outside of the block's DB transaction, so a rolled-back block can't
+       * also roll back the table creation.
+       */
+      await client.query(createStageTablesSql);
+      clientsWithStageTables.add(client);
+    }
+    await client.query('BEGIN;');
+    await copyFromBuffers(client, [
+      {
+        messages: stagedTransactions,
+        statement: copyStageTableSql('chaingraph_stage_transaction'),
+      },
+      {
+        messages: stagedOutputs,
+        statement: copyStageTableSql('chaingraph_stage_output'),
+      },
+      {
+        messages: stagedInputs,
+        statement: copyStageTableSql('chaingraph_stage_input'),
+      },
+      {
+        messages: stagedBlockTransactions,
+        statement: copyStageTableSql('chaingraph_stage_block_transaction'),
+      },
+    ]);
+    const saveTransactionsResult = await client.query<{ count: string }>(
+      addAllStagedTransactions
+    );
+    const savedTransactionCount = Number(saveTransactionsResult.rows[0]!.count);
+    const transactionCacheMisses =
+      unknownTransactions.length - savedTransactionCount;
+    const addBlockResult = await client.query<{
+      insertedBlockTransactionCount: string;
+      insertedNodeBlockCount: string;
+      joinedTransactionCount: string;
+    }>(addStagedBlock, blockParameters);
+    await verifyBlockTransactionsLinked(
+      client,
+      block,
+      Number(addBlockResult.rows[0]!.joinedTransactionCount)
+    );
+    await client.query('COMMIT;');
+    return {
+      attemptedSavedTransactions: unknownTransactions,
+      transactionCacheMisses,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
+  } finally {
+    client.release();
+  }
+};
+
+/**
  * Save a block to the database, inserting all transactions which aren't already
  * known to exist in the database. (This method should only be used for blocks
  * which are not already saved to the database.)
@@ -717,6 +1466,14 @@ export const saveBlock = async ({
     },
     { alreadySaved: [], unknown: [] }
   );
+
+  if (chaingraphWritePath === 'copy') {
+    return saveBlockViaCopy({
+      block,
+      nodeAcceptances,
+      unknownTransactions: blockTransactions.unknown,
+    });
+  }
 
   const inputs: {
     inputIndex: number;
@@ -905,31 +1662,11 @@ SELECT
       insertedNodeBlockCount: string;
       joinedTransactionCount: string;
     }>(addBlockQuery);
-    const joinedTransactionCount = Number(
-      addBlockResult.rows[0]!.joinedTransactionCount
+    await verifyBlockTransactionsLinked(
+      client,
+      block,
+      Number(addBlockResult.rows[0]!.joinedTransactionCount)
     );
-    const linkedBlockTransactionCount = Number(
-      (
-        await client.query<{ count: string }>(
-          /* sql */ `
-          SELECT COUNT(*)::bigint AS count
-            FROM block_transaction
-            INNER JOIN block ON block.internal_id = block_transaction.block_internal_id
-            WHERE block.hash = $1;
-        `,
-          [Buffer.from(block.hash, 'hex')]
-        )
-      ).rows[0]!.count
-    );
-    if (
-      joinedTransactionCount !== block.transactions.length ||
-      linkedBlockTransactionCount !== block.transactions.length
-    ) {
-      // eslint-disable-next-line functional/no-throw-statement
-      throw new Error(
-        `Failed to save all transactions for block ${block.height} (${block.hash}): joined ${joinedTransactionCount}/${block.transactions.length}, linked ${linkedBlockTransactionCount}/${block.transactions.length}.`
-      );
-    }
     await client.query('COMMIT;');
     return {
       attemptedSavedTransactions,
