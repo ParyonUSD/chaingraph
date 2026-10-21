@@ -13,6 +13,7 @@ accepted_and_replaced_transactions AS (
     SELECT newly_spent.node_internal_id, input.transaction_internal_id, CASE WHEN input.transaction_internal_id != newly_spent.transaction_internal_id THEN newly_spent.accepted_at ELSE NULL END AS replaced_at
         FROM input INNER JOIN newly_spent ON input.outpoint_transaction_hash = newly_spent.outpoint_transaction_hash AND input.outpoint_index = newly_spent.outpoint_index
         WHERE input.outpoint_transaction_hash != '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
+--        GROUP BY newly_spent.node_internal_id, input.transaction_internal_id, replaced -- doesn't improve performance
 ),
 deleted_node_transactions AS (
     DELETE FROM node_transaction

@@ -213,7 +213,11 @@ test.serial(
       'FUNCTION trigger_node_block_insert()',
       'FUNCTION pg_temp.trigger_node_block_insert()'
     );
-    const expected = downMigration.replace(
+    const initFunction =
+      /CREATE OR REPLACE FUNCTION trigger_node_block_insert\(\)[\s\S]*?\n\$\$;/u.exec(
+        readMigration('1616195337538_init', 'up')
+      );
+    const expected = initFunction![0].replace(
       'FUNCTION trigger_node_block_insert()',
       'FUNCTION pg_temp.expected_legacy_node_block_insert()'
     );
