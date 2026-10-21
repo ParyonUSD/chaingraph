@@ -91,6 +91,9 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100002000_bound_block_confirmation_mempool_cleanup/up.sql'
   ),
+  migration(
+    'default/1791100003000_output_category_capability_statistics/up.sql'
+  ),
   migration('default/1791200000000_add_incomplete_block_audit/up.sql'),
 ];
 
