@@ -29,7 +29,10 @@ import got from 'got';
 import pg from 'pg';
 
 import { indexDefinitions } from '../components/db-utils.js';
-import { configureTrackingTriggersSql } from '../components/unspent-tracking.js';
+import {
+  configureTrackingTriggersSql,
+  partitionOf,
+} from '../components/unspent-tracking.js';
 import type * as DbModule from '../db.js';
 import type {
   ChaingraphBlock,
@@ -3982,6 +3985,13 @@ test.serial(
             `SELECT unspent_tracking_read_mode() AS mode;`
           )
         ).rows[0]!.mode;
+      const partitionCount = Number(
+        (
+          await client.query<{ n: string }>(
+            `SELECT min(partition_count) AS n FROM unspent_tracking_progress;`
+          )
+        ).rows[0]!.n
+      );
       await stopTriggers(false);
       t.true(
         (
@@ -3999,6 +4009,32 @@ test.serial(
       });
       await compareDeferredQueryRoot(t, 'tracking stopped', ours);
       await stopTriggers(true);
+      /*
+       * Child-before-parent across the start of tracking: node A's mempool
+       * child is at the starting watermark; its parent is saved above it
+       * before tracking is initialized, so the job sees the parent's outputs
+       * for the first time and never walks the child's input.
+       */
+      await db.saveTransactionForNodes(
+        transaction('2c', [[hash('2a'), 0]], 1),
+        [{ nodeInternalId: nodeA, validatedAt: new Date() }]
+      );
+      const startWatermark = await transactionId('2c');
+      await saveBlockFor(
+        block('2b', [transaction('2a', [[hash('fb'), 0]])]),
+        nodeA
+      );
+      t.true(
+        (
+          await client.query<{ initialized: boolean }>(
+            /* sql */ `SELECT unspent_tracking_initialize($1::integer, $2::bigint,
+              (SELECT last_value FROM block_internal_id_seq),
+              (SELECT last_value FROM unspent_tracking_events_id_seq)) AS initialized;`,
+            [partitionCount, startWatermark]
+          )
+        ).rows[0]!.initialized,
+        'restarted below the parent'
+      );
       // restart without the rebuild (an explicit no-backfill pass), to observe the pending state
       await db.runUnspentTrackingJobPass({
         backfill: false,
@@ -4314,6 +4350,70 @@ test.serial(
         'repair: link restored, job drained',
         ours
       );
+      /*
+       * A mempool drop applied by the partition holding the transaction's
+       * outputs while another partition has not consumed the release event
+       * yet (held by a batch in flight); then a new block (no event) has
+       * node A accept the transaction again.
+       */
+      const eventOrderPartitions = Number(
+        (
+          await client.query<{ n: string }>(
+            `SELECT min(partition_count) AS n FROM unspent_tracking_progress;`
+          )
+        ).rows[0]!.n
+      );
+      if (eventOrderPartitions > 1) {
+        await saveFor(
+          fundingBlock('b4', [transaction('f4', [[hash('fc'), 0]], 2)])
+        );
+        await db.saveTransactionForNodes(
+          transaction('04', [[hash('f4'), 0]], 2),
+          [{ nodeInternalId: nodeA, validatedAt: new Date() }]
+        );
+        await drainDeferred(t, db, 'partial release: mempool spender', ours);
+        const heldPartition =
+          (partitionOf(hash('04'), eventOrderPartitions) + 1) %
+          eventOrderPartitions;
+        await holder.query('BEGIN;');
+        await holder.query(
+          /* sql */ `SELECT pg_advisory_xact_lock(1970172785, $1::integer);`,
+          [heldPartition]
+        );
+        await db.archiveMempoolTransaction({
+          nodeInternalId: nodeA,
+          replacedAt: new Date(),
+          transactionInternalId: await transactionId('04'),
+        });
+        await db.runUnspentTrackingJobPass({
+          maxMs: 3_000,
+          settleWaitMs: 2_000,
+        });
+        await compareDeferredQueryRoot(
+          t,
+          'partial release: one partition applied the drop',
+          ours
+        );
+        await saveFor(
+          fundingBlock('b5', [transaction('04', [[hash('f4'), 0]], 2)])
+        );
+        await compareDeferredQueryRoot(
+          t,
+          'partial release: re-accepted by a new block',
+          ours
+        );
+        await holder.query('COMMIT;');
+        await drainDeferred(t, db, 'partial release: drained', ours);
+        await compareDeferredStored(
+          t,
+          'partial release: drained',
+          await transactionId('f0'),
+          ours
+        );
+        await compareDeferredQueryRoot(t, 'partial release: drained', ours);
+      } else {
+        t.log('partial release: needs more than one partition, skipped');
+      }
       const idleStart = Date.now();
       const idle = await db.runUnspentTrackingJobPass({
         maxMs: 5_000,
@@ -4338,6 +4438,32 @@ test.serial(
             last !== undefined && last.events === 0 && last.affected === 0
         ),
         'idle pass: no event, no output checked'
+      );
+      /*
+       * Sequence values no committed row took (a rolled-back insert, a block
+       * insert that conflicted): the watermarks pass them once the job has
+       * reached the settled limits, so the job counts as caught up.
+       */
+      await client.query(
+        `SELECT nextval('block_internal_id_seq'), nextval('unspent_tracking_events_id_seq');`
+      );
+      await db.runUnspentTrackingJobPass({ maxMs: 5_000, settleWaitMs: 2_000 });
+      const gapPass = await db.runUnspentTrackingJobPass({
+        maxMs: 5_000,
+        settleWaitMs: 2_000,
+      });
+      t.true(gapPass.caughtUp, 'sequence gaps: caught up');
+      t.true(gapPass.backfillReady, 'sequence gaps: backfill not held back');
+      t.deepEqual(
+        (
+          await client.query<{ block: boolean; event: boolean }>(/* sql */ `
+          SELECT (SELECT min(block_internal_id) FROM unspent_tracking_progress)
+                   >= (SELECT last_value FROM block_internal_id_seq) AS block,
+                 (SELECT min(consumed_event_id) FROM unspent_tracking_progress)
+                   >= (SELECT last_value FROM unspent_tracking_events_id_seq) AS event;`)
+        ).rows[0],
+        { block: true, event: true },
+        'sequence gaps: watermarks at the sequences'
       );
       // cspell:ignore indisvalid indexrelid relname
       /*
@@ -4376,6 +4502,8 @@ test.serial(
       await client.query(
         `UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'output_unspent_node_${nodeA}_search_index'::regclass;`
       );
+      // an event id no committed row takes, right before the node is recorded
+      await client.query(`SELECT nextval('unspent_tracking_events_id_seq');`);
       const indexStatements = await db.ensureUnspentTrackingIndexes();
       t.true(
         indexStatements.includes(
