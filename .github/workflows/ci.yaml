@@ -4,6 +4,13 @@ on: [push, pull_request]
 jobs:
   e2e-tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        write-path: [sql, copy]
+    name: e2e-tests (write path ${{ matrix.write-path }})
+    env:
+      CHAINGRAPH_WRITE_PATH: ${{ matrix.write-path }}
     services:
       postgres:
         image: postgres:14
@@ -38,7 +45,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: e2e-test-log
+          name: e2e-test-log-${{ matrix.write-path }}
           path: data/chaingraph/log-e2e.ndjson
 
   check-yarn-cache:
