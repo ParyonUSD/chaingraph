@@ -3,29 +3,30 @@ on: [push, pull_request]
 
 jobs:
   e2e-tests:
-    runs-on: ubuntu-latest
+    name: e2e-tests (unspent-tracking ${{ matrix.unspent-tracking }}, write path ${{ matrix.write-path }})
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
+        unspent-tracking: ['false', 'true']
         write-path: [sql, copy]
-    name: e2e-tests (write path ${{ matrix.write-path }})
     env:
+      CHAINGRAPH_UNSPENT_TRACKING: ${{ matrix.unspent-tracking }}
       CHAINGRAPH_WRITE_PATH: ${{ matrix.write-path }}
-    services:
-      postgres:
-        image: postgres:14
-        env:
-          POSTGRES_DB: chaingraph
-          POSTGRES_USER: chaingraph
-          POSTGRES_PASSWORD: very_insecure_postgres_password
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
     steps:
+      # the runner image ships PostgreSQL with the service disabled; Ubuntu's
+      # defaults listen on localhost with scram-sha-256 auth for TCP
+      - name: Start the runner's PostgreSQL
+        run: |
+          sudo systemctl start postgresql.service
+          until pg_isready -h localhost -p 5432; do sleep 1; done
+          sudo -u postgres psql -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE chaingraph WITH LOGIN SUPERUSER PASSWORD 'very_insecure_postgres_password'" \
+            -c "CREATE DATABASE chaingraph OWNER chaingraph"
+      - name: Print the PostgreSQL version
+        env:
+          PGPASSWORD: very_insecure_postgres_password
+        run: psql -h localhost -U chaingraph -d chaingraph -c 'select version()'
       - name: Check out repository code
         uses: actions/checkout@v7
         with:
@@ -35,6 +36,16 @@ jobs:
         with:
           node-version: '18'
       - run: yarn install --immutable --immutable-cache
+      # production settings that change plans and read-ahead (the chart's
+      # init-db-config): effective_io_concurrency 200, random_page_cost 1.1
+      - name: Configure Postgres like production
+        env:
+          PGPASSWORD: very_insecure_postgres_password
+        run: |
+          psql -h localhost -U chaingraph -d chaingraph -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET effective_io_concurrency = '200'" \
+            -c "ALTER SYSTEM SET random_page_cost = '1.1'" \
+            -c "SELECT pg_reload_conf()"
       - run: yarn test
       - run: yarn cov:lcov
       - name: Upload test coverage
@@ -45,7 +56,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: e2e-test-log-${{ matrix.write-path }}
+          name: e2e-test-log-unspent-${{ matrix.unspent-tracking }}-${{ matrix.write-path }}
           path: data/chaingraph/log-e2e.ndjson
 
   check-yarn-cache:

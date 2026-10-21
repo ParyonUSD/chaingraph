@@ -40,11 +40,14 @@ import {
   mempoolTransactionExpirationScanIntervalMs,
   postgresMaxConnections,
   trustedNodes,
+  unspentTracking,
 } from './config.js';
 import {
   acceptBlocksViaHeaders,
   archiveMempoolTransactionsAcceptedByBlocks,
+  configureUnspentTracking,
   createIndexes,
+  ensureUnspentTrackingIndexes,
   expireMempoolTransaction,
   getAllKnownBlockHashes,
   getIncompleteBlockAuditState,
@@ -59,9 +62,12 @@ import {
   reenableMempoolCleaning,
   registerTrustedNodeWithDb,
   removeStaleBlocksForNode,
+  runUnspentTrackingJobPass,
   saveBlock,
   saveIncompleteBlockAudit,
   saveTransactionForNodes,
+  setUnspentTrackingLoggers,
+  unspentTrackingJobPool,
 } from './db.js';
 import type {
   ExpiringMempoolTransaction,
@@ -135,6 +141,16 @@ const msPerSecond = 1000;
  * the Postgres connection was lost (e.g. Postgres is restarting).
  */
 const incompleteBlockRepairRetryDelayMs = 5_000;
+/**
+ * Delay before retrying creation of the unspent tracking indexes after a lost
+ * Postgres connection (invalid indexes left behind are rebuilt on retry).
+ */
+const unspentTrackingStartRetryDelayMs = 5_000;
+/**
+ * Block saves taking at least this long are logged with a per-step breakdown
+ * (a cold-cache mempool-cleaning trigger can hold a save for minutes).
+ */
+const slowBlockSaveMs = 10_000;
 const durationDecimalPlaces = 1;
 const transactionRateDecimalPlaces = 2;
 
@@ -375,6 +391,19 @@ export class Agent {
 
   incompleteBlockRepairTimeout: ReturnType<typeof setTimeout> | undefined;
 
+  /**
+   * Unspent tracking (`CHAINGRAPH_UNSPENT_TRACKING`): the job's next scheduled
+   * pass, the pass in flight, and whether another pass was requested while
+   * one was running.
+   */
+  unspentTrackingJobTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  unspentTrackingJobRunning: Promise<void> | undefined;
+
+  unspentTrackingJobRequested = false;
+
+  unspentTrackingJobStarted = false;
+
   mempoolTransactionExpirationScanTimeout:
     | ReturnType<typeof setTimeout>
     | undefined;
@@ -421,6 +450,14 @@ export class Agent {
   blockDbRestored = false;
 
   successfullyInitialized = false;
+
+  /**
+   * Set while the post-registration initialization (synchronous_commit,
+   * unspent tracking configuration) runs: `scheduleBlockBufferFill` keeps
+   * calling `checkInitialization` until `successfullyInitialized`, and a
+   * second concurrent run would repeat the configuration DDL.
+   */
+  initializationInProgress = false;
 
   /**
    * Chaingraph does not currently support live transaction saving during
@@ -900,16 +937,66 @@ export class Agent {
         this.scheduleBlockBufferFill();
       }, second);
     } else {
+      if (this.initializationInProgress) {
+        return;
+      }
+      this.initializationInProgress = true;
+      // eslint-disable-next-line functional/no-let
+      let fatalInitializationError = false;
       optionallyDisableSynchronousCommit()
         .then((disabled) => {
           if (disabled) {
             this.logger.debug('Disabled synchronous_commit for initial sync.');
           }
         })
-        .catch((err) => {
+        .catch((err: unknown) => {
+          // optional: initialization continues without it
           this.logger.error(err);
         })
+        .then(async () => {
+          setUnspentTrackingLoggers({
+            info: (message) => {
+              this.logger.info(message);
+            },
+            warn: (message) => {
+              this.logger.warn(message);
+            },
+          });
+          return configureUnspentTracking();
+        })
+        .then((statements) => {
+          if (statements.length > 0) {
+            this.logger.info(
+              `Configured unspent tracking (CHAINGRAPH_UNSPENT_TRACKING=${String(
+                unspentTracking.enabled
+              )}): ${statements.join(' ')}`
+            );
+          }
+        })
+        .catch((err: unknown) => {
+          /*
+           * Tracking not configured as the setting says: with tracking on, the
+           * release-event triggers may be off (the stored set would go
+           * stale); with tracking off on a database where it had started, the
+           * query root may still serve stored values this agent no longer
+           * keeps up to date. Either way, syncing must not start.
+           */
+          fatalInitializationError = true;
+          this.logger.fatal(
+            err,
+            `Agent: failed to configure unspent tracking (CHAINGRAPH_UNSPENT_TRACKING=${String(
+              unspentTracking.enabled
+            )}); shutting down.`
+          );
+          this.shutdown().catch((shutdownErr) => {
+            this.logger.error(shutdownErr);
+          });
+        })
         .finally(() => {
+          this.initializationInProgress = false;
+          if (fatalInitializationError) {
+            return;
+          }
           this.successfullyInitialized = true;
           this.scheduleBlockBufferFill();
         });
@@ -1001,6 +1088,7 @@ export class Agent {
                       );
                       this.scheduleIncompleteBlockRepair();
                       this.scheduleMempoolTransactionExpirationScan();
+                      this.startUnspentTrackingJob();
                     });
                   })
                   .catch((err) => {
@@ -1214,6 +1302,111 @@ export class Agent {
         }; an accepted block already spends the same outpoint, archived with replaced_at ${transaction.replacedAt.toISOString()}.`
       );
     });
+  }
+
+  /**
+   * Unspent tracking (`CHAINGRAPH_UNSPENT_TRACKING`): once the initial sync is
+   * complete and the managed indexes exist, create the per-node indexes and
+   * start the recurring job. It runs every
+   * `CHAINGRAPH_UNSPENT_TRACKING_INTERVAL_MS` and after each block save; one
+   * pass at a time.
+   */
+  startUnspentTrackingJob() {
+    if (
+      !unspentTracking.enabled ||
+      !unspentTracking.runJob ||
+      this.unspentTrackingJobStarted
+    ) {
+      return;
+    }
+    this.unspentTrackingJobStarted = true;
+    ensureUnspentTrackingIndexes()
+      .then((statements) => {
+        if (statements.length > 0) {
+          this.logger.info(
+            `Agent: created the unspent tracking indexes: ${statements.join(
+              ' '
+            )}`
+          );
+        }
+        this.logger.info(
+          `Agent: starting the unspent tracking job (${unspentTracking.connections} partitions), every ${unspentTracking.intervalMs} ms and after each block save.`
+        );
+        this.requestUnspentTrackingJobPass();
+      })
+      .catch((err: unknown) => {
+        if (isPostgresConnectionError(err) && !this.willShutdown) {
+          this.logger.warn(
+            `Agent: creating the unspent tracking indexes lost the Postgres connection (${describePostgresError(
+              err
+            )}); retrying in ${
+              unspentTrackingStartRetryDelayMs / msPerSecond
+            } seconds.`
+          );
+          setTimeout(() => {
+            if (this.willShutdown) {
+              return;
+            }
+            this.unspentTrackingJobStarted = false;
+            this.startUnspentTrackingJob();
+          }, unspentTrackingStartRetryDelayMs);
+          return;
+        }
+        this.logger.fatal(err);
+        this.shutdown().catch((shutdownErr) => {
+          this.logger.error(shutdownErr);
+        });
+      });
+  }
+
+  // eslint-disable-next-line complexity
+  requestUnspentTrackingJobPass(delayMs = 0) {
+    if (!this.unspentTrackingJobStarted || this.willShutdown) {
+      return;
+    }
+    if (this.unspentTrackingJobRunning !== undefined) {
+      this.unspentTrackingJobRequested = true;
+      return;
+    }
+    if (this.unspentTrackingJobTimeout !== undefined) {
+      if (delayMs > 0) {
+        return;
+      }
+      clearTimeout(this.unspentTrackingJobTimeout);
+    }
+    this.unspentTrackingJobTimeout = setTimeout(() => {
+      this.unspentTrackingJobTimeout = undefined;
+      if (
+        unspentTracking.pauseDuringSync &&
+        (this.blockBuffer.count() > 0 || this.blockBuffer.reservedBlocks > 0)
+      ) {
+        // a catch-up is in progress: retry once the block buffer is empty
+        this.requestUnspentTrackingJobPass(unspentTracking.intervalMs);
+        return;
+      }
+      this.unspentTrackingJobRunning = runUnspentTrackingJobPass()
+        .then((summary) => {
+          if (summary.busy) {
+            this.logger.debug(
+              'Agent: unspent tracking job busy (another instance holds a partition lock).'
+            );
+          }
+        })
+        .catch((err: unknown) => {
+          this.logger.error(
+            err,
+            'Agent: unspent tracking job pass failed (retried next pass).'
+          );
+        })
+        .finally(() => {
+          this.unspentTrackingJobRunning = undefined;
+          const again = this.unspentTrackingJobRequested;
+          this.unspentTrackingJobRequested = false;
+          this.requestUnspentTrackingJobPass(
+            again ? 0 : unspentTracking.intervalMs
+          );
+        });
+    }, delayMs);
   }
 
   canScheduleIncompleteBlockRepair() {
@@ -1909,6 +2102,29 @@ export class Agent {
   }
 
   /**
+   * Warn with a per-step breakdown when a block save takes at least
+   * {@link slowBlockSaveMs}.
+   */
+  logSlowBlockSave(
+    block: ChaingraphBlock,
+    durationMs: number,
+    stepMs: {
+      block: number;
+      check: number;
+      commit: number;
+      transactions: number;
+    }
+  ) {
+    if (durationMs >= slowBlockSaveMs) {
+      this.logger.warn(
+        `Agent: slow block save – height ${block.height} (${
+          block.hash
+        }) took ${durationMs.toLocaleString()} ms: transactions ${stepMs.transactions.toLocaleString()} ms, block + node_block (incl. the mempool-cleaning trigger) ${stepMs.block.toLocaleString()} ms, check ${stepMs.check.toLocaleString()} ms, commit ${stepMs.commit.toLocaleString()} ms.`
+      );
+    }
+  }
+
+  /**
    * Save a block to the database including any previously-unseen transactions.
    *
    * This also marks the nodes by which the block has been accepted and removes
@@ -1959,16 +2175,18 @@ export class Agent {
     );
 
     const startTime = Date.now();
-    const { attemptedSavedTransactions, transactionCacheMisses } =
+    const { attemptedSavedTransactions, stepMs, transactionCacheMisses } =
       await saveBlock({
         block,
         nodeAcceptances,
         transactionCache: this.transactionCache,
       });
     this.blockDb?.add(block.hash);
+    this.requestUnspentTrackingJobPass();
     const completionTime = Date.now();
 
     const durationMs = completionTime - startTime;
+    this.logSlowBlockSave(block, durationMs, stepMs);
     const transactions = attemptedSavedTransactions.length;
     const savedTransactionCount = transactions - transactionCacheMisses;
     const inputs = attemptedSavedTransactions.reduce(
@@ -2396,6 +2614,9 @@ export class Agent {
     if (this.mempoolTransactionExpirationScanTimeout !== undefined) {
       clearTimeout(this.mempoolTransactionExpirationScanTimeout);
     }
+    if (this.unspentTrackingJobTimeout !== undefined) {
+      clearTimeout(this.unspentTrackingJobTimeout);
+    }
     this.mempoolTransactionExpirationTimers.forEach((timeout) => {
       clearTimeout(timeout);
     });
@@ -2405,6 +2626,8 @@ export class Agent {
     });
     this.shutdownPromise = this.blockBuffer
       .drain()
+      .then(async () => this.unspentTrackingJobRunning)
+      .then(async () => unspentTrackingJobPool.end())
       .then(async () => {
         this.logger.debug('Block buffer drained, stopping PG pool...');
         return pool.end();

@@ -50,6 +50,21 @@ const expectedOptions = [
   'CHAINGRAPH_POSTGRES_MAX_CONNECTIONS',
   'CHAINGRAPH_POSTGRES_SYNCHRONOUS_COMMIT',
   'CHAINGRAPH_TRUSTED_NODES',
+  'CHAINGRAPH_UNSPENT_TRACKING',
+  'CHAINGRAPH_UNSPENT_TRACKING_BACKFILL',
+  'CHAINGRAPH_UNSPENT_TRACKING_BACKFILL_BATCH_PREFIXES',
+  'CHAINGRAPH_UNSPENT_TRACKING_BATCH_INPUTS',
+  'CHAINGRAPH_UNSPENT_TRACKING_CONNECTIONS',
+  'CHAINGRAPH_UNSPENT_TRACKING_DURING_SYNC',
+  'CHAINGRAPH_UNSPENT_TRACKING_INTERVAL_MS',
+  'CHAINGRAPH_UNSPENT_TRACKING_PASS_MAX_MS',
+  'CHAINGRAPH_UNSPENT_TRACKING_READ_HASHED_MAX_TRANSACTIONS',
+  'CHAINGRAPH_UNSPENT_TRACKING_READ_PROBED_MAX_TRANSACTIONS',
+  'CHAINGRAPH_UNSPENT_TRACKING_READ_STORED_MAX_EVENTS',
+  'CHAINGRAPH_UNSPENT_TRACKING_RUN_JOB',
+  'CHAINGRAPH_UNSPENT_TRACKING_SETTLE_MS',
+  'CHAINGRAPH_UNSPENT_TRACKING_STALL_MAX_MS',
+  'CHAINGRAPH_UNSPENT_TRACKING_START',
   'CHAINGRAPH_USER_AGENT',
   'CHAINGRAPH_WRITE_PATH',
   'NODE_ENV',
@@ -440,6 +455,127 @@ const postgresSynchronousCommit =
  */
 const isProduction = configuration.NODE_ENV === 'production';
 
+const booleanSetting = (
+  name: (typeof expectedOptions)[number],
+  defaultValue: boolean
+) => {
+  const raw = configuration[name].toLowerCase();
+  if (raw === '') {
+    return defaultValue;
+  }
+  if (raw !== 'true' && raw !== 'false') {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `Invalid value provided in the '${name}' environment variable: ${configuration[name]}. Must be one of the following: true, false`
+    );
+  }
+  return raw === 'true';
+};
+
+const nonNegativeIntegerSetting = (
+  name: (typeof expectedOptions)[number],
+  defaultValue: number,
+  minimum = 0
+) => {
+  const raw = configuration[name];
+  if (raw === '') {
+    return defaultValue;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < minimum) {
+    // eslint-disable-next-line functional/no-throw-statement
+    throw new Error(
+      `Invalid value provided in the '${name}' environment variable: ${raw}. Must be an integer of at least ${minimum}.`
+    );
+  }
+  return value;
+};
+
+/* eslint-disable @typescript-eslint/no-magic-numbers */
+/**
+ * Stored per-node unspent set (`output.unspent_node_ids`, query root
+ * `unspent_output`), maintained by a job inside the agent. Set via the
+ * `CHAINGRAPH_UNSPENT_TRACKING*` environment variables (see `defaults.env`).
+ */
+const unspentTracking = {
+  backfill: booleanSetting('CHAINGRAPH_UNSPENT_TRACKING_BACKFILL', false),
+  backfillBatchPrefixes: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_TRACKING_BACKFILL_BATCH_PREFIXES',
+    64,
+    1
+  ),
+  batchInputs: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_TRACKING_BATCH_INPUTS',
+    50_000,
+    1
+  ),
+  connections: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_TRACKING_CONNECTIONS',
+    4,
+    1
+  ),
+  enabled: booleanSetting('CHAINGRAPH_UNSPENT_TRACKING', false),
+  intervalMs: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_TRACKING_INTERVAL_MS',
+    5_000
+  ),
+  passMaxMs: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_TRACKING_PASS_MAX_MS',
+    30_000
+  ),
+  /**
+   * `pause` (default): no job pass while the agent has blocks downloading or
+   * waiting to be saved (a catch-up); the job then drains at full width.
+   * `run`: the job runs alongside the catch-up (competes with the block
+   * saves for I/O).
+   */
+  pauseDuringSync:
+    configuration.CHAINGRAPH_UNSPENT_TRACKING_DURING_SYNC !== 'run',
+  readHashedMaxTransactions: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_TRACKING_READ_HASHED_MAX_TRANSACTIONS',
+    20_000
+  ),
+  readProbedMaxTransactions: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_TRACKING_READ_PROBED_MAX_TRANSACTIONS',
+    200_000
+  ),
+  readStoredMaxEvents: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_TRACKING_READ_STORED_MAX_EVENTS',
+    10_000
+  ),
+  runJob: booleanSetting('CHAINGRAPH_UNSPENT_TRACKING_RUN_JOB', true),
+  settleMs: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_TRACKING_SETTLE_MS',
+    200
+  ),
+  stallMaxMs: nonNegativeIntegerSetting(
+    'CHAINGRAPH_UNSPENT_TRACKING_STALL_MAX_MS',
+    60_000
+  ),
+  startAtGenesis: configuration.CHAINGRAPH_UNSPENT_TRACKING_START === 'genesis',
+};
+/* eslint-enable @typescript-eslint/no-magic-numbers */
+if (
+  !['', 'pause', 'run'].includes(
+    configuration.CHAINGRAPH_UNSPENT_TRACKING_DURING_SYNC
+  )
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_UNSPENT_TRACKING_DURING_SYNC' environment variable: ${configuration.CHAINGRAPH_UNSPENT_TRACKING_DURING_SYNC}. Must be one of the following: pause, run`
+  );
+}
+if (
+  !['', 'tip', 'genesis'].includes(
+    configuration.CHAINGRAPH_UNSPENT_TRACKING_START
+  )
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_UNSPENT_TRACKING_START' environment variable: ${configuration.CHAINGRAPH_UNSPENT_TRACKING_START}. Must be one of the following: tip, genesis`
+  );
+}
+
 const writePaths = ['sql', 'copy'] as const;
 const isWritePath = (value: string): value is (typeof writePaths)[number] =>
   writePaths.includes(value as (typeof writePaths)[number]);
@@ -478,4 +614,5 @@ export {
   postgresSynchronousCommit,
   isProduction,
   trustedNodes,
+  unspentTracking,
 };

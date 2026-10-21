@@ -102,6 +102,8 @@
     "subquery",
     "symlinks",
     "templating",
+    "tgisinternal",
+    "tgrelid",
     "txindex",
     "unintuitive",
     "unnest",
@@ -111,6 +113,9 @@
     "UTXOs",
     "varint",
     "verack",
+    "xact",
+    "xmax",
+    "xmin",
     "xprivkey",
     "xpubkey"
   ],
