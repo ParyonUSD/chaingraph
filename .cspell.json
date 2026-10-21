@@ -108,6 +108,7 @@
     "upserting",
     "UTXO",
     "UTXOs",
+    "varint",
     "verack",
     "xprivkey",
     "xpubkey"
