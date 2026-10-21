@@ -1142,6 +1142,7 @@ export class Agent {
       nodeInternalId: transaction.nodeInternalId,
       replacedAt: transaction.expiresAt,
       transactionInternalId: transaction.transactionInternalId,
+      validatedAt: transaction.validatedAt,
     });
     if (!archived) {
       this.logger.debug(

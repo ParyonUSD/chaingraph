@@ -469,3 +469,49 @@ INSERT INTO node_transaction (node_internal_id, transaction_internal_id)
     t.deepEqual((await pool.query(membershipQuery)).rows, [{ node: 1, tx: 3 }]);
   }
 );
+
+/*
+ * Regression: an expiry scheduled for one validation also archived a later
+ * validation of the same transaction (e.g. one restored by a mempool resync
+ * after the first was confirmed and a re-org removed the block), and through the
+ * history trigger that validation's descendants.
+ */
+test.serial(
+  '[e2e] expiry leaves a transaction validated again after it was scheduled',
+  async (t) => {
+    const { pool, archiveMempoolTransactions } = t.context.db;
+    // 2 spends 1; node 1 re-validated 1 after the expiry was scheduled
+    await pool.query(/* sql */ `
+INSERT INTO input SELECT 2, 0, hash, 0 FROM transaction WHERE internal_id = 1;
+INSERT INTO node_transaction VALUES
+  (1, 1, '2026-01-02 00:00:00.123456'), (1, 2, '2026-01-02'),
+  (2, 1, '2026-01-01 00:00:00.123456');
+`);
+    const replacedAt = new Date('2026-01-01T01:00:00.000Z');
+    const archived = await archiveMempoolTransactions([
+      {
+        nodeInternalId: 1,
+        replacedAt,
+        transactionInternalId: 1,
+        validatedAt: new Date('2026-01-01T00:00:00.123Z'),
+      },
+      {
+        nodeInternalId: 2,
+        replacedAt,
+        transactionInternalId: 1,
+        validatedAt: new Date('2026-01-01T00:00:00.123Z'),
+      },
+    ]);
+    t.deepEqual(
+      archived.map((expiry) => ({ node: expiry.nodeInternalId })),
+      [{ node: 2 }]
+    );
+    t.deepEqual((await pool.query(membershipQuery)).rows, [
+      { node: 1, tx: 1 },
+      { node: 1, tx: 2 },
+    ]);
+    t.deepEqual((await pool.query(historyQuery)).rows, [
+      { node: 2, replaced: '2026-01-01 01:00:00', tx: 1 },
+    ]);
+  }
+);
