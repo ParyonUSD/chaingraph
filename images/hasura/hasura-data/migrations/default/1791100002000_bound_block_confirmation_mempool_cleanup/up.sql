@@ -15,9 +15,9 @@ DECLARE
   spent_outpoint_indexes bigint[];
 BEGIN
   /*
-   * Keep each lookup bounded by the rows in this statement. In particular,
-   * OFFSET 0 prevents Postgres from flattening the outpoint lookup into a scan
-   * of the historical input table.
+   * Keep each lookup bounded by the rows in this statement. OFFSET 0 prevents
+   * Postgres from flattening the per-row lookups into scans of the historical
+   * block_transaction and input tables.
    */
   SELECT array_agg(new_table.node_internal_id ORDER BY new_table.node_internal_id, new_table.block_internal_id),
          array_agg(new_table.block_internal_id ORDER BY new_table.node_internal_id, new_table.block_internal_id),
@@ -51,9 +51,15 @@ BEGIN
          spent_outpoint_hashes, spent_outpoint_indexes
     FROM unnest(confirmed_node_ids, confirmed_transaction_ids, confirmed_timestamps)
       WITH ORDINALITY AS accepted(node_internal_id, transaction_internal_id, accepted_at, ordinality)
-    JOIN input
-      ON input.transaction_internal_id = accepted.transaction_internal_id
-    WHERE input.outpoint_transaction_hash != '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea;
+    CROSS JOIN LATERAL (
+      SELECT input.input_index,
+             input.outpoint_transaction_hash,
+             input.outpoint_index
+        FROM input
+        WHERE input.transaction_internal_id = accepted.transaction_internal_id
+          AND input.outpoint_transaction_hash != '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea
+        OFFSET 0
+    ) AS input;
 
   IF spent_transaction_ids IS NULL THEN
     RETURN NEW;
