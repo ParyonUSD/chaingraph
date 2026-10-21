@@ -293,11 +293,22 @@ interface PlanNode {
   'Node Type': string;
   Plans?: PlanNode[];
   'Relation Name'?: string;
+  'Rows Removed by Filter'?: number;
+  'Rows Removed by Index Recheck'?: number;
 }
 /* eslint-enable @typescript-eslint/naming-convention */
+const rowsReadPerLoop = (node: PlanNode) =>
+  node['Actual Rows'] +
+  (node['Rows Removed by Filter'] ?? 0) +
+  (node['Rows Removed by Index Recheck'] ?? 0);
+/**
+ * Rows of `relation` read by the scans of an EXPLAIN ANALYZE plan: those
+ * emitted plus those discarded by the scan's filter or index recheck (all
+ * reported per loop).
+ */
 const rowsScanned = (node: PlanNode, relation: string): number =>
   (node['Relation Name'] === relation && node['Node Type'].endsWith('Scan')
-    ? node['Actual Rows'] * node['Actual Loops']
+    ? rowsReadPerLoop(node) * node['Actual Loops']
     : 0) +
   (node.Plans ?? []).reduce(
     (total, child) => total + rowsScanned(child, relation),
