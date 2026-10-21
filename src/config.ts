@@ -42,6 +42,8 @@ const expectedOptions = [
   'CHAINGRAPH_LOG_LEVEL_STDOUT',
   'CHAINGRAPH_LOG_LEVEL_PATH',
   'CHAINGRAPH_LOG_PATH',
+  'CHAINGRAPH_MEMPOOL_RESYNC',
+  'CHAINGRAPH_MEMPOOL_RESYNC_MIN_INTERVAL_MS',
   'CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_MS',
   'CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS',
   'CHAINGRAPH_POSTGRES_CONNECTION_STRING',
@@ -64,6 +66,7 @@ const expectedOptions = [
   'CHAINGRAPH_UNSPENT_TRACKING_STALL_MAX_MS',
   'CHAINGRAPH_UNSPENT_TRACKING_START',
   'CHAINGRAPH_USER_AGENT',
+  'CHAINGRAPH_WRITE_PATH',
   'NODE_ENV',
 ] as const;
 const requireStringValues = (
@@ -166,6 +169,34 @@ if (
   // eslint-disable-next-line functional/no-throw-statement
   throw new Error(
     'The CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS environment variable must be an integer greater than 0.'
+  );
+}
+
+if (
+  configuration.CHAINGRAPH_MEMPOOL_RESYNC.toLowerCase() !== 'true' &&
+  configuration.CHAINGRAPH_MEMPOOL_RESYNC.toLowerCase() !== 'false'
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_MEMPOOL_RESYNC' environment variable: ${configuration.CHAINGRAPH_MEMPOOL_RESYNC}. Must be one of the following: true, false`
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_MEMPOOL_RESYNC` environment variable.
+ */
+const mempoolResync =
+  configuration.CHAINGRAPH_MEMPOOL_RESYNC.toLowerCase() === 'true';
+
+const mempoolResyncMinIntervalMs = Number(
+  configuration.CHAINGRAPH_MEMPOOL_RESYNC_MIN_INTERVAL_MS
+);
+if (
+  !Number.isInteger(mempoolResyncMinIntervalMs) ||
+  mempoolResyncMinIntervalMs < 0
+) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    'The CHAINGRAPH_MEMPOOL_RESYNC_MIN_INTERVAL_MS environment variable must be an integer greater than or equal to 0.'
   );
 }
 
@@ -545,6 +576,24 @@ if (
   );
 }
 
+const writePaths = ['sql', 'copy'] as const;
+const isWritePath = (value: string): value is (typeof writePaths)[number] =>
+  writePaths.includes(value as (typeof writePaths)[number]);
+if (!isWritePath(configuration.CHAINGRAPH_WRITE_PATH)) {
+  // eslint-disable-next-line functional/no-throw-statement
+  throw new Error(
+    `Invalid value provided in the 'CHAINGRAPH_WRITE_PATH' environment variable: ${
+      configuration.CHAINGRAPH_WRITE_PATH
+    }. Must be one of the following: ${writePaths.join(', ')}`
+  );
+}
+/**
+ * Set via the `CHAINGRAPH_WRITE_PATH` environment variable: `sql` (multi-row
+ * `INSERT … VALUES` statements) or `copy` (binary `COPY` into temporary
+ * staging tables, then `INSERT … SELECT`).
+ */
+const chaingraphWritePath = configuration.CHAINGRAPH_WRITE_PATH;
+
 export {
   blockBufferTargetSizeMb,
   chaingraphInternalApiPort,
@@ -553,8 +602,11 @@ export {
   chaingraphLogLevelStdout,
   chaingraphLogLevelPath,
   chaingraphUserAgent,
+  chaingraphWritePath,
   genesisBlocks,
   incompleteBlockRepairBatchSize,
+  mempoolResync,
+  mempoolResyncMinIntervalMs,
   mempoolTransactionExpirationMs,
   mempoolTransactionExpirationScanIntervalMs,
   postgresMaxConnections,

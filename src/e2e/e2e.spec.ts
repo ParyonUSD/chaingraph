@@ -97,7 +97,15 @@ const dbUpMigrationPaths = [
   migration(
     'default/1791100001000_fix_search_output_prefix_literal_bytes/up.sql'
   ),
+  migration(
+    'default/1791100002000_bound_block_confirmation_mempool_cleanup/up.sql'
+  ),
+  migration(
+    'default/1791100003000_output_category_capability_statistics/up.sql'
+  ),
+  migration('default/1791200000000_add_incomplete_block_audit/up.sql'),
   migration('default/1791500000000_unspent_node_ids/up.sql'),
+  migration('default/1791600000000_node_block_height/up.sql'),
 ];
 
 const chaingraphInternalApiPort = '3201';
@@ -177,6 +185,7 @@ const e2eEnvVariables = {
   CHAINGRAPH_INTERNAL_API_PORT: chaingraphInternalApiPort,
   CHAINGRAPH_LOG_FIREHOSE: logP2pMessage.toString(),
   CHAINGRAPH_LOG_PATH: chaingraphE2eLogPath,
+  CHAINGRAPH_MEMPOOL_RESYNC_MIN_INTERVAL_MS: '100',
   CHAINGRAPH_MEMPOOL_TRANSACTION_EXPIRATION_SCAN_INTERVAL_MS: '100',
   CHAINGRAPH_POSTGRES_CONNECTION_STRING: postgresE2eConnectionStringTestDb,
   CHAINGRAPH_TRUSTED_NODES: e2eTrustedNodesSet1,
@@ -205,6 +214,40 @@ const peers = {
   node1: placeholder,
   node2: placeholder,
   node3: placeholder,
+};
+
+/**
+ * The transaction hashes (hex, as displayed) each mock node announces in reply
+ * to a BIP35 `mempool` request, and the number of requests each has received.
+ */
+const mempoolReplies: { [nodeName in keyof typeof peers]: string[] } = {
+  node1: [],
+  node2: [],
+  node3: [],
+};
+const mempoolRequestCounts: { [nodeName in keyof typeof peers]: number } = {
+  node1: 0,
+  node2: 0,
+  node3: 0,
+};
+const respondToMempoolRequests = (nodeName: keyof typeof peers, peer: Peer) => {
+  peer.on('mempool', () => {
+    mempoolRequestCounts[nodeName] += 1;
+    logger.debug(
+      `e2e: ${nodeName} received mempool request, announcing: ${mempoolReplies[
+        nodeName
+      ].join(', ')}`
+    );
+    /**
+     * BIP35 replies may be split across multiple `inv` messages; announce each
+     * transaction in its own message.
+     */
+    mempoolReplies[nodeName].forEach((hash) => {
+      peer.sendMessage(
+        peer.messages.Inventory.forTransaction(Buffer.from(hash, 'hex'))
+      );
+    });
+  });
 };
 
 test.beforeEach((t) => {
@@ -259,15 +302,24 @@ test.before(async () => {
   };
   node1.on('peerready', (peer) => {
     logPeerConnection(`node1`, peer);
-    if (!peer.subversion.includes('tx-broadcast')) peers.node1 = peer;
+    if (!peer.subversion.includes('tx-broadcast')) {
+      peers.node1 = peer;
+      respondToMempoolRequests('node1', peer);
+    }
   });
   node2.on('peerready', (peer) => {
     logPeerConnection(`node2`, peer);
-    if (!peer.subversion.includes('tx-broadcast')) peers.node2 = peer;
+    if (!peer.subversion.includes('tx-broadcast')) {
+      peers.node2 = peer;
+      respondToMempoolRequests('node2', peer);
+    }
   });
   node3.on('peerready', (peer) => {
     logPeerConnection(`node3`, peer);
-    if (!peer.subversion.includes('tx-broadcast')) peers.node3 = peer;
+    if (!peer.subversion.includes('tx-broadcast')) {
+      peers.node3 = peer;
+      respondToMempoolRequests('node3', peer);
+    }
   });
 
   if (logP2pMessage) {
@@ -825,6 +877,32 @@ const waitForConfirmedMempoolArchive = async (
   return waitForConfirmedMempoolArchive(remainingAttempts - 1);
 };
 
+const mempoolPollingAttempts = 50;
+const mempoolPollingIntervalMs = 100;
+const getMempoolTransactionHashes = async () =>
+  (
+    await client.query<{ hash: string }>(
+      /* sql */ `SELECT encode(hash, 'hex') AS hash FROM node_transaction JOIN transaction ON node_transaction.transaction_internal_id = transaction.internal_id ORDER BY hash ASC;`
+    )
+  ).rows.map((row) => row.hash);
+/**
+ * Poll node_transaction until its hashes (as listed by
+ * {@link getMempoolTransactionHashes}) satisfy `expected`: the agent saves
+ * transactions received from peers asynchronously. Returns the last hashes
+ * read.
+ */
+const waitForMempoolTransactionHashes = async (
+  expected: (hashes: string[]) => boolean,
+  remainingAttempts = mempoolPollingAttempts
+): Promise<string[]> => {
+  const hashes = await getMempoolTransactionHashes();
+  if (expected(hashes) || remainingAttempts === 0) {
+    return hashes;
+  }
+  await sleep(mempoolPollingIntervalMs);
+  return waitForMempoolTransactionHashes(expected, remainingAttempts - 1);
+};
+
 test.serial(
   '[e2e] ignores inbound transactions before initial sync is complete',
   async (t) => {
@@ -853,6 +931,27 @@ test.serial('[e2e] completes initial sync', async (t) => {
   t.pass();
 });
 
+test.serial(
+  '[e2e] requests the mempool of each node once mempool tracking is enabled',
+  async (t) => {
+    await waitForStdout('Agent: enabled mempool tracking.');
+    await waitForStdout(
+      'node1: requested node mempool (BIP35) – triggers: mempool-tracking-enabled'
+    );
+    await waitForStdout(
+      'node2: requested node mempool (BIP35) – triggers: mempool-tracking-enabled'
+    );
+    await waitForStdout(
+      'node3: requested node mempool (BIP35) – triggers: mempool-tracking-enabled'
+    );
+    const delay = 500;
+    await sleep(delay);
+    t.true(mempoolRequestCounts.node1 >= 1);
+    t.true(mempoolRequestCounts.node2 >= 1);
+    t.true(mempoolRequestCounts.node3 >= 1);
+  }
+);
+
 test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
   await waitForStdout('Agent: all managed indexes have been created.');
   await waitForStdout('Agent: enabled mempool tracking.');
@@ -876,8 +975,10 @@ test.serial('[e2e] creates expected indexes after initial sync', async (t) => {
     'block_internal_id_key',
     'block_pkey',
     'block_transaction_pkey',
+    'incomplete_block_audit_pkey',
     'input_pkey',
     'node_block_history_pkey',
+    'node_block_node_height_index',
     'node_block_pkey',
     'node_internal_id_key',
     'node_name_key',
@@ -2091,6 +2192,14 @@ test.serial(
     const [, tx1] = tipA[0]!.transactions;
     peers.node1.sendMessage(new peers.node1.messages.Transaction(tx1));
     logger.debug(`node1: sent tipA[0] transaction 0: ${tx1!.hash}`);
+    // the block must arrive after the transaction is saved for it to be known
+    t.true(
+      (
+        await waitForMempoolTransactionHashes((hashes) =>
+          hashes.includes(tx1!.hash)
+        )
+      ).includes(tx1!.hash)
+    );
     newBlocks('node1', [tipA[0]!]);
     newBlocks('node2', [tipB[0]!]);
     newBlocks('node3', [tipB[0]!]);
@@ -2115,6 +2224,73 @@ test.serial(
   }
 );
 
+const getNodeValidationCount = async (nodeName: string, hash: string) =>
+  Number(
+    (
+      await client.query<{ count: string }>(
+        /* sql */ `
+        SELECT COUNT(*) FROM node_transaction
+          INNER JOIN node
+            ON node.internal_id = node_transaction.node_internal_id
+          INNER JOIN transaction
+            ON transaction.internal_id = node_transaction.transaction_internal_id
+          WHERE node.name = $1 AND transaction.hash = $2;
+      `,
+        [nodeName, hexToBin(hash)]
+      )
+    ).rows[0]!.count
+  );
+const deleteNodeValidation = async (nodeName: string, hash: string) =>
+  client.query(
+    /* sql */ `
+    DELETE FROM node_transaction
+      USING node, transaction
+      WHERE node_transaction.node_internal_id = node.internal_id
+        AND node_transaction.transaction_internal_id = transaction.internal_id
+        AND node.name = $1
+        AND transaction.hash = $2;
+    `,
+    [nodeName, hexToBin(hash)]
+  );
+const nodeValidationPollingAttempts = 50;
+const nodeValidationPollingIntervalMs = 100;
+/**
+ * Wait for the node's `node_transaction` row for the transaction, returning
+ * the final count of matching rows (`0` if it never appeared).
+ */
+const waitForNodeValidation = async (
+  nodeName: string,
+  hash: string,
+  remainingAttempts = nodeValidationPollingAttempts
+): Promise<number> => {
+  const count = await getNodeValidationCount(nodeName, hash);
+  if (count !== 0 || remainingAttempts === 0) {
+    return count;
+  }
+  await sleep(nodeValidationPollingIntervalMs);
+  return waitForNodeValidation(nodeName, hash, remainingAttempts - 1);
+};
+
+/**
+ * Model https://github.com/bitauth/chaingraph/issues/81: node3 accepted a
+ * transaction (its `node_transaction` row was saved and the agent cached
+ * node3's acknowledgement), the transaction was later confirmed (archiving the
+ * row), then a re-organization returned it to node3's mempool. Nodes don't
+ * re-announce such transactions; they only appear in replies to `mempool`.
+ */
+test.serial(
+  '[e2e] prepares a transaction for return to the mempool by a re-org',
+  async (t) => {
+    peers.node3.sendMessage(
+      new peers.node3.messages.Transaction(new Transaction(halTxRaw))
+    );
+    t.is(await waitForNodeValidation('node3', halTxHash), 1);
+    await deleteNodeValidation('node3', halTxHash);
+    t.is(await getNodeValidationCount('node3', halTxHash), 0);
+    mempoolReplies.node3 = [halTxHash];
+  }
+);
+
 test.serial('[e2e] handles re-org of a single block', async (t) => {
   newBlocks('node1', [tipA[1]!]);
   newBlocks('node2', [tipB[1]!]);
@@ -2135,6 +2311,24 @@ test.serial('[e2e] handles re-org of a single block', async (t) => {
     ['node1', 'node3']
   );
 });
+
+test.serial(
+  '[e2e] re-records transactions returned to the mempool by a re-org',
+  async (t) => {
+    await waitForStdout(
+      'node3: requested node mempool (BIP35) – triggers: reorganization'
+    );
+    t.is(await waitForNodeValidation('node3', halTxHash), 1);
+    /**
+     * Clean up: stop announcing the transaction, wait for any pending replies,
+     * then remove node3's validation so later tests are unaffected.
+     */
+    mempoolReplies.node3 = [];
+    const delay = 500;
+    await sleep(delay);
+    await deleteNodeValidation('node3', halTxHash);
+  }
+);
 
 test.serial('[e2e] new block saved after reorg', async (t) => {
   const acceptedBlocks = (
@@ -2363,20 +2557,21 @@ test.serial(
     peers.node1.sendMessage(new peers.node1.messages.Transaction(tx2));
     logger.debug(`node1: sent tx2: ${tx2!.hash}`);
     peers.node1.sendMessage(new peers.node1.messages.Transaction(tx3));
-    logger.debug(`node1: sent tx3: ${tx2!.hash}`);
-    const delay = 100;
-    await sleep(delay);
-    const mempool1 = await client.query<{ encode: string }>(
-      /* sql */ `SELECT encode(hash, 'hex') FROM node_transaction JOIN transaction ON node_transaction.transaction_internal_id = transaction.internal_id ORDER BY hash ASC;`
+    logger.debug(`node1: sent tx3: ${tx3!.hash}`);
+    const expectedMempool = [
+      tx1!.hash,
+      tx3!.hash,
+      tx2!.hash,
+      chipnetCashTokensTxHash,
+      halTxSpent,
+      halTxHash,
+    ];
+    t.deepEqual(
+      await waitForMempoolTransactionHashes(
+        (hashes) => hashes.join() === expectedMempool.join()
+      ),
+      expectedMempool
     );
-    t.deepEqual(mempool1.rows, [
-      { encode: tx1!.hash },
-      { encode: tx3!.hash },
-      { encode: tx2!.hash },
-      { encode: chipnetCashTokensTxHash },
-      { encode: halTxSpent },
-      { encode: halTxHash },
-    ]);
     newBlocks('node1', [tipA[161]!]);
     newBlocks('node2', [tipB[161]!]);
     newBlocks('node3', [tipA[161]!]);
@@ -2388,13 +2583,10 @@ test.serial(
     await waitForStdout(
       /Saved new block – height:\s+3162[^\n]+nodes: node1, node3/u
     );
-    const mempool2 = await client.query<{ encode: string }>(
-      /* sql */ `SELECT encode(hash, 'hex') FROM node_transaction JOIN transaction ON node_transaction.transaction_internal_id = transaction.internal_id ORDER BY hash ASC;`
-    );
-    t.deepEqual(mempool2.rows, [
-      { encode: chipnetCashTokensTxHash },
-      { encode: halTxSpent },
-      { encode: halTxHash },
+    t.deepEqual(await getMempoolTransactionHashes(), [
+      chipnetCashTokensTxHash,
+      halTxSpent,
+      halTxHash,
     ]);
     t.pass();
   }
@@ -2513,6 +2705,204 @@ test.serial(
       ),
       historicalRepairBlock.transactions.length
     );
+  }
+);
+
+const getIncompleteBlockAuditMarkers = async () =>
+  (
+    await client.query<{
+      auditedThroughBlockInternalId: string;
+      nodeInternalId: number;
+      nodeName: string;
+    }>(/* sql */ `
+      SELECT node.name AS "nodeName",
+             node.internal_id AS "nodeInternalId",
+             incomplete_block_audit.audited_through_block_internal_id
+               AS "auditedThroughBlockInternalId"
+        FROM incomplete_block_audit
+        INNER JOIN node
+          ON node.internal_id = incomplete_block_audit.node_internal_id
+        ORDER BY node.name;
+    `)
+  ).rows;
+
+const waitForIncompleteBlockAuditMarker = async (
+  nodeName: string,
+  remainingAttempts = blockRepairPollingAttempts
+): Promise<Awaited<ReturnType<typeof getIncompleteBlockAuditMarkers>>> => {
+  const markers = await getIncompleteBlockAuditMarkers();
+  if (
+    remainingAttempts <= 0 ||
+    markers.some((marker) => marker.nodeName === nodeName)
+  ) {
+    return markers;
+  }
+  await sleep(blockRepairPollingIntervalMs);
+  return waitForIncompleteBlockAuditMarker(nodeName, remainingAttempts - 1);
+};
+
+test.serial(
+  '[e2e] records incomplete block audit markers and skips audited blocks on restart',
+  async (t) => {
+    t.timeout(oneMinute);
+    const markers = await waitForIncompleteBlockAuditMarker('node4');
+    const markersByNode = new Map(
+      markers.map((marker) => [marker.nodeName, marker])
+    );
+    ['node1', 'node2', 'node4'].forEach((nodeName) => {
+      t.true(markersByNode.has(nodeName), `missing marker for ${nodeName}`);
+    });
+    const maxBlockInternalId = Number(
+      (
+        await client.query<{ max: string }>(
+          /* sql */ `SELECT MAX(internal_id) AS max FROM block;`
+        )
+      ).rows[0]!.max
+    );
+    markers.forEach((marker) => {
+      const auditedThrough = Number(marker.auditedThroughBlockInternalId);
+      t.true(auditedThrough > 0 && auditedThrough <= maxBlockInternalId);
+    });
+    /*
+     * The previous agent process completed a scan for node1 and node2, so this
+     * process loaded their markers (and skipped their audited blocks); node4 is
+     * new, so all of its blocks were audited (which repaired the incomplete
+     * historical block above).
+     */
+    t.regex(
+      stdoutBuffer,
+      new RegExp(
+        `starting incomplete block repair scan;[^\\n]*${
+          markersByNode.get('node1')!.nodeInternalId
+        }: \\d+[^\\n]*${markersByNode.get('node4')!.nodeInternalId}: none`,
+        'u'
+      )
+    );
+  }
+);
+
+test.serial(
+  '[e2e] getIncompleteBlocks skips blocks already audited for a node',
+  async (t) => {
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+      postgresE2eConnectionStringTestDb;
+    /*
+     * An earlier test ends the shared `db.js` pool, so load a fresh module
+     * instance (with its own pool) for this test.
+     */
+    const freshDbModuleUrl = `../db.js?incomplete-block-audit=${Date.now()}`;
+    const { getIncompleteBlocks, pool: freshDbPool } = (await import(
+      freshDbModuleUrl
+    )) as typeof DbModule;
+    const markersByNode = new Map(
+      (await getIncompleteBlockAuditMarkers()).map((marker) => [
+        marker.nodeName,
+        marker,
+      ])
+    );
+    const auditedNode1 = markersByNode.get('node1')!;
+    const auditedNode4 = markersByNode.get('node4')!;
+    const removedRow = (
+      await client.query<{
+        blockInternalId: string;
+        transactionIndex: number;
+        transactionInternalId: string;
+      }>(
+        /* sql */ `
+        DELETE FROM block_transaction
+          USING block
+          WHERE block.internal_id = block_transaction.block_internal_id
+            AND block.hash = $1
+            AND block_transaction.transaction_index = $2
+          RETURNING block_transaction.block_internal_id AS "blockInternalId",
+            block_transaction.transaction_internal_id
+              AS "transactionInternalId",
+            block_transaction.transaction_index AS "transactionIndex";
+      `,
+        [hexToBin(historicalRepairBlockHash), historicalRepairTransactionIndex]
+      )
+    ).rows[0]!;
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      t.true(
+        Number(removedRow.blockInternalId) <=
+          Number(auditedNode1.auditedThroughBlockInternalId)
+      );
+      const height = historicalRepairTipIndex + splitHeight + 1;
+      const scan = async (
+        nodeInternalIds: number[],
+        auditedThroughBlockInternalIds?: number[]
+      ) =>
+        getIncompleteBlocks({
+          auditedThroughBlockInternalIds,
+          excludedBlockHashes: [],
+          heightLowerBound: height,
+          heightUpperBound: height + 1,
+          limit: 10,
+          nodeInternalIds,
+        });
+      t.deepEqual(
+        await scan(
+          [auditedNode1.nodeInternalId],
+          [Number(auditedNode1.auditedThroughBlockInternalId)]
+        ),
+        { incompleteBlocks: [], scannedBlockCount: 0 }
+      );
+      const unaudited = await scan([auditedNode1.nodeInternalId]);
+      t.deepEqual(unaudited.scannedBlockCount, 1);
+      t.deepEqual(
+        unaudited.incompleteBlocks.map((block) => block.hash),
+        [historicalRepairBlockHash]
+      );
+      const oneNodeUnaudited = await scan(
+        [auditedNode1.nodeInternalId, auditedNode4.nodeInternalId],
+        [Number(auditedNode1.auditedThroughBlockInternalId), 0]
+      );
+      t.deepEqual(
+        oneNodeUnaudited.incompleteBlocks.map((block) => block.hash),
+        [historicalRepairBlockHash]
+      );
+      /*
+       * All markers positive (the bounded per-node join, not the full-audit
+       * fallback): node4's marker is below the block, so the block is still
+       * returned although node1 has already audited it.
+       */
+      const blockInternalId = Number(removedRow.blockInternalId);
+      t.true(blockInternalId > 1);
+      const oneNodeAuditedBelow = await scan(
+        [auditedNode1.nodeInternalId, auditedNode4.nodeInternalId],
+        [
+          Number(auditedNode1.auditedThroughBlockInternalId),
+          blockInternalId - 1,
+        ]
+      );
+      t.deepEqual(
+        oneNodeAuditedBelow.incompleteBlocks.map((block) => block.hash),
+        [historicalRepairBlockHash]
+      );
+    } finally {
+      await client.query(
+        /* sql */ `
+        INSERT INTO block_transaction
+          (block_internal_id, transaction_internal_id, transaction_index)
+          VALUES ($1, $2, $3);
+      `,
+        [
+          removedRow.blockInternalId,
+          removedRow.transactionInternalId,
+          removedRow.transactionIndex,
+        ]
+      );
+      await freshDbPool.end();
+      if (originalPostgresConnectionString === undefined) {
+        delete process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+      } else {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
   }
 );
 
@@ -6088,5 +6478,231 @@ test.serial(
       t.true(/\b(?:test_)?output_search_index\b/u.test(plan), plan);
       t.false(plan.includes('Seq Scan'), plan);
     });
+  }
+);
+
+test.serial(
+  '[e2e] [sql] node_block.block_height matches block.height for every row',
+  async (t) => {
+    const counts = (
+      await client.query<{ mismatched: string; total: string }>(/* sql */ `
+  SELECT COUNT(*)::bigint AS total,
+         COUNT(*) FILTER (WHERE node_block.block_height IS DISTINCT FROM block.height)::bigint AS mismatched
+    FROM node_block
+    JOIN block ON block.internal_id = node_block.block_internal_id;
+  `)
+    ).rows[0]!;
+    t.true(Number(counts.total) > 0);
+    t.deepEqual(counts.mismatched, '0');
+  }
+);
+
+test.serial(
+  '[e2e] [sql] node_block inserts without block_height take the height from block',
+  async (t) => {
+    await client.query('BEGIN;');
+    const insertWithoutHeight = async () =>
+      (
+        await client.query<{ blockHeight: string }>(/* sql */ `
+WITH inserted_block AS (
+  INSERT INTO block (height, version, "timestamp", hash, previous_block_hash, merkle_root, bits, nonce, size_bytes)
+    VALUES (987654, 1, 0, decode(repeat('e1', 32), 'hex'), decode(repeat('e2', 32), 'hex'), decode(repeat('e3', 32), 'hex'), 0, 0, 81)
+    RETURNING internal_id
+)
+INSERT INTO node_block (node_internal_id, block_internal_id, accepted_at)
+  SELECT node.internal_id, inserted_block.internal_id, NULL
+    FROM node CROSS JOIN inserted_block
+    WHERE node.name = 'node1'
+  RETURNING block_height AS "blockHeight";
+`)
+      ).rows;
+    const rollback = async () => client.query('ROLLBACK;');
+    const rows = await insertWithoutHeight().then(
+      async (result) => rollback().then(() => result),
+      async (error: unknown) =>
+        // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+        rollback().then(async () => Promise.reject(error))
+    );
+    t.deepEqual(rows, [{ blockHeight: '987654' }]);
+  }
+);
+
+test.serial(
+  '[e2e] [sql] node_block_height migration backfills existing rows and can be re-applied',
+  async (t) => {
+    const migrationDirectory = 'default/1791600000000_node_block_height';
+    const downMigration = readFileSync(
+      migration(`${migrationDirectory}/down.sql`),
+      'utf8'
+    );
+    const upMigration = readFileSync(
+      migration(`${migrationDirectory}/up.sql`),
+      'utf8'
+    );
+    const describeNodeBlockHeight = async () =>
+      (
+        await client.query<{
+          indexExists: boolean;
+          mismatched: string;
+          notNull: boolean;
+          total: string;
+          triggerExists: boolean;
+        }>(/* sql */ `
+SELECT COUNT(*)::bigint AS total,
+       COUNT(*) FILTER (WHERE node_block.block_height IS DISTINCT FROM block.height)::bigint AS mismatched,
+       (SELECT is_nullable = 'NO' FROM information_schema.columns
+          WHERE table_name = 'node_block' AND column_name = 'block_height') AS "notNull",
+       to_regclass('node_block_node_height_index') IS NOT NULL AS "indexExists",
+       EXISTS (SELECT 1 FROM pg_trigger
+          WHERE tgname = 'trigger_public_node_block_fill_height') AS "triggerExists"
+  FROM node_block
+  JOIN block ON block.internal_id = node_block.block_internal_id;
+`)
+      ).rows[0]!;
+    await client.query('BEGIN;');
+    const reapply = async () => {
+      await client.query(downMigration);
+      const columnAfterDown = (
+        await client.query(/* sql */ `
+SELECT 1 FROM information_schema.columns
+  WHERE table_name = 'node_block' AND column_name = 'block_height';
+`)
+      ).rowCount;
+      await client.query(upMigration);
+      const afterBackfill = await describeNodeBlockHeight();
+      await client.query(upMigration);
+      const afterReapply = await describeNodeBlockHeight();
+      /*
+       * A nullable, partly filled column (e.g. an interrupted manual apply) is
+       * backfilled again.
+       */
+      await client.query(downMigration);
+      await client.query(/* sql */ `
+ALTER TABLE node_block ADD COLUMN block_height bigint;
+UPDATE node_block SET block_height = -1
+  WHERE block_internal_id = (SELECT min(block_internal_id) FROM node_block);
+`);
+      await client.query(upMigration);
+      const afterPartial = await describeNodeBlockHeight();
+      return { afterBackfill, afterPartial, afterReapply, columnAfterDown };
+    };
+    const rollback = async () => client.query('ROLLBACK;');
+    const { afterBackfill, afterPartial, afterReapply, columnAfterDown } =
+      await reapply().then(
+        async (result) => rollback().then(() => result),
+        async (error: unknown) =>
+          // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+          rollback().then(async () => Promise.reject(error))
+      );
+    t.deepEqual(columnAfterDown, 0);
+    t.true(Number(afterBackfill.total) > 0);
+    [afterBackfill, afterReapply, afterPartial].forEach((state) => {
+      t.deepEqual(state.mismatched, '0');
+      t.true(state.notNull);
+      t.true(state.indexExists);
+      t.true(state.triggerExists);
+    });
+  }
+);
+
+test.serial(
+  '[e2e] [sql] node_block_height migration handles block internal_ids beyond the int4 array range',
+  async (t) => {
+    /*
+     * Array subscripts are int4, so ids above 2^31 - 1 must not take the
+     * array-literal backfill even when the id span is small. The migration
+     * runs against scratch block/node_block tables found first on the
+     * search_path.
+     */
+    const upMigration = readFileSync(
+      migration('default/1791600000000_node_block_height/up.sql'),
+      'utf8'
+    );
+    await client.query('BEGIN;');
+    const backfill = async () => {
+      await client.query(/* sql */ `
+CREATE SCHEMA node_block_height_migration_test;
+SET LOCAL search_path = node_block_height_migration_test, public;
+CREATE TABLE block (internal_id bigint PRIMARY KEY, height integer NOT NULL);
+CREATE TABLE node_block (
+  node_internal_id bigint NOT NULL,
+  block_internal_id bigint NOT NULL REFERENCES block (internal_id),
+  accepted_at timestamp without time zone
+);
+INSERT INTO block VALUES (3000000000, 5);
+INSERT INTO node_block VALUES (1, 3000000000, NULL);
+`);
+      await client.query(upMigration);
+      return (
+        await client.query<{ blockHeight: string }>(
+          'SELECT block_height AS "blockHeight" FROM node_block;'
+        )
+      ).rows;
+    };
+    const rollback = async () => client.query('ROLLBACK;');
+    const rows = await backfill().then(
+      async (result) => rollback().then(() => result),
+      async (error: unknown) =>
+        // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+        rollback().then(async () => Promise.reject(error))
+    );
+    t.deepEqual(rows, [{ blockHeight: '5' }]);
+  }
+);
+
+test.serial(
+  '[e2e] [sql] per-node tip query uses node_block_node_height_index',
+  async (t) => {
+    /*
+     * The SQL Hasura generates for:
+     * node(where: {name: {_eq: $node}}) {
+     *   accepted_blocks(order_by: {block_height: desc}, limit: 1) { block { hash height } }
+     * }
+     */
+    const tipQuery = /* sql */ `
+SELECT block.height
+  FROM node
+  LEFT JOIN LATERAL (
+    SELECT * FROM node_block
+      WHERE node.internal_id = node_block.node_internal_id
+      ORDER BY block_height DESC NULLS FIRST
+      LIMIT 1
+  ) AS tip ON true
+  JOIN block ON block.internal_id = tip.block_internal_id
+  WHERE node.name = 'node1'`;
+    const expectedHeight = (
+      await client.query<{ height: string }>(/* sql */ `
+SELECT MAX(block.height)::bigint AS height
+  FROM node_block
+  JOIN node ON node.internal_id = node_block.node_internal_id
+  JOIN block ON block.internal_id = node_block.block_internal_id
+  WHERE node.name = 'node1';
+`)
+    ).rows[0]!.height;
+    t.deepEqual((await client.query<{ height: string }>(tipQuery)).rows, [
+      { height: expectedHeight },
+    ]);
+    await client.query('BEGIN;');
+    const explain = async () => {
+      // cspell: disable-next-line
+      await client.query('SET LOCAL enable_seqscan = off;');
+      await client.query('SET LOCAL enable_sort = off;');
+      return (
+        await client.query<{ [column: string]: string }>(
+          `EXPLAIN (COSTS OFF) ${tipQuery}`
+        )
+      ).rows
+        .map((row) => Object.values(row).join(''))
+        .join('\n');
+    };
+    const rollback = async () => client.query('ROLLBACK;');
+    const plan = await explain().then(
+      async (result) => rollback().then(() => result),
+      async (error: unknown) =>
+        // eslint-disable-next-line functional/no-promise-reject -- roll back, then propagate the original failure
+        rollback().then(async () => Promise.reject(error))
+    );
+    t.true(plan.includes('node_block_node_height_index'), plan);
+    t.false(plan.includes('Sort'), plan);
   }
 );

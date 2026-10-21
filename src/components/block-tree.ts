@@ -206,16 +206,28 @@ export class BlockTree {
       return this.getLocatorForNode(nodeName);
     }
     const newHashes = headers.map((header) => header.hash);
+    /**
+     * A `headers` reply may begin below the fork point (e.g. when the fork
+     * block is not in our locator), so leading headers can match blocks we
+     * already have. Only headers from the first differing height replace
+     * (and make stale) existing blocks.
+     */
+    const firstDivergingIndex = newHashes.findIndex(
+      (hash, index) => chain[firstHeight + index] !== hash
+    );
+    const sharedCount =
+      firstDivergingIndex === -1 ? newHashes.length : firstDivergingIndex;
+    const divergeHeight = firstHeight + sharedCount;
     const staleHashes = chain.splice(
-      firstHeight,
-      newHashes.length,
-      ...newHashes
+      divergeHeight,
+      newHashes.length - sharedCount,
+      ...newHashes.slice(sharedCount)
     );
     if (staleHashes.length !== 0) {
       this.logger.warn(
         `${nodeName}: removed ${staleHashes.length} stale block(s) from the block tree.`
       );
-      this.onStaleBlocks(staleHashes, firstHeight, nodeName);
+      this.onStaleBlocks(staleHashes, divergeHeight, nodeName);
     }
     this.logger.debug(
       `${nodeName}: added ${

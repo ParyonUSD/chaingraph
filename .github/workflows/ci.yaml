@@ -3,14 +3,16 @@ on: [push, pull_request]
 
 jobs:
   e2e-tests:
-    name: e2e-tests (unspent-tracking ${{ matrix.unspent-tracking }})
+    name: e2e-tests (unspent-tracking ${{ matrix.unspent-tracking }}, write path ${{ matrix.write-path }})
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
         unspent-tracking: ['false', 'true']
+        write-path: [sql, copy]
     env:
       CHAINGRAPH_UNSPENT_TRACKING: ${{ matrix.unspent-tracking }}
+      CHAINGRAPH_WRITE_PATH: ${{ matrix.write-path }}
     steps:
       # the runner image ships PostgreSQL with the service disabled; Ubuntu's
       # defaults listen on localhost with scram-sha-256 auth for TCP
@@ -54,7 +56,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: e2e-test-log-unspent-${{ matrix.unspent-tracking }}
+          name: e2e-test-log-unspent-${{ matrix.unspent-tracking }}-${{ matrix.write-path }}
           path: data/chaingraph/log-e2e.ndjson
 
   check-yarn-cache:

@@ -18,7 +18,7 @@ For more information, and for examples of live subscriptions and complex queries
 This is the ParyonUSD fork of [bitauth/chaingraph](https://github.com/bitauth/chaingraph). This section exists only on `paryon`.
 
 - **`master`** — only changes proposed upstream. It is the head branch of [bitauth/chaingraph#76](https://github.com/bitauth/chaingraph/pull/76), so anything pushed there appears in that PR; nothing fork-only goes on `master`. Once #76 merges, `master` is reset onto `upstream/master` and `paryon` is rebased.
-- **`paryon`** (this branch) — the deployed fork: `master` plus fork-only work (ingestion gate harness, PR #4; parked block-confirmation trigger fix, PR #5; experiment images; GKE-specific changes). Production and lab images are built from `paryon`, and PRs for fork-only work target `paryon`.
+- **`paryon`** (this branch) — the deployed fork: `master` plus fork-only work (ingestion performance check for schema changes, PR #4; block-confirmation trigger fix, PR #5; experiment images; GKE-specific changes). Production and lab images are built from `paryon`, and PRs for fork-only work target `paryon`.
 - **Promotion** — to propose a fork-only change upstream, cherry-pick it from `paryon` onto a new branch off `master` and open a separate upstream PR; do not fold it into #76.
 - **Archive tags** — every pre-consolidation branch is tagged `archive/<branch>`. `archive/output-membership-arrays` is `e800183`; `archive/pre-array-master` is `b19783b`.
 
@@ -100,7 +100,7 @@ subscription MonitorSyncTips {
 >
 > Note, Chaingraph saves blocks asynchronously, and large blocks can take longer to save to the database. During initial sync, this may cause the subscription to occasionally update its result with lower-height (more recently saved) blocks. Regardless, this subscription will roughly track sync progress for each connected node.
 >
-> This query could also be ordered by block height, but because non-primary indexes are created after initial sync (to reduce time required), ordering by block height can be slow until after the initial sync is complete.
+> To get each node's highest accepted block instead, order by `block_height` (a copy of the block's height on each `node_block`): `accepted_blocks(limit: 1, order_by: { block_height: desc })` is a single probe of the `(node_internal_id, block_height)` index, which exists from the start of initial sync. Prefer it to `block(where: { accepted_by: { node: { name: { _eq: $node } } } }, order_by: { height: desc }, limit: 1)`, which walks every block above the node's tip and is slow when one database holds several networks.
 
 </details>
 
@@ -124,6 +124,16 @@ As a best practice, consider preserving the `my-values.yaml` file for future ref
 helm list # show releases
 helm status my-chaingraph > status.txt
 ```
+
+#### Post-upgrade: extended statistics on `output`
+
+The migration `1791100003000_output_category_capability_statistics` (fork-only) creates the extended statistics object `output_category_capability_stats` on `output (token_category, nonfungible_token_capability)` with a statistics target of 10000. It does not run `ANALYZE`, because analyzing `output` takes several minutes on a mainnet database. After the upgrade, run this once against the Chaingraph database:
+
+```sql
+ANALYZE output;
+```
+
+Until then the planner behaves as before; Postgres's background auto-analyze will also populate the statistics eventually.
 
 ## Architecture
 

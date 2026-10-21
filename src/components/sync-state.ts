@@ -4,25 +4,12 @@ export interface InitialSyncState {
   additionalSyncedHeights: number[];
 }
 
-const removeValueIfPresent = (array: number[], value: number) => {
-  const index = array.indexOf(value);
-  if (index !== -1) {
-    array.splice(index, 1);
-    return true;
-  }
-  return false;
-};
-
 /**
  * A simple data structure to keep track of the known database syncing progress
  * for a particular node.
  */
 export class SyncState {
   fullySyncedUpToHeight: number;
-
-  pendingSyncOfHeights: number[];
-
-  additionalSyncedHeights: number[];
 
   /**
    * The block time claimed by the latest synced block. Chaingraph assumes the
@@ -56,15 +43,33 @@ export class SyncState {
 
   constructor(initialState: InitialSyncState) {
     this.fullySyncedUpToHeight = initialState.fullySyncedUpToHeight;
-    this.pendingSyncOfHeights = initialState.pendingSyncOfHeights.slice();
-    this.additionalSyncedHeights = initialState.additionalSyncedHeights.slice();
-    this.pendingSyncHeights = new Set(this.pendingSyncOfHeights);
-    this.additionalSyncedHeightSet = new Set(this.additionalSyncedHeights);
+    this.pendingSyncHeights = new Set(initialState.pendingSyncOfHeights);
+    this.additionalSyncedHeightSet = new Set(
+      initialState.additionalSyncedHeights
+    );
     this.pendingSyncHeight = this.computePendingSyncHeightFrom(
       this.fullySyncedUpToHeight
     );
     this.latestSyncedBlockTime =
       initialState.fullySyncedUpToHeight > 0 ? 'caught-up' : undefined;
+  }
+
+  /**
+   * Heights currently pending sync, in the order they were marked. (Derived
+   * from a `Set`: removing a height is O(1), so marking many heights as synced
+   * – e.g. after `catchUpViaHeaders` accepts a long run of known blocks – is
+   * linear rather than quadratic.)
+   */
+  get pendingSyncOfHeights() {
+    return [...this.pendingSyncHeights];
+  }
+
+  /**
+   * Heights above `fullySyncedUpToHeight` which have been synced, in the order
+   * they were marked.
+   */
+  get additionalSyncedHeights() {
+    return [...this.additionalSyncedHeightSet];
   }
 
   // eslint-disable-next-line complexity
@@ -82,18 +87,14 @@ export class SyncState {
       this.fullySyncedUpToHeight < height &&
       !this.additionalSyncedHeightSet.has(height)
     ) {
-      this.additionalSyncedHeights.push(height);
       this.additionalSyncedHeightSet.add(height);
-      if (this.pendingSyncHeights.delete(height)) {
-        removeValueIfPresent(this.pendingSyncOfHeights, height);
-      }
+      this.pendingSyncHeights.delete(height);
     }
 
     // eslint-disable-next-line functional/no-let
     let nextHeight = this.fullySyncedUpToHeight + 1;
     // eslint-disable-next-line functional/no-loop-statement
     while (this.additionalSyncedHeightSet.delete(nextHeight)) {
-      removeValueIfPresent(this.additionalSyncedHeights, nextHeight);
       this.fullySyncedUpToHeight = nextHeight;
       nextHeight += 1;
     }
@@ -106,7 +107,6 @@ export class SyncState {
       !this.pendingSyncHeights.has(height) &&
       !this.additionalSyncedHeightSet.has(height)
     ) {
-      this.pendingSyncOfHeights.push(height);
       this.pendingSyncHeights.add(height);
       this.updatePendingSyncHeight();
     }
@@ -125,14 +125,12 @@ export class SyncState {
         ? this.fullySyncedUpToHeight
         : height - 1;
 
-    this.pendingSyncOfHeights = this.pendingSyncOfHeights.filter(
-      (pending) => pending < height
+    this.pendingSyncHeights = new Set(
+      this.pendingSyncOfHeights.filter((pending) => pending < height)
     );
-    this.additionalSyncedHeights = this.additionalSyncedHeights.filter(
-      (completed) => completed < height
+    this.additionalSyncedHeightSet = new Set(
+      this.additionalSyncedHeights.filter((completed) => completed < height)
     );
-    this.pendingSyncHeights = new Set(this.pendingSyncOfHeights);
-    this.additionalSyncedHeightSet = new Set(this.additionalSyncedHeights);
     this.resetPendingSyncHeight();
   }
 
