@@ -32,6 +32,7 @@ import { indexDefinitions } from '../components/db-utils.js';
 import {
   backfillRetainEventsSql,
   configureTrackingTriggersSql,
+  outputHasDefaultSql,
   partitionOf,
 } from '../components/unspent-tracking.js';
 import type * as DbModule from '../db.js';
@@ -3653,6 +3654,223 @@ const drainDeferred = async (
   }
   return stalled;
 };
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentTrackingEnabled
+  )}): after an initial sync from scratch the backfill writes only the outputs whose value differs`,
+  async (t) => {
+    if (!unspentTrackingEnabled) {
+      t.pass();
+      return;
+    }
+    t.timeout(unspentTestTimeoutMs);
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const db = await deferredDbModule('unspent-from-scratch');
+    const hash = (byte: string) => `ed${byte.repeat(31)}`;
+    const count = async (sql: string) =>
+      Number((await client.query<{ n: string }>(sql)).rows[0]!.n);
+    const hasDefault = async () =>
+      (await client.query<{ hasDefault: boolean }>(outputHasDefaultSql))
+        .rows[0]!.hasDefault;
+    const pending = async () =>
+      (
+        await client.query<{ pending: boolean }>(
+          `SELECT unspent_tracking_backfill_pending() AS pending;`
+        )
+      ).rows[0]!.pending;
+    const readMode = async () =>
+      (
+        await client.query<{ mode: string }>(
+          `SELECT unspent_tracking_read_mode() AS mode;`
+        )
+      ).rows[0]!.mode;
+    const nodes = await deferredNodes();
+    // outputs whose value is not '{}': unspent for at least one node
+    const differingSql = /* sql */ `SELECT count(*) AS n FROM (${nodes
+      .map((node) => nodeUnspentReferenceSql(node.id))
+      .join(' UNION ')}) u`;
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      /*
+       * The e2e database was migrated while empty, then the agents (tracking
+       * at the tip enabled, not started: CHAINGRAPH_UNSPENT_TRACKING_RUN_JOB
+       * is false) ran the initial sync: every output was saved with the
+       * column default '{}', as the rows of an upgraded database read it.
+       */
+      t.true(await hasDefault(), 'default set while tracking has not started');
+      t.is(
+        await count(
+          `SELECT count(*) AS n FROM output WHERE unspent_node_ids IS NULL;`
+        ),
+        0,
+        "every output saved during the initial sync reads '{}'"
+      );
+      const syncedOutputs = await count(`SELECT count(*) AS n FROM output;`);
+      t.true(syncedOutputs > 0);
+      /*
+       * The job's first pass drops the default, settles its limits after the
+       * drop and starts tracking at the tip.
+       */
+      await db.runUnspentTrackingJobPass({
+        backfill: false,
+        maxMs: 60_000,
+        settleWaitMs: 2_000,
+      });
+      t.false(await hasDefault(), 'default dropped before tracking starts');
+      const trackingStart = Number(
+        (
+          await client.query<{ id: string | null }>(
+            `SELECT tracking_start_transaction_internal_id AS id FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.id
+      );
+      t.true(trackingStart > 0, 'tracking started at the tip');
+      t.true(await pending(), 'backfill pending');
+      // outputs saved after tracking started are NULL until the job processes them
+      const node = nodes[0]!.id;
+      await db.saveBlock({
+        block: {
+          bits: 0,
+          hash: hash('b0'),
+          height: 997_000,
+          merkleRoot: '00'.repeat(32),
+          nonce: 0,
+          previousBlockHash: '00'.repeat(32),
+          sizeBytes: 0,
+          timestamp: 0,
+          transactions: [
+            {
+              hash: hash('f0'),
+              inputs: [
+                {
+                  outpointIndex: 0,
+                  outpointTransactionHash: hash('ff'),
+                  sequenceNumber: 0,
+                  unlockingBytecode: '51',
+                },
+              ],
+              isCoinbase: false,
+              locktime: 0,
+              outputs: [
+                { lockingBytecode: '51', valueSatoshis: 1000n },
+                { lockingBytecode: '52', valueSatoshis: 1000n },
+              ],
+              sizeBytes: 60,
+              version: 2,
+            },
+          ],
+          version: 1,
+        },
+        nodeAcceptances: [
+          { acceptedAt: new Date(), nodeInternalId: node, nodeName: 'scratch' },
+        ],
+        transactionCache: new Map() as unknown as Parameters<
+          typeof db.saveBlock
+        >[0]['transactionCache'],
+      });
+      t.is(
+        await count(
+          /* sql */ `SELECT count(*) AS n FROM output WHERE transaction_hash = '\\x${hash(
+            'f0'
+          )}'::bytea AND unspent_node_ids IS NULL;`
+        ),
+        2,
+        'outputs saved after tracking started are NULL'
+      );
+      await db.ensureUnspentTrackingIndexes();
+      await drainDeferred(t, db, 'from scratch: tracking started');
+      /*
+       * The backfill: its preparation takes only the outputs whose value is
+       * not '{}' (those the job has written since tracking started), not
+       * every output, and its batches write only the pre-tracking outputs
+       * whose value differs from '{}'.
+       */
+      const notEmptyBefore = await count(
+        `SELECT count(*) AS n FROM output WHERE unspent_node_ids IS DISTINCT FROM '{}';`
+      );
+      const outputsSinceStart = await count(/* sql */ `
+        SELECT count(*) AS n FROM output o JOIN transaction tx ON tx.hash = o.transaction_hash
+          WHERE tx.internal_id > ${trackingStart};`);
+      t.true(
+        notEmptyBefore <= outputsSinceStart,
+        `${notEmptyBefore} outputs not '{}', ${outputsSinceStart} saved since tracking started`
+      );
+      const differing = await count(differingSql);
+      t.true(differing > 0 && differing < syncedOutputs);
+      // cspell:ignore xact xmin
+      const backfillStartXid = (
+        await client.query<{ xid: string }>(
+          `SELECT (pg_current_xact_id()::text::bigint % 4294967296)::text AS xid;`
+        )
+      ).rows[0]!.xid;
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ;');
+      const prepared = (
+        await client.query<{ result: { [key: string]: unknown } }>(/* sql */ `
+          SELECT unspent_tracking_backfill_prepare(
+            (SELECT tracking_start_transaction_internal_id FROM unspent_tracking_settings),
+            (SELECT tracking_start_block_internal_id FROM unspent_tracking_settings),
+            (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq)) AS result;`)
+      ).rows[0]!.result;
+      await client.query('COMMIT;');
+      t.log({ differing, notEmptyBefore, prepared, syncedOutputs });
+      t.is(
+        Number(prepared.rows),
+        notEmptyBefore,
+        "the preparation takes only the outputs whose value is not '{}'"
+      );
+      const backfillPasses = async (remaining: number): Promise<void> => {
+        await db.runUnspentTrackingJobPass({
+          backfill: true,
+          maxMs: 60_000,
+          settleWaitMs: 2_000,
+        });
+        return (await pending()) && remaining > 0
+          ? backfillPasses(remaining - 1)
+          : undefined;
+      };
+      await backfillPasses(50);
+      t.false(await pending(), 'backfill complete');
+      const written = await count(/* sql */ `
+        SELECT count(*) AS n FROM output o WHERE o.xmin::text::bigint > ${backfillStartXid};`);
+      t.log({ written });
+      t.true(
+        written <= differing + notEmptyBefore,
+        `${written} outputs written, ${differing} differ from '{}'`
+      );
+      t.true(written < syncedOutputs, `${written} of ${syncedOutputs} written`);
+      await drainDeferred(t, db, 'from scratch: backfill complete');
+      t.not(await readMode(), 'live', 'backfill complete: stored set');
+      t.is(
+        await count(
+          `SELECT count(*) AS n FROM output WHERE unspent_node_ids IS NULL;`
+        ),
+        0,
+        'no output left NULL'
+      );
+      await client.query('ANALYZE;');
+      await compareDeferredStored(t, 'from scratch: backfill complete', 0);
+      await compareDeferredQueryRoot(t, 'from scratch: backfill complete');
+    } finally {
+      /*
+       * The tests below start from a database where tracking never started
+       * and the outputs were saved without the default (NULL).
+       */
+      await client.query(`SELECT unspent_tracking_stop();`);
+      await client.query(/* sql */ `
+        UPDATE unspent_tracking_settings SET rebuild_required = false;
+        ALTER TABLE output ALTER COLUMN unspent_node_ids DROP DEFAULT;
+        UPDATE output SET unspent_node_ids = NULL WHERE unspent_node_ids IS NOT NULL;`);
+      await db.pool.end();
+      await db.unspentTrackingJobPool.end();
+      if (originalPostgresConnectionString !== undefined) {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+  }
+);
 
 test.serial(
   `[e2e] unspent tracking (${String(

@@ -38,6 +38,7 @@ import {
   configurationLockKey,
   configureTrackingTriggersSql,
   deleteConsumedEventsSql,
+  dropOutputDefaultSql,
   formatBatchLog,
   headersAcceptedEventsSql,
   initializeSql,
@@ -46,6 +47,7 @@ import {
   nextStallState,
   nextTransactionIdSql,
   nodeIndexDefinitions,
+  outputHasDefaultSql,
   parseBatchResult,
   parseWatchPassResult,
   progressSql,
@@ -56,8 +58,10 @@ import {
   runBatchSql,
   serverVersionError,
   serverVersionSql,
+  setOutputDefaultSql,
   snapshotSettledSql,
   stopTrackingSql,
+  trackingStartStateSql,
   trackingTriggerNames,
   transactionReacceptedEventsSql,
   watchPassSql,
@@ -2120,11 +2124,57 @@ export const setUnspentTrackingLoggers = (
   unspentTrackingLog.warn = loggers.warn;
 };
 
+const lockNotAvailable = '55P03';
+const isLockNotAvailable = (err: unknown) =>
+  (err as { code?: string } | undefined)?.code === lockNotAvailable;
+
 const runStatements = async (client: pg.PoolClient, statements: string[]) =>
   statements.reduce<Promise<unknown>>(
     async (chain, statement) => chain.then(async () => client.query(statement)),
     Promise.resolve()
   );
+
+/**
+ * Tracking at the tip, not started yet (an initial sync): give
+ * `output.unspent_node_ids` the default `'{}'`, so outputs saved until tracking
+ * starts read as on an upgraded database (see {@link setOutputDefaultSql}).
+ * Runs inside the configuration transaction; the settings row is locked first,
+ * so it never sets the default once tracking has started (tracking does not
+ * start while the column has one). If the lock on `output` is not granted
+ * within the lock timeout, outputs keep NULL (the backfill then writes them
+ * all) and the next agent start tries again. Returns the statements run.
+ */
+// cspell:ignore savepoint
+const setOutputDefaultBeforeTracking = async (client: pg.PoolClient) => {
+  const [state] = (
+    await client.query<{ hasDefault: boolean; started: boolean }>(
+      trackingStartStateSql
+    )
+  ).rows;
+  if (state === undefined || state.started || state.hasDefault) {
+    return [];
+  }
+  await client.query('SAVEPOINT unspent_output_default;');
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    await runStatements(client, setOutputDefaultSql);
+    await client.query('RELEASE SAVEPOINT unspent_output_default;');
+    unspentTrackingLog.info(
+      "Unspent tracking has not started: outputs are saved with unspent_node_ids '{}' until it starts at the tip, so the backfill writes only the outputs whose value differs."
+    );
+    return setOutputDefaultSql;
+  } catch (err) {
+    if (!isLockNotAvailable(err)) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw err;
+    }
+    await client.query('ROLLBACK TO SAVEPOINT unspent_output_default;');
+    unspentTrackingLog.warn(
+      "Unspent tracking: could not lock output to set the unspent_node_ids default '{}' (lock timeout); outputs saved before tracking starts stay NULL, so the backfill writes every one of them. Retried at the next agent start."
+    );
+    return [];
+  }
+};
 
 /**
  * Enable the release-event triggers when tracking is on, write the read
@@ -2201,8 +2251,16 @@ export const configureUnspentTracking = async () => {
       unspentTracking.readStoredMaxEvents,
     ]);
     await client.query(buildRootSql);
+    const defaultStatements = unspentTracking.startAtGenesis
+      ? []
+      : await setOutputDefaultBeforeTracking(client);
     await client.query('COMMIT;');
-    return [...statements, writeSettingsSql, buildRootSql];
+    return [
+      ...statements,
+      writeSettingsSql,
+      buildRootSql,
+      ...defaultStatements,
+    ];
   } catch (err) {
     await client.query('ROLLBACK;');
     // eslint-disable-next-line functional/no-throw-statement
@@ -2416,9 +2474,6 @@ const settleLimits = async (client: pg.PoolClient, waitMs: number) => {
 const serializationFailure = '40001';
 const isSerializationFailure = (err: unknown) =>
   (err as { code?: string } | undefined)?.code === serializationFailure;
-const lockNotAvailable = '55P03';
-const isLockNotAvailable = (err: unknown) =>
-  (err as { code?: string } | undefined)?.code === lockNotAvailable;
 
 /**
  * One batch of one partition in its own REPEATABLE READ transaction (one
@@ -2596,6 +2651,42 @@ const runWatchPass = async (
 };
 
 /**
+ * Drop the default of `output.unspent_node_ids` if it has one (set while
+ * tracking at the tip had not started; see {@link setOutputDefaultSql}), so
+ * every output saved from now on is NULL ("not processed yet"). Returns
+ * whether the column still has a default (the lock on `output` was not
+ * granted within the lock timeout: retried next pass).
+ */
+const dropOutputDefault = async (client: pg.PoolClient) => {
+  const hasDefault =
+    (await client.query<{ hasDefault: boolean }>(outputHasDefaultSql)).rows[0]
+      ?.hasDefault === true;
+  if (!hasDefault) {
+    return { dropped: false, hasDefault: false };
+  }
+  await client.query('BEGIN;');
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    await runStatements(client, dropOutputDefaultSql);
+    await client.query('COMMIT;');
+    unspentTrackingLog.info(
+      "Unspent tracking job: dropped the unspent_node_ids default '{}' before tracking starts (outputs saved from now on are NULL until the job processes them)."
+    );
+    return { dropped: true, hasDefault: false };
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    if (!isLockNotAvailable(err)) {
+      // eslint-disable-next-line functional/no-throw-statement
+      throw err;
+    }
+    unspentTrackingLog.warn(
+      'Unspent tracking job: could not lock output to drop the unspent_node_ids default (lock timeout); tracking starts once it is dropped (retried next pass).'
+    );
+    return { dropped: false, hasDefault: true };
+  }
+};
+
+/**
  * Start tracking if it has not started (at the settled limits, or at genesis),
  * and re-partition if the configured connection count changed.
  */
@@ -2604,15 +2695,43 @@ const ensureInitialized = async (
   partitionCount: number,
   limits: SettledLimits
 ) => {
-  const initialized =
-    (
-      await client.query<{ initialized: boolean }>(initializeSql, [
-        partitionCount,
-        unspentTracking.startAtGenesis ? 0 : limits.transactionLimit,
-        unspentTracking.startAtGenesis ? 0 : limits.blockLimit,
-        limits.eventLimit,
-      ])
-    ).rows[0]?.initialized === true;
+  /*
+   * The settings row is locked before the column default is checked, so an
+   * agent setting the default (setOutputDefaultBeforeTracking) either commits
+   * first and is seen here, or sees that tracking has started.
+   */
+  await client.query('BEGIN;');
+  // eslint-disable-next-line functional/no-let
+  let initialized = false;
+  // eslint-disable-next-line functional/no-try-statement
+  try {
+    const [state] = (
+      await client.query<{ hasDefault: boolean; started: boolean }>(
+        trackingStartStateSql
+      )
+    ).rows;
+    if (state?.started === false && state.hasDefault) {
+      await client.query('ROLLBACK;');
+      unspentTrackingLog.warn(
+        'Unspent tracking job: output.unspent_node_ids has a default (set by an agent in its initial sync); tracking starts once it is dropped (next pass).'
+      );
+      return;
+    }
+    initialized =
+      (
+        await client.query<{ initialized: boolean }>(initializeSql, [
+          partitionCount,
+          unspentTracking.startAtGenesis ? 0 : limits.transactionLimit,
+          unspentTracking.startAtGenesis ? 0 : limits.blockLimit,
+          limits.eventLimit,
+        ])
+      ).rows[0]?.initialized === true;
+    await client.query('COMMIT;');
+  } catch (err) {
+    await client.query('ROLLBACK;');
+    // eslint-disable-next-line functional/no-throw-statement
+    throw err;
+  }
   if (initialized) {
     unspentTrackingLog.info(
       `Unspent tracking job: tracking started at ${
@@ -2690,6 +2809,16 @@ export const runUnspentTrackingJobPass = async (
     const coordinator = await unspentTrackingJobPool.connect();
     // eslint-disable-next-line functional/no-try-statement
     try {
+      const outputDefault = await dropOutputDefault(coordinator);
+      if (outputDefault.dropped || outputDefault.hasDefault) {
+        /*
+         * Outputs saved with the default may belong to transactions above
+         * limits read before the drop: settle new limits after it, so
+         * tracking starts above every output saved with the default.
+         */
+        settleCandidate = undefined;
+        settledLimits = undefined;
+      }
       await settleLimits(
         coordinator,
         options.settleWaitMs ?? Math.max(unspentTracking.settleMs * 5, 1_000)

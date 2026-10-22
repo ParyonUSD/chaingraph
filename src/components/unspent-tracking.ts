@@ -6,7 +6,8 @@
  * query root.
  *
  * - Ingestion stays append-only: outputs are inserted with a NULL
- *   `unspent_node_ids` ("not processed yet"); the only write-path additions
+ *   `unspent_node_ids` ("not processed yet"; `'{}'` before tracking at the
+ *   tip starts, see {@link setOutputDefaultSql}); the only write-path additions
  *   are the release-event triggers and an "accepted" event on the agent's
  *   re-acceptance paths.
  * - A recurring job runs one batch per partition (outpoint hash range), each
@@ -149,6 +150,47 @@ SELECT
   (SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM unspent_tracking_events_id_seq)::text AS "eventLimit";`;
 export const nextTransactionIdSql = /* sql */ `SELECT pg_current_xact_id()::text AS "nextXid";`;
 export const snapshotSettledSql = /* sql */ `SELECT pg_snapshot_xmin(pg_current_snapshot()) > $1::xid8 AS settled;`;
+
+/**
+ * The column default of `output.unspent_node_ids` before tracking starts.
+ *
+ * Outputs saved before tracking starts (at the tip) are pre-tracking: the
+ * backfill computes their values, and it writes only the rows whose value may
+ * differ from `'{}'` (most outputs are spent by a transaction every node
+ * accepts). Rows that existed when the migration added the column read `'{}'`;
+ * rows saved later read NULL unless the column has a default. So while
+ * tracking at the tip is enabled but not started (an initial sync), the agent
+ * sets the default `'{}'`: a database built from scratch then ends its initial
+ * sync in the same state as an upgraded one, and the backfill writes only the
+ * outputs that differ, not every output.
+ *
+ * Outputs of transactions above the tracking start must be NULL ("not
+ * processed yet"), so the default is dropped before the job settles the limits
+ * it starts tracking at, and tracking does not start while the column has a
+ * default. Tracking from genesis keeps NULL: the job processes every output,
+ * and NULL lets it take its fast path.
+ *
+ * `ALTER TABLE` takes a short exclusive lock on `output`; `lock_timeout` keeps
+ * it from queueing behind a long read (the change is retried later).
+ */
+// cspell:ignore atthasdef attrelid attname attisdropped
+export const outputDefaultLockTimeout = '5s';
+export const trackingStartStateSql = /* sql */ `
+SELECT s.tracking_start_transaction_internal_id IS NOT NULL AS started,
+       (SELECT a.atthasdef FROM pg_attribute a
+          WHERE a.attrelid = 'output'::regclass AND a.attname = 'unspent_node_ids' AND NOT a.attisdropped) AS "hasDefault"
+  FROM unspent_tracking_settings s FOR UPDATE;`;
+export const outputHasDefaultSql = /* sql */ `
+SELECT a.atthasdef AS "hasDefault" FROM pg_attribute a
+  WHERE a.attrelid = 'output'::regclass AND a.attname = 'unspent_node_ids' AND NOT a.attisdropped;`;
+export const setOutputDefaultSql = [
+  `SET LOCAL lock_timeout = '${outputDefaultLockTimeout}';`,
+  /* sql */ `ALTER TABLE output ALTER COLUMN unspent_node_ids SET DEFAULT '{}';`,
+];
+export const dropOutputDefaultSql = [
+  `SET LOCAL lock_timeout = '${outputDefaultLockTimeout}';`,
+  /* sql */ `ALTER TABLE output ALTER COLUMN unspent_node_ids DROP DEFAULT;`,
+];
 
 export const initializeSql = /* sql */ `SELECT unspent_tracking_initialize($1::integer, $2::bigint, $3::bigint, $4::bigint) AS initialized;`;
 export const repartitionSql = /* sql */ `SELECT unspent_tracking_repartition($1::integer) AS repartitioned;`;
