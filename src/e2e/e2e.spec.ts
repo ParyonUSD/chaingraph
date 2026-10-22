@@ -3700,10 +3700,17 @@ test.serial(
        * column default '{}', as the rows of an upgraded database read it.
        */
       t.true(await hasDefault(), 'default set while tracking has not started');
+      /*
+       * Only the genesis blocks are saved before the agent configures
+       * tracking (when it registers its nodes): their outputs stay NULL, and
+       * the backfill takes them like any output whose value is not '{}'.
+       */
       t.is(
-        await count(
-          `SELECT count(*) AS n FROM output WHERE unspent_node_ids IS NULL;`
-        ),
+        await count(/* sql */ `
+          SELECT count(*) AS n FROM output o JOIN transaction tx ON tx.hash = o.transaction_hash
+            WHERE o.unspent_node_ids IS NULL
+              AND NOT EXISTS (SELECT 1 FROM block_transaction bt JOIN block b ON b.internal_id = bt.block_internal_id
+                                WHERE bt.transaction_internal_id = tx.internal_id AND b.height = 0);`),
         0,
         "every output saved during the initial sync reads '{}'"
       );
@@ -3793,9 +3800,13 @@ test.serial(
       const outputsSinceStart = await count(/* sql */ `
         SELECT count(*) AS n FROM output o JOIN transaction tx ON tx.hash = o.transaction_hash
           WHERE tx.internal_id > ${trackingStart};`);
+      const genesisOutputs = await count(/* sql */ `
+        SELECT count(*) AS n FROM output o JOIN transaction tx ON tx.hash = o.transaction_hash
+          JOIN block_transaction bt ON bt.transaction_internal_id = tx.internal_id
+          JOIN block b ON b.internal_id = bt.block_internal_id WHERE b.height = 0;`);
       t.true(
-        notEmptyBefore <= outputsSinceStart,
-        `${notEmptyBefore} outputs not '{}', ${outputsSinceStart} saved since tracking started`
+        notEmptyBefore <= outputsSinceStart + genesisOutputs,
+        `${notEmptyBefore} outputs not '{}', ${outputsSinceStart} saved since tracking started, ${genesisOutputs} in genesis blocks`
       );
       const differing = await count(differingSql);
       t.true(differing > 0 && differing < syncedOutputs);
@@ -3814,7 +3825,14 @@ test.serial(
             (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq)) AS result;`)
       ).rows[0]!.result;
       await client.query('COMMIT;');
-      t.log({ differing, notEmptyBefore, prepared, syncedOutputs });
+      t.log({
+        differing,
+        genesisOutputs,
+        notEmptyBefore,
+        outputsSinceStart,
+        prepared,
+        syncedOutputs,
+      });
       t.is(
         Number(prepared.rows),
         notEmptyBefore,

@@ -2138,37 +2138,38 @@ const runStatements = async (client: pg.PoolClient, statements: string[]) =>
  * Tracking at the tip, not started yet (an initial sync): give
  * `output.unspent_node_ids` the default `'{}'`, so outputs saved until tracking
  * starts read as on an upgraded database (see {@link setOutputDefaultSql}).
- * Runs inside the configuration transaction; the settings row is locked first,
- * so it never sets the default once tracking has started (tracking does not
- * start while the column has one). If the lock on `output` is not granted
- * within the lock timeout, outputs keep NULL (the backfill then writes them
- * all) and the next agent start tries again. Returns the statements run.
+ * Its own transaction (no other table is locked while it waits for `output`,
+ * which block saves hold); the settings row is locked first, so it never sets
+ * the default once tracking has started (tracking does not start while the
+ * column has one). If the lock on `output` is not granted within the lock
+ * timeout, outputs keep NULL (the backfill then writes them all) and the next
+ * agent start tries again. Returns the statements run.
  */
-// cspell:ignore savepoint
 const setOutputDefaultBeforeTracking = async (client: pg.PoolClient) => {
-  const [state] = (
-    await client.query<{ hasDefault: boolean; started: boolean }>(
-      trackingStartStateSql
-    )
-  ).rows;
-  if (state === undefined || state.started || state.hasDefault) {
-    return [];
-  }
-  await client.query('SAVEPOINT unspent_output_default;');
+  await client.query('BEGIN;');
   // eslint-disable-next-line functional/no-try-statement
   try {
+    const [state] = (
+      await client.query<{ hasDefault: boolean; started: boolean }>(
+        trackingStartStateSql
+      )
+    ).rows;
+    if (state === undefined || state.started || state.hasDefault) {
+      await client.query('COMMIT;');
+      return [];
+    }
     await runStatements(client, setOutputDefaultSql);
-    await client.query('RELEASE SAVEPOINT unspent_output_default;');
+    await client.query('COMMIT;');
     unspentTrackingLog.info(
       "Unspent tracking has not started: outputs are saved with unspent_node_ids '{}' until it starts at the tip, so the backfill writes only the outputs whose value differs."
     );
     return setOutputDefaultSql;
   } catch (err) {
+    await client.query('ROLLBACK;');
     if (!isLockNotAvailable(err)) {
       // eslint-disable-next-line functional/no-throw-statement
       throw err;
     }
-    await client.query('ROLLBACK TO SAVEPOINT unspent_output_default;');
     unspentTrackingLog.warn(
       "Unspent tracking: could not lock output to set the unspent_node_ids default '{}' (lock timeout); outputs saved before tracking starts stay NULL, so the backfill writes every one of them. Retried at the next agent start."
     );
@@ -2251,10 +2252,10 @@ export const configureUnspentTracking = async () => {
       unspentTracking.readStoredMaxEvents,
     ]);
     await client.query(buildRootSql);
+    await client.query('COMMIT;');
     const defaultStatements = unspentTracking.startAtGenesis
       ? []
       : await setOutputDefaultBeforeTracking(client);
-    await client.query('COMMIT;');
     return [
       ...statements,
       writeSettingsSql,
