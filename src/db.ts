@@ -42,6 +42,7 @@ import {
   formatBatchLog,
   headersAcceptedEventsSql,
   initializeSql,
+  lockTrackingSettingsSql,
   markNodeIndexedSql,
   nextSkipThrough,
   nextStallState,
@@ -2135,6 +2136,21 @@ const runStatements = async (client: pg.PoolClient, statements: string[]) =>
   );
 
 /**
+ * Lock the settings row and read the tracking start state (call inside a
+ * transaction). The state is read in its own statement after the lock is
+ * granted, so a default committed by the previous holder of the lock is seen.
+ */
+export const readTrackingStartState = async (client: pg.PoolClient) => {
+  await client.query(lockTrackingSettingsSql);
+  const [state] = (
+    await client.query<{ hasDefault: boolean; started: boolean }>(
+      trackingStartStateSql
+    )
+  ).rows;
+  return state;
+};
+
+/**
  * Tracking at the tip, not started yet (an initial sync): give
  * `output.unspent_node_ids` the default `'{}'`, so outputs saved until tracking
  * starts read as on an upgraded database (see {@link setOutputDefaultSql}).
@@ -2149,11 +2165,7 @@ const setOutputDefaultBeforeTracking = async (client: pg.PoolClient) => {
   await client.query('BEGIN;');
   // eslint-disable-next-line functional/no-try-statement
   try {
-    const [state] = (
-      await client.query<{ hasDefault: boolean; started: boolean }>(
-        trackingStartStateSql
-      )
-    ).rows;
+    const state = await readTrackingStartState(client);
     if (state === undefined || state.started || state.hasDefault) {
       await client.query('COMMIT;');
       return [];
@@ -2706,11 +2718,7 @@ const ensureInitialized = async (
   let initialized = false;
   // eslint-disable-next-line functional/no-try-statement
   try {
-    const [state] = (
-      await client.query<{ hasDefault: boolean; started: boolean }>(
-        trackingStartStateSql
-      )
-    ).rows;
+    const state = await readTrackingStartState(client);
     if (state?.started === false && state.hasDefault) {
       await client.query('ROLLBACK;');
       unspentTrackingLog.warn(

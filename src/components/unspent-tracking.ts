@@ -175,11 +175,18 @@ export const snapshotSettledSql = /* sql */ `SELECT pg_snapshot_xmin(pg_current_
  */
 // cspell:ignore atthasdef attrelid attname attisdropped
 export const outputDefaultLockTimeout = '5s';
+/**
+ * Lock the settings row, then read in a separate statement (a READ COMMITTED
+ * snapshot taken after the lock is granted, so it sees what the previous
+ * holder committed) whether tracking has started and whether the column has a
+ * default.
+ */
+export const lockTrackingSettingsSql = /* sql */ `SELECT 1 FROM unspent_tracking_settings FOR UPDATE;`;
 export const trackingStartStateSql = /* sql */ `
 SELECT s.tracking_start_transaction_internal_id IS NOT NULL AS started,
        (SELECT a.atthasdef FROM pg_attribute a
           WHERE a.attrelid = 'output'::regclass AND a.attname = 'unspent_node_ids' AND NOT a.attisdropped) AS "hasDefault"
-  FROM unspent_tracking_settings s FOR UPDATE;`;
+  FROM unspent_tracking_settings s;`;
 export const outputHasDefaultSql = /* sql */ `
 SELECT a.atthasdef AS "hasDefault" FROM pg_attribute a
   WHERE a.attrelid = 'output'::regclass AND a.attname = 'unspent_node_ids' AND NOT a.attisdropped;`;

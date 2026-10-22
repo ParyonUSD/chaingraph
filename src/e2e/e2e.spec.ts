@@ -3891,6 +3891,59 @@ test.serial(
 );
 
 test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentTrackingEnabled
+  )}): the tracking start check sees a default committed while it waits for the settings row`,
+  async (t) => {
+    if (!unspentTrackingEnabled) {
+      t.pass();
+      return;
+    }
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const db = await deferredDbModule('unspent-default-check');
+    const holder = await db.pool.connect();
+    const checker = await db.pool.connect();
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      // an agent setting the default holds the settings row
+      await holder.query('BEGIN;');
+      t.deepEqual(await db.readTrackingStartState(holder), {
+        hasDefault: false,
+        started: false,
+      });
+      await holder.query(
+        `ALTER TABLE output ALTER COLUMN unspent_node_ids SET DEFAULT '{}';`
+      );
+      // the job's check waits for the row, then must see the committed default
+      await checker.query('BEGIN;');
+      const checked = db.readTrackingStartState(checker);
+      await deferredSleep(500);
+      await holder.query('COMMIT;');
+      t.deepEqual(
+        await checked,
+        { hasDefault: true, started: false },
+        'default committed by the previous holder of the settings row'
+      );
+      await checker.query('ROLLBACK;');
+    } finally {
+      await holder.query('ROLLBACK;');
+      await client.query(
+        `ALTER TABLE output ALTER COLUMN unspent_node_ids DROP DEFAULT;`
+      );
+      holder.release();
+      checker.release();
+      await db.pool.end();
+      await db.unspentTrackingJobPool.end();
+      if (originalPostgresConnectionString !== undefined) {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+  }
+);
+
+test.serial(
   `[e2e] unspent tracking (${String(
     unspentTrackingEnabled
   )}): deferred job and query root equal the per-node reference`,
