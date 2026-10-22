@@ -17,7 +17,15 @@ const nodeName = 'node1';
 const kilobyte = 1_000;
 const megabyte = 1_000_000;
 
-const hashForHeight = (height: number) => height.toString(16).padStart(64, '0');
+/**
+ * Each stub node follows its own chain: block hashes start with the node's
+ * one-byte chain id, followed by the height.
+ */
+const hashForBlock = (chainId: number, height: number) =>
+  `${chainId.toString(16).padStart(2, '0')}${height
+    .toString(16)
+    .padStart(62, '0')}`;
+const bestHeight = 100_000;
 
 const loadAgentClass = async () => {
   process.env.CHAINGRAPH_TRUSTED_NODES = `${nodeName}:127.0.0.1:18333:testnet4`;
@@ -26,21 +34,36 @@ const loadAgentClass = async () => {
 
 const createTestAgent = (
   agentClass: typeof AgentClass,
-  { bufferTargetBytes }: { bufferTargetBytes: number }
+  {
+    bufferTargetBytes,
+    nodeNames = [nodeName],
+  }: { bufferTargetBytes: number; nodeNames?: string[] }
 ) => {
   const sentRequests: string[] = [];
-  const peer = {
+  const createPeer = () => ({
     // eslint-disable-next-line @typescript-eslint/naming-convention
     messages: { GetData: { forBlock: (hash: string) => hash } },
     sendMessage: (hash: string) => {
       sentRequests.push(hash);
     },
     status: 'ready',
-  };
-  const state = {
-    fillScheduled: false,
-    nextHeight: 1,
-  };
+  });
+  const chainIdOf = (name: string) => nodeNames.indexOf(name) + 1;
+  const nodeOfHash = (hash: string) =>
+    nodeNames[parseInt(hash.slice(0, 2), 16) - 1]!;
+  const nodes = Object.fromEntries(
+    nodeNames.map((name) => {
+      const syncState = {
+        getPendingSyncHeight: () => syncState.pendingHeight,
+        markHeightAsPendingSync: (height: number) => {
+          syncState.pendingHeight = Math.max(syncState.pendingHeight, height);
+        },
+        pendingHeight: 0,
+      };
+      return [name, { peer: createPeer(), syncState }];
+    })
+  );
+  const state = { fillScheduled: false };
   const noop = () => undefined;
   const agent = Object.create(agentClass.prototype) as AgentClass;
   Object.assign(agent, {
@@ -51,30 +74,24 @@ const createTestAgent = (
       targetSize: bufferTargetBytes,
     }),
     blockDownloads: [],
-    blockTree: { getNodesWithBlock: () => [nodeName] },
-    logger: { debug: noop, error: noop, trace: noop, warn: noop },
-    nodes: {
-      [nodeName]: {
-        peer,
-        syncState: { markHeightAsPendingSync: noop },
-      },
+    blockTree: {
+      getBestHeights: () =>
+        Object.fromEntries(nodeNames.map((name) => [name, bestHeight])),
+      getBlockHeaderHash: (name: string, height: number) =>
+        hashForBlock(chainIdOf(name), height),
+      getNodesWithBlock: (hash: string) => [nodeOfHash(hash)],
+      getSourceNodesForBlockHeader: (hash: string) => [nodeOfHash(hash)],
     },
+    logger: { debug: noop, error: noop, trace: noop, warn: noop },
+    nodes,
     scheduleBlockBufferFill: () => {
       state.fillScheduled = true;
     },
     scheduleBlockParse: noop,
-    selectNextBlockToDownload: () => {
-      const height = state.nextHeight;
-      state.nextHeight += 1;
-      return {
-        hash: hashForHeight(height),
-        height,
-        sourceNodes: [nodeName],
-      };
-    },
     syncedAtLastFillAttempt: false,
     willShutdown: false,
   });
+  const { peer } = nodes[nodeName]!;
 
   /**
    * Run scheduled fills until the agent stops scheduling them (the real
@@ -99,7 +116,7 @@ const createTestAgent = (
    */
   const deliverSentDownloads = () => {
     sentDownloads().forEach((download) => {
-      agent.handleBlockFromNode(nodeName, {
+      agent.handleBlockFromNode(download.requestedFromNode!, {
         header: { hash: download.hash },
       } as unknown as Parameters<AgentClass['handleBlockFromNode']>[1]);
     });
@@ -115,6 +132,7 @@ const createTestAgent = (
     agent,
     clearAllDownloads,
     deliverSentDownloads,
+    nodes,
     peer,
     runScheduledFills,
     sentDownloads,
@@ -224,6 +242,41 @@ test.serial(
       'no download waits for the download timeout'
     );
     t.is(sentRequests.length, 2 * sentBeforeDisconnect);
+    assertNoDeferredReservations(t, agent);
+    clearAllDownloads();
+  }
+);
+
+test.serial(
+  'a chain whose nodes cannot take a request does not hold back the other chains',
+  async (t) => {
+    const agentClass = await loadAgentClass();
+    const {
+      agent,
+      clearAllDownloads,
+      nodes,
+      runScheduledFills,
+      sentDownloads,
+    } = createTestAgent(agentClass, {
+      bufferTargetBytes: 100 * megabyte,
+      nodeNames: ['node1', 'node2'],
+    });
+    agent.blockBuffer.addBlock(bufferedBlockOfSize(100 * kilobyte));
+    /**
+     * node1's chain is the least synced, and its only node is disconnected.
+     */
+    nodes.node1!.peer.status = 'disconnected';
+    nodes.node2!.syncState.pendingHeight = 50_000;
+    runScheduledFills();
+
+    t.is(
+      sentDownloads().filter(
+        (download) => download.requestedFromNode === 'node2'
+      ).length,
+      maxPendingDownloads,
+      'node2 downloads its chain'
+    );
+    t.is(nodes.node1!.syncState.pendingHeight, 0, 'nothing marked pending');
     assertNoDeferredReservations(t, agent);
     clearAllDownloads();
   }

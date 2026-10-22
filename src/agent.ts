@@ -1108,19 +1108,19 @@ export class Agent {
         return;
       }
       this.syncedAtLastFillAttempt = false;
-      const { hash, height, sourceNodes } = nextBlock;
-      if (!this.hasDownloadSlotForBlock(hash, height)) {
+      if (nextBlock === 'no-download-slot') {
         /**
-         * Every node with this block already has the maximum number of
+         * Every node with a next block already has the maximum number of
          * pending downloads (or is disconnected). Reserving space now would
          * hold buffer space for a request that is not sent, so stop here: the
          * next finished download frees a slot and schedules another fill.
          */
         this.logger.trace(
-          `fillBlockBuffer: no download slot available for block ${height} (${hash}); waiting for a pending download to finish.`
+          'fillBlockBuffer: no download slot available; waiting for a pending download to finish.'
         );
         return;
       }
+      const { hash, height, sourceNodes } = nextBlock;
       this.blockBuffer.reserveBlock();
       this.requestBlock(hash, height);
       sourceNodes.forEach((nodeName) => {
@@ -1748,6 +1748,14 @@ export class Agent {
     return syncPercentages.sort((a, b) => a.syncPercentage - b.syncPercentage);
   }
 
+  /**
+   * Select the next block to download: the next block of the least-synced
+   * chain whose next block a connected node can take now (fewer than
+   * `maxPendingDownloads` pending downloads). Returns `false` when every
+   * remaining block of every chain is pending, and `'no-download-slot'` when
+   * blocks remain but no node with any chain's next block can take a request
+   * (the next finished download or connection schedules another fill).
+   */
   selectNextBlockToDownload() {
     const percentages = this.getChainSyncPercentages();
     const leastSyncedChain = percentages[0]!;
@@ -1761,16 +1769,28 @@ export class Agent {
       );
       return false;
     }
-    const { nodeName, pendingHeight } = leastSyncedChain;
-    const height = pendingHeight + 1;
+    const selected = percentages
+      .filter((chain) => chain.pendingHeight < chain.bestHeight)
+      .map((chain) => {
+        const height = chain.pendingHeight + 1;
+        return {
+          chain,
+          hash: this.blockTree.getBlockHeaderHash(chain.nodeName, height)!,
+          height,
+        };
+      })
+      .find(({ hash, height }) => this.hasDownloadSlotForBlock(hash, height));
+    if (selected === undefined) {
+      return 'no-download-slot' as const;
+    }
+    const { chain, hash, height } = selected;
     this.logger.trace(
-      `Selecting next block from least-synced chain – node: ${
-        leastSyncedChain.nodeName
+      `Selecting next block from least-synced chain with a free download slot – node: ${
+        chain.nodeName
       } | selected: ${height} | best: ${
-        leastSyncedChain.bestHeight
-      } | synced: ${renderSyncPercentage(leastSyncedChain.syncPercentage)}%`
+        chain.bestHeight
+      } | synced: ${renderSyncPercentage(chain.syncPercentage)}%`
     );
-    const hash = this.blockTree.getBlockHeaderHash(nodeName, height)!;
     const sourceNodes = this.blockTree.getSourceNodesForBlockHeader(
       hash,
       height
