@@ -1039,6 +1039,7 @@ export class Agent {
         this.blockBuffer.reservedBlocks
       })`
     );
+    this.retryDeferredDownloads();
     if (!this.blockBuffer.isFull()) {
       const nextBlock = this.selectNextBlockToDownload();
       if (nextBlock === false) {
@@ -1107,8 +1108,20 @@ export class Agent {
         return;
       }
       this.syncedAtLastFillAttempt = false;
-      this.blockBuffer.reserveBlock();
       const { hash, height, sourceNodes } = nextBlock;
+      if (!this.hasDownloadSlotForBlock(hash, height)) {
+        /**
+         * Every node with this block already has the maximum number of
+         * pending downloads (or is disconnected). Reserving space now would
+         * hold buffer space for a request that is not sent, so stop here: the
+         * next finished download frees a slot and schedules another fill.
+         */
+        this.logger.trace(
+          `fillBlockBuffer: no download slot available for block ${height} (${hash}); waiting for a pending download to finish.`
+        );
+        return;
+      }
+      this.blockBuffer.reserveBlock();
       this.requestBlock(hash, height);
       sourceNodes.forEach((nodeName) => {
         this.nodes[nodeName]!.syncState!.markHeightAsPendingSync(height);
@@ -1872,6 +1885,40 @@ export class Agent {
   }
 
   /**
+   * Check whether a connected node with the given block has fewer than
+   * `maxPendingDownloads` pending downloads, so a request for the block would
+   * be sent now rather than deferred.
+   *
+   * @param hash - the header hash of the block
+   * @param height - the known height of the block
+   */
+  hasDownloadSlotForBlock(hash: string, height: number) {
+    return (
+      this.orderNodesByExpectedDownloadSpeed(
+        this.blockTree.getNodesWithBlock(hash, height)
+      ).length !== 0
+    );
+  }
+
+  /**
+   * Send the downloads which `requestBlock` deferred (because every node with
+   * the block had reached `maxPendingDownloads` or was disconnected) as soon as
+   * a node can take them, rather than waiting for the download timeout.
+   * Deferred downloads keep their buffer reservation, so they are sent before
+   * any new block is reserved.
+   */
+  retryDeferredDownloads() {
+    this.blockDownloads
+      .filter((download) => download.requestedFromNode === undefined)
+      .forEach((download) => {
+        if (this.hasDownloadSlotForBlock(download.hash, download.height)) {
+          this.clearDownload(download);
+          this.requestBlock(download.hash, download.height);
+        }
+      });
+  }
+
+  /**
    * Request the specified block from the node expected to return it the
    * fastest.
    *
@@ -1898,7 +1945,7 @@ export class Agent {
     const [node] = this.orderNodesByExpectedDownloadSpeed(nodeNames);
     if (node === undefined) {
       this.logger.debug(
-        `All nodes with block ${height} (${hash}) are either responding slowly and have reached the maximum number of pending downloads (${maxPendingDownloads}) or are disconnected. Will retry download in ${
+        `All nodes with block ${height} (${hash}) are either responding slowly and have reached the maximum number of pending downloads (${maxPendingDownloads}) or are disconnected. Will retry download when a node has a free download slot or after ${
           downloadTimeout / msPerSecond
         } seconds.`
       );
