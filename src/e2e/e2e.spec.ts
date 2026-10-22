@@ -32,6 +32,7 @@ import { indexDefinitions } from '../components/db-utils.js';
 import {
   backfillRetainEventsSql,
   configureTrackingTriggersSql,
+  genesisStartReadGuardSql,
   outputHasDefaultSql,
   partitionOf,
 } from '../components/unspent-tracking.js';
@@ -3933,6 +3934,80 @@ test.serial(
       );
       holder.release();
       checker.release();
+      await db.pool.end();
+      await db.unspentTrackingJobPool.end();
+      if (originalPostgresConnectionString !== undefined) {
+        process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING =
+          originalPostgresConnectionString;
+      }
+    }
+  }
+);
+
+test.serial(
+  `[e2e] unspent_node_ids (${String(
+    unspentTrackingEnabled
+  )}): tracking from genesis over outputs that read '{}' answers live until the job has passed them`,
+  async (t) => {
+    if (!unspentTrackingEnabled) {
+      t.pass();
+      return;
+    }
+    t.timeout(unspentTestTimeoutMs);
+    const originalPostgresConnectionString =
+      process.env.CHAINGRAPH_POSTGRES_CONNECTION_STRING;
+    const db = await deferredDbModule('unspent-genesis-over-default');
+    const readMode = async () =>
+      (
+        await client.query<{ mode: string }>(
+          `SELECT unspent_tracking_read_mode() AS mode;`
+        )
+      ).rows[0]!.mode;
+    // eslint-disable-next-line functional/no-try-statement
+    try {
+      /*
+       * An initial sync at the tip saved every output with the default '{}';
+       * the agent then restarts with CHAINGRAPH_UNSPENT_TRACKING_START=genesis
+       * and starts tracking from genesis (as ensureInitialized does).
+       */
+      await client.query(
+        `UPDATE output SET unspent_node_ids = '{}' WHERE unspent_node_ids IS DISTINCT FROM '{}';`
+      );
+      await client.query('BEGIN;');
+      // eslint-disable-next-line functional/no-try-statement
+      try {
+        await client.query(/* sql */ `
+          SELECT unspent_tracking_initialize(4, 0, 0,
+            (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM unspent_tracking_events_id_seq));`);
+        await client.query(genesisStartReadGuardSql);
+        await client.query('COMMIT;');
+      } catch (err) {
+        await client.query('ROLLBACK;');
+        // eslint-disable-next-line functional/no-throw-statement
+        throw err;
+      }
+      await db.ensureUnspentTrackingIndexes();
+      await client.query('ANALYZE;');
+      t.is(await readMode(), 'live', 'outputs not processed yet: live');
+      await compareDeferredQueryRoot(t, 'genesis start: before the job');
+      await drainDeferred(t, db, 'genesis start');
+      t.not(await readMode(), 'live', 'job passed the start: stored set');
+      t.false(
+        (
+          await client.query<{ required: boolean }>(
+            `SELECT rebuild_required AS required FROM unspent_tracking_settings;`
+          )
+        ).rows[0]!.required,
+        'read guard cleared'
+      );
+      await client.query('ANALYZE;');
+      await compareDeferredStored(t, 'genesis start: caught up', 0);
+      await compareDeferredQueryRoot(t, 'genesis start: caught up');
+    } finally {
+      await client.query(`SELECT unspent_tracking_stop();`);
+      await client.query(/* sql */ `
+        UPDATE unspent_tracking_settings SET rebuild_required = false;
+        UPDATE output SET unspent_node_ids = NULL WHERE unspent_node_ids IS NOT NULL;`);
       await db.pool.end();
       await db.unspentTrackingJobPool.end();
       if (originalPostgresConnectionString !== undefined) {

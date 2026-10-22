@@ -199,6 +199,22 @@ export const dropOutputDefaultSql = [
   /* sql */ `ALTER TABLE output ALTER COLUMN unspent_node_ids DROP DEFAULT;`,
 ];
 
+/**
+ * Tracking from genesis: every output is processed by the job, but outputs
+ * saved before tracking started may already read `'{}'` (the column default
+ * of rows that existed when the migration ran, or the default set during an
+ * initial sync at the tip) and the query root's backlog correction only reads
+ * NULL as unprocessed. Reads therefore use the live per-node test until the
+ * job has passed every transaction saved before the start (the rebuild
+ * watermark; cleared once the job passes it). Run in the transaction that
+ * starts tracking.
+ */
+export const genesisStartReadGuardSql = /* sql */ `
+UPDATE unspent_tracking_settings
+  SET rebuild_required = true,
+      rebuild_through_transaction_internal_id = GREATEST(COALESCE(rebuild_through_transaction_internal_id, 0),
+        (SELECT COALESCE(max(internal_id), 0) FROM transaction));`;
+
 export const initializeSql = /* sql */ `SELECT unspent_tracking_initialize($1::integer, $2::bigint, $3::bigint, $4::bigint) AS initialized;`;
 export const repartitionSql = /* sql */ `SELECT unspent_tracking_repartition($1::integer) AS repartitioned;`;
 export const progressSql = /* sql */ `

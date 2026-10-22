@@ -40,6 +40,7 @@ import {
   deleteConsumedEventsSql,
   dropOutputDefaultSql,
   formatBatchLog,
+  genesisStartReadGuardSql,
   headersAcceptedEventsSql,
   initializeSql,
   lockTrackingSettingsSql,
@@ -2735,6 +2736,9 @@ const ensureInitialized = async (
           limits.eventLimit,
         ])
       ).rows[0]?.initialized === true;
+    if (initialized && unspentTracking.startAtGenesis) {
+      await client.query(genesisStartReadGuardSql);
+    }
     await client.query('COMMIT;');
   } catch (err) {
     await client.query('ROLLBACK;');
@@ -2926,7 +2930,7 @@ export const runUnspentTrackingJobPass = async (
       if (rebuildRequired && !unspentTracking.backfill && !rebuildWarned) {
         rebuildWarned = true;
         unspentTrackingLog.warn(
-          'Unspent tracking job: a rebuild after a stop is pending; it runs although CHAINGRAPH_UNSPENT_TRACKING_BACKFILL=false (until it completes, unspent_output answers with the live predicate).'
+          'Unspent tracking job: a rebuild is pending (after a stop, or tracking from genesis over outputs saved before it started); it runs although CHAINGRAPH_UNSPENT_TRACKING_BACKFILL=false (until it completes, unspent_output answers with the live predicate).'
         );
       }
       if (
